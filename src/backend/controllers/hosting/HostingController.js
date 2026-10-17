@@ -1,0 +1,87 @@
+/*
+ * Copyright (C) 2024-present Puter Technologies Inc.
+ *
+ * This file is part of Puter.
+ *
+ * Puter is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published
+ * by the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+import { HttpError } from '../../core/http/HttpError.js';
+import { PuterController } from '../types.js';
+import {
+    DEFAULT_FREE_SUBSCRIPTION,
+    DEFAULT_TEMP_SUBSCRIPTION,
+} from '../../services/metering/consts.js';
+
+/**
+ * Site hosting endpoints. Listing and create/update are not exposed as
+ * controller routes — clients use the `puter-subdomains` driver (select /
+ * create / update / read) so they get the v1-shape with uuids and nested
+ * objects (no raw mysql ids). Only `/delete-site` lives here because v1 also
+ * exposed it as a top-level POST.
+ */
+export class HostingController extends PuterController {
+    registerRoutes(router) {
+        // -- Delete site ---------------------------------------------
+
+        router.post(
+            '/delete-site',
+            {
+                subdomain: 'api',
+                requireUserActor: true,
+                allowFullAccessToken: true,
+                requireVerified: true,
+                // Destructive, and pairs with the `subdomains:create`
+                // budget on the driver side.
+                rateLimit: {
+                    scope: 'delete-site',
+                    limit: 60,
+                    window: 60_000,
+                    key: 'user',
+                    bySubscription: {
+                        [DEFAULT_FREE_SUBSCRIPTION]: 30,
+                        [DEFAULT_TEMP_SUBSCRIPTION]: 10,
+                    },
+                },
+            },
+            async (req, res) => {
+                const { site_uuid } = req.body ?? {};
+                if (!site_uuid || typeof site_uuid !== 'string') {
+                    throw new HttpError(400, 'Missing or invalid `site_uuid`', {
+                        legacyCode: 'bad_request',
+                    });
+                }
+
+                // Owner-scoped, so another user's site reads as missing.
+                const row = await this.stores.subdomain.getByUuid(site_uuid, {
+                    userId: req.actor.user.id,
+                });
+                if (!row) {
+                    throw new HttpError(
+                        404,
+                        'Site not found or not owned by you',
+                        { legacyCode: 'not_found' },
+                    );
+                }
+                await this.drivers.subdomains.delete({ uid: site_uuid });
+
+                res.json({});
+            },
+        );
+    }
+
+    onServerStart() {}
+    onServerPrepareShutdown() {}
+    onServerShutdown() {}
+}

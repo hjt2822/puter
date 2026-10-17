@@ -1,0 +1,804 @@
+/*
+ * Copyright (C) 2024-present Puter Technologies Inc.
+ *
+ * This file is part of Puter.
+ *
+ * Puter is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published
+ * by the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+import {
+    CreateTableCommand,
+    CreateTableCommandInput,
+    DynamoDBClient,
+} from '@aws-sdk/client-dynamodb';
+import {
+    BatchGetCommand,
+    BatchGetCommandInput,
+    BatchWriteCommand,
+    BatchWriteCommandInput,
+    DeleteCommand,
+    DynamoDBDocumentClient,
+    GetCommand,
+    PutCommand,
+    QueryCommand,
+    ScanCommand,
+    UpdateCommand,
+} from '@aws-sdk/lib-dynamodb';
+import { NodeHttpHandler } from '@smithy/node-http-handler';
+//@ts-expect-error - no types available for dynalite
+import dynalite from 'dynalite';
+import { randomUUID } from 'node:crypto';
+import { once } from 'node:events';
+import { Agent as httpsAgent } from 'node:https';
+import { HttpError } from '../../core/http';
+import type { IConfig, IDynamoConfig } from '../../types';
+import { BoundedTtlMap } from '../../util/boundedTtlMap.js';
+import { runWithConcurrencyLimitSettled } from '../../util/concurrency.js';
+import { Span } from '../../util/span.js';
+import { PuterClient } from '../types';
+import {
+    clampStoredNumber,
+    isRepairableMarshallError,
+    repairForMarshall,
+} from './marshallRepair.js';
+import { attachThrottleLogging } from './throttleLog.js';
+
+const LOCAL_DYNAMO_MEMORY_PREFIX = ':memory:';
+const localDynaliteEndpointPromises = new Map<string, Promise<string>>();
+const MAX_BATCH_WRITE_ITEMS = 25;
+// Chunks of one batch write in flight at once.
+const BATCH_WRITE_CONCURRENCY = 4;
+const MAX_BATCH_RETRIES = 8;
+const BATCH_RETRY_BASE_MS = 25;
+
+// In-memory mode gives each DDBClient its own unique key, which keys
+// into a fresh dynalite server. This is what test parallelism needs:
+// two clients in the same Node process don't share state. Persistent
+// paths still share by `path`, so prod-like reuse keeps working.
+const getDynalitePathKey = (path?: string, inMemory?: boolean) => {
+    if (inMemory) return `${LOCAL_DYNAMO_MEMORY_PREFIX}#${randomUUID()}`;
+    if (path === ':memory:')
+        return `${LOCAL_DYNAMO_MEMORY_PREFIX}#${randomUUID()}`;
+    return path || './volatile/runtime/puter-ddb';
+};
+
+const isMemoryPathKey = (pathKey: string) =>
+    pathKey.startsWith(LOCAL_DYNAMO_MEMORY_PREFIX);
+
+const getOrCreateLocalDynaliteEndpoint = async (pathKey: string) => {
+    let endpointPromise = localDynaliteEndpointPromises.get(pathKey);
+    if (endpointPromise) return endpointPromise;
+
+    endpointPromise = (async () => {
+        const dynaliteOptions = isMemoryPathKey(pathKey)
+            ? { createTableMs: 0 }
+            : { createTableMs: 0, path: pathKey };
+
+        const dynaliteInstance = dynalite(dynaliteOptions);
+        const dynaliteServer = dynaliteInstance.listen(0, '127.0.0.1');
+        dynaliteServer.unref?.();
+        await once(dynaliteServer, 'listening');
+
+        const address = dynaliteServer.address();
+        const port =
+            (typeof address === 'object' && address
+                ? address.port
+                : undefined) || 4567;
+        return `http://127.0.0.1:${port}`;
+    })();
+
+    localDynaliteEndpointPromises.set(pathKey, endpointPromise);
+    endpointPromise.catch(() => {
+        if (localDynaliteEndpointPromises.get(pathKey) === endpointPromise) {
+            localDynaliteEndpointPromises.delete(pathKey);
+        }
+    });
+
+    return endpointPromise;
+};
+
+const chunkValues = <T>(values: T[], size: number): T[][] => {
+    if (values.length === 0) {
+        return [];
+    }
+
+    const chunks: T[][] = [];
+    for (let index = 0; index < values.length; index += size) {
+        chunks.push(values.slice(index, index + size));
+    }
+    return chunks;
+};
+
+type BatchWriteItems = NonNullable<BatchWriteCommandInput['RequestItems']>;
+type WriteRequest = BatchWriteItems[string][number];
+
+/** Consumed capacity summed per table across the requests of one batch. */
+class ConsumedCapacityTally {
+    #byTable = new Map<string, number>();
+
+    add(entries: { TableName?: string; CapacityUnits?: number }[] = []) {
+        for (const { TableName, CapacityUnits } of entries) {
+            if (!TableName) continue;
+            this.#byTable.set(
+                TableName,
+                (this.#byTable.get(TableName) ?? 0) +
+                    Number(CapacityUnits ?? 0),
+            );
+        }
+    }
+
+    entries() {
+        return Array.from(this.#byTable, ([TableName, CapacityUnits]) => ({
+            TableName,
+            CapacityUnits,
+        }));
+    }
+}
+
+const sleep = async (ms: number) => {
+    await new Promise((resolve) => setTimeout(resolve, ms));
+};
+
+// One caller writing an out-of-range number usually keeps doing it, so the
+// warning is per-target and throttled rather than one line per write.
+const repairWarnings = new BoundedTtlMap<string, true>({
+    maxEntries: 1_000,
+    ttlMs: 60_000,
+});
+
+const warnRepaired = (target: string, message: string): void => {
+    if (!repairWarnings.shouldEmit(target)) return;
+    console.warn(
+        `[ddb] clamped an out-of-range value in ${target}: ${message}`,
+    );
+};
+
+/**
+ * Send a write, and if the payload was rejected while being encoded for a value
+ * the store cannot represent, clamp it and send it once more.
+ *
+ * Nothing is inspected on the way in: the payload of a successful write is
+ * never walked, so this costs one `try` on the hot path. The repair only runs
+ * on the failure, and only retries when it actually changed something —
+ * otherwise the original error stands.
+ */
+const sendRepairingValues = async <TPayload, TResult>(
+    payload: TPayload,
+    send: (payload: TPayload) => Promise<TResult>,
+    describe: () => string,
+): Promise<TResult> => {
+    try {
+        return await send(payload);
+    } catch (error) {
+        if (!isRepairableMarshallError(error)) throw error;
+
+        const repaired = repairForMarshall(payload);
+        if (!repaired.changed) throw error;
+
+        warnRepaired(describe(), (error as Error).message);
+        return send(repaired.value as TPayload);
+    }
+};
+
+export class DDBClient extends PuterClient {
+    #documentClient: DynamoDBDocumentClient | null = null;
+    #localInitPromise: Promise<void> | null = null;
+    #ddbConfig: IDynamoConfig;
+    // Resolved once at construction. In-memory mode generates a unique
+    // key per instance so parallel clients don't share state, but
+    // `recreateClient()` reuses this same key and so reuses the server.
+    #localPathKey: string;
+    #keyNamesByTable = new Map<string, string[]>();
+
+    constructor(config: IConfig) {
+        super(config);
+        this.#ddbConfig = config.dynamo ?? {};
+        this.#localPathKey = getDynalitePathKey(
+            this.#ddbConfig.path,
+            this.#ddbConfig.inMemory,
+        );
+
+        if (this.#ddbConfig.aws) {
+            this.#bindAwsClient();
+            return;
+        }
+
+        this.#localInitPromise = this.#bindLocalClient();
+        this.#localInitPromise.catch((error) => {
+            console.error('Failed to initialize local DynamoDB client', error);
+        });
+    }
+
+    async recreateClient() {
+        if (this.#ddbConfig.aws) {
+            this.#bindAwsClient();
+            return;
+        }
+
+        this.#localInitPromise = this.#bindLocalClient();
+        await this.#localInitPromise;
+    }
+
+    @Span('ddb.get', (table: string) => ({ 'db.table': table }))
+    async get<T extends Record<string, unknown>>(
+        table: string,
+        key: T,
+        consistentRead = false,
+    ) {
+        const command = new GetCommand({
+            TableName: table,
+            Key: key,
+            ConsistentRead: consistentRead,
+            ReturnConsumedCapacity: 'TOTAL',
+        });
+
+        const client = await this.#getDocumentClient();
+        return client.send(command);
+    }
+
+    @Span('ddb.put', (table: string) => ({ 'db.table': table }))
+    async put<T extends Record<string, unknown>>(table: string, item: T) {
+        const client = await this.#getDocumentClient();
+        return sendRepairingValues(
+            item,
+            (itemToWrite) =>
+                client.send(
+                    new PutCommand({
+                        TableName: table,
+                        Item: itemToWrite,
+                        ReturnConsumedCapacity: 'TOTAL',
+                    }),
+                ),
+            () => `a put to ${table}`,
+        );
+    }
+
+    // UnprocessedKeys retried with capped exponential backoff, same posture as
+    // #batchWrite's UnprocessedItems: a batch this size can be throttled or
+    // partially served, and the caller shouldn't have to know that.
+    @Span('ddb.batchGet', (params: unknown[]) => ({
+        'db.batch_size': params.length,
+    }))
+    async batchGet(
+        params: { table: string; items: Record<string, unknown> }[],
+        consistentRead = false,
+    ) {
+        const allRequestItemsPerTable = params.reduce(
+            (acc, curr) => {
+                if (!acc[curr.table]) acc[curr.table] = [];
+                acc[curr.table].push(curr.items);
+                return acc;
+            },
+            {} as Record<string, Record<string, unknown>[]>,
+        );
+
+        const requestItems = Object.entries(allRequestItemsPerTable).reduce(
+            (acc, [table, keyList]) => {
+                acc[table] = {
+                    Keys: keyList,
+                    ConsistentRead: consistentRead,
+                };
+                return acc;
+            },
+            {} as NonNullable<BatchGetCommandInput['RequestItems']>,
+        );
+
+        const client = await this.#getDocumentClient();
+        const responsesByTable = new Map<string, Record<string, unknown>[]>();
+        const capacity = new ConsumedCapacityTally();
+
+        const drained = await this.#sendWithUnprocessedRetry(
+            requestItems,
+            async (pending) => {
+                const response = await client.send(
+                    new BatchGetCommand({
+                        RequestItems: pending,
+                        ReturnConsumedCapacity: 'TOTAL',
+                    }),
+                );
+                for (const [table, items] of Object.entries(
+                    response.Responses ?? {},
+                )) {
+                    const existing = responsesByTable.get(table) ?? [];
+                    existing.push(...items);
+                    responsesByTable.set(table, existing);
+                }
+                capacity.add(response.ConsumedCapacity);
+                return response.UnprocessedKeys as typeof pending | undefined;
+            },
+        );
+
+        if (!drained) {
+            throw new HttpError(
+                400,
+                'Failed to batch get all items from DynamoDB',
+                { legacyCode: 'bad_request' },
+            );
+        }
+
+        return {
+            Responses: Object.fromEntries(responsesByTable),
+            ConsumedCapacity: capacity.entries(),
+        };
+    }
+
+    @Span('ddb.batchPut', (params: unknown[]) => ({
+        'db.batch_size': params.length,
+    }))
+    async batchPut(params: { table: string; item: Record<string, unknown> }[]) {
+        return this.#batchWrite(
+            params.map(({ table, item }) => ({
+                table,
+                request: { PutRequest: { Item: item } },
+            })),
+        );
+    }
+
+    @Span('ddb.batchDel', (params: unknown[]) => ({
+        'db.batch_size': params.length,
+    }))
+    async batchDel(params: { table: string; key: Record<string, unknown> }[]) {
+        return this.#batchWrite(
+            params.map(({ table, key }) => ({
+                table,
+                request: { DeleteRequest: { Key: key } },
+            })),
+        );
+    }
+
+    // Shared BatchWriteItem plumbing for batchPut/batchDel and the TTL sweep:
+    // 25-item chunks a few at a time, UnprocessedItems retried, consumed
+    // capacity summed per table across every request.
+    async #batchWrite(params: { table: string; request: WriteRequest }[]) {
+        if (params.length === 0) {
+            return { ConsumedCapacity: [] };
+        }
+
+        const client = await this.#getDocumentClient();
+        const capacity = new ConsumedCapacityTally();
+        // Once a chunk fails, the rest aren't started. Those in flight settle
+        // before the error is thrown, so no write lands after the caller's
+        // cleanup.
+        let failed = false;
+
+        const outcomes = await runWithConcurrencyLimitSettled(
+            chunkValues(params, MAX_BATCH_WRITE_ITEMS),
+            BATCH_WRITE_CONCURRENCY,
+            async (chunk) => {
+                if (failed) return;
+                const requestItems: BatchWriteItems = {};
+                for (const { table, request } of chunk) {
+                    (requestItems[table] ??= []).push(request);
+                }
+                try {
+                    const drained = await this.#sendWithUnprocessedRetry(
+                        requestItems,
+                        async (pending) => {
+                            const response = await sendRepairingValues(
+                                pending,
+                                (itemsToWrite) =>
+                                    client.send(
+                                        new BatchWriteCommand({
+                                            RequestItems: itemsToWrite,
+                                            ReturnConsumedCapacity: 'TOTAL',
+                                        }),
+                                    ),
+                                () =>
+                                    `a batch write to ${Object.keys(pending).join(', ')}`,
+                            );
+                            capacity.add(response.ConsumedCapacity);
+                            return response.UnprocessedItems as
+                                BatchWriteItems | undefined;
+                        },
+                    );
+                    if (!drained) {
+                        throw new HttpError(
+                            400,
+                            'Failed to batch write all items to DynamoDB',
+                            { legacyCode: 'bad_request' },
+                        );
+                    }
+                } catch (error) {
+                    failed = true;
+                    throw error;
+                }
+            },
+        );
+        const rejected = outcomes.find(
+            (outcome): outcome is PromiseRejectedResult =>
+                outcome.status === 'rejected',
+        );
+        if (rejected) throw rejected.reason;
+
+        return { ConsumedCapacity: capacity.entries() };
+    }
+
+    /**
+     * Send a batch request and resend whatever comes back unprocessed, with
+     * capped exponential backoff. `send` returns the unprocessed remainder.
+     * Resolves false when items are still left after the last retry.
+     */
+    async #sendWithUnprocessedRetry<TItems extends object>(
+        requestItems: TItems,
+        send: (pending: TItems) => Promise<TItems | undefined>,
+    ): Promise<boolean> {
+        let pending: TItems | undefined = requestItems;
+        for (let attempt = 0; attempt <= MAX_BATCH_RETRIES; attempt++) {
+            if (!pending || Object.keys(pending).length === 0) return true;
+            pending = await send(pending);
+            if (
+                attempt < MAX_BATCH_RETRIES &&
+                pending &&
+                Object.keys(pending).length > 0
+            ) {
+                await sleep(Math.min(1000, BATCH_RETRY_BASE_MS * 2 ** attempt));
+            }
+        }
+        return !pending || Object.keys(pending).length === 0;
+    }
+
+    @Span('ddb.del', (table: string) => ({ 'db.table': table }))
+    async del<T extends Record<string, unknown>>(
+        table: string,
+        key: T,
+        opts?: {
+            returnOld?: boolean;
+            /** Refused (`ConditionalCheckFailedException`) unless it holds. */
+            condition?: {
+                expression: string;
+                names?: Record<string, string>;
+                values?: Record<string, unknown>;
+            };
+        },
+    ) {
+        const command = new DeleteCommand({
+            TableName: table,
+            Key: key,
+            ReturnConsumedCapacity: 'TOTAL',
+            // ALL_OLD makes the delete an atomic claim: exactly one caller
+            // gets the attributes back.
+            ...(opts?.returnOld ? { ReturnValues: 'ALL_OLD' as const } : {}),
+            ...(opts?.condition
+                ? {
+                      ConditionExpression: opts.condition.expression,
+                      ...(opts.condition.names
+                          ? { ExpressionAttributeNames: opts.condition.names }
+                          : {}),
+                      ...(opts.condition.values
+                          ? {
+                                ExpressionAttributeValues:
+                                    opts.condition.values,
+                            }
+                          : {}),
+                  }
+                : {}),
+        });
+
+        const client = await this.#getDocumentClient();
+        return client.send(command);
+    }
+
+    @Span('ddb.query', (table: string) => ({ 'db.table': table }))
+    async query<T extends Record<string, unknown>>(
+        table: string,
+        keys: T,
+        limit = 0,
+        pageKey?: Record<string, unknown>,
+        index = '',
+        consistentRead = false,
+        options?: {
+            scanIndexForward?: boolean;
+            beginsWith?: { key: string; value: string };
+            select?: 'COUNT';
+            filter?: {
+                expression: string;
+                values?: Record<string, unknown>;
+                names?: Record<string, string>;
+            };
+        },
+    ) {
+        const keyExpressionParts = Object.keys(keys).map(
+            (key) => `#${key} = :${key}`,
+        );
+        const expressionAttributeValues = Object.entries(keys).reduce(
+            (acc, [key, value]) => {
+                acc[`:${key}`] = value;
+                return acc;
+            },
+            {} as Record<string, unknown>,
+        );
+        const expressionAttributeNames = Object.keys(keys).reduce(
+            (acc, key) => {
+                acc[`#${key}`] = key;
+                return acc;
+            },
+            {} as Record<string, string>,
+        );
+
+        if (options?.beginsWith?.key && options.beginsWith.value !== '') {
+            const beginsKey = options.beginsWith.key;
+            const beginsValueToken = `:${beginsKey}_begins_with`;
+            keyExpressionParts.push(
+                `begins_with(#${beginsKey}, ${beginsValueToken})`,
+            );
+            expressionAttributeValues[beginsValueToken] =
+                options.beginsWith.value;
+            expressionAttributeNames[`#${beginsKey}`] = beginsKey;
+        }
+
+        if (options?.filter) {
+            Object.assign(expressionAttributeValues, options.filter.values);
+            Object.assign(expressionAttributeNames, options.filter.names);
+        }
+
+        const command = new QueryCommand({
+            TableName: table,
+            ...(!index ? {} : { IndexName: index }),
+            KeyConditionExpression: keyExpressionParts.join(' AND '),
+            ExpressionAttributeValues: expressionAttributeValues,
+            ExpressionAttributeNames: expressionAttributeNames,
+            ConsistentRead: consistentRead,
+            ...(!pageKey ? {} : { ExclusiveStartKey: pageKey }),
+            ...(!limit ? {} : { Limit: limit }),
+            ...(options?.filter
+                ? { FilterExpression: options.filter.expression }
+                : {}),
+            ...(options?.select ? { Select: options.select } : {}),
+            ...(options?.scanIndexForward !== undefined
+                ? { ScanIndexForward: options.scanIndexForward }
+                : {}),
+            ReturnConsumedCapacity: 'TOTAL',
+        });
+
+        const client = await this.#getDocumentClient();
+        return client.send(command);
+    }
+
+    @Span('ddb.update', (table: string) => ({ 'db.table': table }))
+    async update<T extends Record<string, unknown>>(
+        table: string,
+        key: T,
+        expression: string,
+        expressionValues?: Record<string, unknown>,
+        expressionNames?: Record<string, string>,
+        options?: { condition?: string },
+    ) {
+        const hasValues =
+            !!expressionValues && Object.keys(expressionValues).length > 0;
+        const hasNames =
+            !!expressionNames && Object.keys(expressionNames).length > 0;
+        const client = await this.#getDocumentClient();
+        return sendRepairingValues(
+            expressionValues,
+            (valuesToWrite) =>
+                client.send(
+                    new UpdateCommand({
+                        TableName: table,
+                        Key: key,
+                        UpdateExpression: expression,
+                        ...(hasValues
+                            ? { ExpressionAttributeValues: valuesToWrite }
+                            : {}),
+                        ...(hasNames
+                            ? { ExpressionAttributeNames: expressionNames }
+                            : {}),
+                        ...(options?.condition
+                            ? { ConditionExpression: options.condition }
+                            : {}),
+                        ReturnValues: 'ALL_NEW',
+                        ReturnConsumedCapacity: 'TOTAL',
+                    }),
+                ),
+            () => `an update to ${table}`,
+        );
+    }
+
+    /** Lets throttle logs name a put's key without logging the item. */
+    registerKeySchema(
+        table: string,
+        keySchema: NonNullable<CreateTableCommandInput['KeySchema']>,
+    ) {
+        this.#keyNamesByTable.set(
+            table,
+            keySchema.map((key) => key.AttributeName!),
+        );
+    }
+
+    async createTableIfNotExists(
+        params: CreateTableCommandInput,
+        ttlAttribute?: string,
+    ) {
+        if (params.TableName && params.KeySchema) {
+            this.registerKeySchema(params.TableName, params.KeySchema);
+        }
+
+        // Real-AWS deployments provision tables externally (Terraform / IaC),
+        // so we no-op there by default. Self-hosters pointing at
+        // dynamodb-local opt in via `dynamo.bootstrapTables: true`.
+        if (this.#ddbConfig.aws && !this.#ddbConfig.bootstrapTables) {
+            console.warn(
+                'Creating DynamoDB tables is disabled by default; set `dynamo.bootstrapTables: true` in config to enable (intended for local emulators).',
+            );
+            return;
+        }
+
+        let alreadyExisted = false;
+        try {
+            const client = await this.#getDocumentClient();
+            await client.send(new CreateTableCommand(params));
+        } catch (error) {
+            if ((error as Error)?.name !== 'ResourceInUseException') {
+                throw error;
+            }
+            alreadyExisted = true;
+        }
+
+        // Only sweep a table that was already there. `CreateTable` returns
+        // while the table is still CREATING, so scanning it right away races
+        // its transition to ACTIVE and intermittently throws
+        // `ResourceNotFoundException` — and a table we just created holds no
+        // items to expire anyway.
+        if (ttlAttribute && alreadyExisted) {
+            try {
+                await this.#deleteExpiredItems(
+                    params.TableName!,
+                    params.KeySchema!,
+                    ttlAttribute,
+                );
+            } catch (error) {
+                // The sweep is opportunistic cleanup, so a table that isn't
+                // queryable yet must never fail boot. Emulators differ on
+                // whether `CreateTable` reports an existing table as in-use,
+                // which can still land us here on a CREATING table.
+                if ((error as Error)?.name !== 'ResourceNotFoundException') {
+                    throw error;
+                }
+                console.warn(
+                    `[ddb] skipped TTL sweep for ${params.TableName}: table not queryable yet`,
+                );
+            }
+        }
+    }
+
+    async #getDocumentClient() {
+        if (this.#documentClient) {
+            return this.#documentClient;
+        }
+
+        if (this.#localInitPromise) {
+            await this.#localInitPromise;
+        }
+
+        if (!this.#documentClient) {
+            throw new Error('DynamoDB document client is not initialized');
+        }
+
+        return this.#documentClient;
+    }
+
+    #bindAwsClient() {
+        const accessKeyId = this.#ddbConfig.aws?.access_key;
+        const secretAccessKey = this.#ddbConfig.aws?.secret_key;
+
+        if (!accessKeyId || !secretAccessKey) {
+            throw new Error(
+                'DynamoDB aws config requires both `access_key` and `secret_key`',
+            );
+        }
+
+        this.#bindClient({
+            credentials: { accessKeyId, secretAccessKey },
+            region: this.#ddbConfig.aws?.region || 'us-west-2',
+            endpoint: this.#ddbConfig.endpoint,
+        });
+    }
+
+    async #bindLocalClient() {
+        const endpoint = await getOrCreateLocalDynaliteEndpoint(
+            this.#localPathKey,
+        );
+        this.#bindClient({
+            credentials: { accessKeyId: 'fake', secretAccessKey: 'fake' },
+            region: 'us-west-2',
+            endpoint,
+        });
+    }
+
+    #bindClient({
+        credentials,
+        region,
+        endpoint,
+    }: {
+        credentials: { accessKeyId: string; secretAccessKey: string };
+        region: string;
+        endpoint?: string;
+    }) {
+        const ddbClient = new DynamoDBClient({
+            credentials,
+            maxAttempts: 3,
+            requestHandler: new NodeHttpHandler({
+                connectionTimeout: 5000,
+                requestTimeout: 5000,
+                httpsAgent: new httpsAgent({ keepAlive: true }),
+            }),
+            ...(endpoint ? { endpoint } : {}),
+            region,
+        });
+        attachThrottleLogging(ddbClient, region, (table) =>
+            this.#keyNamesByTable.get(table),
+        );
+
+        this.#documentClient = DynamoDBDocumentClient.from(ddbClient, {
+            marshallOptions: {
+                removeUndefinedValues: true,
+            },
+            unmarshallOptions: {
+                wrapNumbers: clampStoredNumber,
+            },
+        });
+    }
+
+    async #deleteExpiredItems(
+        table: string,
+        keySchema: NonNullable<CreateTableCommandInput['KeySchema']>,
+        ttlAttribute: string,
+    ) {
+        const now = Math.floor(Date.now() / 1000);
+        const keyNames = keySchema.map((key) => key.AttributeName!);
+
+        let lastEvaluatedKey: Record<string, unknown> | undefined;
+        const client = await this.#getDocumentClient();
+
+        do {
+            const scan = await client.send(
+                new ScanCommand({
+                    TableName: table,
+                    // 0 means no expiry, so it must never sweep.
+                    FilterExpression: '#ttl < :now AND #ttl <> :none',
+                    ExpressionAttributeNames: {
+                        '#ttl': ttlAttribute,
+                        ...Object.fromEntries(
+                            keyNames.map((key) => [`#k_${key}`, key]),
+                        ),
+                    },
+                    ExpressionAttributeValues: { ':now': now, ':none': 0 },
+                    ProjectionExpression: keyNames
+                        .map((key) => `#k_${key}`)
+                        .join(', '),
+                    ...(lastEvaluatedKey
+                        ? { ExclusiveStartKey: lastEvaluatedKey }
+                        : {}),
+                }),
+            );
+
+            lastEvaluatedKey = scan.LastEvaluatedKey as
+                Record<string, unknown> | undefined;
+            const items = scan.Items;
+            if (!items || items.length === 0) continue;
+
+            await this.#batchWrite(
+                items.map((item) => ({
+                    table,
+                    request: {
+                        DeleteRequest: {
+                            Key: Object.fromEntries(
+                                keyNames.map((key) => [key, item[key]]),
+                            ),
+                        },
+                    },
+                })),
+            );
+        } while (lastEvaluatedKey);
+    }
+}

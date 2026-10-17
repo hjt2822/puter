@@ -1,0 +1,1001 @@
+---
+title: puter.ai.chat()
+description: Chat with AI models, analyze images and videos, and perform function calls using 500+ models from OpenAI, Anthropic, Google, and more.
+platforms: [websites, apps, nodejs, workers]
+---
+
+Given a prompt returns the completion that best matches the prompt.
+
+## Syntax
+
+```js
+puter.ai.chat(prompt)
+puter.ai.chat(prompt, options = {})
+puter.ai.chat(prompt, testMode = false, options = {})
+puter.ai.chat(prompt, media, testMode = false, options = {})
+puter.ai.chat(prompt, [mediaURLArray], testMode = false, options = {})
+puter.ai.chat([messages], testMode = false, options = {})
+```
+
+## Parameters
+
+#### `prompt` (String)
+
+A string containing the prompt you want to complete.
+
+#### `options` (Object) (Optional)
+
+An object containing the following properties:
+
+- `model` (String) - The model you want to use for the completion. If not specified, defaults to `gpt-5.4-nano`. More than 500 models are available from vendors including OpenAI, Anthropic, Google, Alibaba Cloud, xAI, Mistral, OpenRouter, Infron, and others. For a full list, see the [AI models list](https://developer.puter.com/ai/models/) page.
+- `provider` (String) (Optional) - Pin the request to a specific vendor, for example `openrouter` or `infron`. Without it, Puter selects a vendor for the requested model. Call [`puter.ai.listModelProviders()`](/AI/listModelProviders) for the available values, and [`puter.ai.listModels(provider)`](/AI/listModels) for the models a given vendor serves.
+- `signal` (AbortSignal) (Optional) - Abort the request, including while waiting for the next streamed chunk. Cancellation rejects with the signal reason (normally an `AbortError`).
+- `stream` (Boolean) - A boolean indicating whether you want to stream the completion. Defaults to `false`.
+- `max_tokens` (Number) - The maximum number of tokens to generate in the completion. By default, the specific model's maximum is used.
+- `temperature` (Number) - A number between 0 and 2 indicating the randomness of the completion. Lower values make the output more focused and deterministic, while higher values make it more random. By default, the model's own temperature is used. Some OpenAI reasoning models ignore `temperature` and `top_p`. GPT-5.6 and GPT-6 Sol/Luna accept them only with `reasoning_effort: 'none'`, and GPT-6 Astra, GPT-6.1 Sol, and GPT-5.3 Codex always ignore them. `gemini-4-argon` ignores `temperature` too. `gemini-3.1-flash-lite` and `gemini-3-flash-preview` use it.
+- `tools` (Array) (Optional) - Function definitions the AI can call. See [Function Calling](#function-calling) for details.
+- `reasoning_effort` / `reasoning.effort` (String) (Optional) - Controls how much effort reasoning models spend thinking. Supported values: `none`, `minimal`, `low`, `medium`, `high`, and `xhigh`. Lower values give faster responses with less reasoning. OpenAI models, Meta's Muse Spark models, `gemini-4-argon`, `gemini-3.1-flash-lite` and `gemini-3-flash-preview` only; Muse Spark always reasons, so `none` is ignored for it. `gemini-4-argon` accepts `low`, `medium` and `high`, and uses `medium` when you leave it unset. `gemini-3.1-flash-lite` and `gemini-3-flash-preview` accept `minimal`, `low`, `medium` and `high`, and use Google's default level when you leave it unset. For these three Gemini models, any other value fails with `400 bad_request`, and messages can contain text and images only.
+- `verbosity` / `text.verbosity` (String) (Optional) - Controls how long or short responses are. Supported values: `low`, `medium`, and `high`. Lower values give shorter responses. OpenAI models only.
+- `normalize` (Boolean) (Optional) - Controls the format of the non-streaming response. When `true`, the response is normalized to the OpenAI format regardless of the model's vendor: `message.content` is a string, tool calls appear as `message.tool_calls`, and `finish_reason` is one of `stop`, `length`, `tool_calls`, or `content_filter` — or the vendor's own stop reason, passed through unchanged when it has no OpenAI equivalent. When `false`, the response keeps the vendor's native format (for Anthropic models, an array of content blocks). When unset, the SDK-wide `puter.ai.normalize` applies — itself tri-state: set it to `true` to normalize every call regardless of release date, `false` to disable normalization for every call, and when it is left unset too (the default) the release-date policy applies: **models released on or after September 1, 2026 return normalized (OpenAI-format) responses by default**, and for older models the default is unchanged — `message.content` keeps its vendor-native shape. (A handful of reasoning fields were made consistent across all models independently of this option; see [Reasoning fields on existing models](#reasoning-fields-on-existing-models).) Streaming responses are unaffected — chunks already share one format across vendors. See [Response normalization](#response-normalization).
+- `compaction` (Boolean | Object) (Optional) - Opt into inline context compaction for long conversations. Pass `true` to enable it with provider defaults, or `{ trigger_tokens: number }` to set the token threshold at which earlier context is summarized. When the model compacts, you receive a `compaction` chunk while streaming (or a `compaction` field on the result when not streaming) containing an opaque `encrypted_content` summary. Resend that item in `messages` on the next turn in place of the summarized history. The compaction chunk shape is identical across providers, so the same code works whether `model` is an OpenAI or Anthropic model. See [Compaction](#compaction).
+- `toolChoice` (String | Object) (Optional) - Which tool, if any, the model must call. Pass `"auto"` (the model decides), `"none"` (never call a tool), `"required"` (call at least one), or an object naming a specific tool: `{ type: "tool", name: "..." }`. Requires `tools`.
+- `parallelToolCalls` (Boolean) (Optional) - Whether the model may call more than one tool in a single turn. Left unset, tool calls run one at a time.
+- `stopSequences` (Array of String) (Optional) - Up to the model's limit of strings; generation stops the moment one of them appears in the output.
+- `outputFormat` (Object) (Optional) - Constrains the response to a JSON schema: `{ type: "json_schema", schema, name?, strict? }`.
+- `thinking` (Object | null) (Optional) - Extended-thinking control: `{ type: "adaptive" | "enabled" | "disabled" | "between_tools", budgetTokens?, display? }`. Pass `null` to send no thinking configuration at all (the model's own default); leaving it unset falls back to the legacy derivation from `reasoning_effort`. `budgetTokens` only applies to `type: "enabled"`.
+- `streamToolInput` (Boolean) (Optional) - Streaming only. When `true`, a tool call's arguments arrive incrementally as `tool_use_start` / `tool_input_delta` chunks instead of a single `tool_use` chunk once the call completes.
+
+#### `testMode` (Boolean) (Optional)
+
+A boolean indicating whether you want to use the test API. Defaults to `false`. This is useful for testing your code without using up API credits.
+
+#### `media` (String | File)
+
+A string containing the URL or Puter path of an image or video, or a `File` object containing the media you want to provide as context for the completion.
+
+#### `mediaURLArray` (Array)
+
+An array of strings containing the URLs of images or videos you want to provide as context for the completion.
+
+#### `messages` (Array)
+
+An array of objects containing the messages you want to complete. Each object must have a `role` and a `content` property. The `role` property must be one of `system`, `assistant`, `user`, or `tool`. The `content` property can be:
+
+1. A string containing the message text
+2. An array of content objects for multimodal messages
+
+When using an array of content objects, each object can have:
+
+- `type` (String) - The type of content:
+  - `"text"` - Text content
+  - `"file"` - File content
+- `text` (String) - The text content (required when type is "text")
+- `puter_path` (String) - The path to the file in Puter's file system (required when type is "file")
+
+An example of a valid `messages` parameter with text only:
+
+```js
+[
+  {
+    role: "system",
+    content: "Hello, how are you?",
+  },
+  {
+    role: "user",
+    content: "I am doing well, how are you?",
+  },
+];
+```
+
+An example with mixed content including files:
+
+```js
+[
+  {
+    role: "user",
+    content: [
+      {
+        type: "file",
+        puter_path: "~/Desktop/document.pdf",
+      },
+      {
+        type: "text",
+        text: "Please summarize this document",
+      },
+    ],
+  },
+];
+```
+
+Providing a messages array is especially useful for building chatbots where you want to provide context to the completion.
+
+## Return value
+
+Returns a `Promise` that resolves to either:
+
+- A [`ChatResponse`](/Objects/chatresponse) object containing the chat response data, or
+- An async iterable object of [`ChatResponseChunk`](/Objects/chatresponsechunk) (when `stream` is set to `true`) that you can use with a `for await...of` loop to receive the response in parts as they become available.
+
+In case of an error, the `Promise` will reject with an error message.
+
+For streaming responses, an error from the AI provider is returned as a chunk
+with `type: "error"` and a `message` describing the failure. This also happens
+if the provider stops sending the response before it is complete. Check for
+error chunks in your `for await...of` loop before treating the response as complete.
+
+If the network connection fails after streaming starts, the loop throws
+`{ message, code: "network_error" }`. Malformed or truncated JSON throws
+`{ message, code: "invalid_stream_response" }`. If the stream sends nothing for 15
+minutes, it throws `{ message, code: "request_timeout" }`; a call that gets no
+response at all for 15 minutes rejects the same way. Neither is retried, since
+the model may already have run (see
+[Request timeouts](/rate-limits-and-quotas/#request-timeouts)). Use
+`try...catch` around the call and loop to handle these failures.
+
+### Stopping a stream
+
+Break out of the `for await...of` loop to stop a chat stream. When using
+`new ReadableStream(response)`, call `reader.cancel()` to stop it.
+
+You can also pass an `AbortSignal` to stop generation before output arrives:
+
+```js
+const controller = new AbortController();
+const stopButton = document.createElement('button');
+stopButton.textContent = 'Stop';
+stopButton.onclick = () => controller.abort();
+document.body.append(stopButton);
+try {
+    const response = await puter.ai.chat('Write a long story', {
+        stream: true,
+        signal: controller.signal,
+    });
+    for await (const part of response) {
+        if (part.type === 'text') console.log(part.text);
+    }
+} catch (error) {
+    if (error.name !== 'AbortError') throw error;
+} finally {
+    stopButton.remove();
+}
+```
+
+Output generated before the provider processes cancellation may still be billed.
+
+The `ReadableStream` adapter emits text chunks as UTF-8 text. Other chunk types
+(including usage, tool calls, reasoning and errors) are serialized as JSON followed
+by a newline. Use the async iterator to receive every chunk as an object.
+
+## Vendors
+
+We use different vendors for different models and try to use the best vendor available at the time of the request. Vendors currently include Alibaba Cloud, Anthropic, Azure OpenAI, DeepSeek, Google, Infron, Meta, MiniMax, Mistral, Moonshot AI, OpenAI, OpenRouter, Together AI, xAI, and Z.AI. Call [`puter.ai.listModelProviders()`](/AI/listModelProviders) for the current list, or pass `provider` in the options object to pin a request to one of them.
+
+## Response Normalization
+
+Most vendors respond in the OpenAI chat format, where `message.content` is a string and tool calls appear as `message.tool_calls`. Anthropic models historically respond in Anthropic's native format instead, where `message.content` is an array of content blocks such as `[{ type: "text", text: "..." }]`.
+
+**Going forward, all models released on or after September 1, 2026 return responses in the OpenAI format**, no matter which vendor serves them — so the same response-handling code works across every new model. For models released before that date, the `normalize` default does not change: leave the option unset and `message.content` keeps its vendor-native shape.
+
+### Reasoning fields on existing models
+
+Separately from the `normalize` default, four reasoning-related fields were made consistent across vendors. These apply to **every** model, including ones released before the cutoff, and are not affected by `normalize`:
+
+| Field | Before | Now |
+| --- | --- | --- |
+| `message.reasoning_content` | Present on providers following the DeepSeek convention (DeepSeek, OpenRouter and others) | **Renamed to `message.reasoning`.** Read `reasoning` instead — `reasoning_content` is no longer present on non-streaming responses. |
+| `message.reasoning` on OpenAI Responses models | Always present as `null` | Absent when the model returned no reasoning summary; a string when it did. `if (msg.reasoning)` is unaffected; `'reasoning' in msg` changes. |
+| `message.reasoning_details` on OpenAI Responses models | Not present | Present when the model returned reasoning items, carrying their `id` and `encrypted_content` for replay. |
+| `finish_reason` on OpenAI Responses models | Always `"stop"` | `"tool_calls"` when the turn ended in tool calls, `"stop"` otherwise. |
+
+If your code reads `message.reasoning_content` on a non-streaming response, that is the one change that removes a field — switch to `message.reasoning`.
+
+You can control this per call with the `normalize` option:
+
+```js
+// Force the OpenAI format on any model, old or new:
+const response = await puter.ai.chat("Hello", { model: "claude-sonnet-5", normalize: true });
+console.log(response.message.content);   // a string, or null on a tool-only turn
+console.log(response.finish_reason);     // "stop" | "length" | "tool_calls" | "content_filter" | vendor value
+
+// Force the vendor-native format, even on a post-cutoff model:
+const native = await puter.ai.chat("Hello", { model: "claude-sonnet-5", normalize: false });
+```
+
+Or SDK-wide with `puter.ai.normalize`:
+
+```js
+// Unset (the default): the release-date rule applies — models released on or
+// after September 1, 2026 return the OpenAI format, older models stay native.
+puter.ai.normalize = true;      // force normalization: every chat() call
+                                // returns the OpenAI format, old or new model
+puter.ai.normalize = false;     // disable normalization: every chat() call
+                                // returns the vendor-native format
+puter.ai.normalize = undefined; // back to the release-date rule
+```
+
+A `normalize` option on an individual call always overrides `puter.ai.normalize` in either direction. Normalized responses carry `normalized: true`.
+
+On a normalized response, extended-thinking output (from reasoning models that expose it) is joined into `message.reasoning`, and Anthropic stop reasons are mapped to OpenAI values (`end_turn` → `stop`, `max_tokens` → `length`, `tool_use` → `tool_calls`, `refusal` → `content_filter`). A vendor stop reason with no OpenAI equivalent — Anthropic's `pause_turn`, for instance — passes through unchanged, so treat `finish_reason` as an open set. See [`finish_reason`](/Objects/chatresponse) for the full mapping.
+
+Normalization does not cost you the ability to continue a reasoning turn. The opaque parts a provider needs back — Anthropic thinking-block signatures, OpenAI reasoning item ids and encrypted content — are preserved verbatim on `message.reasoning_details`. Resend that array as-is alongside the message when you continue an extended-thinking tool-use loop. The artifacts are vendor-specific and only meaningful to the model that produced them, so replay them to the same model — don't carry them across vendors.
+
+One caveat. The release-date rule applies to the model that actually serves the request — if a request is rerouted to a fallback provider, the served model's release date decides.
+
+One thing to know about the release-date rule: a model's release date comes from the catalog of whichever provider serves it, and some providers report it from their own live listing. Models served through OpenRouter carry the date OpenRouter itself assigns, so a model newly listed there on or after September 1, 2026 is normalized by default without Puter shipping any change. Pin `normalize: false` if your code depends on a provider's native shape.
+
+Streaming is unaffected by normalization: streamed [`ChatResponseChunk`](/Objects/chatresponsechunk) objects already share one format across all vendors, and the chunk types a model emits do not depend on the `normalize` option. Reasoning models stream their thinking as `reasoning` chunks on every provider, whether or not normalization applies.
+
+## Function Calling
+
+Function calling (also known as tool calling) allows AI models to request data or perform actions by calling functions you define. This enables the AI to access real-time information, interact with external systems, and perform tasks beyond its training data.
+
+1. **Define tools** - Create function specifications in the `tools` array passed to `puter.ai.chat()`
+2. **AI requests a tool call** - If the AI determines it needs to call a function, it responds with a `tool_calls` array instead of a text message
+3. **Execute the function** - Your code matches the requested function and runs it with the provided arguments
+4. **Send the result back** - Pass the function result back to the AI with `role: "tool"`
+5. **AI responds** - The AI uses the tool result to generate its final response
+
+Tools are defined in the `tools` parameter as an array of function specifications:
+
+- `type` (String) - Must be `"function"`
+- `function.name` (String) - The function name (e.g., `"get_weather"`)
+- `function.description` (String) - Description of what the function does and when to use it
+- `function.parameters` (Object) - [JSON Schema](https://json-schema.org/) object defining the function's input arguments
+- `function.strict` (Boolean) (Optional) - Whether to enforce strict parameter validation
+
+When the AI wants to call a function, the response includes `message.tool_calls`. Each tool call contains:
+
+- `id` (String) - Unique identifier for this tool call (used when sending results back)
+- `function.name` (String) - The name of the function to call
+- `function.arguments` (String) - JSON string containing the function arguments
+
+After executing the function, send the result back by including a message with:
+
+- `role` (String) - Must be `"tool"`
+- `tool_call_id` (String) - The `id` from the tool call
+- `content` (String) - The function result as a string
+
+Gemini models can attach `extra_content.google.thought_signature` to a tool call. Send the assistant message back with its `tool_calls` unchanged, including `extra_content`, so the model can continue its reasoning. In a stream, the signature arrives on the `tool_use` chunk's `extra_content`.
+
+See the [Function Calling example](/playground/ai-function-calling/) for a complete working implementation.
+
+### Web Search
+
+Specific to OpenAI models, you can use the built-in web search tool, allowing the AI to access up-to-date information from the internet.
+
+Pass in the `tools` parameter with the type of `web_search`.
+
+```js
+{
+  model: 'openai/gpt-5.6-luna',
+  tools: [{type: "web_search"}]
+}
+```
+
+The code implementation is available in our [web search example](/playground/ai-web-search/).
+
+List of OpenAI models that support the web search can be found in their [API compatibility documentation](https://platform.openai.com/docs/guides/tools-web-search#api-compatibility).
+
+## Prompt Caching
+
+Specific to Anthropic models, you can use the cache control feature, allowing you to optimize costs for repeated prompts.
+
+Pass in the `cache_control` parameter inside the object in the `messages` array.
+
+```js
+[
+    {
+        role: 'system',
+        content: 'a really long system prompt',
+        cache_control: { type: "ephemeral" }
+    },
+    {
+        role: 'user',
+        content: '<your message>'
+    },
+]
+```
+
+You can find the implementation in our [prompt caching example](/playground/ai-claude-cache-control/). Find more details about cache control in [Anthropic documentation](https://platform.claude.com/docs/en/build-with-claude/prompt-caching).
+
+## Compaction
+
+For long, multi-turn conversations that you keep on the client, enable
+`compaction` so the model can summarize earlier context before it overflows the
+context window. When it fires, the model summarizes the older turns into a single
+**compaction artifact** and answers from that summary instead of the full
+history — so the request stays small.
+
+You get the artifact back as a `compaction` item (a stream chunk when streaming,
+or `result.compaction` when not). On the next turn you carry it forward **as the
+first block of the assistant turn that produced it**, together with that turn's
+reply text — the artifact stands in for the older turns it summarized, and the
+recent exchange is preserved. The item shape is the same across providers, so the
+same code works for OpenAI and Anthropic models.
+
+#### Enabling it
+
+Pass `compaction` in the options object:
+
+- `compaction: true` — enable with provider defaults.
+- `compaction: { trigger_tokens: 60000 }` — set the token threshold at which the
+  model compacts.
+
+The artifact is `{ type: 'compaction', id, encrypted_content }`. `encrypted_content`
+is an opaque payload; treat it as a black box and just carry it forward.
+
+#### Streaming
+
+```js
+const resp = await puter.ai.chat(messages, {
+    model: 'gpt-5.5',                       // or 'claude-opus-4-8' — same code
+    stream: true,
+    compaction: { trigger_tokens: 60000 },
+});
+
+let text = '';
+let compaction = null;
+for await ( const part of resp ) {
+    if ( part.type === 'text' )             text += part.text;
+    else if ( part.type === 'compaction' )  compaction = part;                 // { type, id, encrypted_content }
+    else if ( part.type === 'error' )       console.error('stream error:', part.message);
+}
+
+// Next turn: rebuild the assistant turn from the compaction artifact + the reply
+// text it came with (artifact first), then add the new user message. The artifact
+// replaces the older compacted turns; the recent exchange is kept. Keep
+// compaction enabled so it can compact again later.
+if ( compaction ) {
+    const next = await puter.ai.chat(
+        [
+            { role: 'system', content: 'You are a helpful assistant.' },
+            {
+                role: 'assistant',
+                content: [ compaction, { type: 'text', text } ],
+            },
+            { role: 'user', content: 'now compare the two approaches' },
+        ],
+        { model: 'gpt-5.5', stream: true, compaction: true }
+    );
+    for await ( const part of next ) {
+        if ( part.type === 'text' ) document.write(part.text);
+    }
+}
+```
+
+#### Non-streaming
+
+```js
+const result = await puter.ai.chat(messages, {
+    model: 'gpt-5.5',
+    compaction: { trigger_tokens: 60000 },
+});
+console.log(result.message.content);
+
+if ( result.compaction ) {
+    // result.compaction is { type: 'compaction', id, encrypted_content } — the
+    // same item you get from the stream. Rebuild the assistant turn from it plus
+    // the reply text (artifact first), then add the new user message:
+    const next = await puter.ai.chat(
+        [
+            { role: 'system', content: 'You are a helpful assistant.' },
+            {
+                role: 'assistant',
+                content: [
+                    result.compaction,
+                    { type: 'text', text: result.message.content },
+                ],
+            },
+            { role: 'user', content: 'now compare the two approaches' },
+        ],
+        { model: 'gpt-5.5', compaction: true }
+    );
+    console.log(next.message.content);
+}
+```
+
+#### Notes
+
+- **Keep `compaction` enabled on every turn** of the conversation so it can
+  compact again as the conversation keeps growing.
+- **Carry the artifact as the first block of its assistant turn**, alongside that
+  turn's reply text, then continue with new turns. The artifact replaces the older
+  compacted turns; don't drop the recent exchange.
+- **It only fires once the context is large enough.** Anthropic models require a
+  minimum threshold of **50,000 tokens**, and the conversation must actually
+  exceed your `trigger_tokens`. OpenAI models don't enforce that floor, so they
+  can compact smaller conversations. If nothing compacts, your input was below
+  the threshold.
+- **Handle the `error` chunk** when streaming — provider errors (e.g. a
+  `trigger_tokens` below a provider's minimum) arrive as an `error` chunk, not a
+  thrown exception.
+
+## Image Generation (Gemini Image Models)
+
+Certain Gemini models can generate and edit images as part of a chat conversation. These models accept text and image inputs, and return text and images in the response.
+
+#### Supported Models
+
+| Model | Quality Levels |
+|-------|---------------|
+| `gemini-3-pro-image-preview` | `1K`, `2K`, `4K` |
+| `gemini-3.1-flash-image-preview` | `512`, `1K`, `2K`, `4K` |
+
+#### Options
+
+Pass `image_config` in the options object to control image output:
+
+| Option | Type | Description |
+|--------|------|-------------|
+| `image_config.aspect_ratio` | `String` | Aspect ratio (e.g. `"16:9"`, `"1:1"`, `"9:16"`) |
+| `image_config.image_size` | `String` | Output quality/resolution. Must be one of the model's supported quality levels |
+
+For available aspect ratios and image sizes per model, see the [Gemini Image Generation documentation](https://ai.google.dev/gemini-api/docs/image-generation#aspect_ratios_and_image_size).
+
+#### Response Format
+
+The response includes an `images` array on the message when the model generates images:
+
+```js
+{
+    message: {
+        role: "assistant",
+        content: "Here is your image.",
+        images: [
+            {
+                type: "image_url",
+                image_url: { url: "data:image/png;base64,..." }
+            }
+        ]
+    }
+}
+```
+
+#### Multi-Turn Image Editing
+
+You can send generated images back in the conversation to iteratively edit them. Include the image in an `assistant` message using the `image_url` content type, and pass the `thoughtSignature` from the previous response to maintain editing context:
+
+```js
+const previousImage = result.message.images[0].image_url.url;
+const thoughtSignature = result.message.images[0].thoughtSignature;
+
+const result2 = await puter.ai.chat([
+    { role: "user", content: "Create an infographic about photosynthesis" },
+    { role: "assistant", content: [
+        { type: "text", text: "Here is the infographic." },
+        { type: "image_url", image_url: { url: previousImage }, thoughtSignature },
+    ]},
+    { role: "user", content: "Translate all text to Spanish" },
+], {
+    model: "gemini-3.1-flash-image-preview",
+    image_config: { aspect_ratio: "16:9", image_size: "2K" },
+});
+
+const editedImage = result2.message.images[0].image_url.url;
+```
+
+The code implementation is available in our [image generation example](/playground/ai-image-chat/) and [multi-turn image editing example](/playground/ai-image-edit/).
+
+#### Streaming
+
+Image generation works with `stream: true`. Image chunks arrive as `image` events:
+
+```js
+const resp = await puter.ai.chat("Draw a cat", {
+    model: "gemini-3.1-flash-image-preview",
+    stream: true,
+});
+
+for await (const part of resp) {
+    if (part.text) console.log(part.text);
+    if (part.image) {
+        // part.image is { type: "image_url", image_url: { url: "data:..." } }
+        const img = document.createElement("img");
+        img.src = part.image.image_url.url;
+        document.body.appendChild(img);
+    }
+}
+```
+
+## Examples
+
+<strong class="example-title">Ask GPT-5.6 Luna a question</strong>
+
+```html;ai-chatgpt
+<html>
+<body>
+    <script src="https://js.puter.com/v2/"></script>
+    <script>
+        puter.ai.chat(`What is life?`, { model: "gpt-5.6-luna" }).then(puter.print);
+    </script>
+</body>
+</html>
+```
+
+<strong class="example-title">Image Analysis</strong>
+
+```html;ai-gpt-vision
+<html>
+<body>
+    <script src="https://js.puter.com/v2/"></script>
+    <img src="https://assets.puter.site/doge.jpeg" style="display:block;">
+    <script>
+        puter.ai
+            .chat(`What do you see?`, `https://assets.puter.site/doge.jpeg`, {
+                model: "gpt-5.6-luna",
+            })
+            .then(puter.print);
+    </script>
+</body>
+</html>
+```
+
+<strong class="example-title">Video Analysis</strong>
+
+```html;ai-video-analysis
+<html>
+<body>
+    <script src="https://js.puter.com/v2/"></script>
+    <script>
+        puter.ai
+            .chat(`What do you see?`, `https://assets.puter.site/puppy.mp4`, {
+                model: "reka/reka-edge",
+            })
+            .then(puter.print);
+    </script>
+</body>
+</html>
+```
+
+<strong class="example-title">Stream the response</strong>
+
+```html;ai-chat-stream
+<html>
+<body>
+    <script src="https://js.puter.com/v2/"></script>
+    <script>
+    (async () => {
+        const resp = await puter.ai.chat('Tell me in detail what Rick and Morty is all about.', {model: 'gemini-3.5-flash-lite', stream: true });
+        for await ( const part of resp ) document.write(part?.text.replaceAll('\n', '<br>'));
+    })();
+    </script>
+</body>
+</html>
+```
+
+<strong class="example-title">Function Calling</strong>
+
+```html;ai-function-calling
+<html>
+<body>
+    <script src="https://js.puter.com/v2/"></script>
+    <script>
+        // Mock weather function
+        function getWeather(location) {
+            return location + ': 22°C, Sunny';
+        }
+
+        // Define the tool
+        const tools = [{
+            type: "function",
+            function: {
+                name: "get_weather",
+                description: "Get current weather for a location",
+                parameters: {
+                    type: "object",
+                    properties: {
+                        location: { type: "string", description: "City name" }
+                    },
+                    required: ["location"]
+                }
+            }
+        }];
+
+        (async () => {
+            const question = "What's the weather in Paris?";
+            puter.print("Question: " + question + "<br/>");
+            puter.print("(Loading...)<br/>");
+
+            // Call AI with tools
+            const response = await puter.ai.chat(question, { tools });
+
+            // Check if AI wants to call a function
+            if (response.message.tool_calls?.length > 0) {
+                const toolCall = response.message.tool_calls[0];
+                const args = JSON.parse(toolCall.function.arguments);
+                const weatherData = getWeather(args.location);
+
+                // Send result back to AI
+                const finalResponse = await puter.ai.chat([
+                    { role: "user", content: question },
+                    response.message,
+                    { role: "tool", tool_call_id: toolCall.id, content: weatherData }
+                ]);
+
+                puter.print("Answer: " + finalResponse);
+            } else {
+                // If the AI responds directly without calling a tool, print its message
+                puter.print("Answer: " + response);
+            }
+        })();
+    </script>
+</body>
+</html>
+```
+
+<strong class="example-title">Streaming Function Calling</strong>
+
+```html;ai-streaming-function-calling
+<html>
+<body>
+    <script src="https://js.puter.com/v2/"></script>
+    <script>
+        // Define the tool
+        const tools = [{
+            type: "function",
+            function: {
+                name: "get_weather",
+                description: "Get current weather for a location",
+                parameters: {
+                    type: "object",
+                    properties: {
+                        location: { type: "string", description: "City name" }
+                    },
+                    required: ["location"]
+                }
+            }
+        }];
+
+        // Mock weather function
+        function getWeather(location) {
+            return `The weather in ${location} is 22°C and Sunny.`;
+        }
+
+        (async () => {
+            const question = "What's the weather in Paris?";
+            puter.print(`Question: ${question}<br/>`);
+
+            // 1. Call AI with stream: true AND tools
+            const response = await puter.ai.chat(question, { 
+                tools,
+                stream: true 
+            });
+
+            // 2. Iterate through the stream
+            for await (const part of response) {
+                
+                // Standard Text Stream
+                if (part.type === 'text') {
+                    puter.print(part.text);
+                }
+                
+                // Tool Call Detected
+                else if (part.type === 'tool_use') {
+                    const toolCall = part;
+                    const funcName = toolCall.name;
+                    const args = toolCall.input; // Already parsed: { location: "Paris" }
+
+                    puter.print(`<br/>[System] Calling tool: ${funcName} with args: ${JSON.stringify(args)}<br/>`);
+
+                    // Execute the local function
+                    let result;
+                    if (funcName === 'get_weather') {
+                        result = getWeather(args.location);
+                    }
+
+                    // Send the tool result back to the AI to get the final answer
+                    const finalResponse = await puter.ai.chat([
+                        { role: "user", content: question },
+                        { role: "assistant", tool_calls: [{
+                            id: toolCall.id,
+                            type: "function",
+                            function: { name: funcName, arguments: JSON.stringify(args) }
+                        }]},
+                        { role: "tool", tool_call_id: toolCall.id, content: result }
+                    ], { stream: true });
+
+                    for await (const finalPart of finalResponse) {
+                        if (finalPart.text) puter.print(finalPart.text);
+                    }
+                }
+            }
+        })();
+    </script>
+</body>
+</html>
+```
+
+<strong class="example-title">Web Search</strong>
+
+```html;ai-web-search
+<html>
+<body>
+    <script src="https://js.puter.com/v2/"></script>
+    <script>
+        puter.print(`Loading...`);
+        puter.ai
+            .chat("Summarize what the User-Pays Model is: https://docs.puter.com/user-pays-model/", {
+                model: "openai/gpt-5.6-luna",
+                tools: [{ type: "web_search" }],
+            })
+            .then(puter.print);
+    </script>
+</body>
+</html>
+```
+
+<strong class="example-title">Prompt caching with Claude</strong>
+
+```html;ai-claude-cache-control
+<html>
+<body>
+    <script src="https://js.puter.com/v2/"></script>
+    <script>
+        const systemPrompt = `You are an expert customer support agent for Acme Corporation, a global technology company specializing in cloud computing, AI solutions, and enterprise software.
+COMPANY OVERVIEW:
+Acme Corporation was founded in 2010 and is headquartered in San Francisco, California. We serve over 50,000 enterprise customers across 120 countries. Our products include AcmeCloud (infrastructure-as-a-service), AcmeBrain (AI/ML platform), AcmeFlow (workflow automation), and AcmeShield (cybersecurity suite). Our mission is to empower businesses of all sizes with reliable, scalable, and secure technology solutions.
+
+PRODUCT POLICIES:
+Policy 1 - Subscription Tiers: We offer four subscription tiers: Starter ($29/month per user), Professional ($79/month per user), Enterprise ($149/month per user), and Ultimate ($299/month per user). Each tier includes different levels of API access, storage, and support. Starter includes 10GB storage and email support. Professional includes 100GB storage, priority email, and chat support. Enterprise includes 1TB storage, 24/7 phone support, and a dedicated account manager. Ultimate includes unlimited storage, 24/7 priority support, a dedicated account manager, and custom SLA agreements.
+Policy 2 - Refund Policy: All subscriptions come with a 30-day money-back guarantee. After 30 days, refunds are prorated based on remaining time. Annual subscriptions receive a 20% discount but refunds after 30 days are calculated at the monthly rate. Enterprise and Ultimate customers may negotiate custom refund terms with their account manager. Refund requests must be submitted through the billing portal or by contacting support.
+Policy 3 - Data Retention: Customer data is retained for the duration of the subscription plus 90 days after cancellation. After 90 days, all data is permanently deleted unless the customer requests an extension. Backups are maintained for 30 days on Starter and Professional tiers, 90 days on Enterprise, and 365 days on Ultimate. Customers can export their data at any time through the dashboard or API.
+Policy 4 - Service Level Agreements: Starter tier: 99.5% uptime guarantee. Professional tier: 99.9% uptime guarantee. Enterprise tier: 99.95% uptime guarantee. Ultimate tier: 99.99% uptime guarantee with custom SLA options. SLA credits are calculated as 10x the downtime duration applied to the next billing cycle. Scheduled maintenance windows are excluded from SLA calculations and are announced 72 hours in advance.
+Policy 5 - Security and Compliance: All tiers include SOC 2 Type II compliance, GDPR compliance, and TLS 1.3 encryption. Enterprise and Ultimate tiers additionally include HIPAA compliance, FedRAMP authorization (in progress), and custom data residency options. Two-factor authentication is available on all tiers and mandatory on Enterprise and Ultimate. SSO integration via SAML 2.0 and OIDC is available on Professional tier and above.
+Policy 6 - API Rate Limits: Starter: 100 requests per minute. Professional: 1,000 requests per minute. Enterprise: 10,000 requests per minute. Ultimate: 100,000 requests per minute with burst capacity up to 500,000. Rate limit increases can be requested by Enterprise and Ultimate customers through their account manager. API usage is monitored and customers approaching their limits are notified automatically.
+Policy 7 - Support Escalation: Level 1 (General Support): Available to all tiers, response within 24 hours for Starter, 4 hours for Professional, 1 hour for Enterprise, and 15 minutes for Ultimate. Level 2 (Technical Specialist): Available to Professional and above, response within 8 hours for Professional, 2 hours for Enterprise, and 30 minutes for Ultimate. Level 3 (Engineering Team): Available to Enterprise and above, response within 4 hours for Enterprise and 1 hour for Ultimate.
+Policy 8 - Account Management: Each Enterprise and Ultimate customer is assigned a dedicated account manager who conducts quarterly business reviews, provides usage analytics and optimization recommendations, assists with onboarding and training for new team members, and coordinates with product teams on feature requests. Account managers are available during business hours (9 AM - 6 PM in the customer's local timezone) and can be reached via email, phone, or the customer portal. For urgent issues outside business hours, Enterprise and Ultimate customers can use the 24/7 emergency hotline.
+`;
+
+        async function askQuestion(question) {
+            const response = await puter.ai.chat(
+                [
+                    {
+                        role: "system",
+                        content: systemPrompt,
+                        cache_control: { type: "ephemeral" },
+                    },
+                    { role: "user", content: question },
+                ],
+                { model: "claude-sonnet-4-6", normalize: true }
+            );
+            return response.message.content;
+        }
+
+        (async () => {
+            puter.print("<b>Call 1 (cache write: first time processing system prompt)</b><br>");
+            const r1 = await askQuestion("How do I get a refund?");
+            puter.print(r1 + "<br><br>");
+
+            puter.print("<b>Call 2 (cache hit: system prompt reused from cache)</b><br>");
+            const r2 = await askQuestion("What are your API rate limits?");
+            puter.print(r2 + "<br><br>");
+
+            puter.print("<b>Call 3 (cache hit)</b><br>");
+            const r3 = await askQuestion("What is your data retention policy?");
+            puter.print(r3 + "<br><br>");
+        })();
+    </script>
+</body>
+</html>
+```
+
+<strong class="example-title">Image Generation</strong>
+
+```html;ai-image-chat
+<html>
+<body>
+    <script src="https://js.puter.com/v2/"></script>
+    <script>
+    (async () => {
+        puter.print("Generating image...<br>");
+        const result = await puter.ai.chat("Draw a cute cat wearing a top hat", {
+            model: "gemini-3.1-flash-image-preview",
+        });
+        puter.print(result.message.content + "<br>");
+        if (result.message.images?.length > 0) {
+            const img = document.createElement("img");
+            img.src = result.message.images[0].image_url.url;
+            img.style.maxWidth = "512px";
+            document.body.appendChild(img);
+        }
+    })();
+    </script>
+</body>
+</html>
+```
+
+<strong class="example-title">Multi-Turn Image Editing</strong>
+
+```html;ai-image-edit
+<html>
+<body>
+    <script src="https://js.puter.com/v2/"></script>
+    <script>
+    (async () => {
+        const model = "gemini-3.1-flash-image-preview";
+
+        // Step 1: Generate initial image
+        puter.print("Step 1: Generating infographic...<br>");
+        const r1 = await puter.ai.chat("Create a simple infographic about photosynthesis", {
+            model,
+            image_config: { image_size: "1K" },
+        });
+        const img1 = r1.message.images?.[0]?.image_url?.url;
+        const thoughtSignature1 = r1.message.images?.[0]?.thoughtSignature;
+        if (img1) {
+            const el = document.createElement("img");
+            el.src = img1;
+            el.style.maxWidth = "512px";
+            document.body.appendChild(el);
+        }
+
+        // Step 2: Edit the image in a follow-up turn
+        puter.print("<br>Step 2: Translating to Spanish...<br>");
+        const r2 = await puter.ai.chat([
+            { role: "user", content: "Create a simple infographic about photosynthesis" },
+            { role: "assistant", content: [
+                { type: "text", text: r1.message.content },
+                { type: "image_url", image_url: { url: img1 }, thoughtSignature: thoughtSignature1 },
+            ]},
+            { role: "user", content: "Translate all text to Spanish. Keep everything else the same." },
+        ], {
+            model,
+            image_config: { aspect_ratio: "16:9", image_size: "2K" },
+        });
+        const img2 = r2.message.images?.[0]?.image_url?.url;
+        if (img2) {
+            const el = document.createElement("img");
+            el.src = img2;
+            el.style.maxWidth = "512px";
+            document.body.appendChild(el);
+        }
+        puter.print("<br>Done!");
+    })();
+    </script>
+</body>
+</html>
+```
+
+<strong class="example-title">Working with Files</strong>
+
+```html;ai-resume-analyzer
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Resume Analyzer</title>
+    <script src="https://js.puter.com/v2/"></script>
+    <style>
+        body { font-family: Arial, sans-serif; max-width: 600px; margin: 20px auto; padding: 20px;}
+        .container { border: 1px solid #ccc; padding: 20px; border-radius: 5px;}
+        .upload-area {border: 2px dashed #ccc; padding: 40px; text-align: center; margin: 20px 0; border-radius: 5px; cursor: pointer;  transition: border-color 0.3s;}
+        .upload-area:hover {border-color: #007bff;}
+        .upload-area.dragover { border-color: #007bff; background-color: #f8f9fa;}
+        input[type="file"] { display: none;}
+        button { width: 100%; padding: 10px; background: #007bff; color: white; border: none; border-radius: 5px; cursor: pointer; margin-top: 10px;}
+        button:disabled { background: #ccc; }
+        #response { margin-top: 20px; padding: 15px; background: #f8f9fa; border-radius: 5px; display: none; }
+        .file-name { margin-top: 10px; font-style: italic; color: #666; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Resume Analyzer</h1>
+        <p>Upload your resume (PDF, DOC, or TXT) and get a quick analysis of your key strengths in two sentences.</p>
+
+        <div class="upload-area" onclick="document.getElementById('fileInput').click()">
+            <p>Click here to upload your resume or drag and drop</p>
+            <input type="file" id="fileInput" accept=".pdf,.doc,.docx,.txt" />
+        </div>
+
+        <div class="file-name" id="fileName" style="display: none;"></div>
+
+        <button id="analyzeBtn" disabled>Analyze My Resume</button>
+
+        <div id="response"></div>
+    </div>
+
+    <script>
+        let uploadedFile = null;
+
+        // File upload handling
+        const fileInput = document.getElementById('fileInput');
+        const uploadArea = document.querySelector('.upload-area');
+        const fileName = document.getElementById('fileName');
+        const analyzeBtn = document.getElementById('analyzeBtn');
+        const response = document.getElementById('response');
+
+        fileInput.addEventListener('change', handleFileSelect);
+        uploadArea.addEventListener('dragover', handleDragOver);
+        uploadArea.addEventListener('drop', handleDrop);
+
+        function handleFileSelect(e) {
+            const file = e.target.files[0];
+            if (file) {
+                uploadedFile = file;
+                fileName.textContent = `Selected: ${file.name}`;
+                fileName.style.display = 'block';
+                analyzeBtn.disabled = false;
+            }
+        }
+
+        function handleDragOver(e) {
+            e.preventDefault();
+            uploadArea.classList.add('dragover');
+        }
+
+        function handleDrop(e) {
+            e.preventDefault();
+            uploadArea.classList.remove('dragover');
+
+            const file = e.dataTransfer.files[0];
+            if (file) {
+                uploadedFile = file;
+                fileName.textContent = `Selected: ${file.name}`;
+                fileName.style.display = 'block';
+                analyzeBtn.disabled = false;
+            }
+        }
+
+        // Remove dragover class when drag leaves
+        uploadArea.addEventListener('dragleave', () => {
+            uploadArea.classList.remove('dragover');
+        });
+
+        // Analyze resume
+        analyzeBtn.addEventListener('click', async () => {
+            if (!uploadedFile) return;
+
+            analyzeBtn.disabled = true;
+            analyzeBtn.textContent = 'Analyzing...';
+            response.style.display = 'none';
+
+            try {
+                // First, upload the file to Puter
+                const puterFile = await puter.fs.write(`temp_resume_${Date.now()}.${uploadedFile.name.split('.').pop()}`,
+                    uploadedFile
+                );
+
+                const uploadedPath = puterFile.path;
+
+                // Analyze the resume with AI
+                const completion = await puter.ai.chat([
+                    {
+                        role: 'user',
+                        content: [
+                            {
+                                type: 'file',
+                                puter_path: uploadedPath
+                            },
+                            {
+                                type: 'text',
+                                text: 'Please analyze this resume and suggest how to improve it. Only a few sentences are needed.'
+                            }
+                        ]
+                    }
+                ], { model: 'claude-sonnet-4-6', stream: true });
+
+                let text = '';
+
+                // Display the response
+                for await ( const part of completion ) {
+                    text += part?.text;
+                    response.innerHTML = text;
+                }
+
+                response.style.display = 'block';
+
+                // Clean up the temporary file
+                await puter.fs.delete(uploadedPath);
+
+            } catch (error) {
+                response.innerHTML = `<strong>Error:</strong><br>${error.message}`;
+                response.style.display = 'block';
+            }
+
+            analyzeBtn.disabled = false;
+            analyzeBtn.textContent = 'Analyze My Resume';
+        });
+    </script>
+</body>
+</html>
+```

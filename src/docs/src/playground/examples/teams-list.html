@@ -1,0 +1,22 @@
+<html>
+<body>
+    <script src="https://js.puter.com/v2/"></script>
+    <script>
+        (async () => {
+            const teams = await puter.teams.list();
+
+            if (teams.length === 0) {
+                puter.print('You are not on a team.');
+                return;
+            }
+
+            for (const team of teams) {
+                puter.print(`${team.name ?? team.handle ?? 'Unnamed team'}<br>`);
+                puter.print(`uid: ${team.uid}<br>`);
+                puter.print(`owner: ${team.isOwner}<br>`);
+                puter.print(`directory open to apps: ${team.directoryEnabled}<br><br>`);
+            }
+        })();
+    </script>
+</body>
+</html>

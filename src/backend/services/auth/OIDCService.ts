@@ -1,0 +1,814 @@
+/*
+ * Copyright (C) 2024-present Puter Technologies Inc.
+ *
+ * This file is part of Puter.
+ *
+ * Puter is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published
+ * by the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+import type { LayerInstances } from '../../types';
+import type { puterServices } from '../index';
+import type { UserRow } from '../../stores/user/UserStore';
+import { isOwnedEmailConflict } from '../../stores/user/UserStore.js';
+import { PuterService } from '../types';
+import { signupClientIp } from '../user/SignupService.js';
+import { cleanEmail, isStorableEmail } from '../../util/email.js';
+import { generateUsername } from '../../util/username.js';
+import { provisionUser } from '../../util/userProvisioning.js';
+import { Context } from '../../core';
+import { HttpError } from '../../core/http/HttpError.js';
+import crypto from 'node:crypto';
+import { v4 as uuidv4 } from 'uuid';
+import { verifyOidcIdToken, type JwksCacheEntry } from './oidcIdToken';
+
+const GOOGLE_DISCOVERY_URL =
+    'https://accounts.google.com/.well-known/openid-configuration';
+const APPLE_DISCOVERY_URL =
+    'https://appleid.apple.com/.well-known/openid-configuration';
+const MICROSOFT_DISCOVERY_URL_TEMPLATE =
+    'https://login.microsoftonline.com/{tenant}/v2.0/.well-known/openid-configuration';
+const GOOGLE_SCOPES = 'openid email profile';
+const APPLE_SCOPES = 'openid email';
+const MICROSOFT_SCOPES = 'openid email profile';
+// Home tenant of personal Microsoft accounts (outlook.com, hotmail, …).
+// Microsoft verifies those emails itself; work/school (Entra) emails are
+// admin-editable and only attested via the opt-in `xms_edov` claim.
+const MICROSOFT_CONSUMER_TENANT = '9188040d-6c67-4c5b-b112-36a304b66dad';
+const STATE_EXPIRY_SEC = 600; // 10 minutes
+// The popup redeems this on the request the provider redirects it into, so it
+// only has to outlive one hop.
+const POPUP_RETURN_EXPIRY_SEC = 300; // 5 minutes
+const VALID_OIDC_FLOWS = ['login', 'signup', 'revalidate'] as const;
+const REVALIDATION_EXPIRY_SEC = 300; // 5 minutes
+// Every `oidc-state` token shares one signing key; the payload says which job.
+const POPUP_RETURN_PURPOSE = 'popup-return';
+
+interface ProviderConfig {
+    client_id: string;
+    client_secret: string;
+    authorization_endpoint: string;
+    token_endpoint: string;
+    userinfo_endpoint: string;
+    scopes: string;
+    response_mode?: string;
+    // From OIDC discovery — used to verify the id_token signature when there
+    // is no userinfo endpoint (e.g. Apple). Absent for custom providers
+    // configured without discovery (those use the userinfo path instead).
+    jwks_uri?: string;
+    issuer?: string;
+}
+
+interface OIDCUserInfo {
+    sub: string;
+    email?: string;
+    email_verified?: boolean;
+    name?: string;
+    picture?: string;
+    [k: string]: unknown;
+}
+
+/**
+ * OIDC/OAuth2 service — sign-in with Google (extensible to other providers).
+ *
+ * Delegates to TokenService for JWT state signing, AuthService for session
+ * creation, UserStore for user creation.
+ *
+ * Config shape: `config.oidc.providers.<providerId>.{ client_id, client_secret,
+ * ... }`
+ */
+export class OIDCService extends PuterService {
+    declare protected services: LayerInstances<typeof puterServices>;
+
+    #discoveryCache: Map<string, Record<string, string>> = new Map();
+    #discoveryInFlight: Map<string, Promise<Record<string, string> | null>> =
+        new Map();
+    #discoveryMisses = 0;
+    #enabledProviderIds: string[] | null = null;
+    #applePrivateKey:
+        | { pem: string; key: crypto.KeyObject }
+        | { pem: string; error: unknown }
+        | null = null;
+    #jwksCache: Map<string, JwksCacheEntry> = new Map();
+    #providers: Record<string, Record<string, string>> = {};
+
+    override onServerStart(): void {
+        const oidcConfig = this.config.oidc;
+        this.#providers = (oidcConfig?.providers ?? {}) as Record<
+            string,
+            Record<string, string>
+        >;
+    }
+
+    // -- Provider config ---------------------------------------------
+
+    async getProviderConfig(
+        providerId: string,
+    ): Promise<ProviderConfig | null> {
+        const raw = this.#providers[providerId];
+        if (!raw?.client_id) return null;
+
+        if (providerId === 'apple') {
+            if (!raw.team_id || !raw.key_id || !raw.private_key) return null;
+            const discovery = await this.#fetchDiscovery(
+                APPLE_DISCOVERY_URL,
+                'Apple',
+            );
+            if (!discovery) return null;
+            return {
+                client_id: raw.client_id,
+                client_secret: this.#generateAppleClientSecret(
+                    raw.team_id,
+                    raw.client_id,
+                    raw.key_id,
+                    raw.private_key,
+                ),
+                authorization_endpoint: discovery.authorization_endpoint,
+                token_endpoint: discovery.token_endpoint,
+                userinfo_endpoint: '',
+                scopes: raw.scopes ?? APPLE_SCOPES,
+                response_mode: 'form_post',
+                jwks_uri: discovery.jwks_uri,
+                issuer: discovery.issuer,
+            };
+        }
+
+        // Google, Microsoft, and custom providers require a static client_secret.
+        if (!raw.client_secret) return null;
+
+        if (providerId === 'microsoft') {
+            const tenant = raw.tenant_id || 'common';
+            const discoveryUrl = MICROSOFT_DISCOVERY_URL_TEMPLATE.replace(
+                '{tenant}',
+                tenant,
+            );
+            const discovery = await this.#fetchDiscovery(
+                discoveryUrl,
+                'Microsoft',
+            );
+            if (!discovery) return null;
+            return {
+                client_id: raw.client_id,
+                client_secret: raw.client_secret,
+                authorization_endpoint: discovery.authorization_endpoint,
+                token_endpoint: discovery.token_endpoint,
+                userinfo_endpoint: discovery.userinfo_endpoint,
+                scopes: raw.scopes ?? MICROSOFT_SCOPES,
+                jwks_uri: discovery.jwks_uri,
+                issuer: discovery.issuer,
+            };
+        }
+
+        if (providerId === 'google') {
+            const discovery = await this.#fetchDiscovery(
+                GOOGLE_DISCOVERY_URL,
+                'Google',
+            );
+            if (!discovery) return null;
+            return {
+                client_id: raw.client_id,
+                client_secret: raw.client_secret,
+                authorization_endpoint: discovery.authorization_endpoint,
+                token_endpoint: discovery.token_endpoint,
+                userinfo_endpoint: discovery.userinfo_endpoint,
+                scopes: raw.scopes ?? GOOGLE_SCOPES,
+                jwks_uri: discovery.jwks_uri,
+                issuer: discovery.issuer,
+            };
+        }
+
+        // Custom provider — must have all endpoints configured explicitly
+        if (
+            raw.authorization_endpoint &&
+            raw.token_endpoint &&
+            raw.userinfo_endpoint
+        ) {
+            return {
+                client_id: raw.client_id,
+                client_secret: raw.client_secret,
+                authorization_endpoint: raw.authorization_endpoint,
+                token_endpoint: raw.token_endpoint,
+                userinfo_endpoint: raw.userinfo_endpoint,
+                scopes: raw.scopes ?? 'openid email profile',
+            };
+        }
+
+        return null;
+    }
+
+    async getEnabledProviderIds(): Promise<string[]> {
+        if (this.#enabledProviderIds) return [...this.#enabledProviderIds];
+        const ids = Object.keys(this.#providers);
+        const missesBefore = this.#discoveryMisses;
+        const configs = await Promise.allSettled(
+            ids.map((id) => this.getProviderConfig(id)),
+        );
+        const enabled: string[] = [];
+        for (const [i, result] of configs.entries()) {
+            if (result.status === 'rejected') throw result.reason;
+            if (result.value) enabled.push(ids[i]);
+        }
+        // Provider config is fixed after start, so only a failed discovery
+        // fetch (retried next time) can change the answer.
+        if (this.#discoveryMisses === missesBefore) {
+            this.#enabledProviderIds = enabled;
+        }
+        return [...enabled];
+    }
+
+    // -- Auth URL ----------------------------------------------------
+
+    getCallbackUrl(flow: string): string | null {
+        if (!(VALID_OIDC_FLOWS as readonly string[]).includes(flow))
+            return null;
+        const origin = (this.config.origin ?? '').replace(/\/$/, '');
+        return `${origin}/auth/oidc/callback/${flow}`;
+    }
+
+    async getAuthorizationUrl(
+        providerId: string,
+        state: string,
+        flow: string,
+    ): Promise<string | null> {
+        const config = await this.getProviderConfig(providerId);
+        if (!config) return null;
+        const redirectUri =
+            this.getCallbackUrl(flow) ??
+            `${this.config.api_base_url ?? ''}/auth/oidc/callback`;
+        const params = new URLSearchParams({
+            client_id: config.client_id,
+            redirect_uri: redirectUri,
+            response_type: 'code',
+            scope: config.scopes,
+            state,
+        });
+        if (config.response_mode) {
+            params.set('response_mode', config.response_mode);
+        }
+        return `${config.authorization_endpoint}?${params.toString()}`;
+    }
+
+    // -- State tokens (CSRF) -----------------------------------------
+
+    signState(payload: Record<string, unknown>): string {
+        return this.services.token.sign('oidc-state', payload, {
+            expiresIn: STATE_EXPIRY_SEC,
+        });
+    }
+
+    /**
+     * Sign the facts a popup needs back from an OIDC round trip.
+     *
+     * The return URL states the opener's origin and that a login completed.
+     * Both come out of a verified `state`, but they reach the popup as bare
+     * query parameters — and the popup treats the opener's origin as the app
+     * identity it mints a token for. Since a URL says nothing about who wrote
+     * it, that pair is re-signed here so the popup can tell a real return leg
+     * from a crafted link.
+     *
+     * Short-lived: this is consumed on the very next request, as the provider
+     * redirects the popup home.
+     */
+    signPopupReturn(payload: Record<string, unknown>): string {
+        return this.services.token.sign(
+            'oidc-state',
+            { ...payload, purpose: POPUP_RETURN_PURPOSE },
+            { expiresIn: POPUP_RETURN_EXPIRY_SEC },
+        );
+    }
+
+    /** Verify a popup-return proof. Returns null on a bad or expired one. */
+    verifyPopupReturn(token: string): Record<string, unknown> | null {
+        const decoded = this.#verifySigned(token);
+        if (decoded?.purpose !== POPUP_RETURN_PURPOSE) return null;
+        return decoded;
+    }
+
+    verifyState(token: string): Record<string, unknown> | null {
+        const decoded = this.#verifySigned(token);
+        // An authorization state carries no purpose.
+        if (!decoded || decoded.purpose !== undefined) return null;
+        return decoded;
+    }
+
+    #verifySigned(token: string): Record<string, unknown> | null {
+        try {
+            return this.services.token.verify<Record<string, unknown>>(
+                'oidc-state',
+                token,
+            );
+        } catch {
+            return null;
+        }
+    }
+
+    // -- Revalidation tokens -----------------------------------------
+
+    signRevalidation(userUuid: string): string {
+        return this.services.token.sign(
+            'oidc-state',
+            {
+                user_uuid: userUuid,
+                purpose: 'revalidate',
+            },
+            { expiresIn: REVALIDATION_EXPIRY_SEC },
+        );
+    }
+
+    // -- Token exchange ----------------------------------------------
+
+    async exchangeCodeForTokens(
+        providerId: string,
+        code: string,
+        redirectUri: string,
+    ): Promise<{ access_token: string; [k: string]: unknown } | null> {
+        const config = await this.getProviderConfig(providerId);
+        if (!config) return null;
+
+        const body = new URLSearchParams({
+            grant_type: 'authorization_code',
+            code,
+            redirect_uri: redirectUri,
+            client_id: config.client_id,
+            client_secret: config.client_secret,
+        });
+
+        const res = await fetch(config.token_endpoint, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+            body: body.toString(),
+        });
+
+        if (!res.ok) {
+            console.warn('[oidc] token exchange failed', {
+                status: res.status,
+                body: await res.text(),
+            });
+            return null;
+        }
+
+        return (await res.json()) as { access_token: string };
+    }
+
+    // -- User info ---------------------------------------------------
+
+    async getUserInfo(
+        providerId: string,
+        accessToken: string,
+        idToken?: string,
+    ): Promise<OIDCUserInfo | null> {
+        const config = await this.getProviderConfig(providerId);
+        if (!config) return null;
+
+        // Microsoft: Graph's userinfo endpoint omits `email` for many Entra
+        // accounts and never returns `email_verified`, so read claims from
+        // the verified id_token instead. The email only counts as verified
+        // for personal accounts (Microsoft verifies those itself) or when
+        // the `xms_edov` claim attests the email's domain belongs to the
+        // issuing tenant — an Entra admin can put any address in `mail`
+        // (nOAuth), so everything else is unverified.
+        if (providerId === 'microsoft') {
+            if (!idToken) return null;
+            const claims = await this.#verifyIdToken(idToken, config);
+            if (!claims) return null;
+            return {
+                sub: claims.sub,
+                email: claims.email,
+                email_verified:
+                    claims.tid === MICROSOFT_CONSUMER_TENANT ||
+                    claims.xms_edov === true,
+            };
+        }
+
+        if (config.userinfo_endpoint) {
+            const res = await fetch(config.userinfo_endpoint, {
+                headers: { Authorization: `Bearer ${accessToken}` },
+            });
+            if (!res.ok) return null;
+            return (await res.json()) as OIDCUserInfo;
+        }
+
+        // No userinfo endpoint — verify the id_token signature against the
+        // provider's JWKS and read claims from it (e.g. Apple).
+        if (idToken) {
+            return this.#verifyIdToken(idToken, config);
+        }
+
+        return null;
+    }
+
+    // -- User lookup / creation --------------------------------------
+
+    async findUserByProviderSub(
+        provider: string,
+        providerSub: string,
+    ): Promise<UserRow | null> {
+        const link = await this.stores.oidc.getByProviderSub(
+            provider,
+            providerSub,
+        );
+        if (!link) return null;
+        return this.stores.user.getById(link.user_id as number);
+    }
+
+    async getLinkedProviderForUser(userId: number): Promise<string | null> {
+        const links = await this.stores.oidc.listByUserId(userId);
+        if (!links || links.length === 0) return null;
+        return links[0].provider as string;
+    }
+
+    /**
+     * Find an existing Puter user by the email claimed by the OIDC provider.
+     *
+     * Matches on both the raw `email` column and the canonical `clean_email`
+     * column so that `Foo.Bar+tag@gmail.com` (OIDC) resolves to an account that
+     * signed up as `foobar@gmail.com`. Primary email is preferred over a
+     * clean_email collision.
+     */
+    async findUserByEmail(
+        email: string,
+        opts: { force?: boolean } = {},
+    ): Promise<UserRow | null> {
+        return this.stores.user.findEmailOwner(email, opts);
+    }
+
+    /**
+     * Link an OIDC provider to an existing user. Use when the `sub` wasn't
+     * linked yet but we matched the user by email.
+     *
+     * Does NOT touch the password column — a user who originally signed up with
+     * a password keeps password login. Does mark `email_confirmed` if the
+     * provider verified the email and the row wasn't already confirmed.
+     */
+    async linkProviderToUser(
+        userId: number,
+        providerId: string,
+        claims: OIDCUserInfo,
+    ): Promise<{ success: boolean; error?: string }> {
+        // Fail closed: linking an OIDC identity to an EXISTING account hands
+        // login control to whoever holds that identity, so an absent
+        // `email_verified` claim (from a lax/custom provider) must not be
+        // treated as verified. Built-in providers always send it as `true`.
+        if (claims.email_verified !== true) {
+            return {
+                success: false,
+                error: 'Provider did not verify this email address.',
+            };
+        }
+
+        // Only link to accounts whose email is already confirmed. Unconfirmed
+        // accounts have no proven owner, so linking OIDC would hand control
+        // to whoever holds the OIDC identity.
+        const user = await this.stores.user.getById(userId, { force: true });
+        if (!user) {
+            return { success: false, error: 'User not found.' };
+        }
+        if (!user.email_confirmed) {
+            return {
+                success: false,
+                error: 'Account email is not confirmed. Sign in with your password first to confirm it.',
+            };
+        }
+
+        await this.stores.oidc.link(userId, providerId, claims.sub, null);
+        return { success: true };
+    }
+
+    /**
+     * Create a new Puter user from OIDC claims and link the provider. Returns
+     * `{ success, user, error? }`.
+     *
+     * `raced` means a concurrent callback got there first and the caller should
+     * re-resolve rather than surface an error — see
+     * `#resolveOrCreateOIDCUser`.
+     *
+     * `bonusCode` must already be canonical (`normalizeBonusCode`).
+     */
+    async createUserFromOIDC(
+        providerId: string,
+        claims: OIDCUserInfo,
+        referrer?: string | null,
+        { bonusCode = null }: { bonusCode?: string | null } = {},
+    ): Promise<{
+        success: boolean;
+        user?: UserRow;
+        error?: string;
+        code?: string;
+        raced?: boolean;
+        /**
+         * Support-correlation id for a vetoed signup (the abuse trail id). Safe
+         * to show the user; the veto reason in `error` is not.
+         */
+        requestCode?: string;
+    }> {
+        if (claims.email_verified === false) {
+            return {
+                success: false,
+                error: 'Provider did not verify this email address.',
+            };
+        }
+
+        // No email, no account. Providers can legitimately omit the claim
+        // (e.g. Entra accounts with an empty `mail` attribute); refuse
+        // rather than mint an account we can never contact or recover.
+        const email = claims.email;
+        if (!email) {
+            return {
+                success: false,
+                error: 'Provider did not supply an email address.',
+            };
+        }
+        // A provider we do not run is still just input where this is stored.
+        if (!isStorableEmail(email)) {
+            return {
+                success: false,
+                error: 'Provider supplied an unusable email address.',
+            };
+        }
+
+        if (this.config.disable_user_signup) {
+            return {
+                success: false,
+                error: 'User registration is disabled.',
+            };
+        }
+
+        const username = await generateUsername(this.stores);
+        if (!username) {
+            return {
+                success: false,
+                error: 'Failed to generate unique username.',
+            };
+        }
+
+        const req = Context.get('req')!;
+        const clientIp = signupClientIp(req);
+        const proxyIpChain = req.headers['x-forwarded-for'];
+
+        // Before the signup gate: the abuse harness reads the verdict the
+        // `email.validate` hook caches for this address.
+        try {
+            await this.services.signup.validateEmail(email);
+        } catch (e) {
+            if (!(e instanceof HttpError)) throw e;
+            return { success: false, error: e.message };
+        }
+
+        // OIDC users are never temp and the provider verified the address, so
+        // only the block and the phone/card requirements matter here.
+        const gate = await this.services.signup.runSignupGate({
+            req,
+            // IdP already authenticated the user, so captcha listeners
+            // (e.g. Turnstile) should skip — abuse/IP/email checks still run.
+            source: 'oidc',
+            data: { username, email, ...(bonusCode ? { bonusCode } : {}) },
+            email,
+            isTemp: false,
+            bonusCode,
+        });
+        if (gate.verdict === 'bonus_code_invalid') {
+            return {
+                success: false,
+                error: 'This bonus code is invalid or no longer available.',
+                code: 'bonus_code_invalid',
+            };
+        }
+        if (gate.verdict !== 'allowed') {
+            return {
+                success: false,
+                error: gate.message ?? 'Signup blocked',
+                code: gate.code ?? 'signup_blocked',
+                requestCode: gate.requestCode,
+            };
+        }
+
+        // The caller checked this email was free before we got here, but the
+        // validate hook and the blocklist checks above sit in between — long
+        // enough for a second callback (another tab, a provider retry) to have
+        // created the account. Re-check against the primary, and let the unique
+        // index catch anything still in flight.
+        if (await this.stores.user.findEmailOwner(email, { force: true })) {
+            return { success: false, raced: true };
+        }
+
+        // Default user group: the IdP verified the address, so no temp group.
+        let user: UserRow;
+        try {
+            user = await provisionUser(
+                {
+                    db: this.clients.db,
+                    userStore: this.stores.user,
+                    groupStore: this.stores.group,
+                },
+                {
+                    username,
+                    uuid: uuidv4(),
+                    password: null,
+                    email,
+                    clean_email: cleanEmail(email),
+                    free_storage: this.config.storage_capacity ?? null,
+                    // Email is provider-verified, so the email step is always
+                    // skipped; the phone/card gates still apply when the harness
+                    // flagged them.
+                    requires_email_confirmation: false,
+                    // Confirmed in the INSERT rather than a follow-up update: an
+                    // unconfirmed, password-less row does not own its address, so
+                    // deferring this would let two concurrent callbacks both insert
+                    // and only collide when they confirm — too late to report as a
+                    // race.
+                    email_confirmed: true,
+                    requires_phone_verification: gate.requiresPhoneVerification,
+                    requires_card_verification: gate.requiresCardVerification,
+                    ...(gate.reputation != null
+                        ? { reputation: gate.reputation }
+                        : {}),
+                    audit_metadata: {
+                        ip: clientIp,
+                        ip_fwd: proxyIpChain,
+                        user_agent: req?.headers?.['user-agent'],
+                        origin: req?.headers?.origin,
+                    },
+                    signup_ip: clientIp,
+                    // The abuse harness and the admin IP lookup both key on this
+                    // column, so it holds the trusted client address; the raw
+                    // forwarded chain stays in `audit_metadata.ip_fwd`.
+                    signup_ip_forwarded: clientIp,
+                    signup_user_agent: req?.headers?.['user-agent'] ?? null,
+                    signup_origin: req?.headers?.origin,
+                    signup_server: this.config.serverId,
+                    referrer: referrer ?? null,
+                },
+                this.config.default_user_group,
+            );
+        } catch (e) {
+            if (!isOwnedEmailConflict(e)) throw e;
+            return { success: false, raced: true };
+        }
+
+        // Link OIDC provider (after provisioning so a failed link doesn't
+        // leave an orphaned user without a home folder).
+        //
+        // A 409 here means a concurrent callback for the same identity bound the
+        // sub to its own new account while we were provisioning. That leaves us
+        // holding an account nobody can ever sign in to, so tear it down and let
+        // the caller re-resolve onto the winner.
+        try {
+            await this.stores.oidc.link(user.id, providerId, claims.sub, null);
+        } catch (e) {
+            if ((e as { statusCode?: number })?.statusCode !== 409) throw e;
+            try {
+                await this.services.userAccount.cascadeDelete(user.id);
+            } catch (cleanupError) {
+                console.warn(
+                    '[oidc] failed to clean up raced account:',
+                    cleanupError,
+                );
+            }
+            return { success: false, raced: true };
+        }
+
+        // `user.email-confirmed` too: the provider's attestation IS the
+        // confirmation, and anything keyed on owning a confirmed address —
+        // pending share invites, most importantly — has no other moment to
+        // fire.
+        this.services.signup.announceSignup(user, {
+            ip: clientIp,
+            bonusCode,
+            emailConfirmed: true,
+            saveAccount: true,
+        });
+
+        return { success: true, user };
+    }
+
+    // -- Internals ---------------------------------------------------
+
+    /** Cached once fetched; concurrent callers share one fetch. */
+    async #fetchDiscovery(
+        url: string,
+        label: string,
+    ): Promise<Record<string, string> | null> {
+        const cached = this.#discoveryCache.get(url);
+        if (cached) return cached;
+        const pending = this.#discoveryInFlight.get(url);
+        if (pending) return pending;
+        const load = this.#loadDiscovery(url, label);
+        this.#discoveryInFlight.set(url, load);
+        let data: Record<string, string> | null = null;
+        try {
+            data = await load;
+            return data;
+        } finally {
+            // In one step: a caller that can no longer join this fetch has to
+            // see its miss.
+            this.#discoveryInFlight.delete(url);
+            if (!data) this.#discoveryMisses++;
+        }
+    }
+
+    async #loadDiscovery(
+        url: string,
+        label: string,
+    ): Promise<Record<string, string> | null> {
+        try {
+            const res = await fetch(url);
+            if (!res.ok) return null;
+            const data = (await res.json()) as Record<string, string>;
+            this.#discoveryCache.set(url, data);
+            return data;
+        } catch (e) {
+            console.warn(`[oidc] ${label} discovery fetch failed`, e);
+            return null;
+        }
+    }
+
+    /** The configured key, parsed once; a key that fails to parse keeps failing. */
+    #appleKey(privateKey: string): crypto.KeyObject {
+        if (this.#applePrivateKey?.pem !== privateKey) {
+            try {
+                this.#applePrivateKey = {
+                    pem: privateKey,
+                    key: crypto.createPrivateKey(privateKey),
+                };
+            } catch (error) {
+                this.#applePrivateKey = { pem: privateKey, error };
+            }
+        }
+        if ('error' in this.#applePrivateKey) {
+            throw this.#applePrivateKey.error;
+        }
+        return this.#applePrivateKey.key;
+    }
+
+    #generateAppleClientSecret(
+        teamId: string,
+        clientId: string,
+        keyId: string,
+        privateKey: string,
+    ): string {
+        const header = { alg: 'ES256', kid: keyId, typ: 'JWT' };
+        const now = Math.floor(Date.now() / 1000);
+        const payload = {
+            iss: teamId,
+            sub: clientId,
+            aud: 'https://appleid.apple.com',
+            iat: now,
+            exp: now + 15777000, // ~6 months
+        };
+
+        const headerB64 = Buffer.from(JSON.stringify(header)).toString(
+            'base64url',
+        );
+        const payloadB64 = Buffer.from(JSON.stringify(payload)).toString(
+            'base64url',
+        );
+        const signingInput = `${headerB64}.${payloadB64}`;
+
+        const key = this.#appleKey(privateKey);
+        const signature = crypto.sign('sha256', Buffer.from(signingInput), {
+            key,
+            dsaEncoding: 'ieee-p1363',
+        });
+
+        return `${signingInput}.${signature.toString('base64url')}`;
+    }
+
+    /**
+     * Verify an id_token against the provider's JWKS and return its claims.
+     * Used for providers without a userinfo endpoint (e.g. Apple). Delegates to
+     * the standalone verifier, passing this service's JWKS cache so keys are
+     * reused across calls. See {@link verifyOidcIdToken} for semantics.
+     */
+    async #verifyIdToken(
+        idToken: string,
+        config: ProviderConfig,
+    ): Promise<OIDCUserInfo | null> {
+        const claims = await verifyOidcIdToken(
+            idToken,
+            {
+                jwksUri: config.jwks_uri,
+                issuer: config.issuer,
+                audience: config.client_id,
+            },
+            { cache: this.#jwksCache },
+        );
+        if (!claims) return null;
+        return {
+            sub: claims.sub,
+            email: claims.email,
+            email_verified: claims.email_verified,
+            tid: claims.tid,
+            xms_edov: claims.xms_edov,
+        };
+    }
+}

@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2024 Puter Technologies Inc.
+ * Copyright (C) 2024-present Puter Technologies Inc.
  *
  * This file is part of Puter.
  *
@@ -16,12 +16,11 @@
  * You should have received a copy of the GNU Affero General Public License
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
-import { Service } from "../definitions.js";
-import i18n from "../i18n/i18n.js";
+import { Service } from '../definitions.js';
+import i18n from '../i18n/i18n.js';
 
 export class LocaleService extends Service {
     format_duration (seconds) {
-        console.log('seconds?', typeof seconds, seconds);
         const hours = Math.floor(seconds / 3600);
         const minutes = Math.floor((seconds % 3600) / 60);
         const remainingSeconds = seconds % 60;
@@ -31,11 +30,11 @@ export class LocaleService extends Service {
         const paddedMinutes = minutes.toString().padStart(2, '0');
         const paddedSeconds = remainingSeconds.toString().padStart(2, '0');
 
-        if (hours === 0 && minutes === 0) {
+        if ( hours === 0 && minutes === 0 ) {
             return `${paddedSeconds} ${i18n('seconds')}`;
         }
 
-        if (hours === 0) {
+        if ( hours === 0 ) {
             return `${paddedMinutes}:${paddedSeconds}`;
         }
 

@@ -1,0 +1,2858 @@
+/*
+ * Copyright (C) 2024-present Puter Technologies Inc.
+ *
+ * This file is part of Puter.
+ *
+ * Puter is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published
+ * by the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+import { v4 as uuidv4, v5 as uuidv5 } from 'uuid';
+import {
+    isAccountContext,
+    isAppActor,
+    isPlainUserActor,
+    makeActor,
+    type Actor,
+} from '../../core/actor';
+import { HttpError } from '../../core/http/HttpError.js';
+import { WEB_AND_EXTENSION_PROTOCOLS } from '../../util/validation.js';
+import { awaitLater } from '../../util/concurrency.js';
+import {
+    ASSET_WINDOW_SECONDS,
+    GODMODE_TOKEN_MAX_AGE_SECONDS,
+    GODMODE_TOKEN_WINDOW_SECONDS,
+    WEB_WINDOW_SECONDS,
+} from '../../stores/session/SessionStore.js';
+import { WORKER_SUBDOMAIN_PREFIX } from '../../stores/subdomain/SubdomainStore.js';
+import type { UserRow } from '../../stores/user/UserStore';
+import type { LayerInstances } from '../../types';
+import { sessionCookieFlags } from '../../util/cookieFlags.js';
+import { isGodmodeApp } from '../../util/godmodeApps.js';
+import { Span } from '../../util/span.js';
+import type { puterServices } from '../index';
+import { EVENTS_WORKER_SESSION_NAME } from '../events/workerRuntime.js';
+import { FULL_API_ACCESS, PERMISSION_MAX_LEN } from '../permission/consts';
+import { PuterService } from '../types';
+import type {
+    AccessTokenPayload,
+    AnyTokenPayload,
+    AppUnderUserTokenPayload,
+    SessionRow,
+    SessionTokenPayload,
+} from './types';
+
+const APP_ORIGIN_UUID_NAMESPACE = '33de3768-8ee0-43e9-9e73-db192b97a5d8';
+// Successor uids an origin can derive after its earlier apps were repointed.
+const MAX_ORIGIN_UID_GENERATIONS = 8;
+// Allowed gap between a session's creation time (server clock) and its app's
+// (database clock) before the session counts as older than the app.
+const APP_SESSION_CLOCK_SKEW_SECONDS = 60;
+
+// Revoked and expired sessions are kept this long, so a stale token still gets
+// `session_revoked`/`session_expired` rather than `invalid`, then deleted. Web
+// rows double as sign-in history, so they stay longer.
+const SESSION_RETENTION_SECONDS = 30 * 24 * 60 * 60;
+const WEB_SESSION_RETENTION_SECONDS = 365 * 24 * 60 * 60;
+// Every node checks hourly; the gate lets one node through per week.
+const SESSION_PURGE_CHECK_MS = 60 * 60 * 1000;
+const SESSION_PURGE_GATE_KEY = 'sessions:purge:gate';
+const SESSION_PURGE_GATE_SECONDS = 7 * 24 * 60 * 60;
+// Ids per DELETE, with a pause between, so replicas keep up.
+const SESSION_PURGE_SPAN = 5000;
+const SESSION_PURGE_PAUSE_MS = 50;
+
+const nowSeconds = (): number => Math.floor(Date.now() / 1000);
+
+const positiveUserId = (value: unknown): number | null => {
+    const id = typeof value === 'string' ? Number(value) : value;
+    return typeof id === 'number' && Number.isInteger(id) && id > 0 ? id : null;
+};
+
+/**
+ * Hosted-asset cookie names by kind. `name` is what gets set; `legacyName` is
+ * still read through the v2 deprecation window.
+ */
+export const HOSTED_ASSET_COOKIES = {
+    private: {
+        name: 'puter_private_asset_token_v2',
+        legacyName: 'puter.private.asset.token',
+    },
+    public: {
+        name: 'puter_public_hosted_actor_token_v2',
+        legacyName: 'puter.public.hosted.actor.token',
+    },
+} as const;
+
+export type HostedAssetKind = keyof typeof HOSTED_ASSET_COOKIES;
+
+/** How refusals name each kind; part of the existing error messages. */
+const HOSTED_ASSET_LABELS = {
+    private: { token: 'private-asset', expectedHost: 'expectedPrivateHost' },
+    public: { token: 'public hosted-actor', expectedHost: 'expectedHost' },
+} as const;
+
+export type ReauthReason = 'session_revoked' | 'session_expired';
+
+/**
+ * Request metadata for `authenticate`. `touch: false` checks the token without
+ * recording activity on its session, for re-checks no user made.
+ */
+export interface AuthenticateContext {
+    ip?: string;
+    userAgent?: string;
+    touch?: boolean;
+}
+
+export interface AuthResult {
+    actor?: Actor;
+    reauth?: { reason: ReauthReason; auth_id?: string };
+    invalid?: true;
+    /**
+     * The token authenticated, but its app is on the origin blocklist. The auth
+     * probe surfaces this as `req.appBlocked`; gates translate it to a 403
+     * `app_blocked`. Distinct from `invalid` so the client sees a clear "app
+     * blocked" error rather than a generic auth failure.
+     */
+    blocked?: { reason?: string };
+}
+
+/**
+ * Authentication service.
+ *
+ * Scope is currently narrow — just `authenticateFromToken`, the one method the
+ * auth-probe middleware needs. Session creation, logout, token rotation, 2FA,
+ * and the rest of the auth surface will land when the auth controller is wired
+ * up (it will own mint / rotate / revoke).
+ */
+export class AuthService extends PuterService {
+    declare protected services: LayerInstances<typeof puterServices>;
+
+    #sessionPurge: ReturnType<typeof setInterval> | null = null;
+    #stopping = false;
+
+    override onServerStart(): void {
+        this.#armSessionPurge();
+
+        // Users implicitly hold read access to their own email — needed for
+        // any permission-gated path that asks for `user:<uuid>:email:read`
+        // (puter-js's `user:<uuid>:email:read` permission request flows
+        // through the scan even though the v2 whoami extension inlines the
+        // email field directly and skips the check).
+        this.services.permission.registerImplicator({
+            id: 'user-set-own',
+            shortcut: true,
+            matches: (permission: string) => permission.startsWith('user:'),
+            check: async ({ actor, permission }): Promise<unknown> => {
+                if (!isPlainUserActor(actor)) return undefined;
+                if (!actor.user?.uuid) return undefined;
+                if (permission === `user:${actor.user.uuid}:email:read`) {
+                    return {};
+                }
+                return undefined;
+            },
+        });
+    }
+
+    override onServerPrepareShutdown(): void {
+        this.#stopping = true;
+        if (this.#sessionPurge) clearInterval(this.#sessionPurge);
+        this.#sessionPurge = null;
+    }
+
+    // -- Session purge -----------------------------------------------
+
+    /**
+     * Delete sessions revoked or expired longer ago than their retention,
+     * walking the table by id. Returns the rows deleted, or null when another
+     * node already holds this week's gate.
+     */
+    async purgeEndedSessions(): Promise<number | null> {
+        const claimed = await this.clients.redis.set(
+            SESSION_PURGE_GATE_KEY,
+            String(Date.now()),
+            'EX',
+            SESSION_PURGE_GATE_SECONDS,
+            'NX',
+        );
+        if (claimed !== 'OK') return null;
+
+        const now = nowSeconds();
+        const cutoffs = {
+            cutoff: now - SESSION_RETENTION_SECONDS,
+            webCutoff: now - WEB_SESSION_RETENTION_SECONDS,
+        };
+        let purged = 0;
+        let finished = false;
+        try {
+            const maxId = await this.stores.session.maxId();
+            for (
+                let afterId = 0;
+                afterId < maxId;
+                afterId += SESSION_PURGE_SPAN
+            ) {
+                if (this.#stopping) return purged;
+                purged += await this.stores.session.purgeEndedInRange(
+                    afterId,
+                    SESSION_PURGE_SPAN,
+                    cutoffs,
+                );
+                await new Promise((resolve) =>
+                    setTimeout(resolve, SESSION_PURGE_PAUSE_MS),
+                );
+            }
+            finished = true;
+            return purged;
+        } finally {
+            // A walk cut short frees the gate, so another node restarts it on
+            // its next check instead of next week.
+            if (!finished) {
+                try {
+                    await this.clients.redis.del(SESSION_PURGE_GATE_KEY);
+                } catch {
+                    // The gate expires on its own.
+                }
+            }
+        }
+    }
+
+    #armSessionPurge(): void {
+        const timer = setInterval(() => {
+            void this.#runSessionPurge();
+        }, SESSION_PURGE_CHECK_MS);
+        timer.unref?.();
+        this.#sessionPurge = timer;
+    }
+
+    async #runSessionPurge(): Promise<void> {
+        try {
+            const purged = await this.purgeEndedSessions();
+            if (purged !== null) {
+                console.log(`[auth] purged ${purged} ended sessions`);
+            }
+        } catch (err) {
+            console.warn('[auth] session purge failed', err);
+        }
+    }
+
+    // -- Public API --------------------------------------------------
+
+    async authenticateFromToken(token: string): Promise<Actor | null> {
+        const result = await this.authenticate(token);
+        return result.actor ?? null;
+    }
+
+    /**
+     * Mint a short-lived, server-signed JWT that proves the bearer was
+     * previously identified as `authId` by a real session (the one that just
+     * rejected with reauth-required). The 401 response embeds this token; the
+     * GUI echoes it back on /login or /signup so the controller can re-attach
+     * the new session to the same user row.
+     *
+     * Signing here — rather than letting the client present the raw `auth_id`
+     * UUID — means a leaked UUID alone is not enough to attach a session to an
+     * existing temp account; the attacker would also have to have intercepted a
+     * live 401 from that user. The token's 10-minute TTL bounds that intercept
+     * window. `reason` is why the session was rejected, so a redeemer can tell
+     * a session that ran out from one that was revoked.
+     */
+    signReauthToken(authId: string, reason: ReauthReason): string {
+        return this.services.token.sign(
+            'otp',
+            { auth_id: authId, purpose: 'reauth', reason },
+            { expiresIn: '10m' },
+        );
+    }
+
+    /**
+     * Verify a reauth token and return its `auth_id` and `reason` claims.
+     * Throws an HttpError on signature failure, expiry, or wrong purpose.
+     */
+    verifyReauthToken(token: string): {
+        authId: string;
+        reason: ReauthReason | undefined;
+    } {
+        let decoded: { auth_id?: string; purpose?: string; reason?: string };
+        try {
+            decoded = this.services.token.verify<{
+                auth_id?: string;
+                purpose?: string;
+                reason?: string;
+            }>('otp', token);
+        } catch {
+            throw new HttpError(401, 'Invalid reauth token', {
+                legacyCode: 'token_invalid',
+            });
+        }
+        if (decoded.purpose !== 'reauth' || !decoded.auth_id) {
+            throw new HttpError(401, 'Invalid reauth token', {
+                legacyCode: 'token_invalid',
+            });
+        }
+        const reason =
+            decoded.reason === 'session_revoked' ||
+            decoded.reason === 'session_expired'
+                ? decoded.reason
+                : undefined;
+        return { authId: decoded.auth_id, reason };
+    }
+
+    @Span('auth.authenticate')
+    async authenticate(
+        token: string,
+        ctx: AuthenticateContext = {},
+    ): Promise<AuthResult> {
+        let decoded: AnyTokenPayload;
+        try {
+            decoded = this.services.token.verify<AnyTokenPayload>(
+                'auth',
+                token,
+            );
+        } catch {
+            return { invalid: true };
+        }
+
+        // Tokens predating the `type` field aren't supported.
+        if (!decoded.type) return { invalid: true };
+
+        switch (decoded.type) {
+            case 'session':
+            case 'gui':
+                return await this.#actorFromSessionToken(decoded, ctx);
+            case 'app-under-user':
+                return await this.#actorFromAppUnderUserToken(decoded, ctx);
+            case 'access-token':
+                return await this.#actorFromAccessTokenToken(decoded, ctx);
+            default:
+                return { invalid: true };
+        }
+    }
+
+    // -- Session lifecycle --------------------------------------------
+
+    /**
+     * Create a session and sign a session JWT + GUI JWT for the user.
+     *
+     * `meta` is enriched with request metadata (IP, user-agent, etc.) when a
+     * request context is available.
+     */
+    async createSessionToken(
+        user: UserRow,
+        meta: Record<string, unknown> = {},
+    ): Promise<{
+        session: Record<string, unknown>;
+        token: string;
+        gui_token: string;
+    }> {
+        const auth_id = this.#authIdFor(user);
+        const session = await this.stores.session.create(user.id, {
+            meta,
+            kind: 'web',
+            last_ip: (meta.ip as string | undefined) ?? null,
+            last_user_agent: (meta.user_agent as string | undefined) ?? null,
+            expires_at: nowSeconds() + WEB_WINDOW_SECONDS,
+            auth_id,
+        });
+
+        const token = this.#signSessionTypeToken(
+            'session',
+            user,
+            session.uuid,
+            auth_id,
+        );
+        const gui_token = this.#signSessionTypeToken(
+            'gui',
+            user,
+            session.uuid,
+            auth_id,
+        );
+
+        return { session, token, gui_token };
+    }
+
+    /** Sign a GUI token for an existing session. */
+    createGuiToken(user: UserRow, sessionUuid: string): string {
+        return this.#signSessionTypeToken(
+            'gui',
+            user,
+            sessionUuid,
+            this.#authIdFor(user),
+        );
+    }
+
+    /** Sign a session token for an existing session (upgrade from GUI token). */
+    createSessionTokenForSession(user: UserRow, sessionUuid: string): string {
+        return this.#signSessionTypeToken(
+            'session',
+            user,
+            sessionUuid,
+            this.#authIdFor(user),
+        );
+    }
+
+    /**
+     * Shared signer for session/gui tokens — keeps the v2 claim shape
+     * consistent.
+     */
+    #signSessionTypeToken(
+        type: 'session' | 'gui',
+        user: UserRow,
+        sessionUuid: string,
+        authId: string,
+        opts: {
+            worker?: boolean;
+            workerName?: string;
+            workerUid?: string;
+        } = {},
+    ): string {
+        const claims: Record<string, unknown> = {
+            type,
+            version: '2',
+            // `uuid` retained alongside `session_uid` so any legacy reader
+            // (e.g. middleware that hasn't been updated to v2 claims yet)
+            // still finds the session id where it expects.
+            uuid: sessionUuid,
+            session_uid: sessionUuid,
+            user_uid: user.uuid,
+            auth_id: authId,
+        };
+        if (opts.worker) claims.worker = true;
+        if (opts.workerName) claims.worker_name = opts.workerName;
+        if (opts.workerUid) claims.worker_uid = opts.workerUid;
+        return this.services.token.sign('auth', claims);
+    }
+
+    /**
+     * Worker variant of `createSessionToken` for user-scoped workers (not bound
+     * to any specific app). Idempotent on (user_id, worker_name) via the
+     * `kind='worker'` partial unique index — redeploying the same worker reuses
+     * the row and returns the same stable token. Expires after
+     * `WORKER_WINDOW_SECONDS` (effectively infinite). The emitted JWT carries
+     * `worker: true` and `worker_name` so downstream code can tell a worker
+     * session from a user-driven one without a DB round-trip. `workerUid` binds
+     * the token to the worker's subdomain row, so it stops working with it.
+     */
+    async createWorkerSessionToken(
+        actor: Actor,
+        user: UserRow,
+        workerName: string,
+        meta: Record<string, unknown> = {},
+        { workerUid }: { workerUid?: string } = {},
+    ): Promise<{
+        session: Record<string, unknown>;
+        token: string;
+        gui_token: string;
+    }> {
+        this.#assertWorkerSessionMintAllowed(actor);
+        if (!workerName) {
+            throw new HttpError(400, 'Missing `workerName`', {
+                legacyCode: 'bad_request',
+            });
+        }
+        const auth_id = this.#authIdFor(user);
+        const session = await this.stores.session.getOrCreateWorker(user.id, {
+            appUid: null,
+            workerName,
+            meta,
+            last_ip: (meta.ip as string | undefined) ?? null,
+            last_user_agent: (meta.user_agent as string | undefined) ?? null,
+            auth_id,
+        });
+        if (!session) {
+            throw new HttpError(500, 'Worker session create failed', {
+                legacyCode: 'internal_error',
+            });
+        }
+
+        const token = this.#signSessionTypeToken(
+            'session',
+            user,
+            session.uuid as string,
+            auth_id,
+            { worker: true, workerName, workerUid },
+        );
+        const gui_token = this.#signSessionTypeToken(
+            'gui',
+            user,
+            session.uuid as string,
+            auth_id,
+            { worker: true, workerName, workerUid },
+        );
+
+        return { session, token, gui_token };
+    }
+
+    /**
+     * Worker variant of `getUserAppToken` for app-scoped workers. Idempotent on
+     * (user_id, app_uid, worker_name) via the `kind='worker'` partial unique
+     * index — the same app can host many workers distinguished by name, each
+     * getting its own stable long-lived token. Coexists with an interactive
+     * `kind='app'` session for the same (user, app) because the uniqueness keys
+     * don't overlap.
+     *
+     * `handlerDepth` stamps the writes made with the token as that many events
+     * handler runs deep; `expiresInSeconds` bounds a token that carries one.
+     * Refuses an actor that is itself running behind a handler — the minted
+     * token would outlive any one run, so stamping it with the caller's depth
+     * would only delay the escape, not close it. `workerUid` binds the token to
+     * the worker's subdomain row, so it stops working with it.
+     */
+    async createWorkerAppToken(
+        actor: Actor,
+        appUid: string,
+        workerName: string,
+        options: {
+            handlerDepth?: number;
+            expiresInSeconds?: number;
+            workerUid?: string;
+        } = {},
+    ): Promise<string> {
+        if (!actor.user) {
+            throw new HttpError(403, 'Actor must be a user', {
+                legacyCode: 'forbidden',
+            });
+        }
+        // A handler's own writes already carry its depth; minting a fresh
+        // worker token here would start that worker's whole lifetime at
+        // depth 0 and escape the cap for good, not just for this run.
+        if (actor.handlerDepth) {
+            throw new HttpError(
+                403,
+                'An events handler cannot create a worker',
+                { legacyCode: 'events_handler_worker_forbidden' },
+            );
+        }
+        if (!workerName) {
+            throw new HttpError(400, 'Missing `workerName`', {
+                legacyCode: 'bad_request',
+            });
+        }
+        await this.#assertWorkerAppDelegationAllowed(actor, appUid);
+        const auth_id = this.#authIdFor(actor.user as UserRow);
+        const app = await this.stores.app.getByUid(appUid);
+        const session = await this.stores.session.getOrCreateWorker(
+            actor.user.id,
+            {
+                appUid,
+                workerName,
+                auth_id,
+                notBefore: this.#appSessionsNotBefore(app),
+            },
+        );
+        if (!session) {
+            throw new HttpError(500, 'Worker session create failed', {
+                legacyCode: 'internal_error',
+            });
+        }
+
+        return this.services.token.sign(
+            'auth',
+            {
+                type: 'app-under-user',
+                version: '2',
+                user_uid: actor.user.uuid,
+                app_uid: appUid,
+                session_uid: session.uuid,
+                auth_id,
+                worker: true,
+                worker_name: workerName,
+                ...(options.workerUid ? { worker_uid: options.workerUid } : {}),
+                ...(options.handlerDepth
+                    ? { handler_depth: options.handlerDepth }
+                    : {}),
+            },
+            options.expiresInSeconds
+                ? { expiresIn: options.expiresInSeconds }
+                : undefined,
+        );
+    }
+
+    #authIdFor(user: UserRow): string {
+        return user.uuid;
+    }
+
+    /**
+     * Scope app token delegation by actor kind. An app-under-user or
+     * access-token actor is bound to a single app and may only mint a token for
+     * that same app; only a root user session may request a token for an
+     * arbitrary app (the GUI's app-launch delegation).
+     */
+    #assertAppDelegationAllowed(actor: Actor, appUid: string): void {
+        const callerApp = isAppActor(actor) ? actor.effectiveApp : null;
+        if (!isPlainUserActor(actor) && callerApp?.uid !== appUid) {
+            throw new HttpError(
+                403,
+                'Actor cannot mint a token for another app',
+                { legacyCode: 'forbidden' },
+            );
+        }
+    }
+
+    /**
+     * An app-less worker session token carries the account's own reach: it is a
+     * `type: 'session'` credential with no `app_uid`, so it passes the gates
+     * that keep apps and tokens out of account management. Only an actor that
+     * already holds that reach may mint one — a delegated credential binds its
+     * worker to an app instead, through `createWorkerAppToken`.
+     */
+    #assertWorkerSessionMintAllowed(actor: Actor): void {
+        if (!actor.effectiveApp && !actor.accessToken) return;
+        throw new HttpError(
+            403,
+            'A delegated credential must bind its worker to an app',
+            { legacyCode: 'forbidden' },
+        );
+    }
+
+    /**
+     * Worker-token variant of `#assertAppDelegationAllowed`, with one extra
+     * allowance: an app may bind a worker to an app it created for this same
+     * user (`apps.app_owner`). That's what lets a builder-style app give each
+     * project it generates its own worker identity — and therefore its own KV
+     * and AppData namespace — instead of pooling every generated project into
+     * the builder's.
+     *
+     * The allowance grants no reach the caller lacks: creating the target app
+     * is what stamps `app_owner`, and an app that owns another app already has
+     * full write access to it (`AppDriver.#checkWriteAccess`) including its
+     * `index_url`. Everything else stays as strict as interactive delegation —
+     * a scoped access token still can't delegate at all, and an app can never
+     * name an app it didn't create.
+     *
+     * A full-access ("personal access token") actor is the third shape: it
+     * carries the issuing user's own API reach, which is exactly what
+     * `puter.workers.create` needs — its default sandbox binds the worker to a
+     * `sandbox-<name>` app the same call just created under that user. Blanket-
+     * refusing it broke every worker deploy from a credential minted through
+     * AuthMe (the MCP connector, the CLI). It stays narrower than a root
+     * session: the app must exist and be owned by the same user, and the
+     * resulting token carries an `app`, so account-management gates
+     * (`requireUserActor`) still reject it.
+     */
+    async #assertWorkerAppDelegationAllowed(
+        actor: Actor,
+        appUid: string,
+    ): Promise<void> {
+        const callerApp = isAppActor(actor) ? actor.effectiveApp : null;
+        if (callerApp?.uid === appUid) return;
+
+        const forbidden = () =>
+            new HttpError(403, 'Actor cannot mint a token for another app', {
+                legacyCode: 'forbidden',
+            });
+
+        // Root user session: unchanged: may bind a worker to any app.
+        if (isPlainUserActor(actor)) return;
+        if (!callerApp) {
+            // Scoped access tokens are bound to their issuing identity and
+            // never delegate; full-access ones may name an app of their user's.
+            if (!actor.accessToken?.fullAccess) throw forbidden();
+            const ownApp = await this.stores.app.getByUid(appUid);
+            if (!ownApp) throw forbidden();
+            if (Number(ownApp.owner_user_id) !== Number(actor.user.id))
+                throw forbidden();
+            return;
+        }
+
+        const app = await this.stores.app.getByUid(appUid);
+        if (!app) throw forbidden();
+        if (Number(app.app_owner) !== Number(callerApp.id)) throw forbidden();
+        if (Number(app.owner_user_id) !== Number(actor.user.id))
+            throw forbidden();
+    }
+
+    /**
+     * Convert a jsonwebtoken-style `expiresIn` (seconds, or `'1h'`/`'30d'`)
+     * into an absolute unix-seconds timestamp for the session row. Returns
+     * `null` when no expiry is requested (caller passed `undefined`). Mirrors
+     * `jsonwebtoken`'s allowed unit suffixes (s/m/h/d/w/y).
+     */
+    #hardExpiryFromExpiresIn(
+        expiresIn: string | number | undefined,
+    ): number | null {
+        if (expiresIn === undefined) return null;
+        const now = nowSeconds();
+        if (typeof expiresIn === 'number') return now + Math.floor(expiresIn);
+        const match = /^(\d+)\s*([smhdwy])?$/.exec(expiresIn.trim());
+        if (!match) return null;
+        const value = parseInt(match[1], 10);
+        const unit = match[2] ?? 's';
+        const multiplier: Record<string, number> = {
+            s: 1,
+            m: 60,
+            h: 60 * 60,
+            d: 24 * 60 * 60,
+            w: 7 * 24 * 60 * 60,
+            y: 365 * 24 * 60 * 60,
+        };
+        const seconds = value * (multiplier[unit] ?? 1);
+        return now + seconds;
+    }
+
+    async removeSessionByToken(token: string): Promise<void> {
+        // Try the signed path first. If verify fails (typically because
+        // the JWT expired between authProbe and this logout call —
+        // `req.token` was valid at probe time but the user took a while
+        // before clicking logout), fall back to an *unverified* decode
+        // (with the same decompression as the verified path) just to
+        // recover the `session_uid` so the row still gets soft-revoked.
+        // The recovered uuid is only used as a `revokeCascade` pointer;
+        // a forged uuid (worst case for an unverified read) can't
+        // escalate — `revokeCascade` is a no-op against unknown rows
+        // and only flips `revoked_at` on existing ones.
+        let decoded: AnyTokenPayload | null = null;
+        try {
+            decoded = this.services.token.verify<AnyTokenPayload>(
+                'auth',
+                token,
+            );
+        } catch {
+            decoded = this.services.token.decodeWithoutVerify<AnyTokenPayload>(
+                'auth',
+                token,
+            );
+        }
+        if (!decoded) return;
+        if (decoded.type !== 'session' && decoded.type !== 'gui') return;
+        const sessionPayload = decoded as SessionTokenPayload;
+        const sessionUuid =
+            (sessionPayload.session_uid as string | undefined) ??
+            sessionPayload.uuid;
+        if (!sessionUuid) return;
+        this.#announceRevocation(
+            await this.stores.session.revokeCascade(sessionUuid),
+        );
+    }
+
+    /**
+     * List sessions surfaced to the manage-sessions UI. Excludes `asset` rows
+     * (per-cookie children of `web` rows, revoked transitively via cascade —
+     * surfacing them as standalone entries would be confusing). App rows are
+     * joined to the apps table so the UI can render the authorizing app's title
+     * and icon without a second round trip.
+     */
+    async listSessions(actor: Actor): Promise<Array<Record<string, unknown>>> {
+        if (!actor.user?.id) return [];
+
+        const rows = (await this.stores.session.getByUserId(
+            actor.user.id,
+        )) as Array<Record<string, unknown>>;
+
+        const visible = rows.filter((row) => row.kind !== 'asset');
+
+        const appUids = [
+            ...new Set(
+                visible
+                    .map((row) => row.app_uid)
+                    .filter(
+                        (uid): uid is string =>
+                            typeof uid === 'string' && uid.length > 0,
+                    ),
+            ),
+        ];
+        // One batched read; a uid it doesn't answer exactly (gone, differently
+        // cased, or the batch failed) gets its own lookup, as before.
+        let batched = new Map<string, Record<string, unknown>>();
+        try {
+            batched = await this.stores.app.getByUids(appUids);
+        } catch {
+            // Every uid falls back to its own lookup.
+        }
+        const apps = new Map<string, Record<string, unknown>>();
+        await Promise.all(
+            appUids.map(async (uid) => {
+                const hit = batched.get(uid);
+                if (hit) {
+                    apps.set(uid, hit);
+                    return;
+                }
+                try {
+                    const app = await this.stores.app.getByUid(uid);
+                    if (app) apps.set(uid, app);
+                } catch {
+                    // App lookup failures fall back to app_uid only.
+                }
+            }),
+        );
+
+        const enriched = visible.map((row) => {
+            const meta =
+                (typeof row.meta === 'string'
+                    ? JSON.parse(row.meta as string)
+                    : row.meta) ?? {};
+            const isCurrent = actor.session?.uid === row.uuid;
+            const appUid = typeof row.app_uid === 'string' ? row.app_uid : null;
+            const app = appUid ? (apps.get(appUid) ?? null) : null;
+            return {
+                ...meta,
+                uuid: row.uuid,
+                kind: row.kind,
+                current: isCurrent,
+                label: row.label ?? null,
+                parent_session_id: row.parent_session_id ?? null,
+                created_at: row.created_at,
+                last_activity: row.last_activity,
+                expires_at: row.expires_at ?? null,
+                last_ip: row.last_ip ?? null,
+                last_user_agent: row.last_user_agent ?? null,
+                created_via: row.created_via ?? null,
+                app_uid: appUid,
+                app: app
+                    ? {
+                          uid: app.uid,
+                          name: app.name,
+                          title: app.title,
+                          icon: app.icon,
+                      }
+                    : null,
+            };
+        });
+
+        // Sort: current session first, then most-recently-active. The
+        // manage-sessions UI relies on this so the "you are here" row
+        // anchors the top of the list.
+        enriched.sort((a, b) => {
+            if (a.current !== b.current) return a.current ? -1 : 1;
+            const al = Number(a.last_activity ?? 0);
+            const bl = Number(b.last_activity ?? 0);
+            return bl - al;
+        });
+
+        return enriched;
+    }
+
+    /**
+     * Revoke a session by uuid, cascading to any rows whose `parent_session_id`
+     * points at it. Used by the manage-sessions UI and by
+     * `removeSessionByToken` — semantics are identical.
+     *
+     * This is the revoke path for _every_ session kind, access tokens included:
+     * the uuid is what `listSessions` hands the UI, and ownership is checked
+     * against the row itself by the caller. Their grants are dropped here so
+     * the two entry points leave the same state behind.
+     */
+    async revokeSession(uuid: string): Promise<void> {
+        // Read first — after the cascade these rows carry `revoked_at` and
+        // no longer count as active.
+        const tokenUids = (await this.stores.session.accessTokenUidsForCascade(
+            uuid,
+        )) as string[];
+        this.#announceRevocation(await this.stores.session.revokeCascade(uuid));
+        for (const tokenUid of tokenUids) {
+            await this.#dropAccessTokenGrants(tokenUid);
+        }
+    }
+
+    /**
+     * Rename a session's user-visible label. Throws 404 when the row doesn't
+     * exist or belongs to another user — ownership is enforced inside
+     * `SessionStore.setLabel` via the (uuid, user_id) WHERE clause, so the 404
+     * vs 403 distinction is collapsed (a user can't tell from this endpoint
+     * whether a uuid exists under another account).
+     */
+    async setSessionLabel(
+        actor: Actor,
+        uuid: string,
+        label: string | null,
+    ): Promise<void> {
+        if (!actor.user) {
+            throw new HttpError(403, 'Actor must be a user', {
+                legacyCode: 'forbidden',
+            });
+        }
+        const trimmed =
+            typeof label === 'string' ? label.trim().slice(0, 64) : null;
+        const ok = await this.stores.session.setLabel(
+            uuid,
+            actor.user.id as number,
+            trimmed && trimmed.length > 0 ? trimmed : null,
+        );
+        if (!ok) {
+            throw new HttpError(404, 'Session not found', {
+                legacyCode: 'not_found',
+            });
+        }
+    }
+
+    /**
+     * Tell the rest of the system which sessions just went away.
+     * `sessions.revoked_at` is otherwise only consulted on the next handshake,
+     * which leaves anything already holding a session open — a live socket —
+     * running on a credential that no longer exists.
+     */
+    #announceRevocation(
+        revoked: { userId: number; uuids: string[] } | null | undefined,
+    ): void {
+        if (!revoked?.userId || revoked.uuids.length === 0) return;
+        const payload = {
+            user_id: revoked.userId,
+            session_uids: revoked.uuids,
+        };
+        // Whoever holds the socket may not be whoever revoked the session.
+        this.clients.event?.emit('outer.auth.sessions.revoked', payload, {});
+    }
+
+    /**
+     * Admin-driven cascade: revoke EVERY session row for the given user (web,
+     * app, access_token, asset, worker). No actor context — this is the
+     * "suspension / forced sign-out" path, where workers deliberately go too (a
+     * suspended user shouldn't keep long-lived worker credentials calling back
+     * into the backend). Distinct from `revokeAllSessions` which is the
+     * user-driven UI flow and exempts workers + standalone access tokens by
+     * design.
+     *
+     * Cascades from every row so derived rows (asset under web, app-issued
+     * access tokens under their app session) follow via the parent_session_id
+     * link.
+     */
+    async revokeAllSessionsForUserId(userId: number): Promise<void> {
+        if (!userId) return;
+        const rows = await this.stores.session.getByUserId(userId, {
+            primary: true,
+        });
+        await this.#revokeCascades(rows.map((row) => row.uuid as string));
+    }
+
+    async #revokeCascades(rootUuids: string[]): Promise<void> {
+        if (rootUuids.length === 0) return;
+        const revoked = (await this.stores.session.revokeCascades(
+            rootUuids,
+        )) as { userId: number; uuids: string[] }[];
+        for (const entry of revoked) this.#announceRevocation(entry);
+    }
+
+    /**
+     * Delete every session of a worker that no longer exists, whoever minted
+     * it: worker names are unique, so nothing else can be using them.
+     */
+    async deleteWorkerSessionsByName(workerName: string): Promise<void> {
+        if (!workerName) return;
+        await this.#deleteWorkerSessions({ workerName });
+    }
+
+    /**
+     * Delete the sessions of the workers an app deployed for this user, e.g.
+     * when the user uninstalls it. The workers themselves keep running.
+     */
+    async deleteWorkerSessionsForApp(
+        userId: number,
+        appUid: string,
+    ): Promise<void> {
+        if (!userId || !appUid) return;
+        await this.#deleteWorkerSessions({ userId, appUid });
+    }
+
+    async #deleteWorkerSessions(filter: {
+        workerName?: string;
+        userId?: number;
+        appUid?: string;
+    }): Promise<void> {
+        const deleted = (await this.stores.session.deleteWorkerSessions(
+            filter,
+        )) as { uuid: string; userId: number; accessTokenUid: string | null }[];
+        const byUser = new Map<number, string[]>();
+        for (const row of deleted) {
+            byUser.set(row.userId, [
+                ...(byUser.get(row.userId) ?? []),
+                row.uuid,
+            ]);
+            if (row.accessTokenUid) {
+                await this.#dropAccessTokenGrants(row.accessTokenUid);
+            }
+        }
+        for (const [userId, uuids] of byUser) {
+            this.#announceRevocation({ userId, uuids });
+        }
+    }
+
+    /**
+     * Password-reset cascade: revoke every interactive (web/app) session for
+     * the user, so a hijacked session doesn't outlive a password reset. No
+     * actor context — the recovery flow has no authenticated caller. Leaves
+     * workers and standalone access tokens alone: those are managed credentials
+     * rather than sign-ins, and a routine forgot-password reset shouldn't break
+     * deployments.
+     */
+    async revokeInteractiveSessionsForUserId(userId: number): Promise<void> {
+        if (!userId) return;
+        const rows = await this.stores.session.getByUserId(userId, {
+            primary: true,
+        });
+        await this.#revokeCascades(
+            rows
+                .filter((row) => row.kind === 'web' || row.kind === 'app')
+                .map((row) => row.uuid as string),
+        );
+    }
+
+    async revokeAllSessions(
+        actor: Actor,
+        opts: { includeCurrent?: boolean; includeApps?: boolean } = {},
+    ): Promise<void> {
+        if (!actor.user) {
+            throw new HttpError(403, 'Actor must be a user', {
+                legacyCode: 'forbidden',
+            });
+        }
+        const currentUuid = actor.session?.uid;
+        const rows = await this.stores.session.getByUserId(
+            actor.user.id as number,
+            { primary: true },
+        );
+        await this.#revokeCascades(
+            rows
+                .filter((row) =>
+                    row.kind === 'web'
+                        ? opts.includeCurrent || row.uuid !== currentUuid
+                        : row.kind === 'app' && opts.includeApps,
+                )
+                .map((row) => row.uuid as string),
+        );
+    }
+
+    // -- App / origin resolution -------------------------------------
+
+    /**
+     * Resolve an origin URL to an app UID.
+     *
+     * Fires `app.from-origin` before hashing so listeners can rewrite the
+     * origin (e.g. polotno maps `polotno.com` → `studio.polotno.com` so both
+     * surfaces resolve to the same app row).
+     *
+     * Lookup order:
+     *
+     * 1. **Canonical DB match.** If any app in the DB has an `index_url` that
+     *    normalizes to this origin (across every configured hosting variant —
+     *    `puter.site`, `puter.app`, etc.), return that app's real UID. Required
+     *    for private apps: their `/auth/get-user-app-token` tokens must
+     *    reference the real app row so the app-under-user verification path can
+     *    load them.
+     * 2. **UUIDv5 deterministic fallback.** Origins that don't match any app
+     *    (third-party sites, apps not yet in the DB) get a deterministic
+     *    namespaced UUID
+     */
+    async appUidFromOrigin(origin: string): Promise<string> {
+        const appOrigin = await this.#appOriginFor(origin);
+        if (!appOrigin) {
+            // Not logged: caller input, counted as a per-route 400.
+            throw new HttpError(
+                400,
+                'Origin must be an http(s) or browser-extension URL — a `file://` page or a sandboxed iframe has no origin an app can be identified by',
+                { legacyCode: 'bad_request' },
+            );
+        }
+
+        // Blocked origins can't acquire an app token (or have one minted /
+        // checked / granted), so the app loses every path to Puter resources.
+        const block =
+            await this.services.appOriginBlocklist.isOriginBlocked(appOrigin);
+        if (block.blocked) {
+            throw new HttpError(
+                403,
+                'This app is not allowed to access Puter resources',
+                { legacyCode: 'app_blocked' },
+            );
+        }
+
+        const canonicalUid =
+            await this.#findCanonicalAppUidForOrigin(appOrigin);
+        if (canonicalUid) return canonicalUid;
+
+        return this.#derivedAppUidForOrigin(appOrigin);
+    }
+
+    /**
+     * Batched sibling of {@link appUidFromOrigin} for listing paths that need a
+     * uid per origin without a round trip each. Unparseable or blocked origins
+     * resolve to null instead of throwing.
+     */
+    async appUidsFromOrigins(
+        origins: string[],
+    ): Promise<Map<string, string | null>> {
+        const result = new Map<string, string | null>();
+        const uniqueOrigins = [...new Set(origins)];
+
+        const appOriginByOrigin = new Map<string, string | null>();
+        await Promise.all(
+            uniqueOrigins.map(async (origin) => {
+                try {
+                    appOriginByOrigin.set(
+                        origin,
+                        await this.#appOriginFor(origin),
+                    );
+                } catch {
+                    appOriginByOrigin.set(origin, null);
+                }
+            }),
+        );
+
+        const uniqueAppOrigins = [
+            ...new Set(
+                [...appOriginByOrigin.values()].filter(
+                    (o): o is string => o !== null,
+                ),
+            ),
+        ];
+        const blockedByAppOrigin = new Map<string, boolean>();
+        await Promise.all(
+            uniqueAppOrigins.map(async (appOrigin) => {
+                try {
+                    const block =
+                        await this.services.appOriginBlocklist.isOriginBlocked(
+                            appOrigin,
+                        );
+                    blockedByAppOrigin.set(appOrigin, block.blocked);
+                } catch {
+                    blockedByAppOrigin.set(appOrigin, true);
+                }
+            }),
+        );
+
+        const resolvableAppOrigins = uniqueAppOrigins.filter(
+            (appOrigin) => !blockedByAppOrigin.get(appOrigin),
+        );
+        const canonicalByAppOrigin =
+            await this.#findCanonicalAppUidsForOrigins(resolvableAppOrigins);
+
+        // Gen-0 derived uid per app origin that missed the canonical lookup,
+        // prefetched in one batch so `#derivedAppUidForOrigin`'s loop doesn't
+        // pay a round trip for the common (no repoint) case.
+        const missedAppOrigins = resolvableAppOrigins.filter(
+            (appOrigin) => !canonicalByAppOrigin.get(appOrigin),
+        );
+        const gen0ByAppOrigin = new Map<string, string>();
+        for (const appOrigin of missedAppOrigins) {
+            gen0ByAppOrigin.set(appOrigin, this.#originUid(appOrigin, 0));
+        }
+        const gen0Uids = [...new Set(gen0ByAppOrigin.values())];
+        const prefetched =
+            gen0Uids.length > 0
+                ? await this.stores.app.getByUids(gen0Uids)
+                : new Map<
+                      string,
+                      { index_url?: unknown; owner_user_id?: unknown }
+                  >();
+
+        // Likewise the deleted app's owner for each hosted gen-0 uid with no
+        // row, and the site owner each owner gets compared against.
+        const deletedGen0Uids = missedAppOrigins
+            .filter(
+                (appOrigin) =>
+                    !prefetched.has(gen0ByAppOrigin.get(appOrigin)!) &&
+                    this.#hostedSubdomainForOrigin(appOrigin) !== null,
+            )
+            .map((appOrigin) => gen0ByAppOrigin.get(appOrigin)!);
+        const deletedOwners =
+            deletedGen0Uids.length > 0
+                ? await this.stores.app.getDeletedOwnersByUids(deletedGen0Uids)
+                : new Map<string, number | null>();
+        const subdomainByAppOrigin = new Map<string, string>();
+        for (const appOrigin of missedAppOrigins) {
+            const gen0Uid = gen0ByAppOrigin.get(appOrigin)!;
+            const row = prefetched.get(gen0Uid);
+            const ownerId = row
+                ? positiveUserId(row.owner_user_id)
+                : (deletedOwners.get(gen0Uid) ?? null);
+            const subdomain = this.#hostedSubdomainForOrigin(appOrigin);
+            if (ownerId !== null && subdomain) {
+                subdomainByAppOrigin.set(appOrigin, subdomain);
+            }
+        }
+        const siteRows =
+            subdomainByAppOrigin.size > 0
+                ? await this.stores.subdomain.getBySubdomains([
+                      ...subdomainByAppOrigin.values(),
+                  ])
+                : new Map<string, { user_id?: unknown }>();
+        const getSiteOwnerId = (appOrigin: string) => {
+            const subdomain = subdomainByAppOrigin.get(appOrigin);
+            const row = subdomain ? siteRows.get(subdomain) : undefined;
+            return row
+                ? Promise.resolve(positiveUserId(row.user_id))
+                : this.#siteOwnerIdForOrigin(appOrigin);
+        };
+
+        const derivedByAppOrigin = new Map<string, string>();
+        for (const appOrigin of missedAppOrigins) {
+            const gen0Uid = gen0ByAppOrigin.get(appOrigin)!;
+            const uid = await this.#derivedAppUidForOrigin(
+                appOrigin,
+                (uid) =>
+                    uid === gen0Uid
+                        ? Promise.resolve(prefetched.get(uid) ?? null)
+                        : this.stores.app.getByUid(uid),
+                getSiteOwnerId,
+                (uid) =>
+                    uid === gen0Uid
+                        ? Promise.resolve(deletedOwners.get(uid))
+                        : this.#deletedAppOwnerId(uid),
+            );
+            derivedByAppOrigin.set(appOrigin, uid);
+        }
+
+        for (const origin of origins) {
+            const appOrigin = appOriginByOrigin.get(origin) ?? null;
+            if (appOrigin === null || blockedByAppOrigin.get(appOrigin)) {
+                result.set(origin, null);
+                continue;
+            }
+            const canonicalUid = canonicalByAppOrigin.get(appOrigin);
+            result.set(
+                origin,
+                canonicalUid ?? derivedByAppOrigin.get(appOrigin) ?? null,
+            );
+        }
+
+        return result;
+    }
+
+    /**
+     * Normalized origin of `url` with aliased hosts and hosting-domain variants
+     * collapsed, after `app.from-origin` listeners have rewritten it. Null when
+     * `url` isn't a usable web or extension URL.
+     */
+    async #appOriginFor(url: string): Promise<string | null> {
+        const parsed = this.#originFromUrl(url);
+        if (!parsed) return null;
+        const aliased = this.#canonicalizeAliasedOrigin(parsed) ?? parsed;
+        const canonical = this.#canonicalizeHostedOrigin(aliased) ?? aliased;
+        const event = { origin: canonical };
+        await this.clients.event?.emitAndWait('app.from-origin', event, {});
+        return event.origin;
+    }
+
+    /** `app-<uuidv5(origin)>` for generation `gen` (0 is the first-visit uid). */
+    #originUid(origin: string, gen: number): string {
+        const name = gen === 0 ? origin : `${origin}#${gen}`;
+        return `app-${uuidv5(name, APP_ORIGIN_UUID_NAMESPACE)}`;
+    }
+
+    /**
+     * `app-<uuidv5(origin)>`, unless that uid's row now lives at another
+     * origin. A repointed row keeps its uid (and the data and grants keyed to
+     * it), so the origin it left moves on to a successor uid instead of
+     * resolving to someone's app it no longer serves. The same goes for a row
+     * whose hosted site is now registered to another user, and for a deleted
+     * app's uid on a hosted site its owner no longer holds. The lookups are
+     * injectable so a batch caller can serve prefetched rows.
+     */
+    async #derivedAppUidForOrigin(
+        origin: string,
+        getByUid: (
+            uid: string,
+        ) => Promise<
+            { index_url?: unknown; owner_user_id?: unknown } | null | undefined
+        > = (uid) => this.stores.app.getByUid(uid),
+        getSiteOwnerId: (origin: string) => Promise<number | null> = (o) =>
+            this.#siteOwnerIdForOrigin(o),
+        getDeletedOwnerId: (
+            uid: string,
+        ) => Promise<number | null | undefined> = (uid) =>
+            this.#deletedAppOwnerId(uid),
+    ): Promise<string> {
+        const hosted = this.#hostedSubdomainForOrigin(origin) !== null;
+        for (let gen = 0; gen <= MAX_ORIGIN_UID_GENERATIONS; gen++) {
+            const uid = this.#originUid(origin, gen);
+            const app = await getByUid(uid);
+            if (!app) {
+                if (!hosted) return uid;
+                const deletedOwnerId = await getDeletedOwnerId(uid);
+                if (deletedOwnerId === undefined) return uid;
+                if (
+                    deletedOwnerId !== null &&
+                    deletedOwnerId === (await getSiteOwnerId(origin))
+                ) {
+                    return uid;
+                }
+                continue;
+            }
+            if (
+                typeof app.index_url !== 'string' ||
+                (await this.#appOriginFor(app.index_url)) !== origin
+            ) {
+                continue;
+            }
+            const appOwnerId = positiveUserId(app.owner_user_id);
+            if (appOwnerId === null) return uid;
+            const siteOwnerId = await getSiteOwnerId(origin);
+            if (siteOwnerId === null || siteOwnerId === appOwnerId) return uid;
+        }
+        // Past the cap the uid stops being derivable, but the row created for
+        // it records this origin as its index_url, so the canonical lookup
+        // finds it from then on.
+        return `app-${uuidv4()}`;
+    }
+
+    /** Owner of the deleted app that held `uid`; undefined if none did. */
+    async #deletedAppOwnerId(uid: string): Promise<number | null | undefined> {
+        return (await this.stores.app.getDeletedOwnersByUids([uid])).get(uid);
+    }
+
+    /**
+     * Resolve the user who owns the hosted subdomain `origin` points at.
+     * Returns the `subdomains` row's `user_id` when the origin's host sits
+     * under a configured hosting domain (`static_hosting_domain(_alt)` /
+     * `private_app_hosting_domain(_alt)`) and the subdomain is registered; null
+     * for external origins, apex hosting-domain hosts, and unknown subdomains.
+     * Used to stamp the site owner as the creator of origin-bootstrap app
+     * rows.
+     */
+    async subdomainOwnerIdFromOrigin(origin: string): Promise<number | null> {
+        const subdomain = this.#hostedSubdomainForOrigin(origin);
+        if (!subdomain) return null;
+        const row = await this.stores.subdomain.getBySubdomain(subdomain);
+        return positiveUserId(row?.user_id);
+    }
+
+    /**
+     * Whether `indexUrl` is on a hosted site, or on an origin whose app
+     * identity resolves to an app, owned by someone other than `ownerUserId`. A
+     * private app wins its origin's identity, so an app shouldn't become or
+     * stay private where this is true. Index urls below the origin root never
+     * resolve from an origin, so only the site owner counts for them.
+     */
+    async originHeldByOtherUser(
+        indexUrl: string,
+        ownerUserId: number,
+    ): Promise<boolean> {
+        const origin = await this.#appOriginFor(indexUrl);
+        if (!origin) return false;
+        const siteOwnerId = await this.#siteOwnerIdForOrigin(origin);
+        if (siteOwnerId !== null) return siteOwnerId !== ownerUserId;
+
+        const path = new URL(indexUrl).pathname.toLowerCase();
+        if (path !== '/' && path !== '/index.html') return false;
+        const holderUid = await this.#findCanonicalAppUidForOrigin(origin);
+        const holder = holderUid
+            ? await this.stores.app.getByUid(holderUid)
+            : null;
+        const holderId = positiveUserId(holder?.owner_user_id);
+        return holderId !== null && holderId !== ownerUserId;
+    }
+
+    /**
+     * {@link subdomainOwnerIdFromOrigin}, confirmed against the primary on a
+     * miss so a site registered a moment ago isn't read as unregistered.
+     */
+    async #siteOwnerIdForOrigin(origin: string): Promise<number | null> {
+        const subdomain = this.#hostedSubdomainForOrigin(origin);
+        if (!subdomain) return null;
+        const row =
+            (await this.stores.subdomain.getBySubdomain(subdomain)) ??
+            (await this.stores.subdomain.getBySubdomain(subdomain, {
+                primary: true,
+            }));
+        return positiveUserId(row?.user_id);
+    }
+
+    #hostedSubdomainForOrigin(origin: string): string | null {
+        let parsed: URL;
+        try {
+            parsed = new URL(origin);
+        } catch {
+            return null;
+        }
+        return this.#hostedSubdomainForHost(
+            parsed.host.toLowerCase(),
+            parsed.hostname.toLowerCase(),
+            this.#getHostingDomains(),
+        );
+    }
+
+    /**
+     * Read `app_origin_aliases` from config and return normalized groups — each
+     * group is a deduped list of lowercased, trimmed host strings. Malformed
+     * entries are skipped silently so a bad config row doesn't brick UID
+     * resolution for everyone else.
+     */
+    #getOriginAliasGroups(): string[][] {
+        const config = this.config as { app_origin_aliases?: unknown };
+        const raw = config.app_origin_aliases;
+        if (!Array.isArray(raw)) return [];
+
+        const groups: string[][] = [];
+        for (const group of raw) {
+            if (!Array.isArray(group)) continue;
+            const normalized = [
+                ...new Set(
+                    group
+                        .filter((h): h is string => typeof h === 'string')
+                        .map((h) => h.trim().toLowerCase())
+                        .filter((h) => h.length > 0),
+                ),
+            ];
+            if (normalized.length > 0) groups.push(normalized);
+        }
+        return groups;
+    }
+
+    /**
+     * Find the alias group containing `host` (case-insensitive). Returns the
+     * normalized group, or null when no group claims this host.
+     */
+    #findOriginAliasGroup(host: string): string[] | null {
+        const lower = host.trim().toLowerCase();
+        if (!lower) return null;
+        for (const group of this.#getOriginAliasGroups()) {
+            if (group.includes(lower)) return group;
+        }
+        return null;
+    }
+
+    /**
+     * If the origin's host belongs to an alias group, swap it for the group's
+     * canonical representative (alphabetically first member — chosen for
+     * order-independence so config reordering doesn't shift UUIDs). Returns
+     * null when the host isn't in any group, so the caller keeps the original.
+     */
+    #canonicalizeAliasedOrigin(origin: string): string | null {
+        let parsed: URL;
+        try {
+            parsed = new URL(origin);
+        } catch {
+            return null;
+        }
+        const hostRaw = parsed.host.toLowerCase();
+        const hostStripped = parsed.hostname.toLowerCase();
+        const group =
+            this.#findOriginAliasGroup(hostRaw) ??
+            this.#findOriginAliasGroup(hostStripped);
+        if (!group) return null;
+
+        const canonical = [...group].sort()[0];
+        if (!canonical || canonical === hostRaw || canonical === hostStripped) {
+            return null;
+        }
+        parsed.host = canonical;
+        // Same shape `#originFromUrl` produces. `URL.toString()` would append
+        // a path separator, so an aliased host would hash to a different app
+        // uid (and match the origin blocklist differently) than the canonical
+        // host resolves to on its own.
+        return this.#normalizedOrigin(parsed);
+    }
+
+    /**
+     * Scheme + lowercased host without a trailing dot + explicit port, with no
+     * trailing separator.
+     */
+    #normalizedOrigin(parsed: URL): string {
+        const port = parsed.port ? `:${parsed.port}` : '';
+        // `new URL()` lowercases http(s) hosts but leaves opaque ones alone, and
+        // keeps the fully-qualified trailing dot, so without this one host in
+        // two spellings hashes to two app uids.
+        const host = parsed.hostname.toLowerCase().replace(/\.+$/, '');
+        return `${parsed.protocol}//${host}${port}`;
+    }
+
+    /** Same subdomain on the primary hosting domain; null when not hosted. */
+    #canonicalizeHostedOrigin(origin: string): string | null {
+        let parsed: URL;
+        try {
+            parsed = new URL(origin);
+        } catch {
+            return null;
+        }
+        const hostingDomains = this.#getHostingDomains();
+        const subdomain = this.#hostedSubdomainForHost(
+            parsed.host.toLowerCase(),
+            parsed.hostname.toLowerCase(),
+            hostingDomains,
+        );
+        if (!subdomain) return null;
+        const canonicalDomain = hostingDomains[0];
+        if (!canonicalDomain) return null;
+        const config = this.config as { protocol?: string };
+        const protocol =
+            (typeof config.protocol === 'string'
+                ? config.protocol.trim().replace(/:$/, '')
+                : '') || 'https';
+        return `${protocol}://${subdomain}.${canonicalDomain}`;
+    }
+
+    /** Canonical origin across alias groups and hosting domains. */
+    canonicalizeOrigin(origin: string): string {
+        const parsed = this.#originFromUrl(origin);
+        if (!parsed) return origin;
+        const aliased = this.#canonicalizeAliasedOrigin(parsed) ?? parsed;
+        return this.#canonicalizeHostedOrigin(aliased) ?? aliased;
+    }
+
+    /**
+     * Configured hosting domains (`static_hosting_domain(_alt)` +
+     * `private_app_hosting_domain(_alt)`), normalized, each in both raw
+     * (possibly `host:port`) and port-stripped form.
+     */
+    #getHostingDomains(): string[] {
+        const config = this.config as {
+            static_hosting_domain?: string;
+            static_hosting_domain_alt?: string;
+            private_app_hosting_domain?: string;
+            private_app_hosting_domain_alt?: string;
+        };
+
+        const normalizeDomainValue = (v: unknown): string | null => {
+            if (typeof v !== 'string') return null;
+            const trimmed = v.trim().toLowerCase().replace(/^\./, '');
+            return trimmed || null;
+        };
+        const stripPort = (v: string): string => v.split(':')[0] || v;
+
+        const raw = [
+            normalizeDomainValue(config.static_hosting_domain),
+            normalizeDomainValue(config.static_hosting_domain_alt),
+            normalizeDomainValue(config.private_app_hosting_domain),
+            normalizeDomainValue(config.private_app_hosting_domain_alt),
+        ].filter((d): d is string => !!d);
+        return [...new Set([...raw, ...raw.map(stripPort)])];
+    }
+
+    /**
+     * Extract the subdomain label under the longest matching hosting domain —
+     * longest-first avoids matching `puter.app` before `foo.puter.app`. Null
+     * when the host IS a hosting domain or sits under none of them.
+     */
+    #hostedSubdomainForHost(
+        hostRaw: string,
+        hostStripped: string,
+        hostingDomains: string[],
+    ): string | null {
+        const sorted = [...hostingDomains].sort((a, b) => b.length - a.length);
+        for (const d of sorted) {
+            const suffix = `.${d}`;
+            if (hostRaw === d || hostStripped === d) return null;
+            for (const host of [hostRaw, hostStripped]) {
+                if (host.endsWith(suffix)) {
+                    const prefix = host.slice(0, host.length - suffix.length);
+                    return prefix.split('.')[0] || null;
+                }
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Every `index_url` string that would canonically match `origin` — the
+     * origin's subdomain crossed with every configured hosting domain (static
+     * and private, with and without ports), alias-group hosts, and protocol
+     * variants.
+     */
+    #indexUrlCandidatesForOrigin(origin: string): string[] {
+        let parsed: URL;
+        try {
+            parsed = new URL(origin);
+        } catch {
+            return [];
+        }
+
+        const config = this.config as { protocol?: string };
+        const hostingDomains = this.#getHostingDomains();
+
+        const hostRaw = parsed.host.toLowerCase();
+        const hostStripped = parsed.hostname.toLowerCase();
+
+        const subdomain = this.#hostedSubdomainForHost(
+            hostRaw,
+            hostStripped,
+            hostingDomains,
+        );
+
+        const hostCandidates = new Set<string>([hostRaw, hostStripped]);
+        if (subdomain) {
+            for (const d of hostingDomains) {
+                hostCandidates.add(`${subdomain}.${d}`);
+            }
+        }
+        // Origin alias group expansion: every host listed alongside the
+        // request's host in `app_origin_aliases` becomes a lookup candidate,
+        // so any one of the group's hosts being registered as an `index_url`
+        // resolves the whole group to that row's UID.
+        const aliasGroup =
+            this.#findOriginAliasGroup(hostRaw) ??
+            this.#findOriginAliasGroup(hostStripped);
+        if (aliasGroup) {
+            for (const h of aliasGroup) hostCandidates.add(h);
+        }
+
+        const protocolCandidates = new Set<string>([
+            parsed.protocol.replace(/:$/, ''),
+            (config.protocol ?? '').trim().replace(/:$/, '') || 'https',
+            'https',
+            'http',
+        ]);
+
+        const urlCandidates: string[] = [];
+        for (const hc of hostCandidates) {
+            if (!hc) continue;
+            for (const protocol of protocolCandidates) {
+                if (!protocol) continue;
+                const base = `${protocol}://${hc}`;
+                urlCandidates.push(base, `${base}/`, `${base}/index.html`);
+            }
+        }
+        return [...new Set(urlCandidates)];
+    }
+
+    /**
+     * Uid of the real app row whose `index_url` canonically matches `origin`;
+     * private rows first, then the oldest, across historical duplicates.
+     */
+    async #findCanonicalAppUidForOrigin(
+        origin: string,
+    ): Promise<string | null> {
+        return this.stores.app.findCanonicalUidByIndexUrlCandidates(
+            this.#indexUrlCandidatesForOrigin(origin),
+        );
+    }
+
+    /**
+     * Batched {@link #findCanonicalAppUidForOrigin}, keyed by the origins passed
+     * in, with the same private-first, oldest-id rule.
+     */
+    async #findCanonicalAppUidsForOrigins(
+        origins: string[],
+    ): Promise<Map<string, string | null>> {
+        const result = new Map<string, string | null>();
+        const candidateSetByOrigin = new Map<string, Set<string>>();
+        const allCandidates = new Set<string>();
+
+        for (const origin of origins) {
+            const candidates = this.#indexUrlCandidatesForOrigin(origin);
+            candidateSetByOrigin.set(
+                origin,
+                new Set(candidates.map((c) => c.toLowerCase())),
+            );
+            for (const c of candidates) allCandidates.add(c);
+        }
+
+        if (allCandidates.size === 0) {
+            for (const origin of origins) result.set(origin, null);
+            return result;
+        }
+
+        const winners = (await this.stores.app.listIndexUrlWinners([
+            ...allCandidates,
+        ])) as Array<{
+            index_url: unknown;
+            private_id: unknown;
+            min_id: unknown;
+        }>;
+        const winnerByIndexUrl = new Map<string, (typeof winners)[number]>();
+        for (const winner of winners) {
+            if (typeof winner.index_url === 'string') {
+                winnerByIndexUrl.set(winner.index_url.toLowerCase(), winner);
+            }
+        }
+
+        // Lowest private id across the origin's matching groups, else lowest id.
+        const winnerIdByOrigin = new Map<string, number>();
+        for (const origin of origins) {
+            const candidateSet = candidateSetByOrigin.get(origin);
+            if (!candidateSet) continue;
+
+            let bestPrivateId: number | null = null;
+            let bestMinId: number | null = null;
+            for (const candidate of candidateSet) {
+                const winner = winnerByIndexUrl.get(candidate);
+                if (!winner) continue;
+                if (winner.private_id != null) {
+                    const id = Number(winner.private_id);
+                    if (bestPrivateId === null || id < bestPrivateId) {
+                        bestPrivateId = id;
+                    }
+                }
+                if (winner.min_id != null) {
+                    const id = Number(winner.min_id);
+                    if (bestMinId === null || id < bestMinId) {
+                        bestMinId = id;
+                    }
+                }
+            }
+            const winnerId = bestPrivateId ?? bestMinId;
+            if (winnerId !== null) winnerIdByOrigin.set(origin, winnerId);
+        }
+
+        const uniqueIds = [...new Set(winnerIdByOrigin.values())];
+        // Aggregates can come back as strings; they were Number()-ed above to
+        // match `getByIds` keys.
+        const appsById =
+            uniqueIds.length > 0
+                ? await this.stores.app.getByIds(uniqueIds)
+                : new Map<number, { uid?: unknown }>();
+
+        for (const origin of origins) {
+            const id = winnerIdByOrigin.get(origin);
+            const uid = id !== undefined ? appsById.get(id)?.uid : undefined;
+            result.set(origin, typeof uid === 'string' && uid ? uid : null);
+        }
+
+        return result;
+    }
+
+    /** `app` is `appUid`'s row when the caller already read it. */
+    async getUserAppToken(
+        actor: Actor,
+        appUid: string,
+        app?: { created_epoch?: unknown },
+    ): Promise<string> {
+        if (!actor.user)
+            throw new HttpError(403, 'Actor must be a user', {
+                legacyCode: 'forbidden',
+            });
+        this.#assertAppDelegationAllowed(actor, appUid);
+
+        // Request-context (IP / UA) isn't available on the Actor shape —
+        // the app row's `last_ip` / `last_user_agent` start NULL and get
+        // populated later via `SessionStore.touch` on the first verified
+        // request that carries those headers.
+        app ??= await this.stores.app.getByUid(appUid);
+        const appSession = await this.stores.session.getOrCreateApp(
+            actor.user.id,
+            appUid,
+            {
+                auth_id: this.#authIdFor(actor.user as UserRow),
+                notBefore: this.#appSessionsNotBefore(app),
+            },
+        );
+
+        // An events handler minting for its own app gets a token as deep as
+        // its own and no longer-lived, so minting can't restart its chain.
+        return this.services.token.sign('auth', {
+            type: 'app-under-user',
+            version: '2',
+            user_uid: actor.user.uuid,
+            app_uid: appUid,
+            session_uid: appSession?.uuid,
+            auth_id: this.#authIdFor(actor.user as UserRow),
+            ...(actor.handlerDepth
+                ? {
+                      handler_depth: actor.handlerDepth,
+                      ...(actor.handlerExpiresAt
+                          ? { exp: actor.handlerExpiresAt }
+                          : {}),
+                  }
+                : {}),
+        });
+    }
+
+    /**
+     * Mint the full-access token a godmode app runs on. Only the desktop's own
+     * web session may ask, and only asking extends it: using the token never
+     * does. Its row hangs off that session, so signing out or revoking it takes
+     * the token along. The JWT has no `exp` and stays the same across renewals,
+     * so copies an app handed elsewhere keep working; the row's expiry is what
+     * lapses, at most 12h after the desktop stops asking. A lapsed row is never
+     * revived, and one past its max age is replaced and revoked.
+     */
+    async getGodmodeAppToken(
+        actor: Actor,
+        app: { uid: string; title?: string | null; name?: string | null },
+    ): Promise<{ token: string; expiresAt: number }> {
+        if (
+            !isPlainUserActor(actor) ||
+            !actor.user?.id ||
+            !actor.user.uuid ||
+            actor.session?.kind !== 'web'
+        ) {
+            throw new HttpError(
+                403,
+                'Only a signed-in desktop session can launch this app',
+                { legacyCode: 'forbidden' },
+            );
+        }
+
+        const authId = this.#authIdFor(actor.user as UserRow);
+        const minted = await this.stores.session.getOrCreateGodmodeToken(
+            actor.user.id,
+            {
+                parentSessionUid: actor.session.uid,
+                appUid: app.uid,
+                expiresAt: nowSeconds() + GODMODE_TOKEN_WINDOW_SECONDS,
+                maxAgeSeconds: GODMODE_TOKEN_MAX_AGE_SECONDS,
+                label: app.title || app.name || null,
+                auth_id: authId,
+            },
+        );
+        const row = minted?.row;
+        if (!row?.access_token_uid) {
+            throw new HttpError(500, 'Could not issue the app token', {
+                legacyCode: 'internal_error',
+            });
+        }
+        if (minted.replaced) await this.#retireGodmodeToken(minted.replaced);
+
+        const token = this.services.token.sign('auth', {
+            type: 'access-token',
+            version: '2',
+            token_uid: row.access_token_uid,
+            user_uid: actor.user.uuid,
+            session_uid: row.uuid,
+            auth_id: authId,
+            full_access: true,
+            godmode_app_uid: app.uid,
+        });
+        return { token, expiresAt: Number(row.expires_at) };
+    }
+
+    /**
+     * Revoke a godmode token row the desktop has moved off: the tokens it
+     * minted go with it, and its sockets are dropped.
+     */
+    async #retireGodmodeToken(row: {
+        uuid: string;
+        access_token_uid?: string | null;
+    }): Promise<void> {
+        const tokenUids = (await this.stores.session.accessTokenUidsForCascade(
+            row.uuid,
+        )) as string[];
+        await this.stores.session.revokeCascade(row.uuid);
+        for (const tokenUid of tokenUids) {
+            await this.#dropAccessTokenGrants(tokenUid);
+        }
+        if (row.access_token_uid) {
+            this.clients.event?.emit(
+                'auth.access-token.revoked',
+                { token_uid: row.access_token_uid },
+                {},
+            );
+        }
+    }
+
+    // -- Private / public hosted asset cookies -----------------------
+    //
+    // Sticky cookies set by the puter-site middleware after a visitor passes
+    // the private-app access gate, or resolves as an actor on a public hosted
+    // app; later requests read the cookie and skip the entitlement lookup.
+    // Claims are kept narrow (user, session, app, subdomain, host) so a cookie
+    // minted for one app/subdomain cannot be replayed against another.
+
+    /** Cookie options for both kinds of hosted-asset cookie. */
+    getHostedAssetCookieOptions(
+        opts: {
+            requestHostname?: string;
+        } = {},
+    ): Record<string, unknown> {
+        // Scoped to the request host, no `domain`, so unrelated private-app
+        // subdomains don't share it.
+        const options: Record<string, unknown> = {
+            httpOnly: true,
+            ...sessionCookieFlags(this.config),
+            maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
+            path: '/',
+        };
+        if (opts.requestHostname) {
+            // Browsers default to the response origin anyway; kept for logs.
+            options.hostname = opts.requestHostname;
+        }
+        return options;
+    }
+
+    async createHostedAssetToken(
+        kind: HostedAssetKind,
+        claims: {
+            appUid: string;
+            userUid: string;
+            sessionUuid?: string;
+            subdomain?: string;
+            host?: string;
+        },
+    ): Promise<string> {
+        const { assetSessionUuid, authId } =
+            await this.#mintAssetSessionContext(claims.sessionUuid);
+        return this.services.token.sign('hosted-asset', {
+            kind,
+            version: '2',
+            user_uid: claims.userUid,
+            app_uid: claims.appUid,
+            ...(assetSessionUuid
+                ? { session_uuid: assetSessionUuid }
+                : claims.sessionUuid
+                  ? { session_uuid: claims.sessionUuid }
+                  : {}),
+            ...(authId ? { auth_id: authId } : {}),
+            ...(claims.subdomain ? { subdomain: claims.subdomain } : {}),
+            ...(claims.host ? { host: claims.host } : {}),
+        });
+    }
+
+    /**
+     * Materialize the `kind='asset'` session row that the cookie's
+     * `session_uuid` claim points at. Parented to the minting session so
+     * revoking it kills the cookie. The cascade is one level deep, so a cookie
+     * minted from a godmode token (itself under a web session) outlives logout
+     * of that web session; accepted, as app tokens outlive it too and the
+     * cookie only serves one app's files after an entitlement check.
+     *
+     * Both fields are `null` only when the caller didn't supply a session at
+     * all — the cookie still mints unparented and without an `auth_id` claim
+     * (matches v1 behavior for access-token-minted cookies that aren't tied to
+     * an interactive session).
+     *
+     * If the caller DID supply a `webSessionUuid` but the lookup misses (row
+     * revoked / expired between mint request and this lookup), throw —
+     * otherwise we'd quietly emit an unparented "ghost" cookie that has no
+     * revocation hook for 7 days. The extra check piggybacks on the lookup we
+     * already had to do, so no added perf cost.
+     */
+    async #mintAssetSessionContext(
+        webSessionUuid: string | undefined,
+    ): Promise<{ assetSessionUuid: string | null; authId: string | null }> {
+        if (!webSessionUuid) return { assetSessionUuid: null, authId: null };
+        const webSession = await this.stores.session.getByUuid(webSessionUuid);
+        if (!webSession) {
+            throw new HttpError(401, 'session no longer valid', {
+                legacyCode: 'session_required',
+            });
+        }
+        const authId =
+            ((webSession as SessionRow).auth_id as string | null) ?? null;
+        const row = await this.stores.session.create(
+            (webSession as SessionRow).user_id as number,
+            {
+                kind: 'asset',
+                parent_session_id: webSessionUuid,
+                expires_at: nowSeconds() + ASSET_WINDOW_SECONDS,
+                auth_id: authId,
+            },
+        );
+        return { assetSessionUuid: row.uuid, authId };
+    }
+
+    /**
+     * Verify a hosted-asset cookie of `kind` against what the request expects,
+     * and that the session it was minted under still exists and isn't revoked:
+     * `getByUuid` filters on `revoked_at IS NULL`, so revoking the minting
+     * session invalidates the cookie. Only the leaf row is checked; see
+     * `#mintAssetSessionContext` for the godmode case. A cookie minted without
+     * a session (from an access-token actor) has nothing to bind.
+     */
+    async verifyHostedAssetToken(
+        kind: HostedAssetKind,
+        token: string,
+        expected: {
+            appUid?: string;
+            subdomain?: string;
+            host?: string;
+        } = {},
+    ): Promise<{
+        userUid: string;
+        sessionUuid?: string;
+        appUid?: string;
+        subdomain?: string;
+        host?: string;
+        authId?: string;
+    }> {
+        const decoded = this.#verifyHostedAssetToken(token, kind);
+        const labels = HOSTED_ASSET_LABELS[kind];
+        this.#assertExpected(
+            decoded,
+            'app_uid',
+            expected.appUid,
+            'expectedAppUid',
+        );
+        this.#assertExpected(
+            decoded,
+            'subdomain',
+            expected.subdomain,
+            'expectedSubdomain',
+        );
+        this.#assertExpected(
+            decoded,
+            'host',
+            expected.host,
+            labels.expectedHost,
+        );
+
+        const sessionUuid = decoded.session_uuid as string | undefined;
+        if (sessionUuid) {
+            const session = await this.stores.session.getByUuid(sessionUuid);
+            if (!session) {
+                throw new HttpError(
+                    401,
+                    `${labels.token} token session no longer valid`,
+                    { legacyCode: 'session_required' },
+                );
+            }
+        }
+
+        return {
+            userUid: decoded.user_uid as string,
+            sessionUuid,
+            appUid: decoded.app_uid as string | undefined,
+            subdomain: decoded.subdomain as string | undefined,
+            host: decoded.host as string | undefined,
+            authId: decoded.auth_id as string | undefined,
+        };
+    }
+
+    #verifyHostedAssetToken(
+        token: string,
+        expectedKind: 'private' | 'public',
+    ): Record<string, unknown> {
+        const decoded = this.services.token.verify<Record<string, unknown>>(
+            'hosted-asset',
+            token,
+        );
+        if (decoded.kind !== expectedKind) {
+            throw new HttpError(
+                401,
+                `hosted-asset token is not ${expectedKind}`,
+                { legacyCode: 'token_invalid' },
+            );
+        }
+        if (typeof decoded.user_uid !== 'string' || !decoded.user_uid) {
+            throw new HttpError(401, 'hosted-asset token missing user_uid', {
+                legacyCode: 'token_invalid',
+            });
+        }
+        return decoded;
+    }
+
+    #assertExpected(
+        decoded: Record<string, unknown>,
+        field: string,
+        expected: string | undefined,
+        label: string,
+    ): void {
+        if (expected === undefined) return;
+        if (decoded[field] !== expected) {
+            throw new HttpError(401, `hosted-asset token ${label} mismatch`, {
+                legacyCode: 'token_invalid',
+            });
+        }
+    }
+
+    // -- Access tokens -----------------------------------------------
+
+    /**
+     * Create an access token with the given permissions.
+     *
+     * Each permission spec is `[permissionString, extraObject?]`. The token is
+     * stored in `access_token_permissions` and a JWT is returned.
+     */
+    async createAccessToken(
+        actor: Actor,
+        permissions: Array<[string, Record<string, unknown>?]>,
+        // `expiresIn` follows jsonwebtoken's expiresIn semantics — either
+        // a number of seconds (integer) or a duration string ('1h',
+        // '30d'). `#hardExpiryFromExpiresIn` supports both, and existing
+        // callers / tests pass the string form, so narrowing to `number`
+        // here would force unsafe casts at every call site.
+        options: { expiresIn?: string | number; label?: string | null } = {},
+    ): Promise<string> {
+        if (!actor.user)
+            throw new HttpError(403, 'Actor must be a user', {
+                legacyCode: 'forbidden',
+            });
+        // A full-access token may mint scoped tokens (a read URL, say); they
+        // hang off its own row below, so revoking it takes them along. No other
+        // token mints, and none mints full access.
+        const mintingToken = actor.accessToken
+            ? isAccountContext(actor) && actor.accessToken.fullAccess === true
+                ? actor.accessToken
+                : null
+            : undefined;
+        if (mintingToken === null) {
+            throw new HttpError(
+                403,
+                'Access tokens may not create access tokens',
+                {
+                    legacyCode: 'forbidden',
+                },
+            );
+        }
+
+        // Unrewritten: the column width is the limit, and no row exists yet.
+        for (const [permission] of permissions) {
+            if (
+                typeof permission === 'string' &&
+                permission.length > PERMISSION_MAX_LEN
+            ) {
+                throw new HttpError(400, 'Invalid `permission`', {
+                    legacyCode: 'bad_request',
+                });
+            }
+        }
+
+        // Full-API-access sentinel: a token that may do anything its issuing
+        // user can do via the API (resolved against the issuer at check time —
+        // see PermissionService.#scanAccessToken). Only a plain user actor may
+        // mint one; an app-under-user actor must not be able to escalate the
+        // scoped access it was granted into blanket account-wide access.
+        const wantsFullAccess = permissions.some(
+            ([p]) => p === FULL_API_ACCESS,
+        );
+        if (wantsFullAccess && actor.effectiveApp) {
+            throw new HttpError(403, 'Apps may not mint full-access tokens', {
+                legacyCode: 'forbidden',
+            });
+        }
+        if (wantsFullAccess && mintingToken) {
+            throw new HttpError(
+                403,
+                'Access tokens may not mint full-access tokens',
+                { legacyCode: 'forbidden' },
+            );
+        }
+
+        // Permission-subset enforcement: an access token can only carry
+        // permissions the issuer itself holds. Without this, an
+        // app-under-user actor (third-party app authorized by the user)
+        // could mint a token claiming permissions it was never granted —
+        // those grants live in `access_token_permissions` and are
+        // returned verbatim at check-time, with no re-validation against
+        // the authorizer. `checkMany` is one pipelined MGET against the
+        // per-actor permission cache so the cost is small even for
+        // many-permission mints. The full-access sentinel is excluded — it
+        // isn't a real permission the issuer "holds"; its gate is the
+        // user-actor check above.
+        const requestedPerms = [
+            ...new Set(
+                permissions
+                    .map(([p]) => p)
+                    .filter(
+                        (p): p is string =>
+                            typeof p === 'string' &&
+                            !!p &&
+                            p !== FULL_API_ACCESS,
+                    ),
+            ),
+        ];
+        if (requestedPerms.length > 0) {
+            const granted = await this.services.permission.checkMany(
+                actor,
+                requestedPerms,
+            );
+            const missing = requestedPerms.filter((p) => !granted.get(p));
+            if (missing.length > 0) {
+                throw new HttpError(
+                    403,
+                    `Issuer lacks permission(s): ${missing.join(', ')}`,
+                    {
+                        legacyCode: 'forbidden',
+                        fields: { missing_permissions: missing },
+                    },
+                );
+            }
+        }
+
+        const tokenUid = uuidv4();
+        const auth_id = this.#authIdFor(actor.user as UserRow);
+
+        // Access tokens carry a *hard* row-level expiry — no slide. If the
+        // caller passed `expiresIn`, the row's `expires_at` matches the JWT
+        // exp; otherwise both are absent (open-ended access tokens).
+        const expiresAt = this.#hardExpiryFromExpiresIn(options.expiresIn);
+
+        // App-issued access tokens parent to the issuing app's session row
+        // so cascading the app authorization kills its scoped tokens; one a
+        // full-access token mints parents to that token's row. Tokens issued
+        // by the account itself stay top-level.
+        const issuingApp = actor.effectiveApp;
+        let parent_session_id =
+            issuingApp && actor.session ? actor.session.uid : null;
+        if (mintingToken) {
+            const mintingRow =
+                await this.stores.session.findActiveByAccessTokenUid(
+                    mintingToken.uid,
+                );
+            if (!mintingRow) {
+                throw new HttpError(
+                    403,
+                    'Access tokens may not create access tokens',
+                    { legacyCode: 'forbidden' },
+                );
+            }
+            parent_session_id = mintingRow.uuid;
+        }
+
+        const tokenSession = await this.stores.session.create(
+            actor.user.id as number,
+            {
+                kind: 'access_token',
+                // User-facing name shown (and editable) in the manage-sessions
+                // UI. Trimmed/clamped by the caller; null when unnamed.
+                label: options.label ?? null,
+                parent_session_id,
+                expires_at: expiresAt,
+                auth_id,
+                // Stored on the session row so a raw-uuid revoke (caller has the
+                // token_uid but no JWT) can reverse-find the row and flip
+                // `revoked_at` — see `revokeAccessToken`.
+                access_token_uid: tokenUid,
+            },
+        );
+
+        const jwtPayload: Record<string, unknown> = {
+            type: 'access-token',
+            version: '2',
+            token_uid: tokenUid,
+            user_uid: actor.user.uuid,
+            session_uid: tokenSession.uuid,
+            auth_id,
+        };
+        if (issuingApp) {
+            jwtPayload.app_uid = issuingApp.uid;
+        }
+        // Full-access is carried as a signed claim (not a stored permission
+        // row): it's the single source of truth read at auth time into
+        // `actor.accessToken.fullAccess`, which both `requireNonAccessTokenGate`
+        // and the permission scan consult. The app check above already
+        // rejected app-issued full-access mints.
+        if (wantsFullAccess) {
+            jwtPayload.full_access = true;
+        }
+        // Writes made with a token an events handler mints stay in its chain.
+        // The requested lifetime stands: read URLs routinely outlive a run.
+        if (actor.handlerDepth) {
+            jwtPayload.handler_depth = actor.handlerDepth;
+        }
+
+        // jsonwebtoken's SignOptions.expiresIn is typed as `number |
+        // ${number}${unit}` (template literal), so a plain string can't
+        // be statically proven safe. The runtime accepts the same range
+        // of strings #hardExpiryFromExpiresIn parses ('1h', '30d'), so
+        // the cast is faithful to actual behavior.
+        const jwt = this.services.token.sign(
+            'auth',
+            jwtPayload,
+            // Only `expiresIn` is a valid jsonwebtoken sign option; `label` is
+            // ours (stored on the session row above), so don't forward it.
+            options.expiresIn !== undefined
+                ? { expiresIn: options.expiresIn as number }
+                : {},
+        );
+
+        // The full-access sentinel is not a real grant — it lives in the
+        // signed `full_access` claim, not `access_token_permissions`.
+        await this.stores.permission.insertAccessTokenPerms(
+            tokenUid,
+            { userId: actor.user.id ?? null, appId: issuingApp?.id ?? null },
+            permissions
+                .filter(([permission]) => permission !== FULL_API_ACCESS)
+                .map(([permission, extra]) => ({ permission, extra })),
+        );
+
+        return jwt;
+    }
+
+    /**
+     * Revoke an access token by JWT or token UUID.
+     *
+     * Caller must be a user actor (gated at the route). Ownership is verified
+     * before deletion so one user cannot revoke another user's token by
+     * guessing/leaking the token_uid.
+     */
+    async revokeAccessToken(actor: Actor, tokenOrUuid: string): Promise<void> {
+        if (!actor.user)
+            throw new HttpError(403, 'Actor must be a user', {
+                legacyCode: 'forbidden',
+            });
+
+        let tokenUid: string;
+        let issuerUuidFromJwt: string | undefined;
+        let sessionUidFromJwt: string | undefined;
+        // A uuid says nothing about the token; assume full access.
+        let mayBeFullAccess = true;
+        const isJwt = /^[\w-]+\.[\w-]+\.[\w-]+$/.test(tokenOrUuid.trim());
+        if (isJwt) {
+            const decoded = this.services.token.verify<AccessTokenPayload>(
+                'auth',
+                tokenOrUuid,
+            );
+            if (decoded.type !== 'access-token' || !decoded.token_uid) {
+                throw new HttpError(400, 'Invalid access token', {
+                    legacyCode: 'token_invalid',
+                });
+            }
+            tokenUid = decoded.token_uid;
+            issuerUuidFromJwt = decoded.user_uid;
+            sessionUidFromJwt = decoded.session_uid;
+            mayBeFullAccess = !decoded.app_uid && decoded.full_access === true;
+        } else {
+            tokenUid = tokenOrUuid;
+        }
+
+        // A signature-verified JWT is itself proof of who issued the token —
+        // the body's `user_uid` was set by createAccessToken at mint time.
+        // For raw-uuid input the session row is the primary authority: a
+        // full-access token carries its grant as a signed claim and writes
+        // no `access_token_permissions` row to resolve against, so reading
+        // ownership from the manifest alone leaves the broadest token we
+        // issue unrevokable. The manifest stays as a fallback for rows that
+        // predate session-backed access tokens.
+        let sessionRow: SessionRow | null = null;
+        if (issuerUuidFromJwt !== undefined) {
+            if (issuerUuidFromJwt !== actor.user.uuid) {
+                throw new HttpError(404, 'Access token not found', {
+                    legacyCode: 'not_found',
+                });
+            }
+        } else {
+            sessionRow =
+                await this.stores.session.findActiveByAccessTokenUid(tokenUid);
+            const ownerId =
+                sessionRow?.user_id ??
+                (await this.stores.permission.getAccessTokenAuthorizerId(
+                    tokenUid,
+                ));
+            if (ownerId == null || ownerId !== actor.user.id) {
+                throw new HttpError(404, 'Access token not found', {
+                    legacyCode: 'not_found',
+                });
+            }
+        }
+
+        await this.#revokeAccessTokenTail(
+            tokenUid,
+            sessionUidFromJwt,
+            sessionRow,
+            { mayBeFullAccess },
+        );
+    }
+
+    /**
+     * Revoke an access token presented as its JWT. The account may revoke any
+     * of its scoped tokens, an app only those it issued. An expired token
+     * resolves: there is nothing left to revoke.
+     */
+    async revokeOwnAccessToken(actor: Actor, token: string): Promise<void> {
+        if (!actor.user)
+            throw new HttpError(403, 'Actor must be a user', {
+                legacyCode: 'forbidden',
+            });
+        if (actor.effectiveApp === undefined) {
+            throw new HttpError(403, 'Actor is unresolved', {
+                legacyCode: 'forbidden',
+            });
+        }
+
+        let decoded: AccessTokenPayload;
+        try {
+            decoded = this.services.token.verify<AccessTokenPayload>(
+                'auth',
+                token,
+            );
+        } catch (err) {
+            const name = (err as { name?: string } | null)?.name;
+            if (name === 'TokenExpiredError') return;
+            throw new HttpError(400, 'Invalid access token', {
+                legacyCode: 'token_invalid',
+            });
+        }
+        if (decoded.type !== 'access-token' || !decoded.token_uid) {
+            throw new HttpError(400, 'Invalid access token', {
+                legacyCode: 'token_invalid',
+            });
+        }
+
+        if (decoded.user_uid !== actor.user.uuid) {
+            throw new HttpError(404, 'Access token not found', {
+                legacyCode: 'not_found',
+            });
+        }
+
+        // The account itself may revoke any of its tokens; an app only one it
+        // issued — an account-issued token (no `app_uid`) presented by an app
+        // is a mismatch too, not "no app" passing open.
+        if (!isAccountContext(actor)) {
+            if (
+                !actor.effectiveApp ||
+                decoded.app_uid !== actor.effectiveApp.uid
+            ) {
+                throw new HttpError(404, 'Access token not found', {
+                    legacyCode: 'not_found',
+                });
+            }
+        }
+
+        // Personal API tokens are revoked from account settings only, so a
+        // leaked one holding a sibling's JWT cannot kill it through here.
+        if (decoded.full_access === true) {
+            throw new HttpError(
+                403,
+                'Personal API tokens are revoked from account settings',
+                { legacyCode: 'forbidden' },
+            );
+        }
+
+        // Full access is refused above.
+        await this.#revokeAccessTokenTail(
+            decoded.token_uid,
+            decoded.session_uid,
+            null,
+            { mayBeFullAccess: false },
+        );
+    }
+
+    /**
+     * Drop an access token's grant manifest.
+     *
+     * These rows DELETE rather than soft-revoke — the "no DELETE on revoke"
+     * rule is scoped to the `sessions` table, where the audit trail of when a
+     * session existed and when it died is load-bearing for forensic queries and
+     * the cascade graph. `access_token_permissions` rows are the grant manifest
+     * for an _active_ token; once its session is soft-revoked they are
+     * dead-weight cache entries that would only confuse `checkMany`. If we
+     * later need grant history for audit, that becomes a `revoked_at` column on
+     * this table, not a behavior change here.
+     */
+    async #dropAccessTokenGrants(tokenUid: string): Promise<void> {
+        await this.stores.permission.deleteAccessTokenPerms(tokenUid);
+    }
+
+    /**
+     * Shared tail of `revokeAccessToken` and `revokeOwnAccessToken`: drop the
+     * grant manifest and remove the session row backing the token. Only a
+     * full-access token can hold a socket or have minted tokens of its own, so
+     * only that kind evicts and cascades.
+     */
+    async #revokeAccessTokenTail(
+        tokenUid: string,
+        sessionUidFromJwt: string | undefined,
+        sessionRow: SessionRow | null,
+        opts: { mayBeFullAccess?: boolean } = {},
+    ): Promise<void> {
+        await this.#dropAccessTokenGrants(tokenUid);
+
+        // A v1 JWT carries no `session_uid`, so the row still has to be found
+        // by token identity here.
+        const rowUuid =
+            sessionUidFromJwt ??
+            (
+                sessionRow ??
+                (await this.stores.session.findActiveByAccessTokenUid(tokenUid))
+            )?.uuid;
+        const mayBeFullAccess = opts.mayBeFullAccess !== false;
+        const childTokenUids =
+            rowUuid && mayBeFullAccess
+                ? (
+                      (await this.stores.session.accessTokenUidsForCascade(
+                          rowUuid,
+                      )) as string[]
+                  ).filter((uid) => uid !== tokenUid)
+                : [];
+        if (rowUuid) {
+            await this.stores.session.removeByUuid(rowUuid);
+            if (mayBeFullAccess) {
+                await this.stores.session.revokeCascade(rowUuid);
+            }
+        }
+        for (const childUid of childTokenUids) {
+            await this.#dropAccessTokenGrants(childUid);
+        }
+
+        // Only a token the handshake admits has a socket to drop.
+        if (mayBeFullAccess) {
+            this.clients.event?.emit(
+                'auth.access-token.revoked',
+                { token_uid: tokenUid },
+                {},
+            );
+        }
+    }
+
+    // -- Internals ---------------------------------------------------
+
+    #originFromUrl(url: string): string | null {
+        try {
+            const parsed = new URL(url);
+            // This gets persisted as an app `index_url` and later loaded as
+            // `iframe.src` (see AppStore.createFromOrigin), so anything outside
+            // the allow-list is a stored code-execution vector.
+            if (!WEB_AND_EXTENSION_PROTOCOLS.includes(parsed.protocol)) {
+                return null;
+            }
+            // Extension schemes aren't "special", so `new URL()` accepts them
+            // with no authority at all (`chrome-extension:`).
+            if (!parsed.hostname.replace(/\.+$/, '')) {
+                return null;
+            }
+            return this.#normalizedOrigin(parsed);
+        } catch {
+            return null;
+        }
+    }
+
+    /**
+     * A worker credential lives only as long as the worker it was minted for.
+     * Tokens minted before `worker_uid` existed are held to the worker's name
+     * and owner instead.
+     */
+    async #workerStillDeployed(
+        decoded: {
+            worker?: boolean;
+            worker_name?: string;
+            worker_uid?: string;
+        },
+        userId: number,
+    ): Promise<boolean> {
+        if (!decoded.worker) return true;
+        // Events handler sessions have no worker row; EventsService retires them.
+        if (decoded.worker_name === EVENTS_WORKER_SESSION_NAME) return true;
+        if (!decoded.worker_name) return false;
+        const row = await this.stores.subdomain.getBySubdomain(
+            `${WORKER_SUBDOMAIN_PREFIX}${decoded.worker_name}`,
+        );
+        if (!row || Number(row.user_id) !== Number(userId)) return false;
+        return !decoded.worker_uid || row.uuid === decoded.worker_uid;
+    }
+
+    async #actorFromSessionToken(
+        decoded: SessionTokenPayload,
+        ctx: AuthenticateContext = {},
+    ): Promise<AuthResult> {
+        // v2 tokens prefer `session_uid`; v1 only carries `uuid`. Both
+        // store the web-session uuid.
+        const sessionUuid = decoded.session_uid ?? decoded.uuid;
+
+        // Read together, awaited in the order the checks below need them.
+        const userLookup = this.stores.user.getByUuid(decoded.user_uid);
+        const sessionLookup = sessionUuid
+            ? awaitLater(
+                  this.stores.session.getByUuidAny(
+                      sessionUuid,
+                  ) as Promise<SessionRow | null>,
+              )
+            : null;
+
+        const user = await userLookup;
+        if (!user) return { invalid: true };
+        const deployed = awaitLater(
+            this.#workerStillDeployed(decoded, user.id as number),
+        );
+
+        const rawRow = sessionLookup ? await sessionLookup : null;
+
+        // Only a browser session gets a reauth token back. A worker credential
+        // rides the same token type, so check both the claim and the row.
+        const auth_id =
+            decoded.worker || (rawRow?.kind ?? 'web') !== 'web'
+                ? undefined
+                : this.#authIdFor(user as UserRow);
+
+        const ended = this.#endedSession(rawRow, auth_id);
+        if (ended) return ended;
+
+        const session: SessionRow | null = rawRow;
+
+        if (!session) return { invalid: true };
+        if (!(await deployed)) return { invalid: true };
+
+        void this.#touchSession(session.uuid, user.id, ctx);
+
+        return { actor: this.#buildUserActor(user, session) };
+    }
+
+    async #actorFromAppUnderUserToken(
+        decoded: AppUnderUserTokenPayload,
+        ctx: AuthenticateContext = {},
+    ): Promise<AuthResult> {
+        // Read together, awaited in the order the checks below need them.
+        const userLookup = this.stores.user.getByUuid(decoded.user_uid);
+        const appLookup = awaitLater(this.stores.app.getByUid(decoded.app_uid));
+        const sessionLookup = decoded.session_uid
+            ? awaitLater(
+                  this.stores.session.getByUuidAny(
+                      decoded.session_uid,
+                  ) as Promise<SessionRow | null>,
+              )
+            : null;
+
+        const user = await userLookup;
+        if (!user) return { invalid: true };
+        const deployed = awaitLater(
+            this.#workerStillDeployed(decoded, user.id as number),
+        );
+
+        const app = await appLookup;
+        if (!app) return { invalid: true };
+
+        const blocked = await this.#appOriginBlock(app);
+        if (blocked) return { blocked };
+
+        const rawRow = sessionLookup ? await sessionLookup : null;
+
+        // An app token never carries `auth_id` on its reauth result: only a
+        // user's own session/GUI token can be reattached via a reauth token.
+        const ended = this.#endedSession(rawRow);
+        if (ended) return ended;
+
+        const session: SessionRow | null = rawRow;
+
+        if (!session) return { invalid: true };
+
+        // An origin app's uid is derived from the origin, so a deleted app's
+        // uid returns with the next app on that origin. A session older than
+        // the app was made for the earlier one. Checked before `touch()` so a
+        // rejected token doesn't slide the old session's expiry.
+        const notBefore = this.#appSessionsNotBefore(app);
+        const createdAt = Number(session.created_at);
+        if (notBefore !== null && createdAt > 0 && createdAt < notBefore) {
+            return { reauth: { reason: 'session_revoked' } };
+        }
+        if (!(await deployed)) return { invalid: true };
+
+        void this.#touchSession(session.uuid, user.id, ctx);
+
+        const actor = this.#buildAppUnderUserActor(user, app, session);
+        this.#applyHandlerDepth(actor, decoded);
+        return { actor };
+    }
+
+    /**
+     * Block details when `app`'s origin is on the blocklist, so tokens the app
+     * already holds stop working as soon as it's blocked. The `index_url` host
+     * is the same origin checked at token acquisition.
+     */
+    async #appOriginBlock(app: {
+        index_url?: unknown;
+    }): Promise<{ reason?: string } | null> {
+        const indexUrl = app.index_url;
+        if (typeof indexUrl !== 'string' || !indexUrl) return null;
+        const block =
+            await this.services.appOriginBlocklist.isOriginBlocked(indexUrl);
+        return block.blocked ? { reason: block.reason } : null;
+    }
+
+    /**
+     * Unix seconds before which an app or worker session for `app` belongs to
+     * an earlier app with the same uid; null when the creation time is
+     * unknown.
+     */
+    #appSessionsNotBefore(
+        app: { created_epoch?: unknown } | null | undefined,
+    ): number | null {
+        const created = Number(app?.created_epoch);
+        if (!Number.isFinite(created) || created <= 0) return null;
+        return created - APP_SESSION_CLOCK_SKEW_SECONDS;
+    }
+
+    #createdBefore(row: SessionRow | null, notBefore: number | null): boolean {
+        if (notBefore === null || !row) return false;
+        const createdAt = Number(row.created_at);
+        return createdAt > 0 && createdAt < notBefore;
+    }
+
+    async #actorFromAccessTokenToken(
+        decoded: AccessTokenPayload,
+        ctx: AuthenticateContext = {},
+    ): Promise<AuthResult> {
+        if (!decoded.token_uid || !decoded.user_uid) return { invalid: true };
+
+        // Read together, awaited in the order the checks below need them. The
+        // parent is read once its child row names it.
+        const userLookup = this.stores.user.getByUuid(decoded.user_uid);
+        const sessionLookup = decoded.session_uid
+            ? awaitLater(
+                  this.stores.session.getByUuidAny(
+                      decoded.session_uid,
+                  ) as Promise<SessionRow | null>,
+              )
+            : null;
+        const parentLookup = sessionLookup
+            ? awaitLater(
+                  (async () => {
+                      const row = await sessionLookup;
+                      if (!row?.parent_session_id) return null;
+                      return (await this.stores.session.getByUuidAny(
+                          row.parent_session_id,
+                      )) as SessionRow | null;
+                  })(),
+              )
+            : null;
+        const appLookup = decoded.app_uid
+            ? awaitLater(this.stores.app.getByUid(decoded.app_uid))
+            : null;
+        const godmodeAppLookup =
+            decoded.godmode_app_uid !== undefined &&
+            !decoded.app_uid &&
+            decoded.full_access === true
+                ? awaitLater(this.stores.app.getByUid(decoded.godmode_app_uid))
+                : null;
+
+        const user = await userLookup;
+        if (!user) return { invalid: true };
+
+        let session: SessionRow | null = null;
+        let parentSession: SessionRow | null = null;
+        if (sessionLookup && parentLookup) {
+            const rawRow = await sessionLookup;
+            // No `auth_id` on an access token's reauth result: a reauth token
+            // is only ever minted for the user's own session/GUI token.
+            const ended = this.#endedSession(rawRow);
+            if (ended) return ended;
+            if (!rawRow) return { invalid: true };
+            // A token minted under another session (an app's, a godmode
+            // token's, the desktop's) lives no longer than that session does.
+            if (rawRow.parent_session_id) {
+                const parent = await parentLookup;
+                if (!parent) return { reauth: { reason: 'session_revoked' } };
+                const parentEnded = this.#endedSession(parent);
+                if (parentEnded) return parentEnded;
+                parentSession = parent;
+            }
+            session = rawRow;
+        }
+
+        let authorizer: Actor;
+        if (appLookup) {
+            const app = await appLookup;
+            if (!app) return { invalid: true };
+            const blocked = await this.#appOriginBlock(app);
+            if (blocked) return { blocked };
+            // As with app sessions: a token minted under an earlier app that
+            // held this uid doesn't authenticate as the current one.
+            const notBefore = this.#appSessionsNotBefore(app);
+            if (
+                this.#createdBefore(session, notBefore) ||
+                this.#createdBefore(parentSession, notBefore)
+            ) {
+                return { reauth: { reason: 'session_revoked' } };
+            }
+            authorizer = this.#buildAppUnderUserActor(user, app, null);
+        } else {
+            authorizer = this.#buildUserActor(user, null);
+        }
+
+        // A godmode token stops working once its app is gone or demoted.
+        let godmodeApp: { uid: string; id: number } | null = null;
+        if (decoded.godmode_app_uid !== undefined) {
+            if (!godmodeAppLookup) return { invalid: true };
+            const app = await godmodeAppLookup;
+            if (!app || !isGodmodeApp(app)) return { invalid: true };
+            godmodeApp = { uid: app.uid, id: app.id };
+        }
+
+        if (session) void this.#touchSession(session.uuid, user.id, ctx);
+
+        const actor = makeActor({
+            user: this.#actorUserFromRow(user),
+            accessToken: {
+                uid: decoded.token_uid,
+                issuer: authorizer,
+                authorized: null,
+                // Honor the signed full-access claim only for user-issued
+                // tokens. App-issued tokens (`app_uid` present) can never be
+                // full-access — mirrors the mint-time block — so even a
+                // claim on one is ignored here.
+                fullAccess: !decoded.app_uid && decoded.full_access === true,
+                ...(godmodeApp ? { godmodeApp } : {}),
+            },
+        });
+        this.#applyHandlerDepth(actor, decoded);
+        return { actor };
+    }
+
+    /**
+     * The reauth a revoked or expired session answers with; null while it is
+     * live, or when there is no row.
+     */
+    #endedSession(row: SessionRow | null, authId?: string): AuthResult | null {
+        let reason: ReauthReason;
+        if (row?.revoked_at != null) reason = 'session_revoked';
+        else if (row?.expires_at != null && row.expires_at <= nowSeconds())
+            reason = 'session_expired';
+        else return null;
+        return {
+            reauth:
+                authId === undefined ? { reason } : { reason, auth_id: authId },
+        };
+    }
+
+    /** Best effort: activity bookkeeping never fails an authentication. */
+    async #touchSession(
+        sessionUuid: string,
+        userId: number,
+        ctx: AuthenticateContext,
+    ): Promise<void> {
+        if (ctx.touch === false) return;
+        try {
+            await this.stores.session.touch({
+                uuid: sessionUuid,
+                userId,
+                ip: ctx.ip,
+                userAgent: ctx.userAgent,
+            });
+        } catch {
+            // The next authenticated request touches again.
+        }
+    }
+
+    /** An events handler token's depth and expiry; see `Actor.handlerDepth`. */
+    #applyHandlerDepth(
+        actor: Actor,
+        decoded: AppUnderUserTokenPayload | AccessTokenPayload,
+    ): void {
+        const { handler_depth: handlerDepth, exp } = decoded;
+        if (!Number.isSafeInteger(handlerDepth) || handlerDepth! <= 0) return;
+        actor.handlerDepth = handlerDepth;
+        if (Number.isSafeInteger(exp)) actor.handlerExpiresAt = exp;
+    }
+
+    // -- Actor builders ----------------------------------------------
+
+    #actorUserFromRow(user: UserRow) {
+        // Strip the password hash; pass everything else through so callers
+        // can read metadata, desktop_bg_*, otp_enabled, etc. without
+        // re-fetching the user. Mirrors what /whoami exposes off of UserRow.
+        const { password: _password, ...rest } = user;
+        return {
+            ...rest,
+            email: user.email ?? null,
+            suspended: user.suspended ?? false,
+            email_confirmed: user.email_confirmed ?? false,
+            requires_email_confirmation:
+                user.requires_email_confirmation ?? false,
+            phone: user.phone ?? null,
+            requires_phone_verification:
+                user.requires_phone_verification ?? false,
+            requires_card_verification:
+                user.requires_card_verification ?? false,
+        };
+    }
+
+    /**
+     * A session-less actor for a user whose password was verified outside a
+     * token (WebDAV Basic auth). Same row→actor mapping as the token paths, so
+     * the account gates see every flag they read.
+     */
+    buildPasswordActor(user: UserRow): Actor {
+        return this.#buildUserActor(user, null);
+    }
+
+    #buildUserActor(user: UserRow, session: SessionRow | null): Actor {
+        return makeActor({
+            user: this.#actorUserFromRow(user),
+            session: session
+                ? { uid: session.uuid, kind: session.kind ?? null }
+                : null,
+        });
+    }
+
+    #buildAppUnderUserActor(
+        user: UserRow,
+        app: { uid: string; id: number },
+        session: SessionRow | null,
+    ): Actor {
+        return makeActor({
+            user: this.#actorUserFromRow(user),
+            app: {
+                uid: app.uid,
+                id: app.id,
+            },
+            session: session
+                ? { uid: session.uuid, kind: session.kind ?? null }
+                : null,
+        });
+    }
+}

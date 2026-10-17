@@ -1,0 +1,1254 @@
+/*
+ * Copyright (C) 2024-present Puter Technologies Inc.
+ *
+ * This file is part of Puter.
+ *
+ * Puter is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published
+ * by the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+import type { Request, Response } from 'express';
+import { beforeEach, describe, expect, it } from 'vitest';
+import { resetCardVerificationStatusCache } from '../../../util/cardFallback';
+import { isReservedUsername } from '../../../util/reservedUsernames';
+import { makeActor, type Actor } from '../../actor';
+import { HttpError, isHttpError } from '../HttpError';
+import {
+    DEFAULT_ADMIN_USERNAMES,
+    adminOnlyGate,
+    allowedAppIdsGate,
+    assertNotUserSession,
+    gate,
+    noUserSessionGate,
+    requireAnyVerifiedGate,
+    type AnyVerifiedDeps,
+    requireAuthGate,
+    requireCardVerifiedGate,
+    requirePhoneVerifiedGate,
+    requireTeam2fa,
+    requireVerifiedAccount,
+    requireNonAccessTokenGate,
+    requireUserActorGate,
+    requireVerifiedGate,
+    subdomainGate,
+} from './gates';
+
+// ── Tiny harness ────────────────────────────────────────────────────
+//
+// Gates only touch `req`, never `res`. We capture what they pass to
+// `next()` — either a string ('route'), an HttpError, or `undefined` for
+// pass-through.
+
+type NextArg = undefined | 'route' | HttpError | unknown;
+
+/**
+ * Rebuild an actor literal through `makeActor`, issuer-first, so the derived
+ * `effectiveApp` is present at every level of the token chain.
+ */
+const reviveActor = (actor: Actor): Actor =>
+    makeActor({
+        ...actor,
+        ...(actor.accessToken
+            ? {
+                  accessToken: {
+                      ...actor.accessToken,
+                      issuer: reviveActor(actor.accessToken.issuer),
+                  },
+              }
+            : {}),
+    });
+
+const runGate = (
+    gate: (
+        req: Request,
+        res: Response,
+        next: (arg?: unknown) => void,
+    ) => unknown,
+    req: Partial<Request>,
+): NextArg => {
+    // Normalise the actor the way AuthService does before any gate sees one,
+    // so `effectiveApp` is derived here rather than spelled out on every
+    // literal below. Issuers too: a gate reading the chain reads the derived
+    // field, not `issuer.app`.
+    if (req.actor) req = { ...req, actor: reviveActor(req.actor) };
+
+    let captured: NextArg = undefined;
+    let called = false;
+    gate(req as Request, {} as Response, (arg?: unknown) => {
+        called = true;
+        captured = arg as NextArg;
+    });
+    if (!called) {
+        throw new Error('gate did not call next()');
+    }
+    return captured;
+};
+
+/** `runGate` for a gate that answers asynchronously. */
+const runGateAsync = (
+    gate: (
+        req: Request,
+        res: Response,
+        next: (arg?: unknown) => void,
+    ) => unknown,
+    req: Partial<Request>,
+): Promise<NextArg> => {
+    if (req.actor) req = { ...req, actor: reviveActor(req.actor) };
+    return new Promise((resolve) =>
+        gate(req as Request, {} as Response, (arg?: unknown) =>
+            resolve(arg as NextArg),
+        ),
+    );
+};
+
+const expectHttpError = (got: NextArg, status: number, legacyCode?: string) => {
+    expect(isHttpError(got)).toBe(true);
+    const err = got as HttpError;
+    expect(err.statusCode).toBe(status);
+    if (legacyCode) expect(err.legacyCode).toBe(legacyCode);
+};
+
+// ── gate ────────────────────────────────────────────────────────────
+
+describe('gate', () => {
+    const denied = () =>
+        new HttpError(403, 'nope', { legacyCode: 'forbidden' });
+
+    it('calls next() synchronously when a sync check passes', () => {
+        expect(runGate(gate(() => {}), {})).toBeUndefined();
+    });
+
+    it('hands a sync throw to next(err) synchronously', () => {
+        const err = denied();
+        expect(
+            runGate(
+                gate(() => {
+                    throw err;
+                }),
+                {},
+            ),
+        ).toBe(err);
+    });
+
+    it('calls next() once an async check resolves', async () => {
+        const got = await runGateAsync(
+            gate(async () => {}),
+            {},
+        );
+        expect(got).toBeUndefined();
+    });
+
+    it('hands an async rejection to next(err)', async () => {
+        const err = denied();
+        const got = await runGateAsync(
+            gate(async () => {
+                throw err;
+            }),
+            {},
+        );
+        expect(got).toBe(err);
+    });
+
+    it('passes the request to the check', () => {
+        let seen: unknown;
+        runGate(
+            gate((req) => {
+                seen = req.headers;
+            }),
+            { headers: { host: 'x' } },
+        );
+        expect(seen).toEqual({ host: 'x' });
+    });
+});
+
+// ── subdomainGate ───────────────────────────────────────────────────
+
+describe('subdomainGate', () => {
+    it('passes through (next()) when the active subdomain matches', () => {
+        const got = runGate(subdomainGate('api'), {
+            // express stores subdomains right-to-left → active is the last entry
+            subdomains: ['com', 'puter', 'api'] as unknown as string[],
+        });
+        expect(got).toBeUndefined();
+    });
+
+    it("calls next('route') when subdomain doesn't match — does NOT throw", () => {
+        const got = runGate(subdomainGate('api'), {
+            subdomains: ['com', 'puter', 'admin'] as unknown as string[],
+        });
+        // Critical: subdomainGate skips, it does not reject. This is how
+        // multiple route trees coexist on the same host.
+        expect(got).toBe('route');
+    });
+
+    it('accepts an array of allowed subdomains', () => {
+        const gate = subdomainGate(['api', 'admin']);
+        expect(
+            runGate(gate, {
+                subdomains: ['admin'] as unknown as string[],
+            }),
+        ).toBeUndefined();
+        expect(
+            runGate(gate, {
+                subdomains: ['other'] as unknown as string[],
+            }),
+        ).toBe('route');
+    });
+
+    it("treats a missing/empty subdomains array as ''", () => {
+        const got = runGate(subdomainGate('api'), {});
+        expect(got).toBe('route');
+        // And an empty allow-of-empty does pass:
+        expect(runGate(subdomainGate(''), {})).toBeUndefined();
+    });
+});
+
+// ── requireAuthGate ─────────────────────────────────────────────────
+
+describe('requireAuthGate', () => {
+    it('passes through when an actor is attached and not suspended', () => {
+        const got = runGate(requireAuthGate(), {
+            actor: { user: { uuid: 'u-1', suspended: false } },
+        });
+        expect(got).toBeUndefined();
+    });
+
+    it('returns 401 token_missing when no actor and no prior probe failure', () => {
+        const got = runGate(requireAuthGate(), {});
+        expectHttpError(got, 401, 'token_missing');
+    });
+
+    it('returns 401 token_auth_failed when a token was probed but invalid', () => {
+        const got = runGate(requireAuthGate(), {
+            tokenAuthFailed: true,
+        });
+        expectHttpError(got, 401, 'token_auth_failed');
+    });
+
+    it('returns 403 forbidden for suspended users (no DB hit needed)', () => {
+        const got = runGate(requireAuthGate(), {
+            actor: { user: { uuid: 'u-1', suspended: true } },
+        });
+        expectHttpError(got, 403, 'forbidden');
+    });
+
+    // ── Reauth signal ───────────────────────────────────────────────
+
+    it('returns 401 reauth_required when a reauth signal is present', () => {
+        const got = runGate(requireAuthGate(), {
+            requiresReauth: { reason: 'session_expired', auth_id: 'u-1' },
+        });
+        expectHttpError(got, 401, 'reauth_required');
+        expect((got as HttpError).fields).toMatchObject({
+            code: 'reauth_required',
+            reason: 'session_expired',
+            auth_id: 'u-1',
+        });
+    });
+
+    it('returns 401 reauth_required with reason=session_revoked', () => {
+        const got = runGate(requireAuthGate(), {
+            requiresReauth: { reason: 'session_revoked', auth_id: 'u-2' },
+        });
+        expectHttpError(got, 401, 'reauth_required');
+        expect((got as HttpError).fields).toMatchObject({
+            reason: 'session_revoked',
+            auth_id: 'u-2',
+        });
+    });
+
+    it('returns 401 reauth_required with reason=session_expired', () => {
+        const got = runGate(requireAuthGate(), {
+            requiresReauth: { reason: 'session_expired' },
+        });
+        expectHttpError(got, 401, 'reauth_required');
+        expect((got as HttpError).fields).toMatchObject({
+            reason: 'session_expired',
+        });
+        // No auth_id field at all when none was supplied (vs. set-to-undefined).
+        expect((got as HttpError).fields?.auth_id).toBeUndefined();
+    });
+
+    it('reauth_required takes priority over tokenAuthFailed', () => {
+        // Both flags set: the structured reauth signal wins. v2 clients
+        // key on `code === 'reauth_required'`; v1 clients still see a 401.
+        const got = runGate(requireAuthGate(), {
+            requiresReauth: { reason: 'session_expired', auth_id: 'u-1' },
+            tokenAuthFailed: true,
+        });
+        expectHttpError(got, 401, 'reauth_required');
+    });
+});
+
+// ── requireUserActorGate ────────────────────────────────────────────
+
+describe('requireUserActorGate', () => {
+    it('passes through for plain user actors', () => {
+        const got = runGate(requireUserActorGate(), {
+            actor: { user: { uuid: 'u-1' } },
+        });
+        expect(got).toBeUndefined();
+    });
+
+    it('rejects with 403 when the actor is acting through an app', () => {
+        const got = runGate(requireUserActorGate(), {
+            actor: {
+                user: { uuid: 'u-1' },
+                app: { uid: 'app-1' },
+            },
+        });
+        expectHttpError(got, 403, 'forbidden');
+    });
+
+    it('rejects with 403 when the actor is using an access token', () => {
+        const got = runGate(requireUserActorGate(), {
+            actor: {
+                user: { uuid: 'u-1' },
+                accessToken: {
+                    uid: 'tok-1',
+                    issuer: { user: { uuid: 'u-1' } },
+                },
+            },
+        });
+        expectHttpError(got, 403, 'forbidden');
+    });
+
+    it("falls back to 401 if there's no actor at all (defensive)", () => {
+        // requireAuth runs first, so this is rare — but the gate handles
+        // it anyway rather than dereferencing undefined.
+        const got = runGate(requireUserActorGate(), {});
+        expectHttpError(got, 401, 'token_missing');
+    });
+
+    it('rejects a FULL-ACCESS access token too — account routes stay closed', () => {
+        // The account wall is actor-type based: even a full-access PAT (which
+        // the resource wall lets through) is rejected here, so it can never
+        // reach change-password/email/2FA/token-minting/etc.
+        const got = runGate(requireUserActorGate(), {
+            actor: {
+                user: { uuid: 'u-1' },
+                accessToken: {
+                    uid: 'tok-1',
+                    issuer: { user: { uuid: 'u-1' } },
+                    fullAccess: true,
+                },
+            },
+        });
+        expectHttpError(got, 403, 'forbidden');
+    });
+
+    // allowFullAccess opt-in: relaxes ONLY the access-token half, for
+    // user-resource/inference routes (e.g. the AI proxy).
+    it('admits a full-access PAT when allowFullAccess is set', () => {
+        const got = runGate(requireUserActorGate({ allowFullAccess: true }), {
+            actor: {
+                user: { uuid: 'u-1' },
+                accessToken: {
+                    uid: 'tok-1',
+                    issuer: { user: { uuid: 'u-1' } },
+                    fullAccess: true,
+                },
+            },
+        });
+        expect(got).toBeUndefined();
+    });
+
+    it('still rejects a full-access claim on an app-issued token', () => {
+        const got = runGate(requireUserActorGate({ allowFullAccess: true }), {
+            actor: {
+                user: { uuid: 'u-1' },
+                accessToken: {
+                    uid: 'tok-1',
+                    issuer: { user: { uuid: 'u-1' }, app: { uid: 'app-1' } },
+                    fullAccess: true,
+                },
+            },
+        });
+        expectHttpError(got, 403, 'forbidden');
+    });
+
+    it('still rejects a SCOPED access token even when allowFullAccess is set', () => {
+        const got = runGate(requireUserActorGate({ allowFullAccess: true }), {
+            actor: {
+                user: { uuid: 'u-1' },
+                accessToken: {
+                    uid: 'tok-1',
+                    issuer: { user: { uuid: 'u-1' } },
+                    // no fullAccess
+                },
+            },
+        });
+        expectHttpError(got, 403, 'forbidden');
+    });
+
+    it('still rejects a third-party app even when allowFullAccess is set', () => {
+        const got = runGate(requireUserActorGate({ allowFullAccess: true }), {
+            actor: { user: { uuid: 'u-1' }, app: { uid: 'app-1' } },
+        });
+        expectHttpError(got, 403, 'forbidden');
+    });
+});
+
+// -- requireNonAccessTokenGate --
+
+describe('requireNonAccessTokenGate', () => {
+    it('passes through for plain user actors', () => {
+        const got = runGate(requireNonAccessTokenGate(), {
+            actor: { user: { uuid: 'u-1' } },
+        });
+        expect(got).toBeUndefined();
+    });
+
+    it('passes through for app-under-user actors (only access tokens are gated)', () => {
+        const got = runGate(requireNonAccessTokenGate(), {
+            actor: { user: { uuid: 'u-1' }, app: { uid: 'app-1' } },
+        });
+        expect(got).toBeUndefined();
+    });
+
+    it('rejects a normal (scoped) access token with 403', () => {
+        const got = runGate(requireNonAccessTokenGate(), {
+            actor: {
+                user: { uuid: 'u-1' },
+                accessToken: {
+                    uid: 'tok-1',
+                    issuer: { user: { uuid: 'u-1' } },
+                },
+            },
+        });
+        expectHttpError(got, 403, 'forbidden');
+    });
+
+    it('admits a FULL-ACCESS access token (the resource-wall carve-out)', () => {
+        const got = runGate(requireNonAccessTokenGate(), {
+            actor: {
+                user: { uuid: 'u-1' },
+                accessToken: {
+                    uid: 'tok-1',
+                    issuer: { user: { uuid: 'u-1' } },
+                    fullAccess: true,
+                },
+            },
+        });
+        expect(got).toBeUndefined();
+    });
+
+    it("falls back to 401 if there's no actor at all (defensive)", () => {
+        const got = runGate(requireNonAccessTokenGate(), {});
+        expectHttpError(got, 401, 'token_missing');
+    });
+});
+
+// ── noUserSessionGate ───────────────────────────────────────────────
+
+describe('noUserSessionGate', () => {
+    it('rejects a bare user-session ("root" token) actor with 403', () => {
+        const got = runGate(noUserSessionGate(), {
+            actor: { user: { uuid: 'u-1' } },
+        });
+        expectHttpError(got, 403, 'app_or_api_token_required');
+    });
+
+    it('passes through for app-under-user actors (app/worker tokens)', () => {
+        const got = runGate(noUserSessionGate(), {
+            actor: { user: { uuid: 'u-1' }, app: { uid: 'app-1' } },
+        });
+        expect(got).toBeUndefined();
+    });
+
+    it('passes through for user-scoped worker sessions (kind="worker")', () => {
+        const got = runGate(noUserSessionGate(), {
+            actor: {
+                user: { uuid: 'u-1' },
+                session: { uid: 'sess-1', kind: 'worker' },
+            },
+        });
+        expect(got).toBeUndefined();
+    });
+
+    it('passes through for access-token actors (which access tokens are OK is decided by the other gates)', () => {
+        const got = runGate(noUserSessionGate(), {
+            actor: {
+                user: { uuid: 'u-1' },
+                accessToken: {
+                    uid: 'tok-1',
+                    issuer: { user: { uuid: 'u-1' } },
+                    fullAccess: true,
+                },
+            },
+        });
+        expect(got).toBeUndefined();
+    });
+
+    it("falls back to 401 if there's no actor at all (defensive)", () => {
+        const got = runGate(noUserSessionGate(), {});
+        expectHttpError(got, 401, 'token_missing');
+    });
+});
+
+describe('assertNotUserSession', () => {
+    it('is a no-op for a missing actor (anonymous is the auth gate’s job)', () => {
+        expect(() => assertNotUserSession(undefined)).not.toThrow();
+        expect(() => assertNotUserSession(null)).not.toThrow();
+    });
+
+    it('always admits a user-scoped worker session — workers are never root tokens', () => {
+        // Workers deployed with no app binding hold a session-TYPE token
+        // whose row is kind='worker' (see AuthService.createWorkerSessionToken)
+        // — a bare user actor plus that session ref. The gate is an
+        // annoyance for sign-up-and-scrape abuse; a deployed worker is
+        // already a delegated, revocable credential.
+        expect(() =>
+            assertNotUserSession({
+                app: null,
+                accessToken: null,
+                session: { uid: 'sess-1', kind: 'worker' },
+            }),
+        ).not.toThrow();
+    });
+
+    it('still rejects web sessions', () => {
+        expect(() =>
+            assertNotUserSession({
+                app: null,
+                accessToken: null,
+                session: { uid: 'sess-1', kind: 'web' },
+            }),
+        ).toThrow();
+    });
+
+    it('throws 403 app_or_api_token_required for a bare session actor', () => {
+        try {
+            assertNotUserSession({ app: null, accessToken: null });
+            expect.unreachable('expected assertNotUserSession to throw');
+        } catch (err) {
+            expect(isHttpError(err)).toBe(true);
+            expect((err as HttpError).statusCode).toBe(403);
+            expect((err as HttpError).legacyCode).toBe(
+                'app_or_api_token_required',
+            );
+            // Must point at the credential that works and where to get one.
+            expect((err as HttpError).message).toMatch(/API token/);
+            expect((err as HttpError).message).toMatch(/dashboard/i);
+        }
+    });
+});
+
+// ── adminOnlyGate ───────────────────────────────────────────────────
+
+describe('adminOnlyGate', () => {
+    it("admits the built-in 'admin' and 'system' users by default", () => {
+        for (const username of DEFAULT_ADMIN_USERNAMES) {
+            const got = runGate(adminOnlyGate(), {
+                actor: { user: { uuid: 'u-1', username } },
+            });
+            expect(got).toBeUndefined();
+        }
+    });
+
+    it('admits extras IN ADDITION to the built-ins (not as a replacement)', () => {
+        const gate = adminOnlyGate(['daniel']);
+        // The extra works
+        expect(
+            runGate(gate, {
+                actor: { user: { uuid: 'u-1', username: 'daniel' } },
+            }),
+        ).toBeUndefined();
+        // ...and the built-ins still work
+        expect(
+            runGate(gate, {
+                actor: { user: { uuid: 'u-1', username: 'admin' } },
+            }),
+        ).toBeUndefined();
+    });
+
+    it('reserves every name it admits, so none can be claimed', () => {
+        expect(isReservedUsername('gate_extra')).toBe(false);
+        adminOnlyGate(['Gate_Extra']);
+        expect(isReservedUsername('gate_extra')).toBe(true);
+    });
+
+    it('rejects unknown usernames with 403 forbidden', () => {
+        const got = runGate(adminOnlyGate(), {
+            actor: { user: { uuid: 'u-1', username: 'random-user' } },
+        });
+        expectHttpError(got, 403, 'forbidden');
+    });
+
+    it('rejects when no username is present (anonymous / malformed actor)', () => {
+        // No actor at all
+        expectHttpError(runGate(adminOnlyGate(), {}), 403, 'forbidden');
+        // Actor without a username
+        expectHttpError(
+            runGate(adminOnlyGate(), {
+                actor: { user: { uuid: 'u-1' } },
+            }),
+            403,
+            'forbidden',
+        );
+    });
+
+    it('admits the built-ins regardless of case', () => {
+        // On a SQLite self-host with case-sensitive (BINARY) collation, a
+        // user row could exist with `Admin`/`SYSTEM` capitalization. The
+        // gate must still admit those — case is normalized on both sides.
+        for (const username of ['Admin', 'ADMIN', 'sYsTeM']) {
+            const got = runGate(adminOnlyGate(), {
+                actor: { user: { uuid: 'u-1', username } },
+            });
+            expect(got).toBeUndefined();
+        }
+    });
+
+    it('admits case-mismatched extras (allowlist lowercased on construction)', () => {
+        // Pass an extra in mixed case; the gate must accept the same name
+        // in any case — the on-disk username row may be either, depending
+        // on the DB's column collation.
+        const gate = adminOnlyGate(['Daniel']);
+        expect(
+            runGate(gate, {
+                actor: { user: { uuid: 'u-1', username: 'daniel' } },
+            }),
+        ).toBeUndefined();
+        expect(
+            runGate(gate, {
+                actor: { user: { uuid: 'u-1', username: 'DANIEL' } },
+            }),
+        ).toBeUndefined();
+    });
+
+    // -- Root-token requirement --
+    //
+    // Admin endpoints require a root token (an actor with no app anywhere
+    // in its token chain), so a third-party app an admin authorized can't
+    // reach them on the admin's behalf.
+
+    it('admits an admin acting via a session (root token)', () => {
+        const got = runGate(adminOnlyGate(), {
+            actor: { user: { uuid: 'u-1', username: 'admin' } },
+        });
+        expect(got).toBeUndefined();
+    });
+
+    it("admits an admin's full-access PAT (still a root token — no app)", () => {
+        const got = runGate(adminOnlyGate(), {
+            actor: {
+                user: { uuid: 'u-1', username: 'admin' },
+                accessToken: {
+                    uid: 'tok-1',
+                    issuer: { user: { uuid: 'u-1', username: 'admin' } },
+                    fullAccess: true,
+                },
+            },
+        });
+        expect(got).toBeUndefined();
+    });
+
+    it('rejects an admin acting through an app with 403 (not a root token)', () => {
+        const got = runGate(adminOnlyGate(), {
+            actor: {
+                user: { uuid: 'u-1', username: 'admin' },
+                app: { uid: 'app-1' },
+            },
+        });
+        expectHttpError(got, 403, 'forbidden');
+    });
+
+    it('rejects an admin access token issued through an app (app in the token chain)', () => {
+        // Access-token actors carry their app on `accessToken.issuer.app`,
+        // not top-level `actor.app` — the root-token check must walk the
+        // chain, not just the top level.
+        const got = runGate(adminOnlyGate(), {
+            actor: {
+                user: { uuid: 'u-1', username: 'admin' },
+                accessToken: {
+                    uid: 'tok-1',
+                    issuer: {
+                        user: { uuid: 'u-1', username: 'admin' },
+                        app: { uid: 'app-1' },
+                    },
+                },
+            },
+        });
+        expectHttpError(got, 403, 'forbidden');
+    });
+
+    it('rejects an app-issued access token even when appGated', () => {
+        // The appGated deferral only applies to direct app-under-user
+        // actors: `allowedAppIdsGate` reads top-level `actor.app` and would
+        // pass a chain-only app straight through, so it must not be
+        // deferred to.
+        const got = runGate(adminOnlyGate([], { appGated: true }), {
+            actor: {
+                user: { uuid: 'u-1', username: 'admin' },
+                accessToken: {
+                    uid: 'tok-1',
+                    issuer: {
+                        user: { uuid: 'u-1', username: 'admin' },
+                        app: { uid: 'app-1' },
+                    },
+                },
+            },
+        });
+        expectHttpError(got, 403, 'forbidden');
+    });
+
+    it('admits an admin acting through an app when appGated (allowedAppIdsGate then decides)', () => {
+        // On an appId-gated route the root-token check is deferred to
+        // `allowedAppIdsGate`; this gate must let the app actor through.
+        const got = runGate(adminOnlyGate([], { appGated: true }), {
+            actor: {
+                user: { uuid: 'u-1', username: 'admin' },
+                app: { uid: 'app-1' },
+            },
+        });
+        expect(got).toBeUndefined();
+    });
+
+    it('still admits a root token when appGated', () => {
+        const got = runGate(adminOnlyGate([], { appGated: true }), {
+            actor: { user: { uuid: 'u-1', username: 'admin' } },
+        });
+        expect(got).toBeUndefined();
+    });
+
+    it('applies the username check before the root-token check', () => {
+        // A non-admin acting through an app is rejected for being non-admin,
+        // regardless of the app scope.
+        const got = runGate(adminOnlyGate(), {
+            actor: {
+                user: { uuid: 'u-1', username: 'random-user' },
+                app: { uid: 'app-1' },
+            },
+        });
+        expectHttpError(got, 403, 'forbidden');
+    });
+});
+
+// ── requireVerifiedGate ─────────────────────────────────────────────
+
+describe('requireVerifiedGate', () => {
+    it('is a no-op when the strict flag is false (self-hosted without email)', () => {
+        // Even an unverified user passes when strict is off.
+        const got = runGate(requireVerifiedGate(false), {
+            actor: { user: { uuid: 'u-1', email_confirmed: false } },
+        });
+        expect(got).toBeUndefined();
+    });
+
+    it('passes when email_confirmed is true under strict mode', () => {
+        const got = runGate(requireVerifiedGate(true), {
+            actor: { user: { uuid: 'u-1', email_confirmed: true } },
+        });
+        expect(got).toBeUndefined();
+    });
+
+    it('returns 400 account_is_not_verified for unverified users under strict mode', () => {
+        const got = runGate(requireVerifiedGate(true), {
+            actor: { user: { uuid: 'u-1', email_confirmed: false } },
+        });
+        expectHttpError(got, 403, 'account_is_not_verified');
+    });
+
+    it('treats missing actor as unverified under strict mode', () => {
+        const got = runGate(requireVerifiedGate(true), {});
+        expectHttpError(got, 403, 'account_is_not_verified');
+    });
+});
+
+// ── requireVerifiedAccount ──────────────────────────────────────────
+
+describe('requireVerifiedAccount', () => {
+    it('passes through users that do not require confirmation (e.g. legacy/temp)', () => {
+        const got = runGate(requireVerifiedAccount(), {
+            actor: {
+                user: {
+                    uuid: 'u-1',
+                    requires_email_confirmation: false,
+                    email_confirmed: false,
+                },
+            },
+        });
+        expect(got).toBeUndefined();
+    });
+
+    it('passes through confirmed users even when confirmation is required', () => {
+        const got = runGate(requireVerifiedAccount(), {
+            actor: {
+                user: {
+                    uuid: 'u-1',
+                    requires_email_confirmation: true,
+                    email_confirmed: true,
+                },
+            },
+        });
+        expect(got).toBeUndefined();
+    });
+
+    it('returns 403 email_confirmation_required for pending-confirmation users', () => {
+        const got = runGate(requireVerifiedAccount(), {
+            actor: {
+                user: {
+                    uuid: 'u-1',
+                    requires_email_confirmation: true,
+                    email_confirmed: false,
+                },
+            },
+        });
+        expectHttpError(got, 403, 'email_confirmation_required');
+    });
+
+    it('returns 403 phone_verification_required while the phone gate is set', () => {
+        const got = runGate(requireVerifiedAccount(), {
+            actor: {
+                user: {
+                    uuid: 'u-1',
+                    requires_email_confirmation: false,
+                    email_confirmed: true,
+                    requires_phone_verification: true,
+                },
+            },
+        });
+        expectHttpError(got, 403, 'phone_verification_required');
+    });
+
+    it('returns 403 card_verification_required while the card gate is set', () => {
+        const got = runGate(requireVerifiedAccount(), {
+            actor: {
+                user: {
+                    uuid: 'u-1',
+                    requires_email_confirmation: false,
+                    email_confirmed: true,
+                    requires_card_verification: true,
+                },
+            },
+        });
+        expectHttpError(got, 403, 'card_verification_required');
+    });
+
+    it('returns 403 two_factor_required for a seat whose team requires 2FA', async () => {
+        const teams = { getOrgSeat: async () => ({ require_2fa: 1 }) };
+        const got = await runGateAsync(requireTeam2fa(teams), {
+            actor: { user: { uuid: 'u-1', id: 7, otp_enabled: 0 } },
+        });
+        expectHttpError(got, 403, 'two_factor_required');
+    });
+
+    it('lets the same seat through once it holds 2FA', async () => {
+        const teams = { getOrgSeat: async () => ({ require_2fa: 1 }) };
+        const got = await runGateAsync(requireTeam2fa(teams), {
+            actor: { user: { uuid: 'u-1', id: 7, otp_enabled: 1 } },
+        });
+        expect(got).toBeUndefined();
+    });
+
+    it('does not gate an account that is not a seat', async () => {
+        // No seat row: an ordinary account, whatever any team requires.
+        const teams = { getOrgSeat: async () => null };
+        const got = await runGateAsync(requireTeam2fa(teams), {
+            actor: { user: { uuid: 'u-1', id: 7, otp_enabled: 0 } },
+        });
+        expect(got).toBeUndefined();
+    });
+
+    it('does not gate a seat whose team does not require 2FA', async () => {
+        const teams = { getOrgSeat: async () => ({ require_2fa: 0 }) };
+        const got = await runGateAsync(requireTeam2fa(teams), {
+            actor: { user: { uuid: 'u-1', id: 7, otp_enabled: 0 } },
+        });
+        expect(got).toBeUndefined();
+    });
+
+    it('stays inert where Teams is not deployed', async () => {
+        const got = await runGateAsync(requireTeam2fa(undefined), {
+            actor: { user: { uuid: 'u-1', id: 7, otp_enabled: 0 } },
+        });
+        expect(got).toBeUndefined();
+    });
+
+    it('returns 403 password_change_required while the account owes a password', () => {
+        const got = runGate(requireVerifiedAccount(), {
+            actor: {
+                user: {
+                    uuid: 'u-1',
+                    requires_email_confirmation: false,
+                    email_confirmed: true,
+                    requires_password_change: 1,
+                },
+            },
+        });
+        expectHttpError(got, 403, 'password_change_required');
+    });
+
+    it('passes through once every gate is cleared', () => {
+        const got = runGate(requireVerifiedAccount(), {
+            actor: {
+                user: {
+                    uuid: 'u-1',
+                    requires_email_confirmation: true,
+                    email_confirmed: true,
+                    requires_phone_verification: false,
+                    requires_card_verification: false,
+                    requires_password_change: 0,
+                },
+            },
+        });
+        expect(got).toBeUndefined();
+    });
+
+    it("passes through when there's no actor (auth gate handled it)", () => {
+        const got = runGate(requireVerifiedAccount(), {});
+        expect(got).toBeUndefined();
+    });
+});
+
+// ── allowedAppIdsGate ───────────────────────────────────────────────
+
+describe('allowedAppIdsGate', () => {
+    it('passes a bare user session through (the gate is not an app gate)', () => {
+        // Routes rely on this: `adminOnly` + `allowedAppIds` has to stay
+        // reachable by an admin's root token, not only by an allowed app.
+        const got = runGate(allowedAppIdsGate(['app-allowed']), {
+            actor: { user: { uuid: 'u-1' } },
+        });
+        expect(got).toBeUndefined();
+    });
+
+    it('passes a worker session through', () => {
+        const got = runGate(allowedAppIdsGate(['app-allowed']), {
+            actor: {
+                user: { uuid: 'u-1' },
+                session: { uid: 'sess-1', kind: 'worker' },
+            },
+        });
+        expect(got).toBeUndefined();
+    });
+
+    it('passes a full-access personal access token through', () => {
+        // No app anywhere in the chain, so there is nothing to match.
+        const got = runGate(allowedAppIdsGate(['app-allowed']), {
+            actor: {
+                user: { uuid: 'u-1' },
+                accessToken: {
+                    uid: 'tok-1',
+                    fullAccess: true,
+                    issuer: { user: { uuid: 'u-1' } },
+                },
+            },
+        });
+        expect(got).toBeUndefined();
+    });
+
+    it('judges an access token by the app that issued it', () => {
+        // An access-token actor carries no app of its own — its app is one hop
+        // down the chain, through the issuer — so reading the direct `app`
+        // would let a token from any app through an appId-gated route.
+        const gate = allowedAppIdsGate(['app-allowed']);
+        const tokenIssuedBy = (appUid: string) => ({
+            actor: {
+                user: { uuid: 'u-1' },
+                accessToken: {
+                    uid: 'tok-1',
+                    issuer: {
+                        user: { uuid: 'u-1' },
+                        app: { uid: appUid },
+                    },
+                },
+            },
+        });
+        expect(runGate(gate, tokenIssuedBy('app-allowed'))).toBeUndefined();
+        expect(runGate(gate, tokenIssuedBy('app-other'))).toBeInstanceOf(
+            HttpError,
+        );
+    });
+
+    it('passes when the actor.app.uid is in the allow-list', () => {
+        const got = runGate(allowedAppIdsGate(['app-allowed']), {
+            actor: {
+                user: { uuid: 'u-1' },
+                app: { uid: 'app-allowed' },
+            },
+        });
+        expect(got).toBeUndefined();
+    });
+
+    it('rejects with 403 forbidden when the app is not in the allow-list', () => {
+        const got = runGate(allowedAppIdsGate(['app-allowed']), {
+            actor: {
+                user: { uuid: 'u-1' },
+                app: { uid: 'app-other' },
+            },
+        });
+        expectHttpError(got, 403, 'forbidden');
+    });
+
+    it('rejects every app when the allow-list is empty', () => {
+        const got = runGate(allowedAppIdsGate([]), {
+            actor: {
+                user: { uuid: 'u-1' },
+                app: { uid: 'app-anything' },
+            },
+        });
+        expectHttpError(got, 403, 'forbidden');
+    });
+
+    it('passes an anonymous request through (requireAuth rejects it first)', () => {
+        const got = runGate(allowedAppIdsGate(['app-allowed']), {});
+        expect(got).toBeUndefined();
+    });
+
+    // The composition the admin surfaces are wired with: `adminOnly` defers
+    // app actors here, so the pair means "root token OR allowed app". Both
+    // halves are load-bearing — the admin dashboard calls these routes with a
+    // browser session, the marketplace app with its own token.
+    describe('composed with adminOnlyGate({ appGated: true })', () => {
+        const runChain = (actor: Actor): NextArg => {
+            const first = runGate(adminOnlyGate([], { appGated: true }), {
+                actor,
+            });
+            if (first !== undefined) return first;
+            return runGate(allowedAppIdsGate(['app-allowed']), { actor });
+        };
+
+        it("admits an admin's root token", () => {
+            const got = runChain({ user: { uuid: 'u-1', username: 'admin' } });
+            expect(got).toBeUndefined();
+        });
+
+        it('admits an admin acting through an allowed app', () => {
+            const got = runChain({
+                user: { uuid: 'u-1', username: 'admin' },
+                app: { uid: 'app-allowed' },
+            });
+            expect(got).toBeUndefined();
+        });
+
+        it('rejects an admin acting through another app', () => {
+            const got = runChain({
+                user: { uuid: 'u-1', username: 'admin' },
+                app: { uid: 'app-other' },
+            });
+            expectHttpError(got, 403, 'forbidden');
+        });
+    });
+});
+
+// ── requirePhoneVerifiedGate / requireCardVerifiedGate ──────────────
+
+describe('requirePhoneVerifiedGate', () => {
+    it('passes a user with a verified number on file', () => {
+        const got = runGate(requirePhoneVerifiedGate(), {
+            actor: { user: { uuid: 'u-1', phone: '+15550000000' } },
+        });
+        expect(got).toBeUndefined();
+    });
+
+    it('rejects a user who was never asked to verify a phone', () => {
+        // The pending flag is clear, so the default-on account gate lets this
+        // user through — an opt-in route asking for the factor itself must not.
+        const got = runGate(requirePhoneVerifiedGate(), {
+            actor: { user: { uuid: 'u-1' } },
+        });
+        expectHttpError(got, 403, 'phone_verification_required');
+    });
+
+    it('rejects a user still mid-verification, stale number and all', () => {
+        const got = runGate(requirePhoneVerifiedGate(), {
+            actor: {
+                user: {
+                    uuid: 'u-1',
+                    phone: '+15550000000',
+                    requires_phone_verification: true,
+                },
+            },
+        });
+        expectHttpError(got, 403, 'phone_verification_required');
+    });
+
+    it('rejects when there is no actor at all', () => {
+        const got = runGate(requirePhoneVerifiedGate(), {});
+        expectHttpError(got, 403, 'phone_verification_required');
+    });
+});
+
+describe('requireCardVerifiedGate', () => {
+    const plan = (paid: boolean) => ({ hasPaidPlan: async () => paid });
+
+    it('passes a user with a verified card on file', async () => {
+        const got = await runGateAsync(requireCardVerifiedGate(plan(false)), {
+            actor: { user: { uuid: 'u-1', card_fingerprint: 'fp_1' } },
+        });
+        expect(got).toBeUndefined();
+    });
+
+    it('passes a paying account as card-verified', async () => {
+        const got = await runGateAsync(requireCardVerifiedGate(plan(true)), {
+            actor: { user: { uuid: 'u-1' } },
+        });
+        expect(got).toBeUndefined();
+    });
+
+    it('rejects a user who never verified a card', async () => {
+        const got = await runGateAsync(requireCardVerifiedGate(plan(false)), {
+            actor: { user: { uuid: 'u-1' } },
+        });
+        expectHttpError(got, 403, 'card_verification_required');
+    });
+
+    it('rejects a user still carrying the card gate', async () => {
+        const got = await runGateAsync(requireCardVerifiedGate(plan(false)), {
+            actor: {
+                user: {
+                    uuid: 'u-1',
+                    card_fingerprint: 'fp_1',
+                    requires_card_verification: true,
+                },
+            },
+        });
+        expectHttpError(got, 403, 'card_verification_required');
+    });
+});
+
+// ── requireAnyVerifiedGate ──────────────────────────────────────────
+
+describe('requireAnyVerifiedGate', () => {
+    // The card probe is memoized module-wide; every case starts cold.
+    beforeEach(() => resetCardVerificationStatusCache());
+
+    const deps = (
+        sms: boolean,
+        card: boolean | null,
+        paid = false,
+    ): AnyVerifiedDeps => ({
+        smsConfigured: () => sms,
+        probeCardVerification: async () => card,
+        hasPaidPlan: async () => paid,
+    });
+
+    const both = ['phone', 'card'] as const;
+
+    it('is inert where neither factor can be verified', async () => {
+        const got = await runGateAsync(
+            requireAnyVerifiedGate(both, deps(false, null)),
+            { actor: { user: { uuid: 'u-1' } } },
+        );
+        expect(got).toBeUndefined();
+    });
+
+    it('passes a verified number whatever the deployment can do today', async () => {
+        const got = await runGateAsync(
+            requireAnyVerifiedGate(both, deps(false, null)),
+            { actor: { user: { uuid: 'u-1', phone: '+15550000000' } } },
+        );
+        expect(got).toBeUndefined();
+    });
+
+    it('passes a verified card', async () => {
+        const got = await runGateAsync(
+            requireAnyVerifiedGate(both, deps(true, true)),
+            { actor: { user: { uuid: 'u-1', card_fingerprint: 'fp_1' } } },
+        );
+        expect(got).toBeUndefined();
+    });
+
+    it('takes a paid plan as the card, verified by other means', async () => {
+        const got = await runGateAsync(
+            requireAnyVerifiedGate(both, deps(true, true, true)),
+            { actor: { user: { uuid: 'u-1' } } },
+        );
+        expect(got).toBeUndefined();
+    });
+
+    it('does not let a paid plan stand in for a phone', async () => {
+        const got = await runGateAsync(
+            requireAnyVerifiedGate(['phone'], deps(true, true, true)),
+            { actor: { user: { uuid: 'u-1' } } },
+        );
+        expectHttpError(got, 403, 'phone_verification_required');
+    });
+
+    it('asks about the plan only once the row itself has not answered', async () => {
+        let asked = 0;
+        const counting: AnyVerifiedDeps = {
+            ...deps(true, true),
+            hasPaidPlan: async () => {
+                asked++;
+                return true;
+            },
+        };
+        await runGateAsync(requireAnyVerifiedGate(both, counting), {
+            actor: { user: { uuid: 'u-1', phone: '+15550000000' } },
+        });
+        expect(asked).toBe(0);
+        await runGateAsync(requireAnyVerifiedGate(both, counting), {
+            actor: { user: { uuid: 'u-1' } },
+        });
+        expect(asked).toBe(1);
+    });
+
+    it('leads with the phone flow and names both factors when both are verifiable', async () => {
+        const got = await runGateAsync(
+            requireAnyVerifiedGate(both, deps(true, true)),
+            { actor: { user: { uuid: 'u-1' } } },
+        );
+        expectHttpError(got, 403, 'phone_verification_required');
+        expect((got as HttpError).fields).toEqual({
+            factors: ['phone', 'card'],
+        });
+    });
+
+    it('asks only for the factors the deployment can verify', async () => {
+        const got = await runGateAsync(
+            requireAnyVerifiedGate(both, deps(false, true)),
+            { actor: { user: { uuid: 'u-1' } } },
+        );
+        expectHttpError(got, 403, 'card_verification_required');
+        expect((got as HttpError).fields).toEqual({ factors: ['card'] });
+    });
+
+    it('takes the lead factor from the route order', async () => {
+        const got = await runGateAsync(
+            requireAnyVerifiedGate(['card', 'phone'], deps(true, true)),
+            { actor: { user: { uuid: 'u-1' } } },
+        );
+        expectHttpError(got, 403, 'card_verification_required');
+        expect((got as HttpError).fields).toEqual({
+            factors: ['card', 'phone'],
+        });
+    });
+
+    it('does not count a factor still mid-verification', async () => {
+        const got = await runGateAsync(
+            requireAnyVerifiedGate(both, deps(true, null)),
+            {
+                actor: {
+                    user: {
+                        uuid: 'u-1',
+                        phone: '+15550000000',
+                        requires_phone_verification: true,
+                    },
+                },
+            },
+        );
+        expectHttpError(got, 403, 'phone_verification_required');
+        expect((got as HttpError).fields).toEqual({ factors: ['phone'] });
+    });
+
+    it('rejects when there is no actor at all', async () => {
+        const got = await runGateAsync(
+            requireAnyVerifiedGate(both, deps(true, null)),
+            {},
+        );
+        expectHttpError(got, 403, 'phone_verification_required');
+    });
+});

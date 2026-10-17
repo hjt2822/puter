@@ -1,0 +1,889 @@
+/*
+ * Copyright (C) 2024-present Puter Technologies Inc.
+ *
+ * This file is part of Puter.
+ *
+ * Puter is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published
+ * by the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+import axios from 'axios';
+import { createHmac, randomUUID, timingSafeEqual } from 'node:crypto';
+import { Agent as HttpsAgent } from 'node:https';
+import { IBroadcastPeerConfig } from '../../types.js';
+import { PuterService } from '../types.js';
+
+// -- Wire types ------------------------------------------------------
+
+interface BroadcastEvent {
+    key: string;
+    data: unknown;
+    meta: Record<string, unknown>;
+}
+
+interface IncomingPayload {
+    events?: unknown;
+    key?: string;
+    data?: unknown;
+    meta?: unknown;
+}
+
+interface IncomingResult {
+    ok: boolean;
+    /** HTTP status to send when ok===false. */
+    status?: number;
+    /** Error message body when ok===false. */
+    message?: string;
+    /** Optional informational payload to include when ok===true. */
+    info?: Record<string, unknown>;
+    /**
+     * The peer whose secret actually signed the request. The only trustworthy
+     * name for the sender — a body field naming one is the sender's own claim.
+     */
+    peerId?: string;
+}
+
+interface IncomingHeaders {
+    peerId: string | undefined;
+    timestamp: string | undefined;
+    nonce: string | undefined;
+    signature: string | undefined;
+}
+
+// -- Addressed sends -------------------------------------------------
+
+/** Connections one peer may hold open, and how long an idle one survives. */
+const ADDRESSED_MAX_SOCKETS_PER_PEER = 16;
+const ADDRESSED_MAX_FREE_SOCKETS_PER_PEER = 4;
+const PEER_SOCKET_IDLE_MS = 30_000;
+const ADDRESSED_REQUEST_TIMEOUT_MS = 5_000;
+
+/** What a deployment with no configured identity calls itself. */
+const DEFAULT_REGION_ID = 'local';
+
+// -- Webhook fan-out -------------------------------------------------
+
+/** Largest webhook body by default; peers accept up to 50 MB. */
+const DEFAULT_OUTBOUND_MAX_BODY_BYTES = 4 * 1024 * 1024;
+/** A peer's undelivered backlog holds at most this many bodies' worth. */
+const OUTBOUND_BACKLOG_BODIES = 4;
+/** `{"events":[` and `]}` around the comma-joined events. */
+const EVENTS_BODY_OVERHEAD_BYTES = '{"events":[]}'.length;
+
+// -- Service ---------------------------------------------------------
+
+/**
+ * Cross-node event replication via signed HTTP webhooks.
+ *
+ * **Outbound** — subscribes to local `outer.*` events on the event bus. Each
+ * event is added to a small in-memory set (deduped by serialized shape), then
+ * flushed every `outbound_flush_ms` to each configured peer, as POSTs of at
+ * most `outboundMaxBodyBytes`. A peer that fails keeps a bounded backlog of
+ * what it missed, retried on later flushes. Each POST carries:
+ *
+ * - `X-Broadcast-Peer-Id` — this server's own peerId
+ * - `X-Broadcast-Timestamp` — unix seconds, peer rejects ±5min
+ * - `X-Broadcast-Nonce` — monotonic per-peer counter, peer rejects replays
+ * - `X-Broadcast-Signature` — HMAC-SHA256 of `<ts>.<nonce>.<rawBody>`
+ *
+ * **Inbound** — `BroadcastController` accepts POSTs at `/broadcast/webhook` and
+ * hands each one off to `verifyAndEmit()`. The service validates the HMAC +
+ * nonce + timestamp window, then re-emits each contained event onto the local
+ * bus tagged with `meta.from_outside = true` so the outbound subscriber doesn't
+ * bounce it back.
+ *
+ * Self-loop avoidance:
+ *
+ * - Outbound subscriber skips events with `meta.from_outside`.
+ * - Inbound handler ignores POSTs whose `X-Broadcast-Peer-Id` matches this
+ *   server's own peerId (catches misconfigured loopbacks).
+ */
+export class BroadcastService extends PuterService {
+    /** PeerId → resolved peer config, used for incoming-verify lookup. */
+    #peersByKey: Record<string, IBroadcastPeerConfig> = {};
+    /** Subset of peers with `webhook: true`, used for outbound fan-out. */
+    #webhookPeers: IBroadcastPeerConfig[] = [];
+    /** Identifier used to tell what server a redis fan-out is coming from. */
+    #redisSourceId: string = `${this.config.serverId}:${randomUUID()}`;
+
+    /** Serialized outbound events, oldest first; identical ones coalesce. */
+    #outboundQueue = new Set<string>();
+    /** Per peer, serialized events it has not accepted yet, oldest first. */
+    #outboundBacklogs = new Map<IBroadcastPeerConfig, string[]>();
+    #outboundFlushTimer: ReturnType<typeof setTimeout> | null = null;
+    #outboundIsFlushing = false;
+
+    #webhookReplayWindowSeconds = 300;
+    #outboundFlushMs = 2000;
+    #outboundMaxBodyBytes = DEFAULT_OUTBOUND_MAX_BODY_BYTES;
+    /** Bounds on a peer's backlog, so a peer that stays down can't grow it. */
+    #outboundMaxQueued = 10_000;
+    #outboundMaxQueuedBytes =
+        OUTBOUND_BACKLOG_BODIES * DEFAULT_OUTBOUND_MAX_BODY_BYTES;
+    #webhookProtocol: 'http' | 'https' = 'https';
+    #webhookHostHeader: string | null = null;
+    /**
+     * Self-signed certs are common between Puter nodes — accept them. Kept
+     * alive across flushes, and a pool of its own so a flush never waits for a
+     * socket behind addressed sends at their cap.
+     */
+    #webhookHttpsAgent = new HttpsAgent({
+        rejectUnauthorized: false,
+        keepAlive: true,
+        timeout: PEER_SOCKET_IDLE_MS,
+    });
+    /**
+     * The agent addressed sends use. Separate because they run at event rates,
+     * where a fresh handshake per request outweighs the payload; the pool is
+     * bounded so a peer that stops answering cannot accumulate connections.
+     */
+    #addressedHttpsAgent = new HttpsAgent({
+        rejectUnauthorized: false,
+        keepAlive: true,
+        maxSockets: ADDRESSED_MAX_SOCKETS_PER_PEER,
+        maxFreeSockets: ADDRESSED_MAX_FREE_SOCKETS_PER_PEER,
+        timeout: PEER_SOCKET_IDLE_MS,
+    });
+    #redisSub: ReturnType<typeof this.clients.redis.duplicate> | null = null;
+
+    // -- Lifecycle ---------------------------------------------------
+
+    override onServerStart(): void {
+        this.#loadConfig();
+        this.#subscribeOutbound();
+        this.#subscribeRedisOutbound();
+    }
+
+    override async onServerPrepareShutdown(): Promise<void> {
+        if (this.#outboundFlushTimer) {
+            clearTimeout(this.#outboundFlushTimer);
+            this.#outboundFlushTimer = null;
+        }
+        // Best-effort drain — try one final flush so events queued near
+        // shutdown make it out.
+        try {
+            await this.#flushOutboundEvents();
+        } catch (err) {
+            console.warn('[broadcast] final flush failed', err);
+        }
+        if (this.#redisSub) {
+            await this.#redisSub.unsubscribe('pubsub');
+            this.#redisSub.quit();
+            this.#redisSub = null;
+        }
+    }
+
+    // -- Public API used by BroadcastController ----------------------
+
+    /**
+     * Verify an incoming webhook POST and, if valid, fan its events onto the
+     * local event bus (tagged `from_outside: true`).
+     *
+     * Caller (controller) provides the request's parsed JSON body, the raw
+     * bytes that JSON came from (HMAC verifies over those exact bytes), and the
+     * four broadcast headers.
+     */
+    async verifyAndEmit(
+        rawBody: Buffer | undefined,
+        body: unknown,
+        headers: IncomingHeaders,
+    ): Promise<IncomingResult> {
+        if (!body || typeof body !== 'object') {
+            return { ok: false, status: 400, message: 'Invalid JSON body' };
+        }
+
+        const incomingEvents = this.#normalizeIncomingPayload(
+            body as IncomingPayload,
+        );
+        if (!incomingEvents) {
+            return {
+                ok: false,
+                status: 400,
+                message: 'Invalid broadcast payload',
+            };
+        }
+
+        const verified = await this.verifySignedRequest(rawBody, headers);
+        if (!verified.ok || verified.info?.ignored) return verified;
+
+        await this.#emitIncomingEventsSequentially(incomingEvents);
+        return { ok: true };
+    }
+
+    // -- Addressed peer channel --------------------------------------
+
+    /**
+     * What this deployment calls itself. Peers name each other by this id, and
+     * a deployment that configured none is on its own.
+     */
+    get regionId(): string {
+        return this.#resolveLocalPeerId() ?? DEFAULT_REGION_ID;
+    }
+
+    /** Peers this node may address directly, by id. */
+    get addressablePeers(): string[] {
+        return this.#webhookPeers
+            .map((peer) => this.#resolvePeerIdOf(peer))
+            .filter((id): id is string => id !== null);
+    }
+
+    /**
+     * One signed POST to one named peer, on the same credentials and replay
+     * protection the all-peers fan uses, over the keep-alive agent. Returns the
+     * peer's parsed answer; throws when it could not be reached or refused — a
+     * caller must be able to tell "the peer said no" from "we never heard",
+     * because only the first authorises acting on the peer's behalf.
+     */
+    async postToPeer(
+        peerId: string,
+        path: string,
+        payload: unknown,
+    ): Promise<unknown> {
+        const peer = this.#peersByKey[peerId];
+        if (!peer) throw new Error(`unknown broadcast peer ${peerId}`);
+        const response = await this.#post(
+            peer,
+            path,
+            JSON.stringify(payload),
+            this.#addressedHttpsAgent,
+            ADDRESSED_REQUEST_TIMEOUT_MS,
+        );
+        try {
+            return JSON.parse(String(response ?? ''));
+        } catch {
+            return null;
+        }
+    }
+
+    /**
+     * Verify an inbound signed POST without acting on its body: the half of
+     * `verifyAndEmit` an addressed channel needs, since what it carries is not
+     * an event-bus payload.
+     */
+    async verifySignedRequest(
+        rawBody: Buffer | undefined,
+        headers: IncomingHeaders,
+    ): Promise<IncomingResult> {
+        if (!rawBody) {
+            return {
+                ok: false,
+                status: 400,
+                message: 'Missing or invalid body',
+            };
+        }
+
+        const peerId = headers.peerId;
+        if (!peerId) {
+            return {
+                ok: false,
+                status: 403,
+                message: 'Missing X-Broadcast-Peer-Id',
+            };
+        }
+
+        // Defend against a misconfigured peer that includes us in its
+        // own peer list — easy mistake when bootstrapping a cluster.
+        const localPeerId = this.#resolveLocalPeerId();
+        if (localPeerId && peerId === localPeerId) {
+            return { ok: true, info: { ignored: 'self-peer' } };
+        }
+
+        const peer = this.#peersByKey[peerId];
+        if (!peer || !peer.webhook_secret) {
+            return {
+                ok: false,
+                status: 403,
+                message: 'Unknown peer or webhook not configured',
+            };
+        }
+
+        const tsCheck = this.#parseTimestamp(headers.timestamp);
+        if (!tsCheck.ok) return tsCheck;
+        const timestamp = tsCheck.timestamp;
+
+        const nonceCheck = this.#parseNonce(headers.nonce);
+        if (!nonceCheck.ok) return nonceCheck;
+        const nonce = nonceCheck.nonce;
+
+        if (!headers.signature) {
+            return {
+                ok: false,
+                status: 403,
+                message: 'Missing X-Broadcast-Signature',
+            };
+        }
+
+        const payloadToSign = `${timestamp}.${nonce}.${rawBody.toString('utf8')}`;
+        const expectedHmac = createHmac('sha256', peer.webhook_secret)
+            .update(payloadToSign)
+            .digest('hex');
+        const signatureBuffer = Buffer.from(headers.signature, 'hex');
+        const expectedBuffer = Buffer.from(expectedHmac, 'hex');
+        if (
+            signatureBuffer.length !== expectedBuffer.length ||
+            !timingSafeEqual(signatureBuffer, expectedBuffer)
+        ) {
+            return { ok: false, status: 403, message: 'Invalid signature' };
+        }
+
+        // Atomic claim of (peerId, ts, nonce) in Redis — single key, so
+        // it's cluster-safe and shared across ALB-balanced nodes. Done
+        // post-signature so unsigned/forged requests can't burn slots.
+        if (!(await this.#claimIncomingNonce(peerId, timestamp, nonce))) {
+            return {
+                ok: false,
+                status: 403,
+                message: 'Duplicate or stale nonce',
+            };
+        }
+
+        return { ok: true, peerId };
+    }
+
+    #pubsubFanout(key: string, data: unknown, meta: object): void {
+        const safeMeta = this.#normalizeMeta(meta);
+        if (safeMeta.from_fanout) return;
+        this.clients.redis.publish(
+            'pubsub',
+            JSON.stringify({
+                key,
+                data,
+                meta: safeMeta,
+                source: this.#redisSourceId,
+            }),
+        );
+    }
+
+    // outer.pubsub.* events will be broadcast to other clusters through webhooks
+    // pubsub.* will only fan-out to same-cluster nodes.
+    #subscribeRedisOutbound(): void {
+        this.#redisSub = this.clients.redis.duplicate();
+        this.#redisSub.subscribe('pubsub');
+        this.#redisSub.on('message', (channel: string, message: string) => {
+            if (channel !== 'pubsub') return;
+            const parsed = JSON.parse(message);
+            const { key, data, meta, source } = parsed as {
+                key: string;
+                data: unknown;
+                meta: object;
+                source: string;
+            };
+            if (source === this.#redisSourceId) return;
+            const safeMeta = this.#normalizeMeta(meta);
+
+            this.clients.event.emit(key, data, {
+                ...safeMeta,
+                from_fanout: true,
+                // it's not from outside, but mark it as to prevent sending the webhook twice
+                from_outside: true,
+            });
+        });
+
+        this.clients.event.on(
+            'outer.pubsub.*',
+            (key: string, data: unknown, meta: object) => {
+                this.#pubsubFanout(key, data, meta);
+            },
+        );
+        this.clients.event.on(
+            'pubsub.*',
+            (key: string, data: unknown, meta: object) => {
+                this.#pubsubFanout(key, data, meta);
+            },
+        );
+    }
+
+    // -- Outbound: subscribe + queue + flush ------------------------
+    // outer.* events will be broadcast to other clusters through webhooks
+    // outer will NOT automatically sync to same-cluster peers.
+    #subscribeOutbound(): void {
+        // Wildcard: every `outer.*` event gets considered for broadcast.
+        // The handler skips events that came in via webhook (meta.from_outside)
+        // so we don't bounce them back to peers.
+        this.clients.event.on(
+            'outer.*',
+            (key: string, data: unknown, meta: object) => {
+                this.#handleOutbound(key, data, meta);
+            },
+        );
+    }
+
+    #handleOutbound(
+        key: string,
+        data: unknown,
+        meta: object | undefined,
+    ): void {
+        const safeMeta = this.#normalizeMeta(meta);
+        if (safeMeta.from_outside) return;
+
+        const event: BroadcastEvent = { key, data, meta: safeMeta };
+        let serialized: string;
+        try {
+            serialized = JSON.stringify(event);
+        } catch (err) {
+            console.warn('[broadcast] dropping unserializable outbound event', {
+                key,
+                err,
+            });
+            return;
+        }
+        // It could never be sent, and retrying it would hold up the rest.
+        if (
+            EVENTS_BODY_OVERHEAD_BYTES + Buffer.byteLength(serialized) >
+            this.#outboundMaxBodyBytes
+        ) {
+            console.warn(
+                `[broadcast] dropping outbound event over ${this.#outboundMaxBodyBytes} bytes`,
+                { key },
+            );
+            return;
+        }
+        this.#outboundQueue.add(serialized);
+        this.#scheduleOutboundFlush();
+    }
+
+    #scheduleOutboundFlush(): void {
+        if (this.#outboundFlushTimer) return;
+        this.#outboundFlushTimer = setTimeout(() => {
+            this.#outboundFlushTimer = null;
+            void this.#flushOutboundEvents().catch((err) => {
+                console.warn('[broadcast] outbound flush failed', err);
+            });
+        }, this.#outboundFlushMs);
+    }
+
+    async #flushOutboundEvents(): Promise<void> {
+        if (
+            this.#outboundIsFlushing ||
+            (this.#outboundQueue.size === 0 &&
+                this.#outboundBacklogs.size === 0)
+        )
+            return;
+
+        this.#outboundIsFlushing = true;
+        try {
+            const fresh = this.#outboundQueue;
+            this.#outboundQueue = new Set();
+
+            // Peers at once, each still in order: a slow or hung peer must not
+            // hold up the others' invalidations. Settled, so the flush lock
+            // stays held until every peer is done.
+            const flushed = await Promise.allSettled(
+                this.#webhookPeers.map(async (peer) => {
+                    const backlog = this.#outboundBacklogs.get(peer) ?? [];
+                    // A fresh copy of a backlogged event keeps its later place.
+                    const pending = [
+                        ...backlog.filter((event) => !fresh.has(event)),
+                        ...fresh,
+                    ];
+                    const undelivered = await this.#sendWebhookToPeer(
+                        peer,
+                        pending,
+                    );
+                    // A lost flat-perm invalidation has no TTL to heal it.
+                    if (undelivered.length > 0) {
+                        this.#outboundBacklogs.set(
+                            peer,
+                            this.#boundBacklog(peer, undelivered),
+                        );
+                    } else {
+                        this.#outboundBacklogs.delete(peer);
+                    }
+                }),
+            );
+            for (const result of flushed)
+                if (result.status === 'rejected') throw result.reason;
+        } finally {
+            this.#outboundIsFlushing = false;
+            // Anything that arrived during flush, or is still owed to a peer,
+            // gets the next tick.
+            if (
+                this.#outboundQueue.size > 0 ||
+                this.#outboundBacklogs.size > 0
+            ) {
+                this.#scheduleOutboundFlush();
+            }
+        }
+    }
+
+    /** The newest of a peer's undelivered events that fit its backlog bounds. */
+    #boundBacklog(peer: IBroadcastPeerConfig, events: string[]): string[] {
+        let kept = 0;
+        let bytes = 0;
+        while (kept < events.length && kept < this.#outboundMaxQueued) {
+            bytes += Buffer.byteLength(events[events.length - 1 - kept]);
+            if (bytes > this.#outboundMaxQueuedBytes) break;
+            kept++;
+        }
+        const dropped = events.length - kept;
+        if (dropped === 0) return events;
+        console.warn(
+            `[broadcast] backlog for peer ${peer.peerId ?? 'unknown'} over ${this.#outboundMaxQueued} events or ${this.#outboundMaxQueuedBytes} bytes; dropping ${dropped} oldest`,
+        );
+        return events.slice(dropped);
+    }
+
+    /**
+     * Sends serialized events in order, in bodies under the byte budget, and
+     * stops at the first that fails. Returns the events the peer did not take.
+     */
+    async #sendWebhookToPeer(
+        peer: IBroadcastPeerConfig,
+        events: string[],
+    ): Promise<string[]> {
+        let start = 0;
+        while (start < events.length) {
+            let end = start + 1;
+            let bodyBytes =
+                EVENTS_BODY_OVERHEAD_BYTES + Buffer.byteLength(events[start]);
+            while (end < events.length) {
+                const next = bodyBytes + 1 + Buffer.byteLength(events[end]);
+                if (next > this.#outboundMaxBodyBytes) break;
+                bodyBytes = next;
+                end++;
+            }
+            try {
+                // Same bytes as JSON.stringify({ events }).
+                await this.#post(
+                    peer,
+                    null,
+                    `{"events":[${events.slice(start, end).join(',')}]}`,
+                    this.#webhookHttpsAgent,
+                    15_000,
+                );
+            } catch (err) {
+                console.warn(
+                    `[broadcast] webhook send to peer ${peer.peerId ?? 'unknown'} failed`,
+                    err,
+                );
+                return events.slice(start);
+            }
+            start = end;
+        }
+        return [];
+    }
+
+    /**
+     * One signed POST to one peer. `path` replaces the configured webhook path
+     * for an addressed channel, and is `null` for the webhook itself.
+     */
+    async #post(
+        peer: IBroadcastPeerConfig,
+        path: string | null,
+        rawBody: string,
+        agent: HttpsAgent,
+        timeoutMs: number,
+    ): Promise<string | undefined> {
+        const peerId = this.#resolvePeerIdOf(peer);
+        if (!peerId) return;
+        const requestUrl = this.#normalizeWebhookUrl(peer.webhook_url, path);
+        const mySecret = this.#self()?.secret;
+        if (!requestUrl || !mySecret) return;
+
+        // Shared INCR across all ALB-balanced nodes so concurrent senders
+        // can't emit colliding nonces that the receiver would reject.
+        const nextNonce = await this.#nextOutgoingNonce(peerId);
+
+        const timestamp = Math.floor(Date.now() / 1000);
+        const payloadToSign = `${timestamp}.${nextNonce}.${rawBody}`;
+        const signature = createHmac('sha256', mySecret)
+            .update(payloadToSign)
+            .digest('hex');
+
+        const myPublicId = this.#resolveLocalPeerId() ?? '';
+        const headers: Record<string, string> = {
+            'Content-Type': 'application/json',
+            'Content-Length': String(Buffer.byteLength(rawBody)),
+            'X-Broadcast-Peer-Id': myPublicId,
+            'X-Broadcast-Timestamp': String(timestamp),
+            'X-Broadcast-Nonce': String(nextNonce),
+            'X-Broadcast-Signature': signature,
+        };
+        if (this.#webhookHostHeader) headers.Host = this.#webhookHostHeader;
+
+        const response = await axios.request({
+            method: 'POST',
+            url: requestUrl,
+            headers,
+            data: rawBody,
+            timeout: timeoutMs,
+            // We translate non-2xx into a thrown error ourselves so we
+            // can log the response body on failure.
+            validateStatus: () => true,
+            responseType: 'text',
+            transformResponse: (value: unknown) => value,
+            ...(requestUrl.startsWith('https:') ? { httpsAgent: agent } : {}),
+        });
+
+        if (response.status < 200 || response.status >= 300) {
+            console.warn(
+                `[broadcast] peer ${peerId} responded ${response.status}: ${response.data}`,
+            );
+            throw new Error(
+                `Webhook POST failed: ${response.status} ${response.statusText}`,
+            );
+        }
+        return response.data as string | undefined;
+    }
+
+    // -- Inbound helpers ---------------------------------------------
+
+    #normalizeIncomingPayload(
+        payload: IncomingPayload,
+    ): BroadcastEvent[] | null {
+        if (!payload || typeof payload !== 'object' || Array.isArray(payload))
+            return null;
+
+        // Either `{ events: [...] }` or a single event spread at top level.
+        if (Array.isArray(payload.events)) {
+            const out: BroadcastEvent[] = [];
+            for (const ev of payload.events) {
+                const norm = this.#normalizeIncomingEvent(ev);
+                if (!norm) return null;
+                out.push(norm);
+            }
+            return out;
+        }
+
+        const norm = this.#normalizeIncomingEvent(payload);
+        return norm ? [norm] : null;
+    }
+
+    #normalizeIncomingEvent(event: unknown): BroadcastEvent | null {
+        if (!event || typeof event !== 'object' || Array.isArray(event))
+            return null;
+        const e = event as { key?: unknown; data?: unknown; meta?: unknown };
+        if (typeof e.key !== 'string' || e.key.length === 0) return null;
+        if (e.data === undefined) return null;
+        return {
+            key: e.key,
+            data: e.data,
+            meta: this.#normalizeMeta(e.meta),
+        };
+    }
+
+    async #emitIncomingEventsSequentially(
+        events: BroadcastEvent[],
+    ): Promise<void> {
+        for (const event of events) {
+            // Belt-and-braces: a misbehaving peer that forwards already
+            // outside-tagged events would otherwise bounce ad infinitum.
+            if (event.meta?.from_outside) {
+                console.warn(
+                    '[broadcast] dropping incoming event already tagged from_outside',
+                    { key: event.key },
+                );
+                continue;
+            }
+            const metaOut = { ...event.meta, from_outside: true };
+            try {
+                this.clients.event.emit(event.key, event.data, metaOut);
+            } catch (err) {
+                console.warn('[broadcast] event re-emit failed', {
+                    key: event.key,
+                    err,
+                });
+            }
+        }
+    }
+
+    /**
+     * Atomically claim an inbound (peerId, ts, nonce) tuple. Returns true on
+     * first claim, false on replay. SET NX with TTL = replay window; single key
+     * ⇒ cluster-mode safe.
+     */
+    async #claimIncomingNonce(
+        peerId: string,
+        timestamp: number,
+        nonce: number,
+    ): Promise<boolean> {
+        const key = `broadcast:in:${peerId}:${timestamp}:${nonce}`;
+        const result = await this.clients.redis.set(
+            key,
+            '1',
+            'EX',
+            this.#webhookReplayWindowSeconds,
+            'NX',
+        );
+        return result === 'OK';
+    }
+
+    /**
+     * Atomically allocate the next outbound nonce for a peer. Shared counter
+     * across all ALB-fronted nodes via Redis INCR — guarantees uniqueness so
+     * the receiver's per-peer replay protection accepts every legitimate send.
+     */
+    async #nextOutgoingNonce(peerId: string): Promise<number> {
+        const n = await this.clients.redis.incr(`broadcast:out:${peerId}`);
+        return Number(n);
+    }
+
+    #parseTimestamp(
+        raw: string | undefined,
+    ): { ok: true; timestamp: number } | (IncomingResult & { ok: false }) {
+        if (!raw)
+            return {
+                ok: false,
+                status: 400,
+                message: 'Missing X-Broadcast-Timestamp',
+            };
+        const ts = Number(raw);
+        if (Number.isNaN(ts))
+            return {
+                ok: false,
+                status: 400,
+                message: 'Invalid X-Broadcast-Timestamp',
+            };
+        const nowSec = Math.floor(Date.now() / 1000);
+        const window = this.#webhookReplayWindowSeconds;
+        // 60s of forward tolerance for clock skew; the rest is replay-
+        // window backstop.
+        if (ts < nowSec - window || ts > nowSec + 60) {
+            return {
+                ok: false,
+                status: 400,
+                message: 'Timestamp out of window',
+            };
+        }
+        return { ok: true, timestamp: ts };
+    }
+
+    #parseNonce(
+        raw: string | undefined,
+    ): { ok: true; nonce: number } | (IncomingResult & { ok: false }) {
+        if (raw === undefined || raw === null || raw === '') {
+            return {
+                ok: false,
+                status: 400,
+                message: 'Missing X-Broadcast-Nonce',
+            };
+        }
+        const n = Number(raw);
+        if (Number.isNaN(n))
+            return {
+                ok: false,
+                status: 400,
+                message: 'Invalid X-Broadcast-Nonce',
+            };
+        return { ok: true, nonce: n };
+    }
+
+    // -- Misc --------------------------------------------------------
+
+    #normalizeMeta(meta: unknown): Record<string, unknown> {
+        if (!meta || typeof meta !== 'object' || Array.isArray(meta)) return {};
+        return meta as Record<string, unknown>;
+    }
+
+    #resolveLocalPeerId(): string | null {
+        const id = this.#self()?.peerId;
+        if (typeof id !== 'string' || id.trim() === '') return null;
+        return id.trim();
+    }
+
+    #resolvePeerIdOf(peer: IBroadcastPeerConfig): string | null {
+        const id = peer.peerId;
+        if (typeof id !== 'string' || id.trim() === '') return null;
+        return id.trim();
+    }
+
+    #self() {
+        return this.#broadcastConfig().webhook;
+    }
+
+    #broadcastConfig() {
+        return this.config.broadcast ?? {};
+    }
+
+    #normalizeWebhookUrl(
+        url: string | undefined,
+        path: string | null = null,
+    ): string | null {
+        if (typeof url !== 'string' || url.trim() === '') return null;
+        const trimmed = url.trim();
+        let parsed: URL;
+        try {
+            parsed = trimmed.includes('://')
+                ? new URL(trimmed)
+                : new URL(`${this.#webhookProtocol}://${trimmed}`);
+        } catch {
+            return null;
+        }
+        // Coerce protocol so a misconfigured `http://...` peer URL still
+        // gets sent over our preferred transport.
+        parsed.protocol = `${this.#webhookProtocol}:`;
+        if (path !== null) parsed.pathname = path;
+        return parsed.toString();
+    }
+
+    #loadConfig(): void {
+        const cfg = this.#broadcastConfig();
+        const peers = cfg.peers ?? [];
+
+        for (const peerCfg of peers) {
+            const peerId = this.#resolvePeerIdOf(peerCfg);
+            if (!peerId) {
+                console.warn(
+                    '[broadcast] ignoring peer config with missing key/peerId',
+                    { peerCfg },
+                );
+                continue;
+            }
+            if (this.#peersByKey[peerId]) {
+                console.warn('[broadcast] duplicate peer id', {
+                    peerId,
+                    existing: this.#peersByKey[peerId]?.webhook_url,
+                    duplicate: peerCfg.webhook_url,
+                });
+            }
+            this.#peersByKey[peerId] = {
+                peerId,
+                webhook_secret: peerCfg.webhook_secret,
+                webhook_url: peerCfg.webhook_url,
+                webhook: !!peerCfg.webhook,
+            };
+            if (peerCfg.webhook) {
+                this.#webhookPeers.push({ ...peerCfg, peerId });
+            } else {
+                console.warn(
+                    '[broadcast] non-webhook peer ignored (websocket transport disabled in v2)',
+                    { peerId },
+                );
+            }
+        }
+
+        this.#webhookReplayWindowSeconds = Number(
+            cfg.webhook_replay_window_seconds ?? 300,
+        );
+        const flushMs = Number(cfg.outbound_flush_ms ?? 2000);
+        this.#outboundFlushMs =
+            Number.isFinite(flushMs) && flushMs >= 0 ? flushMs : 2000;
+        const maxBodyBytes = Number(
+            cfg.outboundMaxBodyBytes ?? DEFAULT_OUTBOUND_MAX_BODY_BYTES,
+        );
+        this.#outboundMaxBodyBytes =
+            Number.isFinite(maxBodyBytes) && maxBodyBytes > 0
+                ? maxBodyBytes
+                : DEFAULT_OUTBOUND_MAX_BODY_BYTES;
+        this.#outboundMaxQueuedBytes =
+            OUTBOUND_BACKLOG_BODIES * this.#outboundMaxBodyBytes;
+
+        this.#webhookHostHeader = this.config.domain ?? null;
+        const protoRaw = String(this.config.protocol ?? '')
+            .trim()
+            .replace(/:$/, '')
+            .toLowerCase();
+        this.#webhookProtocol =
+            protoRaw === 'http' || protoRaw === 'https' ? protoRaw : 'https';
+    }
+}

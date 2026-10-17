@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2024 Puter Technologies Inc.
+ * Copyright (C) 2024-present Puter Technologies Inc.
  *
  * This file is part of Puter.
  *
@@ -16,316 +16,439 @@
  * You should have received a copy of the GNU Affero General Public License
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
-import UIWindow from './UIWindow.js'
 
-async function UIWindowShare(items, recipient){
-    return new Promise(async (resolve) => {
-        let h = '';
-        h += `<div style="padding: 30px 40px 20px; border-bottom: 1px solid #ced7e1;">`;
-            h += `<div class="generic-close-window-button" style="margin: 5px;"> &times; </div>`;
+import UIWindow from './UIWindow.js';
+import UIAlert from './UIAlert.js';
+import path from '../lib/path.js';
+import { is_owned_by_me, owner_of_path } from '../helpers/pathOwner.js';
+import { invalidate_shared_roots } from '../helpers/sharedAccess.js';
+import { icons } from '../helpers/actionIcons.js';
+import { mode_label, options_for } from '../helpers/shareModes.js';
+import { has_direct_share, mark_item_shared } from '../helpers/sharedBadge.js';
+import { share_outcome } from '../helpers/shareOutcome.js';
+import shareRecipientPicker from '../helpers/shareRecipientPicker.js';
+import { share_key } from '../helpers/shareSuggest.js';
+import {
+    team_for_share, team_label, teams_for_sharing,
+} from '../helpers/shareTeams.js';
+import { share_link_for } from '../helpers/sharePaths.js';
+import { is_plan_gate_error, open_upgrade_flow } from '../helpers/planGate.js';
+import { with_verification_gate } from '../helpers/verification_gates.js';
 
-            //------------------------------------------------
-            // Icons
-            //------------------------------------------------
-            
-            h += `<div style="display:flex; justify-content: center; margin-bottom: 10px; disable-user-select">`;
-                // 1 item shared
-                if(items.length === 1)
-                    h += `<img src="${items[0].icon}" style="width:70px; height:70px;">`;
-                // 2 items shared
-                else if(items.length === 2){
-                    h += `<img src="${items[0].icon}" style="width:70px; height:70px; z-index: 2;">`;
-                    h += `<img src="${items[1].icon}" style="width:70px; height:70px; margin-left:-55px; margin-top: -10px; z-index:1; transform:scale(0.8);">`;
-                }
-                // 3 items shared
-                else if(items.length === 3){
-                    h += `<img src="${items[0].icon}" style="width:70px; height:70px; z-index: 3;">`;
-                    h += `<img src="${items[1].icon}" style="width:70px; height:70px; margin-left:-55px; margin-top: -10px; z-index:2; transform:scale(0.8);">`;
-                    h += `<img src="${items[2].icon}" style="width:70px; height:70px; margin-left:-55px; margin-top: -20px; z-index:1; transform:scale(0.6);">`;
-                }
-                // 4 items shared
-                else if(items.length === 4){
-                    h += `<img src="${items[0].icon}" style="width:70px; height:70px; z-index: 4;">`;
-                    h += `<img src="${items[1].icon}" style="width:70px; height:70px; margin-left:-55px; margin-top: -15px; z-index:3; transform:scale(0.8);">`;
-                    h += `<img src="${items[2].icon}" style="width:70px; height:70px; margin-left:-55px; margin-top: -25px; z-index:2; transform:scale(0.6);">`;
-                    h += `<img src="${items[3].icon}" style="width:70px; height:70px; margin-left:-55px; margin-top: -35px; z-index:1; transform:scale(0.4);">`;
-                }
-                // 5 items shared
-                else if(items.length >= 5){
-                    h += `<img src="${items[0].icon}" style="width:70px; height:70px; z-index: 5;">`;
-                    h += `<img src="${items[1].icon}" style="width:70px; height:70px; margin-left:-60px; margin-top: -15px; z-index:4; transform:scale(0.8);">`;
-                    h += `<img src="${items[2].icon}" style="width:70px; height:70px; margin-left:-60px; margin-top: -25px; z-index:3; transform:scale(0.6);">`;
-                    h += `<img src="${items[3].icon}" style="width:70px; height:70px; margin-left:-60px; margin-top: -35px; z-index:2; transform:scale(0.4);">`;
-                    h += `<img src="${items[4].icon}" style="width:70px; height:70px; margin-left:-60px; margin-top: -45px; z-index:1; transform:scale(0.2);">`;
-                }
-            h += `</div>`;
+/** What each outcome of a share call is called on screen. */
+const SHARE_MESSAGE = {
+    invited: 'share_invited',
+    shared: 'share_shared_with',
+    updated: 'share_access_updated',
+    unchanged: 'share_already_shared_with',
+};
 
-            // ------------------------------------------------
-            // Name
-            // ------------------------------------------------
-            h += `<h2 style="font-size: 17px; margin-top:0; text-align:center; margin-bottom: 40px; font-weight: 400; color: #303d49;">`;
-                h += `Share <strong>${html_encode(items[0].name)}</strong>`;
-                if(items.length > 1)
-                    h += ` and ${items.length - 1} other item${items.length > 2 ? 's' : ''}`;
-            h += `</h2>`;
+/**
+ * Sharing dialog for one file or directory.
+ *
+ * @param {object} options
+ * @param {string} options.path Item to share.
+ * @param {string} [options.name] Display name; defaults to the path's basename.
+ * @param {string} [options.owner] Owner's username; defaults to the first path
+ *   segment, which is not the current user when a `manage` recipient opens this.
+ * @param {string} [options.uid] The item's uid, when the caller has it; saves
+ *   the lookup the "copy link" button otherwise makes.
+ */
+async function UIWindowShare (options) {
+    options = options ?? {};
+    const item_path = options.path;
+    const item_name = options.name ?? path.basename(item_path);
+    const item_owner =
+        options.owner ?? owner_of_path(item_path) ?? window.user.username;
+    // A delegate passes on access, never the authority to pass it on.
+    const allow_manage = is_owned_by_me(item_path);
 
-            // form
-            h += `<form class="window-give-item-access-form">`;
-                // Error msg
-                h += `<div class="error"></div>`;
-                // Username/email
-                h += `<div style="overflow: hidden;">`;
-                    h += `<label style="font-size: 16px; font-weight: 600;">${i18n('share_with')}</label>`;
-                    h += `<div style="display: flex;">`;
-                        // Username/email
-                        h += `<input placeholder="username" class="access-recipient" value="${html_encode(recipient ?? '')}" style="border-right: none; margin-bottom: 10px; border-top-right-radius: 0; border-bottom-right-radius: 0;" type="text" autocomplete="recipient_email_username" spellcheck="false" autocorrect="off" autocapitalize="off" data-gramm_editor="false"/>`;
-                        // Share
-                        h += `<button class="give-access-btn button button-primary button-normal" style="border-top-left-radius: 0; border-bottom-left-radius: 0;" ${!recipient ? 'disabled' : ''}>${i18n('share')}</button>`
-                    h += `</div>`;                
-                h += `</div>`;
-            h += `</form>`;
+    let h = '';
+    h += '<div class="share-dialog">';
+    h += '<div class="form-error-msg"></div>';
+    h += '<div class="form-success-msg"></div>';
 
-            //recipients
-            h += `<p style="font-size: 14px; margin-bottom: 0px; color: #303d49; text-shadow: 1px 1px white;">People with access</p>`;
-            h += `<div class="share-recipients">`;
-            h += `</div>`;
-        h += `</div>`;
+    h += `<label for="share-recipient">${i18n('share_with')}</label>`;
+    h += '<div class="share-dialog-row">';
+    h += `<input class="share-recipient" id="share-recipient" type="text" autocomplete="off" spellcheck="false"
+                 placeholder="${i18n('share_add_people')}" />`;
+    h += `<select class="share-mode">${options_for('read', { allow_manage })}</select>`;
+    h += '</div>';
+    h += `<button class="share-btn button button-primary button-block button-normal">${i18n('share')}</button>`;
 
-        const el_window = await UIWindow({
-            title: 'Share With…',
-            icon: null,
-            uid: null,
-            is_dir: false,
-            body_content: h,
-            has_head: false,
-            selectable_body: false,
-            draggable_body: true,
-            allow_context_menu: false,
-            is_resizable: false,
-            is_droppable: false,
-            init_center: true,
-            allow_native_ctxmenu: true,
-            allow_user_select: true,
-            onAppend: function(this_window){
-                $(this_window).find(`.access-recipient`).get(0).focus({preventScroll:true});
-            },
-            window_class: 'window-give-access',
-            width: 550,
-            window_css: {
-                height: 'initial',
-            },
-            body_css: {
-                width: 'initial',
-                height: '100%',
-                'background-color': 'rgb(245 247 249)',
-                'backdrop-filter': 'blur(3px)',
+    // The owner's switch between people-only and anyone with the link. A
+    // delegate passes access on to people; opening the item to everyone is
+    // the owner's call, so nobody else gets the control.
+    if ( allow_manage ) {
+        h += '<div class="share-general-access">';
+        h += `<div class="share-dialog-heading">${i18n('share_general_access')}</div>`;
+        h += '<div class="share-dialog-row share-link-row">';
+        h += `<select class="share-link-access" aria-label="${html_encode(i18n('share_general_access'))}">`;
+        h += `<option value="restricted">${i18n('share_link_restricted')}</option>`;
+        h += `<option value="anyone">${i18n('share_link_anyone')}</option>`;
+        h += '</select>';
+        h += `<select class="share-link-mode" aria-label="${html_encode(i18n('share_access_level'))}" hidden>${options_for('read', { allow_manage: false })}</select>`;
+        h += '</div>';
+        h += `<p class="share-link-note">${i18n('share_link_restricted_note')}</p>`;
+        h += `<button class="share-copy-link button button-block button-normal" hidden>${i18n('share_copy_link')}</button>`;
+        h += '</div>';
+    }
+
+    h += `<div class="share-dialog-heading">${i18n('share_who_has_access')}</div>`;
+    h += '<div class="share-list"></div>';
+    h += '</div>';
+
+    // One dialog per item — window-level single_instance would refocus a
+    // dialog still bound to a different file.
+    const $existing = $('.window[data-app="share"]').filter(
+        (_, el) => $(el).attr('data-share-path') === item_path,
+    );
+    if ( $existing.length ) {
+        $existing.focusWindow();
+        return;
+    }
+
+    const el_window = await UIWindow({
+        title: `${i18n('share')} — ${item_name}`,
+        app: 'share',
+        icon: window.icons['share-outline.svg'],
+        uid: null,
+        is_dir: false,
+        body_content: h,
+        has_head: true,
+        selectable_body: false,
+        draggable_body: false,
+        allow_context_menu: false,
+        is_resizable: false,
+        is_droppable: false,
+        init_center: true,
+        allow_native_ctxmenu: false,
+        allow_user_select: false,
+        width: 420,
+        height: 'auto',
+        dominant: true,
+        show_in_taskbar: false,
+        onAppend: function (this_window) {
+            $(this_window).find('.share-recipient').get(0)?.focus({ preventScroll: true });
+        },
+        // The recipient field listens on the document to know when a click
+        // landed outside its suggestions; that has to come off with the window.
+        on_close: () => picker.destroy(),
+        window_class: 'window-share',
+        window_css: { height: 'initial' },
+        body_css: { width: 'initial', padding: '0', 'background-color': 'rgb(245 247 249)' },
+    });
+    $(el_window).attr('data-share-path', item_path);
+
+    const $error = $(el_window).find('.form-error-msg');
+    const $success = $(el_window).find('.form-success-msg');
+    const $list = $(el_window).find('.share-list');
+
+    const show_error = (message) => {
+        $success.hide();
+        $error.html(html_encode(message)).show();
+    };
+
+    const show_success = (message) => {
+        $error.hide();
+        $success.html(message).show();
+    };
+
+    /** The access list as last drawn, which is what a share call changes. */
+    let shown_shares = [];
+
+    /** The caller's teams, offered as recipients. */
+    let teams = [];
+
+    /** The team behind each `data-team` row as last drawn. */
+    const row_teams = new Map();
+
+    /** The item's own "anyone with the link" share as last listed, or null. */
+    let link_share = null;
+    /** The item's uid, which its link is built on; looked up once. */
+    let item_uid = options.uid ?? null;
+
+    const $recipient = $(el_window).find('.share-recipient');
+    const $share_btn = $(el_window).find('.share-btn');
+
+    // One field for every kind of recipient: a colleague, a whole team, someone
+    // shared with before, or an address typed from scratch.
+    const picker = shareRecipientPicker({
+        $input: $recipient,
+        $row: $recipient.closest('.share-dialog-row'),
+        // Nobody already on the list below: offering them again would only
+        // re-grant what the row next to it already shows.
+        excluded: () => shown_shares.map(share_key).filter(Boolean),
+        onChange: () => { $share_btn.prop('disabled', ! picker.recipient()); },
+    });
+    $share_btn.prop('disabled', true);
+
+    // Enter shares, the way it submits the Dashboard's dialog. Bound after the
+    // picker, which takes the press for itself while it is choosing a row.
+    $recipient.on('keydown', (e) => {
+        if ( e.key !== 'Enter' || e.isDefaultPrevented() ) return;
+        if ( $share_btn.prop('disabled') ) return;
+        $share_btn.trigger('click');
+    });
+
+    const render = (shares) => {
+        shown_shares = Array.isArray(shares) ? shares : [];
+        row_teams.clear();
+        // The item's own link share drives the general-access control rather
+        // than a row; a delegate, who has no control, sees it as a row.
+        link_share = shown_shares.find((share) => share.anyone && ! share.inheritedFrom) ?? null;
+        const listed = shown_shares.filter((share) => ! (allow_manage && share.anyone && ! share.inheritedFrom));
+        let rows = '';
+        // The owner's access comes from owning the item, so it can't be revoked
+        rows += '<div class="share-row">';
+        rows += `<span class="share-row-who">${html_encode(item_owner)}${item_owner === window.user.username ? ` (${i18n('share_you')})` : ''}</span>`;
+        rows += `<span class="share-row-owner">${i18n('share_owner')}</span>`;
+        rows += '</div>';
+
+        for ( const share of listed ) {
+            const holder = share.anyone ? i18n('share_row_anyone') : html_encode(share.holder ?? '');
+            if ( share.anyone && ! share.inheritedFrom ) {
+                rows += '<div class="share-row share-row-inherited">';
+                rows += `<span class="share-row-who">${holder}</span>`;
+                rows += `<span class="share-row-mode">${mode_label(share.mode)}</span>`;
+                rows += '</div>';
+                continue;
             }
-        })
-
-        let contacts = [];
-
-        puter.kv.get('contacts').then((kv_contacts) => {
-            if(kv_contacts){
-                try{
-                    contacts = JSON.parse(kv_contacts);
-                    $(el_window).find('.access-recipient').autocomplete({
-                        source: contacts
-                    });
-                }catch(e){
-                    puter.kv.del('contacts');
-                }
+            if ( share.inheritedFrom ) {
+                // Granted on an ancestor, so it can only be changed there
+                rows += '<div class="share-row share-row-inherited">';
+                rows += `<span class="share-row-who">${holder}</span>`;
+                rows += `<span class="share-row-via">${i18n('share_inherited_via', { folder: path.basename(share.inheritedFrom) })}</span>`;
+                rows += `<span class="share-row-mode">${mode_label(share.mode)}</span>`;
+                rows += '</div>';
+                continue;
             }
-        })
-
-        // /stat
-        let perms = [];
-    let printed_users = [];
-        for(let i=0; i<items.length; i++){
-            puter.fs.stat({ 
-                path: items[i].path,
-                returnSubdomains: true,
-                returnPermissions: true,
-            }).then((fsentry) => {
-                let recipients = fsentry.shares?.users;
-                let perm_list = '';
-
-                //owner
-                //check if this user has been printed here before, important for multiple items
-                if(!printed_users.includes(fsentry.owner.username)){
-                    perm_list += `<div class="item-perm-recipient-card item-prop-perm-entry item-permission-owner" style="margin-bottom:5px; margin-top:5px; background-color: #f2f2f2;">`
-                        if(fsentry.owner.username === window.user.username)
-                            perm_list += `You (${fsentry.owner.email ?? fsentry.owner.username})`;
-                        else
-                            perm_list += fsentry.owner.email ?? fsentry.owner.username;
-                        perm_list += `<div style="float:right;"><span class="permission-owner-badge">owner</span></div>`;
-                    perm_list += `</div>`;
-                    // add this user to the list of printed users
-                    printed_users.push(fsentry.owner.username);
-                }
-
-                if(recipients.length > 0){
-                    recipients.forEach((recipient) => {
-                        // others with access
-                        if(recipients.length > 0){
-                            recipients.forEach(perm => {
-                                //check if this user has been printed here before, important for multiple items
-                                if(!printed_users.includes(perm.user.username)){
-                                    perm_list += `<div data-permission="${perm.permission}" class="item-perm-recipient-card item-prop-perm-entry" data-perm-uid="${perm.user.uid}" style="margin-bottom:5px; margin-top:5px;">`
-                                        perm_list += `${perm.user.email ?? perm.user.username}`;
-                                        perm_list += `<div style="float:right;"><span class="remove-permission-link remove-permission-icon" data-recipient-username="${perm.user.username}" data-permission="${perm.permission}">✕</span></div>`;
-                                    perm_list += `</div>`;
-                                    // add this user to the list of printed users
-                                    printed_users.push(perm.user.username);
-                                }
-                            });
-                        }
-                    });
-                }
-                $(el_window).find('.share-recipients').append(`${perm_list}`);                  
-            }).
-            catch((err) => {
-                // console.error(err);
-            })
+            if ( share.pending ) {
+                // Withheld unless the invite is ours to act on: nobody to name,
+                // and the server would refuse the cancellation anyway.
+                const invited = html_encode(share.recipientEmail ?? '');
+                rows += '<div class="share-row share-row-pending">';
+                rows += `<span class="share-row-who">${invited || html_encode(i18n('share_invited_someone'))}</span>`;
+                rows += `<span class="share-row-via">${i18n('share_awaiting_signup')}</span>`;
+                rows += `<span class="share-row-mode">${mode_label(share.mode)}</span>`;
+                if ( invited )
+                    rows += `<button class="share-revoke" data-holder="${invited}" title="${html_encode(i18n('share_cancel_invite'))}" aria-label="${html_encode(i18n('share_cancel_invite'))}">${icons.trash}</button>`;
+                rows += '</div>';
+                continue;
+            }
+            // A team holds the share itself, so the row has no username to
+            // key on; `data-team` carries the uid the handlers address it by.
+            const team = team_for_share(teams, share);
+            if ( team ) row_teams.set(team.uid, team);
+            const key = team
+                ? `data-team="${html_encode(team.uid)}"`
+                : `data-holder="${holder}"`;
+            rows += `<div class="share-row${team ? ' share-row-team' : ''}">`;
+            rows += `<span class="share-row-who">${team ? html_encode(team_label(team)) : holder}</span>`;
+            if ( team ) rows += `<span class="share-row-via">${i18n('share_row_team')}</span>`;
+            rows += `<select class="share-row-mode-select" ${key}>${options_for(share.mode, { allow_manage })}</select>`;
+            rows += `<button class="share-revoke" ${key} title="${html_encode(i18n('share_remove_access'))}" aria-label="${html_encode(i18n('share_remove_access'))}">${icons.trash}</button>`;
+            rows += '</div>';
         }
+        if ( !listed.length ) {
+            rows += `<p class="share-dialog-empty">${i18n('share_no_one')}</p>`;
+        }
+        $list.html(rows);
+        render_link_access();
+        // Every share, mode change and revoke lands here.
+        mark_item_shared(item_path, has_direct_share(shares));
+    };
 
-        $(el_window).find('.give-access-btn').on('click', async function(e){
-            e.preventDefault();
-            e.stopPropagation();
+    const refresh = async () => {
+        try {
+            render(await puter.fs.getShares(item_path));
+        } catch (e) {
+            show_error(e?.message ?? i18n('share_failed'));
+        }
+    };
 
-            $(el_window).find('.error').hide();
+    // -- General access --
 
-            let recipient_email, recipient_username;
-            let recipient_id = $(el_window).find('.access-recipient').val();
+    const $link_access = $(el_window).find('.share-link-access');
+    const $link_mode = $(el_window).find('.share-link-mode');
+    const $link_note = $(el_window).find('.share-link-note');
+    const $copy_link = $(el_window).find('.share-copy-link');
 
-            // todo do some basic validation client-side
-            if(recipient_id === '' || recipient_id === null || recipient_id === undefined)
-                return;
+    /** Put the control where the listing says the item stands. */
+    const render_link_access = () => {
+        if ( ! allow_manage ) return;
+        const on = link_share !== null;
+        $link_access.val(on ? 'anyone' : 'restricted');
+        $link_mode.prop('hidden', ! on);
+        if ( on ) $link_mode.val(link_share.mode);
+        $link_note.html(on
+            ? i18n(link_share.mode === 'write' ? 'share_link_anyone_note_write' : 'share_link_anyone_note_read')
+            : i18n('share_link_restricted_note'));
+        $copy_link.prop('hidden', ! (on && item_uid));
+    };
 
-            if(is_email(recipient_id))
-                recipient_email = recipient_id;
-            else
-                recipient_username = recipient_id;
-            // can't share with self
-            if(recipient_username === window.user.username){
-                $(el_window).find('.error').html('You can\'t share with yourself');
-                $(el_window).find('.error').fadeIn();
-                return;
+    /** Open the item to anyone with the link at `mode`, or close it with null. */
+    const set_link_access = async (mode) => {
+        $link_access.prop('disabled', true);
+        $link_mode.prop('disabled', true);
+        try {
+            if ( mode ) {
+                const created = await with_verification_gate(() => puter.fs.share({
+                    path: item_path,
+                    recipient: { anyone: true },
+                    mode,
+                }));
+                item_uid ??= created?.[0]?.entryUid ?? null;
+                show_success(i18n(mode === 'write' ? 'share_link_on_write' : 'share_link_on_read'));
+            } else {
+                await puter.fs.unshare(item_path, { anyone: true });
+                show_success(i18n('share_link_off'));
             }
-            else if(recipient_email && recipient_email === window.user.email){
-                $(el_window).find('.error').html('You can\'t share with yourself');
-                $(el_window).find('.error').fadeIn();
-                return;
+        } catch (e) {
+            // A plan gate gets the flow that clears it, where the deployment
+            // has one; a refusal is otherwise reported like any other.
+            if ( is_plan_gate_error(e) ) {
+                if ( ! open_upgrade_flow() ) show_error(i18n('share_link_requires_plan'));
+            } else {
+                show_error(e?.message ?? i18n('share_failed'));
             }
+        } finally {
+            $link_access.prop('disabled', false);
+            $link_mode.prop('disabled', false);
+        }
+        // The listing is the truth either way, and it puts the control back.
+        await refresh();
+    };
 
-            // disable 'Give Access' button
-            $(el_window).find('.give-access-btn').prop('disabled', true);
+    $link_access.on('change', function () {
+        set_link_access($(this).val() === 'anyone' ? ($link_mode.val() || 'read') : null);
+    });
+    $link_mode.on('change', function () {
+        set_link_access($(this).val());
+    });
+    $copy_link.on('click', async function () {
+        if ( ! item_uid ) return;
+        try {
+            await window.copy_to_clipboard(share_link_for(
+                { owner: item_owner, uid: item_uid, name: item_name },
+                window.gui_origin,
+            ));
+            show_success(i18n('share_link_copied'));
+        } catch (e) {
+            show_error(e?.message ?? i18n('share_failed'));
+        }
+    });
 
-            let cancelled_due_to_error = false;
-            let share_result;
-            let access_level = 'write';
+    $(el_window).on('click', '.share-btn', async function () {
+        // A team is named by uid; anything typed goes as-is, since a bare
+        // string is what the backend reads as an email or a username.
+        const chosen = picker.recipient();
+        if ( ! chosen ) return;
 
-            $.ajax({
-                url: puter.APIOrigin + "/share",
-                type: "POST",
-                headers: {
-                    "Content-Type": "application/json",
-                    "Authorization": "Bearer " + puter.authToken
-                },
-                data: JSON.stringify({
-                    recipients:[
-                        recipient_username || recipient_email
-                    ],
-                    shares: [
-                        {
-                            $: 'fs-share',
-                            path: items[0].path,
-                            access: access_level,
-                        }
-                    ]
+        $(this).prop('disabled', true);
+        try {
+            const created = await with_verification_gate(() => puter.fs.share({
+                path: item_path,
+                recipient: chosen.value,
+                mode: $(el_window).find('.share-mode').val(),
+            }));
+            picker.clear();
+            $error.hide();
+            // `i18n()` encodes its replacements; encoding first would show the
+            // entities to anyone whose address or username contains one.
+            show_success(
+                i18n(SHARE_MESSAGE[share_outcome(created, shown_shares)], {
+                    recipient: chosen.label,
                 }),
-                success: function(response) {
-                    // show success message
-                    $(el_window).find('.access-recipient-print').html(recipient_id);
-                    let perm_id = `fs:${items[0].uid}:${access_level}`;
+            );
+            picker.remember(chosen, created);
+            invalidate_shared_roots();
+            await refresh();
+        } catch (e) {
+            show_error(e?.message ?? i18n('share_failed'));
+        } finally {
+            $(this).prop('disabled', ! picker.recipient());
+        }
+    });
 
-                    // append recipient to list
-                    let perm_list = '';
-                    perm_list += `<div data-permission="${perm_id}" class="item-perm-recipient-card item-prop-perm-entry" style="margin-bottom:5px; margin-top:5px;">`
-                        perm_list += `${recipient_username}`;
-                        perm_list += `<div style="float:right;"><span class="remove-permission-link remove-permission-icon" data-recipient-username="${recipient_username}" data-permission="${perm_id}">✕</span></div>`;
-                    perm_list += `</div>`;
+    $(el_window).on('change', '.share-row-mode-select', async function () {
+        const team = row_teams.get($(this).attr('data-team'));
+        const holder = $(this).attr('data-holder');
+        const recipient = team ? { team: team.uid } : holder;
+        const name = team ? team_label(team) : holder;
+        const mode = $(this).val();
+        $(this).prop('disabled', true);
+        try {
+            await with_verification_gate(() => puter.fs.share({ path: item_path, recipient, mode }));
+            show_success(i18n('share_access_updated', { recipient: name }));
+            invalidate_shared_roots();
+            await refresh();
+        } catch (e) {
+            show_error(e?.message ?? i18n('share_failed'));
+            invalidate_shared_roots();
+            await refresh();
+        }
+    });
 
-                    // reset input
-                    $(el_window).find('.error').hide();
-                    $(el_window).find('.access-recipient').val('');
+    $(el_window).on('click', '.share-revoke', async function () {
+        const holder = $(this).attr('data-holder');
+        const is_pending = $(this).closest('.share-row').hasClass('share-row-pending');
+        const team = row_teams.get($(this).attr('data-team'));
+        // Losing a team's access is losing everyone in it at once, which
+        // the ordinary "remove {recipient}" wording would understate.
+        const removed_name = team ? team_label(team) : holder;
+        const confirmed = await UIAlert({
+            message: is_pending
+                ? i18n('share_confirm_cancel_invite', { recipient: holder })
+                : i18n(team ? 'share_confirm_remove_team' : 'share_confirm_remove', { recipient: removed_name }),
+            buttons: [
+                { label: i18n('share_remove'), value: true, type: 'primary' },
+                { label: i18n('cancel'), value: false },
+            ],
+            // Stack the confirmation with the dialog that opened it. In
+            // fullpage/dashboard mode this window is promoted to the
+            // stay-on-top band, where an alert defaulting to `stay_on_top:
+            // false` renders underneath it — leaving a confirmation the user
+            // can't reach without closing the dialog behind it.
+            parent_uuid: $(el_window).attr('data-element_uuid'),
+            stay_on_top: $(el_window).attr('data-stay_on_top') === 'true',
+        });
+        if ( ! confirmed ) return;
+        $(this).prop('disabled', true);
+        try {
+            await puter.fs.unshare(item_path, team ? { team: team.uid } : holder);
+            // `i18n()` encodes what it returns, replacements included, so the
+            // raw value goes in — encoding first would show the entities to
+            // anyone whose address or username contains one.
+            show_success(
+                is_pending
+                    ? i18n('share_invite_cancelled', { recipient: holder })
+                    : i18n('share_access_removed', { recipient: removed_name }),
+            );
+            invalidate_shared_roots();
+            await refresh();
+        } catch (e) {
+            show_error(e?.message ?? i18n('share_failed'));
+            $(this).prop('disabled', false);
+        }
+    });
 
-                    // disable 'Give Access' button
-                    $(el_window).find('.give-access-btn').prop('disabled', true);
-                    
-                    // append recipient to list
-                    $(el_window).find('.share-recipients').append(`${perm_list}`);
+    // The uid the link is built on; the copy button waits for it.
+    if ( allow_manage && ! item_uid ) {
+        puter.fs.stat(item_path).then((stat) => {
+            item_uid = stat?.uid ?? null;
+            render_link_access();
+        }).catch(() => { /* the button just stays hidden */ });
+    }
 
-                    // add to contacts
-                    if(!contacts.includes(recipient_username)){
-                        contacts.push(recipient_username);
-                        puter.kv.set('contacts', JSON.stringify(contacts));
-                    }
-
-                },
-                error: function(err) {
-                    // at this point 'username_not_found' and 'shared_with_self' are the only 
-                    // errors that need to stop the loop
-                    if(err.responseJSON.code === "user_does_not_exist" || err.responseJSON.code === 'shared_with_self'){
-                        $(el_window).find('.error').html(err.responseJSON.message);
-                        $(el_window).find('.error').fadeIn();
-                        cancelled_due_to_error = true;
-                    }
-                    // re-enable share button
-                    $(el_window).find('.give-access-btn').prop('disabled', false);
-
-                }
-            });
-
-            // finished
-            if(!cancelled_due_to_error){
-                $(el_window).find(`.access-recipient`).val('');
-            }
-            // re-enable share button
-            $(el_window).find('.give-access-btn').prop('disabled', false);    
-
-            return false;
-        })
-
-        $(el_window).find('.access-recipient').on('input keypress keyup keydown paste', function(){
-            if($(this).val() === ''){
-                $(el_window).find('.give-access-btn').prop('disabled', true);
-            }
-            else{
-                $(el_window).find('.give-access-btn').prop('disabled', false);
-            }
-        })
-
-    })
+    // Teams first: the access list names its rows from them, and the recipient
+    // field suggests both them and the people in them.
+    teams = await teams_for_sharing();
+    picker.setTeams(teams);
+    // Not the encoded form: an attribute set from JS shows entities literally.
+    if ( teams.length ) $recipient.attr('placeholder', i18n('share_add_people_teams', [], false));
+    await refresh();
+    return el_window;
 }
 
-$(document).on('click', '.remove-permission-link', async function(){
-    let recipient_username = $(this).attr('data-recipient-username');
-    let permission = $(this).attr('data-permission');
-
-    fetch(puter.APIOrigin + "/auth/revoke-user-user", {
-        "headers": {
-            "Content-Type": "application/json",
-            "Authorization": `Bearer ${puter.authToken}`,
-        },
-        "body": JSON.stringify({
-            permission: permission,
-            target_username: recipient_username
-        }),
-        "method": "POST"
-    }).then((response) => {
-        $('.item-perm-recipient-card[data-permission="'+permission+'"]').remove();
-    }).catch((err) => {
-        console.error(err);
-    })
-})
-export default UIWindowShare
+export default UIWindowShare;

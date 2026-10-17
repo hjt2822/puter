@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2024 Puter Technologies Inc.
+ * Copyright (C) 2024-present Puter Technologies Inc.
  *
  * This file is part of Puter.
  *
@@ -16,7 +16,7 @@
  * You should have received a copy of the GNU Affero General Public License
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
-import ValueHolder from "./ValueHolder.js";
+import ValueHolder from './ValueHolder.js';
 
 export const Component = def(class Component extends HTMLElement {
     static ID = 'util.Component';
@@ -29,7 +29,7 @@ export const Component = def(class Component extends HTMLElement {
 
     static TODO = [
         'value bindings for create_template',
-    ]
+    ];
 
     static on_self_registered ({ is_owner, on_other_registered }) {
         // Only invoked for Component itself, not subclasses
@@ -37,9 +37,6 @@ export const Component = def(class Component extends HTMLElement {
 
         // Automatically define components for all HTML elements
         on_other_registered(({ cls }) => {
-            if ( cls.ID === 'ui.component.StepHeading' ) {
-                globalThis.sh_shouldbe = cls;
-            }
             if ( globalThis.lib.is_subclass(cls, HTMLElement) ) {
                 defineComponent(cls);
             }
@@ -95,12 +92,12 @@ export const Component = def(class Component extends HTMLElement {
         }
 
         // Setup focus handling
-        if ( property_values && property_values[`event.focus`] ) {
+        if ( property_values && property_values['event.focus'] ) {
             const on_focus_ = this.on_focus;
             this.on_focus = (...a) => {
-                property_values[`event.focus`]();
+                property_values['event.focus']();
                 on_focus_ && on_focus_(...a);
-            }
+            };
         }
         this.addEventListener('focus', () => {
             if ( this.on_focus ) {
@@ -137,14 +134,14 @@ export const Component = def(class Component extends HTMLElement {
     }
 
     connectedCallback () {
-        if (!this.#has_called_on_ready) {
+        if ( ! this.#has_called_on_ready ) {
             this.on_ready && this.on_ready(this.get_api_());
             this.#has_called_on_ready = true;
         }
     }
 
     attach (destination) {
-        if (!this.#has_created_element) {
+        if ( ! this.#has_created_element ) {
             const el = this.create_element_();
             this.dom_.appendChild(el);
             this.#has_created_element = true;
@@ -183,7 +180,10 @@ export const Component = def(class Component extends HTMLElement {
             this.dom_.appendChild(style);
         }
         if ( this.create_template ) {
-            this.create_template({ template });
+            this.create_template({
+                template,
+                content: template.content,
+            });
         }
         const el = template.content.cloneNode(true);
         return el;
@@ -202,7 +202,8 @@ export const Component = def(class Component extends HTMLElement {
                 }
                 this.values_[name].sub(callback);
                 callback(this.values_[name].get(), {});
-            }
+            },
+            dom: this.dom_,
         };
     }
 });
@@ -212,7 +213,7 @@ export const defineComponent = (component) => {
     // because it was designed this way.
     if ( globalThis.lib.is_subclass(component, HTMLElement) ) {
         let name = component.ID;
-        name = 'c-' + name.split('.').pop().toLowerCase();
+        name = `c-${ name.split('.').pop().toLowerCase()}`;
         // TODO: This is necessary because files can be loaded from
         // both `/src/UI` and `/UI` in the URL; we need to fix that
         if ( customElements.get(name) ) return;

@@ -1,0 +1,234 @@
+/*
+ * Copyright (C) 2024-present Puter Technologies Inc.
+ *
+ * This file is part of Puter.
+ *
+ * Puter is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published
+ * by the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+import type { ErrorRequestHandler, RequestHandler } from 'express';
+import { HttpError, isHttpError } from '../HttpError';
+
+interface ErrorHandlerOptions {
+    /**
+     * Optional logger for non-HttpError failures. Receives `(err, req)`.
+     * Defaults to `console.error` with the request method/url.
+     */
+    onUnhandled?: (err: unknown, req: Parameters<RequestHandler>[0]) => void;
+    /**
+     * Optional hook fired for every error caught (HttpError and otherwise). Use
+     * for alarm wiring (e.g., page on 500s) without coupling the middleware to
+     * a specific service.
+     */
+    onError?: (err: unknown, req: Parameters<RequestHandler>[0]) => void;
+}
+
+/**
+ * Terminal express error middleware. Install last, after all routes and
+ * controllers have been registered.
+ *
+ * Express 5 forwards thrown errors (sync and async) here automatically, so
+ * controllers and gate middlewares can simply `throw new HttpError(...)`.
+ *
+ * Response shape is kept for wire-compat with existing clients:
+ *
+ * ```json
+ * {
+ *   "error": "<message>",
+ *   "message": "<message>",
+ *   "code": "<legacyCode || code>",
+ *   "errorCode": "<code, only when both legacyCode and code are set>",
+ *   ...fields
+ * }
+ * ```
+ *
+ * `message` is a duplicate of `error` kept for the legacy GUI, which keys on
+ * `errorJson.message` when parsing auth-window AJAX error responses.
+ *
+ * Non-HttpError failures (programming bugs, unexpected exceptions) become a
+ * generic 500 response — no internal details leak. The full error is passed to
+ * `onUnhandled` for logging/alerting.
+ */
+export const createErrorHandler = (
+    opts: ErrorHandlerOptions = {},
+): ErrorRequestHandler => {
+    const onUnhandled =
+        opts.onUnhandled ??
+        ((err, req) => {
+            console.error(
+                `[v2] unhandled error on ${req.method} ${req.url}:`,
+                err,
+            );
+        });
+
+    return (err, req, res, next): void => {
+        // If the response already started streaming, we can't send a JSON
+        // error. Defer to express's default handler to abort the connection.
+        if (res.headersSent) {
+            opts.onError?.(err, req);
+            next(err);
+            return;
+        }
+
+        const translated = translateKnownClientError(err);
+        if (translated) {
+            err = translated;
+        }
+
+        // Database-batcher load-shed (circuit open, queue overflow, or no
+        // connection available): the persistence layer is temporarily
+        // degraded, not a programming bug. Surface as 503 so clients back
+        // off and retry instead of treating it as a hard failure.
+        if ((err as { code?: string } | null)?.code === 'dbBatchFailed') {
+            res.setHeader('Retry-After', 5);
+            err = new HttpError(503, 'Service temporarily unavailable', {
+                code: 'db_unavailable',
+            });
+        }
+
+        const httpErr = isHttpError(err) ? err : undefined;
+        opts.onError?.(err, req);
+        if (!httpErr) onUnhandled(err, req);
+
+        // A route declaring `errorRenderer` (the Anthropic/OpenAI-compatible
+        // wire surface) wants every error — including gate failures this
+        // middleware never threw itself — in its vendor's envelope instead
+        // of the default Puter shape.
+        const renderer = res.locals?.errorRenderer;
+        const rendered = renderer?.(err, req);
+        if (rendered) {
+            for (const [name, value] of Object.entries(
+                rendered.headers ?? {},
+            )) {
+                res.setHeader(name, value);
+            }
+            res.status(rendered.status).json(rendered.body);
+            return;
+        }
+
+        if (httpErr) {
+            if (httpErr.statusCode === 402 || httpErr.statusCode === 413) {
+                res.setHeader('X-Needs-Upgrade', true); // Instruct clients to retry after 1 hour for payment/storage limit issues
+            }
+            res.status(httpErr.statusCode).json(serializeHttpError(httpErr));
+            return;
+        }
+
+        // Anything else is treated as an unexpected 500. We never serialize
+        // it back to the client to avoid leaking stack traces, internal
+        // error messages, etc.
+        res.status(500).json({
+            error: 'Internal Server Error',
+            message: 'Internal Server Error',
+            code: 'internal_error',
+        });
+    };
+};
+
+/**
+ * Recognise framework-level errors that are caused by the client and re-shape
+ * them as `HttpError`s with `client_*` legacy codes so the alarm gate
+ * (server.ts) treats them as user-caused 4xx and does not page on them.
+ *
+ * Sources covered:
+ *
+ * - `URIError` from `decodeURIComponent` in the express router (raised by
+ *   path-traversal scanners hitting `%c0%ae` etc.)
+ * - Body-parser `entity.parse.failed` (malformed JSON in request body)
+ * - Body-parser `request.aborted` / `ECONNABORTED` (client closed socket
+ *   mid-upload)
+ * - Anything else that already opted into `expose: true` with a numeric
+ *   `statusCode` is mapped to `client_bad_request` so it surfaces with the
+ *   declared status instead of becoming a 500.
+ */
+const translateKnownClientError = (err: unknown): HttpError | null => {
+    if (err instanceof URIError) {
+        return new HttpError(400, 'Bad request URL', {
+            legacyCode: 'client_bad_url',
+        });
+    }
+
+    if (!err || typeof err !== 'object') return null;
+    const e = err as {
+        type?: string;
+        code?: string;
+        statusCode?: number;
+        status?: number;
+        expose?: boolean;
+        message?: string;
+    };
+
+    if (e.type === 'request.aborted' || e.code === 'ECONNABORTED') {
+        return new HttpError(400, 'Request aborted', {
+            legacyCode: 'client_aborted',
+        });
+    }
+
+    if (e.type === 'entity.parse.failed') {
+        return new HttpError(400, 'Malformed JSON in request body', {
+            legacyCode: 'client_bad_json',
+        });
+    }
+
+    // Generic body-parser / http-errors convention: anything tagged
+    // `expose: true` with a real 4xx statusCode is by definition meant
+    // to be returned to the client, not paged on. Honour the declared
+    // status; tag with a known code so the alarm gate skips it.
+    const declaredStatus = e.statusCode ?? e.status;
+    if (
+        e.expose === true &&
+        typeof declaredStatus === 'number' &&
+        declaredStatus >= 400 &&
+        declaredStatus < 500
+    ) {
+        return new HttpError(declaredStatus, e.message ?? 'Bad request', {
+            legacyCode: 'client_bad_request',
+        });
+    }
+
+    return null;
+};
+
+const serializeHttpError = (err: HttpError): Record<string, unknown> => {
+    const payload: Record<string, unknown> = {
+        error: err.message,
+        message: err.message,
+    };
+
+    // `code` slot precedence: legacyCode wins for back-compat. If both are
+    // set, the modern code goes to `errorCode` so clients that key on either
+    // field find what they expect.
+    if (err.legacyCode) {
+        payload.code = err.legacyCode;
+        if (err.code) payload.errorCode = err.code;
+    } else if (err.code) {
+        payload.code = err.code;
+    }
+
+    if (err.fields) {
+        for (const [k, v] of Object.entries(err.fields)) {
+            // Don't let `fields` clobber the canonical slots.
+            if (
+                k === 'error' ||
+                k === 'message' ||
+                k === 'code' ||
+                k === 'errorCode'
+            )
+                continue;
+            payload[k] = v;
+        }
+    }
+
+    return payload;
+};

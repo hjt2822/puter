@@ -1,0 +1,5543 @@
+/*
+ * Copyright (C) 2024-present Puter Technologies Inc.
+ *
+ * This file is part of Puter.
+ *
+ * Puter is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published
+ * by the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+import { createHash } from 'node:crypto';
+import { posix as pathPosix } from 'node:path';
+import type { TransformCallback } from 'node:stream';
+import { pipeline, Readable, Transform } from 'node:stream';
+import { v4 as uuidv4 } from 'uuid';
+import type { EventKey, EventMap } from '../../clients/event/types.js';
+import {
+    BinaryPayload,
+    CompleteWriteRequest,
+    CompleteWriteResponse,
+    SignedWriteRequest,
+    SignedWriteResponse,
+    SignMultipartPartsRequest,
+    SignMultipartPartsResponse,
+    UploadMode,
+    WriteRequest,
+    WriteResponse,
+} from '../../controllers/fs/requestTypes.js';
+import {
+    Actor,
+    handlerDepthOf,
+    isAccountContext,
+    isAppActor,
+    isPlainUserActor,
+} from '../../core/actor.js';
+import { Context } from '../../core/context.js';
+import { HttpError } from '../../core/http/HttpError.js';
+import {
+    AncestorChain,
+    FSEntry,
+    FSEntryCreateInput,
+    FSEntryWriteInput,
+    hasNoBackingS3Object,
+    PendingUploadCreateInput,
+    PendingUploadSession,
+} from '../../stores/fs/FSEntry.js';
+import {
+    clampSignedUploadExpirySeconds,
+    isIncompleteBodyError,
+    isMissingObjectError,
+} from '../../stores/fs/S3ObjectStore.js';
+import { toUploadReservationBytes } from '../../stores/fs/UploadReservationStore.js';
+import type {
+    MultipartCompletePart,
+    ServerUploadInput,
+    SignedUploadResult,
+} from '../../stores/fs/s3Types.js';
+import type { FSEntryStore } from '../../stores/fs/FSEntryStore.js';
+import type { puterStores } from '../../stores/index.js';
+import type { LayerInstances } from '../../types.js';
+import {
+    awaitLater,
+    runWithConcurrencyLimitSettled,
+} from '../../util/concurrency.js';
+import { isUniqueViolation } from '../../util/dbError.js';
+import { AclMode } from '../acl/ACLService.js';
+import type { puterServices } from '../index.js';
+import {
+    APP_DATA_FS_MODE_CLASSES,
+    appDataOwnerOf,
+    appDataPermission,
+    appDataSharingAllowed,
+    carriesClosedAppData,
+    closedAppDataOwners,
+} from '../permission/appDataScopes.js';
+import { MANAGE_PERM_PREFIX } from '../permission/consts.js';
+import { PermissionUtil } from '../permission/permissionUtil.js';
+import { PuterService } from '../types.js';
+import {
+    isOwnersTrash,
+    isTildePath,
+    normalizeAbsolutePath,
+} from './resolveNode.js';
+import type {
+    BatchWritePrepareRequest,
+    NormalizedWriteInput,
+    PreparedBatchWrite,
+    UploadedBatchWriteItem,
+    UploadPayload,
+    UploadPreparedBatchItemInput,
+    UploadProgressTrackerLike,
+} from './types.js';
+
+const DEFAULT_CONTENT_TYPE = 'application/octet-stream';
+const DEFAULT_SIGNED_UPLOAD_EXPIRY_SECONDS = 60 * 15;
+/** Events-API dispatches one batch of changes runs at once. */
+const EVENT_DISPATCH_CONCURRENCY = 8;
+/** Inserts and S3 copies one page of a copy runs at once. */
+const COPY_CONCURRENCY = 8;
+
+/**
+ * Storage-allowance sentinel meaning "don't enforce a quota on this write".
+ *
+ * Also what an unmetered installation reports as its allowance max. Pass it as
+ * the `storageAllowanceMax` argument for writes the system performs on a user's
+ * behalf — small, bounded artifacts a full account must not be able to block.
+ * It is a server-side argument only: never derive it from request input, or a
+ * caller could opt itself out of its own quota.
+ */
+export const UNLIMITED_STORAGE_ALLOWANCE = Number.MAX_SAFE_INTEGER;
+
+// Held past a lease's signed-URL expiry so a client finishing right at the
+// deadline still settles or aborts before the lease would otherwise lapse.
+const UPLOAD_RESERVATION_GRACE_MS = 5 * 60_000;
+// How long a completed lease still counts as pending after settling, so a
+// replica that hasn't caught up to the commit doesn't undercount usage.
+const UPLOAD_RESERVATION_SETTLE_MS = 60_000;
+/** Signed uploads one storage owner may have outstanding at once. */
+export const MAX_PENDING_UPLOADS_PER_OWNER = 10_000;
+
+const RESERVED_METADATA_KEYS: readonly string[] = ['objectKey'];
+
+/**
+ * Trash bookkeeping: `original_path`/`original_name` steer where a later
+ * restore lands. Only `move`'s own trash step may set them — never a write.
+ */
+const CLIENT_TRASH_METADATA_KEYS: readonly string[] = [
+    'original_path',
+    'original_name',
+    'trashed_ts',
+];
+
+/**
+ * The app whose `AppData` subtree `path` sits in, when that app is not
+ * `ownAppUid` — i.e. the target of a cross-app access. Null for anything else.
+ */
+const foreignAppDataOwner = (
+    path: string,
+    username: string,
+    ownAppUid: string,
+): string | null => {
+    if (path.split('/')[1] !== username) return null;
+    const appUid = appDataOwnerOf(path);
+    if (!appUid || appUid === ownAppUid) return null;
+    return appUid;
+};
+
+/** `name` under `parentPath` as stored: no trimming or normalizing. */
+const childPath = (parentPath: string, name: string): string =>
+    parentPath === '/' ? `/${name}` : `${parentPath}/${name}`;
+
+/** `/<username>/AppData/<appUid>`: the directory an app's launch provisions. */
+const isAppDataRootPath = (path: string): boolean => {
+    const segments = path.split('/');
+    // ASCII-case match only, same as MySQL's ci collation on this column.
+    return (
+        segments.length === 4 &&
+        segments[2]?.toLowerCase() === 'appdata' &&
+        segments[3] !== ''
+    );
+};
+
+const isNoSuchKeyError = (err: unknown): boolean => {
+    if (!err || typeof err !== 'object') return false;
+    const e = err as { name?: unknown; Code?: unknown };
+    return e.name === 'NoSuchKey' || e.Code === 'NoSuchKey';
+};
+
+/** Also recorded as the failure reason on a session refused for it. */
+const UPLOAD_NOT_RECEIVED = 'Upload content was not received';
+const uploadNotReceivedError = (): HttpError =>
+    new HttpError(400, UPLOAD_NOT_RECEIVED, { legacyCode: 'bad_request' });
+
+/** A session refused for a missing object keeps giving that answer. */
+const assertSessionCompletable = (session: PendingUploadSession): void => {
+    if (session.status === 'pending') return;
+    if (
+        session.status === 'failed' &&
+        session.failureReason === UPLOAD_NOT_RECEIVED
+    ) {
+        throw uploadNotReceivedError();
+    }
+    throw new HttpError(
+        409,
+        `Upload session is not pending (status=${session.status})`,
+        { legacyCode: 'conflict' },
+    );
+};
+
+/**
+ * Active/settled bytes an owner has pending in signed uploads not yet
+ * committed.
+ */
+type PendingUploadBytes = { activeBytes: number; settledBytes: number };
+
+/** Whose allowance a copy draws on, and the override it is judged against. */
+type CopyAllowance = { ownerId: number; max: number | undefined };
+
+/**
+ * A storage lease taken for one signed-upload session, ready to release or
+ * settle.
+ */
+type HeldUploadReservation = {
+    ownerId: number;
+    sessionId: string;
+    bytes: number;
+};
+
+/** Minimal shape `#probeBatchUploads` needs from a batch completion item. */
+type BatchCompletionProbeItem = {
+    session: PendingUploadSession;
+    finalData: FSEntryCreateInput;
+};
+
+type UploadReservationClaim = {
+    sessionId: string;
+    path: string;
+    incomingSize: number;
+    existingSize: number;
+    expiresInSeconds: number;
+};
+
+/**
+ * A session's reservation, or null for one with nothing to release (unmetered
+ * owner, or predates lease tracking).
+ */
+const heldFromSession = (
+    session: PendingUploadSession,
+): HeldUploadReservation | null => {
+    if (
+        typeof session.reservationOwnerId !== 'number' ||
+        typeof session.reservedBytes !== 'number'
+    ) {
+        return null;
+    }
+    return {
+        ownerId: session.reservationOwnerId,
+        sessionId: session.sessionId,
+        bytes: session.reservedBytes,
+    };
+};
+
+/** One entry a copy makes: `source` copied into `parent` as `name`. */
+type CopyItem = { source: FSEntry; parent: FSEntry; name: string };
+
+interface WriteTargetResolutionInput {
+    index: number;
+    normalizedInput: NormalizedWriteInput;
+}
+
+interface WriteTargetResolutionResult {
+    index: number;
+    normalizedInput: NormalizedWriteInput;
+    existingEntry: FSEntry | null;
+    wasOverwrite: boolean;
+}
+
+interface SignedMultipartCleanupTarget {
+    bucket: string;
+    bucketRegion: string;
+    objectKey: string;
+    signedUploadResult: SignedUploadResult;
+}
+
+interface StartSignedWriteResult {
+    response: SignedWriteResponse;
+    createdDirectoryEntries: FSEntry[];
+}
+
+interface BatchStartSignedWriteResult {
+    responses: SignedWriteResponse[];
+    createdDirectoryEntries: FSEntry[];
+}
+
+export class FSService extends PuterService {
+    /** Overridable so tests can reach the cap without filling it. */
+    static MAX_PENDING_UPLOADS_PER_OWNER = MAX_PENDING_UPLOADS_PER_OWNER;
+    /**
+     * Rows a subtree walk (delete, copy) reads and handles at a time.
+     * Overridable so tests can cross a page boundary.
+     */
+    static SUBTREE_PAGE_SIZE = 1000;
+    /**
+     * Directories one query of a subtree walk reads children for. Kept under
+     * MySQL's `eq_range_index_dive_limit` (200), past which the planner sizes
+     * the IN list from index statistics and may sort all of its children.
+     * Overridable so tests can split a page of directories.
+     */
+    static SUBTREE_WALK_PARENTS = 100;
+
+    declare protected stores: LayerInstances<typeof puterStores>;
+    declare protected services: LayerInstances<typeof puterServices>;
+
+    override onServerStart(): void {
+        this.#registerPermissionRules();
+    }
+
+    /**
+     * FS-domain permission rules. App/site/user registrations live in their own
+     * services (AppPermissionService, SubdomainPermissionService, AuthService).
+     * Splitting by domain keeps the dependency surface narrow: each service
+     * only pulls the stores it actually needs.
+     *
+     * The path rewriter relies on `FSEntryStore.getEntryByPath`'s Redis cache
+     * (60s TTL), which the store invalidates, in every region, on each
+     * rename/move/delete.
+     */
+    #registerPermissionRules(): void {
+        const permissions = this.services.permission;
+        const fsEntryStore = this.stores.fsEntry;
+
+        // -- fs:/path:mode → fs:<uuid>:mode -----------------------------
+        // Clients (puter.perms, requestPermission) emit path-based strings;
+        // stored as-is they'd never match anything, so resolve to uuid up
+        // front.
+        permissions.registerRewriter({
+            id: 'fs-path-to-uid',
+            matches: (permission: string) => {
+                if (
+                    !permission.startsWith('fs:') &&
+                    !permission.startsWith(`${MANAGE_PERM_PREFIX}:fs:`)
+                )
+                    return false;
+                // Parse on component boundaries: a path can contain `fs:` (e.g. a home dir named `…fs`), which a raw split mistakes for the mode delimiter.
+                const parts = PermissionUtil.split(permission);
+                const fsIndex = parts[0] === MANAGE_PERM_PREFIX ? 1 : 0;
+                const specifier = parts[fsIndex + 1];
+                return Boolean(specifier && specifier.startsWith('/'));
+            },
+            rewrite: async (permission: string): Promise<string> => {
+                const parts = PermissionUtil.split(permission);
+                const hasManage = parts[0] === MANAGE_PERM_PREFIX;
+                const fsIndex = hasManage ? 1 : 0;
+                const path = parts[fsIndex + 1];
+                const rest = parts.slice(fsIndex + 2);
+                if (!path) return permission;
+                const entry = await fsEntryStore.getEntryByPath(path);
+                if (!entry) {
+                    throw new HttpError(404, `Entry not found: path=${path}`, {
+                        legacyCode: 'subject_does_not_exist',
+                    });
+                }
+                const joined = PermissionUtil.join('fs', entry.uuid, ...rest);
+                return hasManage ? `${MANAGE_PERM_PREFIX}:${joined}` : joined;
+            },
+        });
+
+        // -- is-owner --------------------------------------------------
+        // For user actors, `fs:<uuid>:*` resolves iff the actor owns the
+        // underlying entry. Without this, `check(user, fs:UUID:*)` can't
+        // find a terminal and the `has_terminal` probe that #scanUserApp
+        // does on the issuer-recurse comes back false, which kills
+        // downstream app-under-user checks on user-owned files.
+        permissions.registerImplicator({
+            id: 'is-owner',
+            shortcut: true,
+            matches: (permission: string): boolean => {
+                return (
+                    permission.startsWith('fs:') ||
+                    permission.startsWith(`${MANAGE_PERM_PREFIX}:fs:`) ||
+                    permission.startsWith(
+                        `${MANAGE_PERM_PREFIX}:${MANAGE_PERM_PREFIX}:fs:`,
+                    )
+                );
+            },
+            check: async ({ actor, permission }): Promise<unknown> => {
+                if (!isPlainUserActor(actor)) return undefined;
+                if (!actor.user?.id) return undefined;
+
+                const stripped = PermissionUtil.stripManageArms(permission);
+                const parts = PermissionUtil.split(stripped);
+                const uid = parts[1];
+                if (!uid) return undefined;
+
+                const entry = await fsEntryStore.getEntryByUuid(uid);
+                if (!entry) return undefined;
+                if (entry.userId === actor.user.id) return {};
+                return undefined;
+            },
+        });
+
+        // -- manage-inherits-from-ancestor -----------------------------
+        // `manage` on a directory covers what is inside it, the way `fs:*`
+        // access already reaches descendants through the ancestor chain.
+        // Without this the two are asymmetric: someone trusted to manage a
+        // shared folder can re-share the folder itself but nothing in it, and
+        // cannot even see who has access to a file within it.
+        //
+        // The whole chain is answered in one pass: split the path into its
+        // ancestors, then look the corresponding grants up in bulk. Recursing a
+        // level at a time would re-enter the permission scan once per level.
+        const permissionStore = this.stores.permission;
+        permissions.registerImplicator({
+            id: 'manage-inherits-from-ancestor',
+            shortcut: true,
+            matches: (permission: string): boolean =>
+                permission.startsWith(`${MANAGE_PERM_PREFIX}:fs:`),
+            check: async ({ actor, permission }): Promise<unknown> => {
+                // Apps are bounded by their user through a separate path;
+                // widening them here would let one outrun that bound.
+                if (!isPlainUserActor(actor)) return undefined;
+                if (!actor.user?.id) return undefined;
+
+                const stripped = PermissionUtil.stripManageArms(permission);
+                const uid = PermissionUtil.split(stripped)[1];
+                if (!uid) return undefined;
+
+                const entry = await fsEntryStore.getEntryByUuid(uid);
+                // Owning the entry is `is-owner`'s answer to give, and it runs
+                // first — there is nothing to inherit on your own tree.
+                if (!entry || entry.userId === actor.user.id) return undefined;
+
+                const ancestors = (
+                    await fsEntryStore.getAncestorChain(entry.path)
+                ).slice(1);
+                if (ancestors.length === 0) return undefined;
+                const wanted = ancestors.map((ancestor) =>
+                    PermissionUtil.join(MANAGE_PERM_PREFIX, 'fs', ancestor.uid),
+                );
+
+                // Read the stores rather than re-entering `scan`, which would
+                // cost one recursive scan per ancestor. A `manage:fs:*` grant
+                // reaches a user three ways — issued to them, group-issued, or
+                // sitting in the flat view — and each store answers the whole
+                // list at once.
+                const [linked, group, flat] = await Promise.all([
+                    permissionStore.readLinkedUserUserPerms(
+                        actor.user.id,
+                        wanted,
+                    ),
+                    permissionStore.readUserGroupPerms(actor.user.id, wanted),
+                    permissionStore.getFlatUserPerms(actor.user.id, wanted),
+                ]);
+                const held =
+                    linked.length > 0 ||
+                    group.length > 0 ||
+                    flat.some((value) => value && !value.deleted);
+                return held ? {} : undefined;
+            },
+        });
+
+        // -- app-owns-appdata -----------------------------------------
+        // Mirror of the ACLService short-circuit at ACLService.check:
+        // an app-under-user actor implicitly holds fs:<uuid>:* on any
+        // entry inside its own /<username>/AppData/<appUid> subtree.
+        // ACL paths (fs.read etc.) already accept these via that
+        // short-circuit, but permissionService.checkMany — used by
+        // createAccessToken's issuer-subset gate — bypasses ACL, so
+        // without this implicator an app can fs.read its appdata but
+        // can't mint a token for the same fs:<uuid>:read it just read.
+        permissions.registerImplicator({
+            id: 'app-owns-appdata',
+            shortcut: true,
+            matches: (permission: string): boolean => {
+                return (
+                    permission.startsWith('fs:') ||
+                    permission.startsWith(`${MANAGE_PERM_PREFIX}:fs:`) ||
+                    permission.startsWith(
+                        `${MANAGE_PERM_PREFIX}:${MANAGE_PERM_PREFIX}:fs:`,
+                    )
+                );
+            },
+            check: async ({ actor, permission }): Promise<unknown> => {
+                if (!isAppActor(actor)) return undefined;
+                const username = actor.user?.username;
+                const appUid = actor.effectiveApp!.uid;
+                if (!username || !appUid) return undefined;
+
+                const stripped = permission.replaceAll(
+                    `${MANAGE_PERM_PREFIX}:`,
+                    '',
+                );
+                const uid = PermissionUtil.split(stripped)[1];
+                if (!uid) return undefined;
+
+                const entry = await fsEntryStore.getEntryByUuid(uid);
+                if (!entry) return undefined;
+
+                const root = `/${username}/AppData/${appUid}`;
+                if (entry.path === root || entry.path.startsWith(`${root}/`)) {
+                    return {};
+                }
+
+                // Another app's AppData, reachable once the user grants it.
+                // Same entry lookup, so this costs nothing extra.
+                const targetAppUid = foreignAppDataOwner(
+                    entry.path,
+                    username,
+                    appUid,
+                );
+                if (!targetAppUid) return undefined;
+                const mode = PermissionUtil.split(stripped)[2];
+                const cls =
+                    APP_DATA_FS_MODE_CLASSES[
+                        mode as keyof typeof APP_DATA_FS_MODE_CLASSES
+                    ];
+                if (!cls) return undefined;
+                const target = await this.stores.app.getByUid(targetAppUid);
+                if (!target || !appDataSharingAllowed(target)) return undefined;
+                const granted = await permissions.check(
+                    actor,
+                    appDataPermission(targetAppUid, 'fs', cls),
+                );
+                return granted ? {} : undefined;
+            },
+        });
+
+        // -- fs-access-levels exploder ----------------------------------
+        // `fs:UUID:see` implies `[list, read, write, manage:fs:UUID]`.
+        // ACLService.check already expands the same-family chain
+        // (see→list→read→write) via MODES_ABOVE, but the `manage:fs:UUID`
+        // arm only shows up here — without it, a grant of `fs:UUID:write`
+        // can't satisfy a direct `scan(actor, 'manage:fs:UUID')`.
+        const FS_MODE_RULES: Record<string, string[]> = {
+            see: ['list', 'read', 'write'],
+            list: ['read', 'write'],
+            read: ['write'],
+            // Widens to nothing, but still emits the manage arm.
+            write: [],
+        };
+        permissions.registerExploder({
+            id: 'fs-access-levels',
+            matches: (permission: string) => {
+                return (
+                    permission.startsWith('fs:') &&
+                    PermissionUtil.split(permission).length >= 3
+                );
+            },
+            explode: async ({ permission }) => {
+                const out = [permission];
+                const [fsPrefix, fileId, specifiedMode, ...rest] =
+                    PermissionUtil.split(permission);
+                const widerModes = FS_MODE_RULES[specifiedMode];
+                if (widerModes) {
+                    for (const mode of widerModes) {
+                        out.push(
+                            PermissionUtil.join(
+                                fsPrefix,
+                                fileId,
+                                mode,
+                                ...rest,
+                            ),
+                        );
+                    }
+                    out.push(
+                        PermissionUtil.join(
+                            MANAGE_PERM_PREFIX,
+                            fsPrefix,
+                            fileId,
+                        ),
+                    );
+                }
+                return out;
+            },
+        });
+    }
+
+    // Unlike the controllers, this layer refuses `~` rather than expanding it:
+    // the actor's username is a request-scoped fact the write path shouldn't
+    // reach for.
+    #normalizePath(path: string): string {
+        if (typeof path === 'string' && isTildePath(path.trim())) {
+            throw new HttpError(
+                400,
+                'Home path must be resolved before write',
+                { legacyCode: 'bad_request' },
+            );
+        }
+        return normalizeAbsolutePath(path);
+    }
+
+    #resolveBucket(): string {
+        const bucket = this.config.s3_bucket ?? 'puter-local';
+        if (typeof bucket !== 'string' || bucket.length === 0) {
+            throw new HttpError(500, 'Missing S3 bucket configuration', {
+                legacyCode: 'internal_error',
+            });
+        }
+        return bucket;
+    }
+
+    #resolveBucketRegion(): string {
+        const bucketRegion =
+            this.config.s3_region ?? this.config.region ?? 'us-west-2';
+
+        if (typeof bucketRegion !== 'string' || bucketRegion.length === 0) {
+            throw new HttpError(500, 'Missing S3 region configuration', {
+                legacyCode: 'internal_error',
+            });
+        }
+
+        return bucketRegion;
+    }
+
+    /**
+     * Where a write's bytes should land. A home region this deployment knows
+     * about names its own bucket; anything else — an unmapped region, a
+     * single-node deployment, no hint at all — falls back to this server's own
+     * bucket, because placement is an optimisation and storing the bytes is
+     * not.
+     */
+    #resolvePlacement(homeRegion?: string): {
+        bucket: string;
+        bucketRegion: string;
+    } {
+        const place = homeRegion
+            ? this.config.servers?.[homeRegion]
+            : undefined;
+        if (homeRegion && !place) {
+            console.warn(
+                `[fs] no storage configured for region '${homeRegion}'; using this server's bucket`,
+            );
+        }
+        return (
+            place ?? {
+                bucket: this.#resolveBucket(),
+                bucketRegion: this.#resolveBucketRegion(),
+            }
+        );
+    }
+
+    #normalizeWriteInput(
+        userId: number,
+        metadata: FSEntryWriteInput,
+        homeRegion?: string,
+    ): NormalizedWriteInput {
+        const normalizedPath = this.#normalizePath(metadata.path);
+        if (normalizedPath === '/') {
+            throw new HttpError(400, 'Cannot write to root path', {
+                legacyCode: 'cannot_write_to_root',
+            });
+        }
+
+        const size = Number(metadata.size);
+        if (!Number.isFinite(size) || size < 0) {
+            throw new HttpError(400, 'Invalid file size', {
+                legacyCode: 'bad_request',
+            });
+        }
+
+        const metadataRecord = metadata as unknown as Record<string, unknown>;
+        const dedupeName = Boolean(
+            metadata.dedupeName ?? metadataRecord.dedupe_name,
+        );
+
+        return {
+            userId,
+            path: normalizedPath,
+            size,
+            contentType: metadata.contentType ?? DEFAULT_CONTENT_TYPE,
+            checksumSha256: metadata.checksumSha256,
+            metadata: this.#sanitizeClientMetadata(metadata.metadata),
+            thumbnail: metadata.thumbnail,
+            associatedAppId: metadata.associatedAppId,
+            overwrite: Boolean(metadata.overwrite),
+            dedupeName,
+            createMissingParents: Boolean(metadata.createMissingParents),
+            immutable: Boolean(metadata.immutable),
+            isPublic: metadata.isPublic,
+            multipartPartSize: metadata.multipartPartSize,
+            ...this.#resolvePlacement(homeRegion),
+        };
+    }
+
+    #sanitizeClientMetadata(
+        metadata: FSEntryWriteInput['metadata'],
+    ): FSEntryWriteInput['metadata'] {
+        if (metadata === null || metadata === undefined) {
+            return metadata;
+        }
+        if (typeof metadata === 'string') {
+            let parsed: unknown;
+            try {
+                parsed = JSON.parse(metadata);
+            } catch {
+                return metadata;
+            }
+            if (
+                !parsed ||
+                typeof parsed !== 'object' ||
+                Array.isArray(parsed)
+            ) {
+                return metadata;
+            }
+            return JSON.stringify(
+                this.#sanitizeClientMetadataRecord(
+                    parsed as Record<string, unknown>,
+                ),
+            );
+        }
+        if (typeof metadata === 'object' && !Array.isArray(metadata)) {
+            return this.#sanitizeClientMetadataRecord(
+                metadata as Record<string, unknown>,
+            );
+        }
+        return metadata;
+    }
+
+    // Narrows the type for `createNonFileEntry`, which only takes a string.
+    #sanitizeStoredMetadata(metadata: string | null): string | null {
+        return this.#sanitizeClientMetadata(metadata) as string | null;
+    }
+
+    // Nothing legitimate sets trash keys through a write — the GUI only ever
+    // sends them via move's `new_metadata` — so drop them for every caller
+    // with an actor; only a no-actor internal call is trusted to carry them.
+    #sanitizeClientMetadataRecord(
+        record: Record<string, unknown>,
+    ): Record<string, unknown> {
+        const cleaned = this.#stripReservedMetadataKeys(record);
+        const actor = Context.get('actor') as Actor | undefined;
+        if (!actor) return cleaned;
+        for (const key of CLIENT_TRASH_METADATA_KEYS) {
+            delete cleaned[key];
+        }
+        return cleaned;
+    }
+
+    #stripReservedMetadataKeys(
+        record: Record<string, unknown>,
+    ): Record<string, unknown> {
+        const cleaned: Record<string, unknown> = { ...record };
+        for (const key of RESERVED_METADATA_KEYS) {
+            delete cleaned[key];
+        }
+        return cleaned;
+    }
+
+    async #findDedupedPath(
+        targetPath: string,
+        isReserved: (path: string) => boolean,
+        loadExistingEntry: (path: string) => Promise<FSEntry | null>,
+    ): Promise<string> {
+        const parentPath = pathPosix.dirname(targetPath);
+        const extension = pathPosix.extname(targetPath);
+        const fileName = pathPosix.basename(targetPath, extension);
+
+        for (let suffix = 1; suffix < 100_000; suffix++) {
+            const dedupedPath = pathPosix.join(
+                parentPath,
+                `${fileName} (${suffix})${extension}`,
+            );
+            if (isReserved(dedupedPath)) {
+                continue;
+            }
+            const existingEntry = await loadExistingEntry(dedupedPath);
+            if (!existingEntry) {
+                return dedupedPath;
+            }
+        }
+
+        throw new HttpError(409, 'Unable to resolve deduped file path', {
+            legacyCode: 'conflict',
+        });
+    }
+
+    /**
+     * `pendingDirectoryPaths` are directories the caller will create before
+     * these files land; a target collides with them as with an existing one.
+     */
+    async #resolveWriteTargets(
+        userId: number,
+        inputs: WriteTargetResolutionInput[],
+        pendingDirectoryPaths: ReadonlySet<string> = new Set(),
+    ): Promise<WriteTargetResolutionResult[]> {
+        const reservedPaths = new Set<string>();
+        const existingEntryCache = new Map<string, Promise<FSEntry | null>>();
+        const initialPaths = Array.from(
+            new Set(inputs.map((input) => input.normalizedInput.path)),
+        );
+        const initialEntries =
+            await this.stores.fsEntry.getEntriesByPathsForUser(
+                userId,
+                initialPaths,
+                {
+                    useTryHardRead: true,
+                    skipCache: true,
+                    // ACL has already gated the write — collision detection
+                    // must see entries in shared folders the writer was
+                    // granted access to, even when those live outside the
+                    // writer's own namespace.
+                    crossNamespace: true,
+                },
+            );
+        for (let index = 0; index < initialPaths.length; index++) {
+            const path = initialPaths[index];
+            if (!path) {
+                continue;
+            }
+            existingEntryCache.set(
+                path,
+                Promise.resolve(initialEntries[index] ?? null),
+            );
+        }
+
+        const loadExistingEntry = async (
+            path: string,
+        ): Promise<FSEntry | null> => {
+            const cachedPromise = existingEntryCache.get(path);
+            if (cachedPromise) {
+                return await cachedPromise;
+            }
+
+            const readPromise = this.stores.fsEntry.getEntryByPath(path, {
+                useTryHardRead: true,
+                skipCache: true,
+            });
+            existingEntryCache.set(path, readPromise);
+            return await readPromise;
+        };
+
+        const results: WriteTargetResolutionResult[] = [];
+        for (const input of inputs) {
+            let normalizedInput = input.normalizedInput;
+            let existingEntry = await loadExistingEntry(normalizedInput.path);
+            const pathReservedInBatch = reservedPaths.has(normalizedInput.path);
+            let pendingDirectory =
+                !existingEntry &&
+                pendingDirectoryPaths.has(normalizedInput.path);
+
+            if (pathReservedInBatch || existingEntry || pendingDirectory) {
+                if (normalizedInput.overwrite) {
+                    if (pathReservedInBatch) {
+                        throw new HttpError(
+                            409,
+                            `Batch contains duplicate target path: ${pathPosix.basename(normalizedInput.path)}`,
+                            { legacyCode: 'conflict' },
+                        );
+                    }
+                } else if (normalizedInput.dedupeName) {
+                    const dedupedPath = await this.#findDedupedPath(
+                        normalizedInput.path,
+                        (path) =>
+                            reservedPaths.has(path) ||
+                            pendingDirectoryPaths.has(path),
+                        loadExistingEntry,
+                    );
+                    normalizedInput = {
+                        ...normalizedInput,
+                        path: dedupedPath,
+                    };
+                    existingEntry = await loadExistingEntry(dedupedPath);
+                    pendingDirectory = false;
+                } else if (pathReservedInBatch) {
+                    throw new HttpError(
+                        409,
+                        `Batch contains duplicate target path: ${pathPosix.basename(normalizedInput.path)}`,
+                        { legacyCode: 'conflict' },
+                    );
+                }
+            }
+
+            if (pendingDirectory || existingEntry?.isDir) {
+                throw new HttpError(
+                    409,
+                    'Cannot overwrite an existing directory',
+                    { legacyCode: 'cannot_overwrite_a_directory' },
+                );
+            }
+            if (existingEntry && !normalizedInput.overwrite) {
+                // v1 wire contract: clients (the GUI's save dialogs among
+                // them) key on `item_with_same_name_exists` + `entry_name`
+                // to offer an overwrite prompt.
+                throw new HttpError(
+                    409,
+                    'A file already exists at this path and overwrite was not requested',
+                    {
+                        legacyCode: 'item_with_same_name_exists',
+                        fields: {
+                            entry_name: pathPosix.basename(
+                                normalizedInput.path,
+                            ),
+                        },
+                    },
+                );
+            }
+
+            // An overwrite reuses the entry's uuid as the object key, so the
+            // bytes must land in the bucket the entry already lives in —
+            // resolved the same way reads resolve it. Uploading to this
+            // server's bucket instead would repoint the row and strand the
+            // old object in the old bucket: a storage leak, and the replaced
+            // content survives there unreferenced.
+            if (existingEntry?.bucket) {
+                normalizedInput = {
+                    ...normalizedInput,
+                    bucket: this.stores.s3Object.resolveBucket(
+                        existingEntry.bucket,
+                    ),
+                    bucketRegion: this.stores.s3Object.resolveRegion(
+                        existingEntry.bucketRegion,
+                    ),
+                };
+            }
+
+            reservedPaths.add(normalizedInput.path);
+            results.push({
+                index: input.index,
+                normalizedInput,
+                existingEntry,
+                wasOverwrite: Boolean(existingEntry),
+            });
+        }
+
+        return results;
+    }
+
+    #toCreateInput(
+        normalizedInput: NormalizedWriteInput,
+        objectKey: string,
+    ): FSEntryCreateInput {
+        return {
+            userId: normalizedInput.userId,
+            uuid: objectKey,
+            path: normalizedInput.path,
+            size: normalizedInput.size,
+            contentType: normalizedInput.contentType,
+            checksumSha256: normalizedInput.checksumSha256,
+            metadata: normalizedInput.metadata,
+            thumbnail: normalizedInput.thumbnail,
+            associatedAppId: normalizedInput.associatedAppId,
+            overwrite: normalizedInput.overwrite,
+            createMissingParents: normalizedInput.createMissingParents,
+            immutable: normalizedInput.immutable,
+            isPublic: normalizedInput.isPublic,
+            multipartPartSize: normalizedInput.multipartPartSize,
+            bucket: normalizedInput.bucket,
+            bucketRegion: normalizedInput.bucketRegion,
+        };
+    }
+
+    #determineUploadMode(
+        requestUploadMode: UploadMode | 'auto' | undefined,
+        size: number,
+    ): UploadMode {
+        const maxSingleUploadSize =
+            this.stores.s3Object.getMaxSingleUploadSize();
+        // An empty object has no part to carry it, so a multipart request
+        // here can only be an attempt at a part URL bound to no bytes.
+        if (size <= 0) {
+            return 'single';
+        }
+        if (requestUploadMode === 'multipart') {
+            return 'multipart';
+        }
+        if (requestUploadMode === 'single') {
+            return size > maxSingleUploadSize ? 'multipart' : 'single';
+        }
+        return size > maxSingleUploadSize ? 'multipart' : 'single';
+    }
+
+    #resolveStorageMax(
+        allowanceMax: number,
+        storageAllowanceMaxOverride?: number,
+    ): number {
+        if (allowanceMax === UNLIMITED_STORAGE_ALLOWANCE) {
+            return allowanceMax;
+        }
+        if (storageAllowanceMaxOverride === undefined) {
+            return allowanceMax;
+        }
+        if (
+            !Number.isFinite(storageAllowanceMaxOverride) ||
+            storageAllowanceMaxOverride < 0
+        ) {
+            return allowanceMax;
+        }
+        return Math.max(allowanceMax, storageAllowanceMaxOverride);
+    }
+
+    /**
+     * The allowance override to apply when charging `owner` for a write the
+     * acting user performs. The controller reads the override off the ACTING
+     * user's row, so it may only widen that same user's cap — a write into a
+     * tree someone else owns is judged against the owner's own allowance, or a
+     * recipient on a large plan could fill an owner's account past its limit.
+     * The unlimited sentinel passes through: it is server-authored (never
+     * derived from a user row) and means "don't meter this write".
+     */
+    #allowanceOverrideFor(
+        owner: number,
+        actingUserId: number,
+        override?: number,
+    ): number | undefined {
+        if (override === UNLIMITED_STORAGE_ALLOWANCE) return override;
+        return owner === actingUserId ? override : undefined;
+    }
+
+    /**
+     * Whose allowance a write to `path` draws on — the owner of the tree it
+     * lands in, which is not the writer when the folder was shared with them.
+     */
+    async #storageOwnerOf(path: string, actingUserId: number): Promise<number> {
+        const owners = await this.#storageOwnersOf([path], actingUserId);
+        return owners.get(path) ?? actingUserId;
+    }
+
+    /**
+     * As above, for a batch. Every item under one home resolves to the same
+     * owner, so the distinct homes are read in a single query rather than one
+     * lookup per item.
+     */
+    async #storageOwnersOf(
+        paths: string[],
+        actingUserId: number,
+    ): Promise<Map<string, number>> {
+        const homeOf = new Map<string, string>();
+        for (const path of paths) {
+            homeOf.set(
+                path,
+                `/${this.#normalizePath(path).split('/')[1] ?? ''}`,
+            );
+        }
+        const homes = [...new Set(homeOf.values())].filter(
+            (home) => home !== '/',
+        );
+        const entries = await this.stores.fsEntry.getEntriesByPaths(homes);
+        return new Map(
+            paths.map((path) => [
+                path,
+                entries.get(homeOf.get(path) as string)?.userId ?? actingUserId,
+            ]),
+        );
+    }
+
+    /**
+     * The shared allowance check: usage plus pending bytes against the max,
+     * from a replica. Only settled bytes can make this stricter than a plain
+     * replica check, so only then is the primary consulted. Returns whether a
+     * limit was actually enforced and throws the existing 413 when `delta`
+     * doesn't fit.
+     */
+    async #checkStorageAllowance(
+        userId: number,
+        delta: number,
+        storageAllowanceMaxOverride?: number,
+        pending?: PendingUploadBytes,
+    ): Promise<boolean> {
+        // Skip the allowance lookup entirely for unmetered writes — it costs
+        // a query plus a quota-bonus round trip whose answer can't matter.
+        if (storageAllowanceMaxOverride === UNLIMITED_STORAGE_ALLOWANCE) {
+            return false;
+        }
+
+        const [fast, resolvedPending] = await Promise.all([
+            this.stores.fsEntry.getUserStorageAllowance(userId),
+            pending ?? this.stores.uploadReservation.outstanding(userId),
+        ]);
+        const fastMax = this.#resolveStorageMax(
+            fast.max,
+            storageAllowanceMaxOverride,
+        );
+        if (fastMax === UNLIMITED_STORAGE_ALLOWANCE) {
+            return false;
+        }
+
+        const { activeBytes, settledBytes } = resolvedPending;
+        const fastProjected = fast.curr + activeBytes + settledBytes + delta;
+        if (!(fastProjected > fastMax)) {
+            return true;
+        }
+        if (settledBytes === 0) {
+            throw new HttpError(413, 'Storage limit reached', {
+                legacyCode: 'storage_limit_reached',
+            });
+        }
+
+        const exact = await this.stores.fsEntry.getUserStorageAllowance(
+            userId,
+            { consistentRead: true },
+        );
+        const exactMax = this.#resolveStorageMax(
+            exact.max,
+            storageAllowanceMaxOverride,
+        );
+        if (exactMax === UNLIMITED_STORAGE_ALLOWANCE) {
+            return false;
+        }
+        if (!(exact.curr + activeBytes + delta > exactMax)) {
+            return true;
+        }
+
+        throw new HttpError(413, 'Storage limit reached', {
+            legacyCode: 'storage_limit_reached',
+        });
+    }
+
+    async #assertStorageAllowance(
+        userId: number,
+        incomingSize: number,
+        existingSize = 0,
+        storageAllowanceMaxOverride?: number,
+        pending?: PendingUploadBytes,
+    ): Promise<void> {
+        await this.#checkStorageAllowance(
+            userId,
+            incomingSize - existingSize,
+            storageAllowanceMaxOverride,
+            pending,
+        );
+    }
+
+    /**
+     * Same check for a batch's combined delta. Returns whether a limit was
+     * actually enforced.
+     */
+    async #assertStorageAllowanceForBatch(
+        userId: number,
+        sizeChanges: Array<{ incomingSize: number; existingSize: number }>,
+        storageAllowanceMaxOverride?: number,
+        pending?: PendingUploadBytes,
+    ): Promise<boolean> {
+        if (sizeChanges.length === 0) {
+            return false;
+        }
+
+        const delta = sizeChanges.reduce(
+            (total, sizeChange) =>
+                total - sizeChange.existingSize + sizeChange.incomingSize,
+            0,
+        );
+        return this.#checkStorageAllowance(
+            userId,
+            delta,
+            storageAllowanceMaxOverride,
+            pending,
+        );
+    }
+
+    /**
+     * Reserve storage for a batch of about-to-be-signed uploads, one owner at a
+     * time so each owner's leases serialize through its own cache key rather
+     * than racing on separate reads. Returns every lease actually taken, so the
+     * caller can settle or release them later; on any failure, everything taken
+     * so far is released before the error propagates.
+     */
+    async #reserveUploadStorage(
+        actingUserId: number,
+        claims: UploadReservationClaim[],
+        storageAllowanceMax?: number,
+    ): Promise<HeldUploadReservation[]> {
+        if (claims.length === 0) {
+            return [];
+        }
+
+        const owners = await this.#storageOwnersOf(
+            claims.map((claim) => claim.path),
+            actingUserId,
+        );
+        const claimsByOwner = new Map<number, UploadReservationClaim[]>();
+        for (const claim of claims) {
+            const owner = owners.get(claim.path) ?? actingUserId;
+            const ownerClaims = claimsByOwner.get(owner) ?? [];
+            ownerClaims.push(claim);
+            claimsByOwner.set(owner, ownerClaims);
+        }
+
+        const held: HeldUploadReservation[] = [];
+        try {
+            for (const [owner, ownerClaims] of claimsByOwner) {
+                const override = this.#allowanceOverrideFor(
+                    owner,
+                    actingUserId,
+                    storageAllowanceMax,
+                );
+                if (override === UNLIMITED_STORAGE_ALLOWANCE) {
+                    continue;
+                }
+
+                const now = Date.now();
+                const leases = ownerClaims.map((claim) => ({
+                    sessionId: claim.sessionId,
+                    bytes: toUploadReservationBytes(
+                        claim.incomingSize,
+                        claim.existingSize,
+                    ),
+                    deadline:
+                        now +
+                        clampSignedUploadExpirySeconds(claim.expiresInSeconds) *
+                            1000 +
+                        UPLOAD_RESERVATION_GRACE_MS,
+                }));
+
+                const taken = await this.stores.uploadReservation.take(
+                    owner,
+                    leases,
+                    FSService.MAX_PENDING_UPLOADS_PER_OWNER,
+                );
+                if (taken && !taken.added) {
+                    throw new HttpError(429, 'Too many uploads in progress', {
+                        legacyCode: 'too_many_requests',
+                    });
+                }
+
+                // `taken === null` means the cache couldn't be reached —
+                // nothing was actually leased, so there is nothing to hold or
+                // release, and pending is treated as zero for this owner.
+                const ownerHeld = taken
+                    ? leases.map((lease) => ({
+                          ownerId: owner,
+                          sessionId: lease.sessionId,
+                          bytes: lease.bytes,
+                      }))
+                    : [];
+                const heldFromIndex = held.length;
+                held.push(...ownerHeld);
+
+                const ownBytes = leases.reduce(
+                    (sum, lease) => sum + lease.bytes,
+                    0,
+                );
+                const pending: PendingUploadBytes = taken
+                    ? {
+                          activeBytes: Math.max(
+                              0,
+                              taken.activeBytes - ownBytes,
+                          ),
+                          settledBytes: taken.settledBytes,
+                      }
+                    : { activeBytes: 0, settledBytes: 0 };
+
+                const enforced = await this.#assertStorageAllowanceForBatch(
+                    owner,
+                    ownerClaims.map((claim) => ({
+                        incomingSize: claim.incomingSize,
+                        existingSize: claim.existingSize,
+                    })),
+                    override,
+                    pending,
+                );
+                if (!enforced && ownerHeld.length > 0) {
+                    // Nothing to guard for this owner — give the leases back
+                    // rather than holding bytes no check will ever read.
+                    await this.stores.uploadReservation.release(
+                        owner,
+                        ownerHeld,
+                    );
+                    held.splice(heldFromIndex, ownerHeld.length);
+                }
+            }
+        } catch (error) {
+            await this.#releaseUploadReservations(held);
+            throw error;
+        }
+
+        return held;
+    }
+
+    #groupReservationsByOwner(
+        items: HeldUploadReservation[],
+    ): Map<number, { sessionId: string; bytes: number }[]> {
+        const byOwner = new Map<
+            number,
+            { sessionId: string; bytes: number }[]
+        >();
+        for (const item of items) {
+            const list = byOwner.get(item.ownerId) ?? [];
+            list.push({ sessionId: item.sessionId, bytes: item.bytes });
+            byOwner.set(item.ownerId, list);
+        }
+        return byOwner;
+    }
+
+    async #releaseUploadReservations(
+        items: HeldUploadReservation[],
+    ): Promise<void> {
+        if (items.length === 0) return;
+        await Promise.all(
+            [...this.#groupReservationsByOwner(items)].map(([owner, list]) =>
+                this.stores.uploadReservation.release(owner, list),
+            ),
+        );
+    }
+
+    async #settleUploadReservations(
+        items: HeldUploadReservation[],
+    ): Promise<void> {
+        if (items.length === 0) return;
+        await Promise.all(
+            [...this.#groupReservationsByOwner(items)].map(([owner, list]) =>
+                this.stores.uploadReservation.settle(
+                    owner,
+                    list,
+                    UPLOAD_RESERVATION_SETTLE_MS,
+                ),
+            ),
+        );
+    }
+
+    async #releaseSessionUploadReservations(
+        sessions: PendingUploadSession[],
+    ): Promise<void> {
+        await this.#releaseUploadReservations(
+            sessions
+                .map(heldFromSession)
+                .filter((item): item is HeldUploadReservation => item !== null),
+        );
+    }
+
+    async #settleSessionUploadReservations(
+        sessions: PendingUploadSession[],
+    ): Promise<void> {
+        await this.#settleUploadReservations(
+            sessions
+                .map(heldFromSession)
+                .filter((item): item is HeldUploadReservation => item !== null),
+        );
+    }
+
+    // Bytes an entry accounts for in the owner's usage: a directory's own row
+    // has a null size, so its cost is the sum over its subtree.
+    async #entryStorageSize(entry: FSEntry): Promise<number> {
+        if (entry.isDir) {
+            return this.stores.fsEntry.getSubtreeSize(entry.userId, entry.path);
+        }
+        return entry.size ?? 0;
+    }
+
+    #toErrorMessage(error: unknown): string {
+        if (error instanceof Error) {
+            return error.message;
+        }
+        return 'Unknown error';
+    }
+
+    #toError(error: unknown, fallbackMessage: string): Error {
+        if (error instanceof Error) {
+            return error;
+        }
+        return new Error(fallbackMessage);
+    }
+
+    #toMultipartParts(
+        parts: CompleteWriteRequest['parts'],
+    ): MultipartCompletePart[] {
+        if (!parts || parts.length === 0) {
+            return [];
+        }
+        return parts.map((part) => ({
+            partNumber: Number(part.partNumber),
+            etag: part.etag,
+        }));
+    }
+
+    #parseSessionMetadata(session: PendingUploadSession): FSEntryCreateInput {
+        if (!session.metadataJson) {
+            throw new HttpError(500, 'Upload session metadata is missing', {
+                legacyCode: 'internal_error',
+            });
+        }
+
+        const parsedMetadata = JSON.parse(
+            session.metadataJson,
+        ) as FSEntryCreateInput;
+        return {
+            ...parsedMetadata,
+            userId: session.userId,
+            uuid: session.overwriteTargetUid ?? session.objectKey,
+            path: session.targetPath,
+            size: session.size,
+            contentType: session.contentType,
+            checksumSha256: session.checksumSha256 ?? undefined,
+            bucket:
+                session.bucket ??
+                parsedMetadata.bucket ??
+                this.#resolveBucket(),
+            bucketRegion:
+                session.bucketRegion ??
+                parsedMetadata.bucketRegion ??
+                this.#resolveBucketRegion(),
+            overwrite: Boolean(session.overwriteTargetUid),
+        };
+    }
+
+    #isBinaryPayload(value: unknown): value is BinaryPayload {
+        return Boolean(
+            value &&
+            typeof value === 'object' &&
+            'base64' in value &&
+            typeof (value as BinaryPayload).base64 === 'string',
+        );
+    }
+
+    #isNodeStream(value: unknown): value is Readable {
+        return Boolean(
+            value &&
+            typeof value === 'object' &&
+            typeof (value as Readable).pipe === 'function',
+        );
+    }
+
+    #isWebReadableStream(value: unknown): value is ReadableStream {
+        return Boolean(
+            value &&
+            typeof value === 'object' &&
+            typeof (value as ReadableStream).getReader === 'function',
+        );
+    }
+
+    #createCountingStream(
+        source: Readable,
+        uploadTracker?: UploadProgressTrackerLike,
+    ): {
+        stream: Readable;
+        uploadedSize: () => number;
+        contentHashSha256: () => string;
+    } {
+        let uploadedBytes = 0;
+        const hash = createHash('sha256');
+        const countingStream = new Transform({
+            transform(
+                chunk: unknown,
+                _encoding: string,
+                callback: TransformCallback,
+            ) {
+                let chunkLength = 0;
+                if (Buffer.isBuffer(chunk) || chunk instanceof Uint8Array) {
+                    chunkLength = chunk.byteLength;
+                    hash.update(chunk);
+                } else if (typeof chunk === 'string') {
+                    chunkLength = Buffer.byteLength(chunk);
+                    hash.update(chunk);
+                }
+                uploadedBytes += chunkLength;
+                if (chunkLength > 0 && uploadTracker) {
+                    uploadTracker.add(chunkLength);
+                }
+                callback(null, chunk as Buffer | Uint8Array | string);
+            },
+        });
+
+        // `pipeline` rather than `pipe` plus a hand-rolled 'error' forward: it
+        // keeps an 'error' listener attached to `countingStream` for the whole
+        // lifetime of the stream, and tears down both ends whichever one fails.
+        // The consumer is an object-store upload that may not have subscribed
+        // yet when a client disconnects mid-request, and destroying a Transform
+        // that nobody is listening to raises an unhandled 'error' event — which
+        // ends the process rather than just the request.
+        pipeline(source, countingStream, (error) => {
+            if (error) {
+                console.warn('upload stream ended early:', error.message);
+            }
+        });
+
+        return {
+            stream: countingStream,
+            uploadedSize: () => uploadedBytes,
+            contentHashSha256: () => hash.digest('hex'),
+        };
+    }
+
+    async #toUploadBody(
+        content: WriteRequest['fileContent'],
+        encoding: WriteRequest['encoding'],
+        uploadTracker?: UploadProgressTrackerLike,
+    ): Promise<UploadPayload> {
+        if (Buffer.isBuffer(content)) {
+            const hash = createHash('sha256');
+            hash.update(content);
+            return {
+                body: content,
+                contentLength: content.byteLength,
+                uploadedSize: () => content.byteLength,
+                contentHashSha256: hash.digest('hex'),
+            };
+        }
+        if (this.#isBinaryPayload(content)) {
+            const buffer = Buffer.from(content.base64, 'base64');
+            const hash = createHash('sha256');
+            hash.update(buffer);
+            return {
+                body: buffer,
+                contentLength: buffer.byteLength,
+                uploadedSize: () => buffer.byteLength,
+                contentHashSha256: hash.digest('hex'),
+            };
+        }
+        if (typeof content === 'string') {
+            if (encoding === 'base64') {
+                const buffer = Buffer.from(content, 'base64');
+                const hash = createHash('sha256');
+                hash.update(buffer);
+                return {
+                    body: buffer,
+                    contentLength: buffer.byteLength,
+                    uploadedSize: () => buffer.byteLength,
+                    contentHashSha256: hash.digest('hex'),
+                };
+            }
+            const buffer = Buffer.from(content, encoding ?? 'utf8');
+            const hash = createHash('sha256');
+            hash.update(buffer);
+            return {
+                body: buffer,
+                contentLength: buffer.byteLength,
+                uploadedSize: () => buffer.byteLength,
+                contentHashSha256: hash.digest('hex'),
+            };
+        }
+        if (content instanceof Uint8Array) {
+            const hash = createHash('sha256');
+            hash.update(content);
+            return {
+                body: content,
+                contentLength: content.byteLength,
+                uploadedSize: () => content.byteLength,
+                contentHashSha256: hash.digest('hex'),
+            };
+        }
+        if (content instanceof ArrayBuffer) {
+            const buffer = Buffer.from(content);
+            const hash = createHash('sha256');
+            hash.update(buffer);
+            return {
+                body: buffer,
+                contentLength: buffer.byteLength,
+                uploadedSize: () => buffer.byteLength,
+                contentHashSha256: hash.digest('hex'),
+            };
+        }
+        if (this.#isNodeStream(content)) {
+            const streamPayload = this.#createCountingStream(
+                content,
+                uploadTracker,
+            );
+            return {
+                body: streamPayload.stream,
+                uploadedSize: streamPayload.uploadedSize,
+                contentHashSha256: null,
+                finalizeContentHashSha256: () =>
+                    streamPayload.contentHashSha256(),
+            };
+        }
+        if (this.#isWebReadableStream(content)) {
+            const reader = content.getReader();
+            const asyncIterable = {
+                async *[Symbol.asyncIterator](): AsyncGenerator<
+                    Uint8Array,
+                    void,
+                    void
+                > {
+                    while (true) {
+                        const readResult = await reader.read();
+                        if (readResult.done) {
+                            return;
+                        }
+                        if (readResult.value) {
+                            yield readResult.value;
+                        }
+                    }
+                },
+            };
+            const streamPayload = this.#createCountingStream(
+                Readable.from(asyncIterable),
+                uploadTracker,
+            );
+            return {
+                body: streamPayload.stream,
+                uploadedSize: streamPayload.uploadedSize,
+                contentHashSha256: null,
+                finalizeContentHashSha256: () =>
+                    streamPayload.contentHashSha256(),
+            };
+        }
+        if (content instanceof Blob) {
+            const reader = content.stream().getReader();
+            const asyncIterable = {
+                async *[Symbol.asyncIterator](): AsyncGenerator<
+                    Uint8Array,
+                    void,
+                    void
+                > {
+                    while (true) {
+                        const readResult = await reader.read();
+                        if (readResult.done) {
+                            return;
+                        }
+                        if (readResult.value) {
+                            yield readResult.value;
+                        }
+                    }
+                },
+            };
+            const streamPayload = this.#createCountingStream(
+                Readable.from(asyncIterable),
+                uploadTracker,
+            );
+            return {
+                body: streamPayload.stream,
+                contentLength: Number.isFinite(content.size)
+                    ? content.size
+                    : undefined,
+                uploadedSize: streamPayload.uploadedSize,
+                contentHashSha256: null,
+                finalizeContentHashSha256: () =>
+                    streamPayload.contentHashSha256(),
+            };
+        }
+
+        throw new HttpError(400, 'Unsupported file content payload', {
+            legacyCode: 'bad_request',
+        });
+    }
+
+    async #uploadContent(
+        input: ServerUploadInput,
+        region: string,
+        uploadBody: UploadPayload,
+    ): Promise<void> {
+        try {
+            await this.stores.s3Object.uploadFromServer(input, region);
+        } catch (error) {
+            // A stream is sent with the caller's declared size as its length,
+            // so a body that ends short of it is a bad request.
+            if (
+                uploadBody.contentLength === undefined &&
+                isIncompleteBodyError(error)
+            ) {
+                throw new HttpError(
+                    400,
+                    'File content is shorter than its declared size',
+                    { legacyCode: 'bad_request' },
+                );
+            }
+            throw error;
+        }
+    }
+
+    async #cleanupPreparedBatchUploads(
+        preparedBatch: PreparedBatchWrite,
+        uploadedItems: UploadedBatchWriteItem[],
+    ): Promise<void> {
+        const cleanupTargets = uploadedItems
+            .map((uploadedItem) => {
+                const preparedItem = preparedBatch.itemsByIndex.get(
+                    uploadedItem.index,
+                );
+                if (!preparedItem || preparedItem.wasOverwrite) {
+                    return null;
+                }
+
+                return {
+                    bucket: preparedItem.normalizedInput.bucket,
+                    bucketRegion: preparedItem.normalizedInput.bucketRegion,
+                    objectKey: uploadedItem.objectKey,
+                };
+            })
+            .filter(
+                (
+                    target,
+                ): target is {
+                    bucket: string;
+                    bucketRegion: string;
+                    objectKey: string;
+                } => Boolean(target),
+            );
+
+        if (cleanupTargets.length === 0) {
+            return;
+        }
+
+        const cleanupResults = await Promise.allSettled(
+            cleanupTargets.map((target) => {
+                return this.stores.s3Object.deleteObject(
+                    target.bucket,
+                    target.objectKey,
+                    target.bucketRegion,
+                );
+            }),
+        );
+
+        const cleanupFailures = cleanupResults.filter(
+            (result) => result.status === 'rejected',
+        );
+        if (cleanupFailures.length > 0) {
+            console.error(
+                'prodfsv2 failed to clean up batch upload objects',
+                cleanupFailures,
+            );
+        }
+    }
+
+    getMaxSingleUploadSize(): number {
+        return this.stores.s3Object.getMaxSingleUploadSize();
+    }
+
+    async #cleanupSignedMultipartUploads(
+        uploads: SignedMultipartCleanupTarget[],
+    ): Promise<void> {
+        if (uploads.length === 0) {
+            return;
+        }
+
+        const cleanupResults = await Promise.allSettled(
+            uploads.map((upload) => {
+                if (
+                    upload.signedUploadResult.uploadMode !== 'multipart' ||
+                    !upload.signedUploadResult.multipartUploadId
+                ) {
+                    return Promise.resolve();
+                }
+
+                return this.stores.s3Object.abortMutipartUpload(
+                    upload.signedUploadResult.multipartUploadId,
+                    upload.bucketRegion,
+                    upload.bucket,
+                    upload.objectKey,
+                );
+            }),
+        );
+
+        const cleanupFailures = cleanupResults.filter(
+            (result) => result.status === 'rejected',
+        );
+        if (cleanupFailures.length > 0) {
+            console.error(
+                'prodfsv2 failed to abort signed multipart uploads',
+                cleanupFailures,
+            );
+        }
+    }
+
+    #toSignedMultipartCleanupTargets(
+        items: Array<{
+            index: number;
+            normalizedInput: NormalizedWriteInput;
+        }>,
+        objectKeys: string[],
+        signedResultsByIndex: Map<number, SignedUploadResult>,
+    ): SignedMultipartCleanupTarget[] {
+        return items
+            .map((item, index) => {
+                const signedUploadResult = signedResultsByIndex.get(item.index);
+                const objectKey = objectKeys[index];
+                if (!signedUploadResult || !objectKey) {
+                    return null;
+                }
+
+                return {
+                    bucket: item.normalizedInput.bucket,
+                    bucketRegion: item.normalizedInput.bucketRegion,
+                    objectKey,
+                    signedUploadResult,
+                };
+            })
+            .filter((upload): upload is SignedMultipartCleanupTarget =>
+                Boolean(upload),
+            );
+    }
+
+    #toSignedWriteResponse(
+        sessionId: string,
+        normalizedInput: NormalizedWriteInput,
+        objectKey: string,
+        signedUploadResult: SignedUploadResult,
+        entryUid: string = objectKey,
+    ): SignedWriteResponse {
+        return {
+            sessionId,
+            uploadMode: signedUploadResult.uploadMode,
+            objectKey,
+            entryUid,
+            bucket: normalizedInput.bucket,
+            bucketRegion: normalizedInput.bucketRegion,
+            contentType: normalizedInput.contentType,
+            expiresAt: signedUploadResult.expiresAt,
+            ...(signedUploadResult.url ? { url: signedUploadResult.url } : {}),
+            ...(signedUploadResult.multipartUploadId
+                ? { multipartUploadId: signedUploadResult.multipartUploadId }
+                : {}),
+            ...(signedUploadResult.multipartPartSize
+                ? { multipartPartSize: signedUploadResult.multipartPartSize }
+                : {}),
+            ...(signedUploadResult.multipartPartCount
+                ? { multipartPartCount: signedUploadResult.multipartPartCount }
+                : {}),
+            ...(signedUploadResult.multipartPartUrls
+                ? { multipartPartUrls: signedUploadResult.multipartPartUrls }
+                : {}),
+        };
+    }
+
+    #toDirectorySignedWriteResponse(
+        fsEntry: FSEntry,
+        directoryCreated: boolean,
+    ): SignedWriteResponse {
+        return {
+            sessionId: '',
+            uploadMode: 'single',
+            objectKey: fsEntry.uuid,
+            entryUid: fsEntry.uuid,
+            bucket: fsEntry.bucket ?? '',
+            bucketRegion: fsEntry.bucketRegion ?? '',
+            contentType: 'inode/directory',
+            expiresAt: Date.now(),
+            directoryCreated,
+            fsEntry,
+        };
+    }
+
+    /**
+     * For drivers and extensions building an ACL descriptor by hand; services
+     * use `ACLService.fsDescriptor`, which reads the store directly.
+     */
+    async getAncestorChain(path: string): Promise<AncestorChain> {
+        return this.stores.fsEntry.getAncestorChain(this.#normalizePath(path));
+    }
+
+    async prepareBatchWrites(
+        userId: number,
+        writeRequests: BatchWritePrepareRequest[],
+        storageAllowanceMax?: number,
+    ): Promise<PreparedBatchWrite> {
+        if (writeRequests.length === 0) {
+            return {
+                userId,
+                items: [],
+                itemsByIndex: new Map(),
+                ...(storageAllowanceMax !== undefined
+                    ? { storageAllowanceMax }
+                    : {}),
+            };
+        }
+
+        const normalizedRequests = writeRequests.map((writeRequest, index) => {
+            const normalizedInput = this.#normalizeWriteInput(
+                userId,
+                writeRequest.fileMetadata,
+            );
+            const requestedThumbnail =
+                writeRequest.thumbnailData ?? normalizedInput.thumbnail ?? null;
+            normalizedInput.thumbnail = null;
+            return {
+                index,
+                normalizedInput,
+                requestedThumbnail,
+                guiMetadata: writeRequest.guiMetadata,
+            };
+        });
+
+        const resolvedTargets = await this.#resolveWriteTargets(
+            userId,
+            normalizedRequests.map((request) => ({
+                index: request.index,
+                normalizedInput: request.normalizedInput,
+            })),
+        );
+        const resolvedTargetMap = new Map<number, WriteTargetResolutionResult>(
+            resolvedTargets.map((resolvedTarget) => [
+                resolvedTarget.index,
+                resolvedTarget,
+            ]),
+        );
+        const resolvedRequests = normalizedRequests.map((request) => {
+            const resolvedTarget = resolvedTargetMap.get(request.index);
+            if (!resolvedTarget) {
+                throw new Error(
+                    `Failed to resolve write target for index ${request.index}`,
+                );
+            }
+            return {
+                ...request,
+                normalizedInput: resolvedTarget.normalizedInput,
+                existingEntry: resolvedTarget.existingEntry,
+                wasOverwrite: resolvedTarget.wasOverwrite,
+            };
+        });
+
+        await this.stores.fsEntry.resolveParentDirectoriesBatch(
+            userId,
+            resolvedRequests.map((item) => ({
+                parentPath: pathPosix.dirname(item.normalizedInput.path),
+                createPaths: item.normalizedInput.createMissingParents,
+            })),
+        );
+
+        const items = resolvedRequests.map((item) => ({
+            index: item.index,
+            normalizedInput: item.normalizedInput,
+            existingEntry: item.existingEntry,
+            objectKey: item.existingEntry?.uuid ?? uuidv4(),
+            wasOverwrite: item.wasOverwrite,
+            requestedThumbnail: item.requestedThumbnail,
+            guiMetadata: item.guiMetadata,
+        }));
+        const itemsByIndex = new Map<number, (typeof items)[number]>();
+        for (const item of items) {
+            itemsByIndex.set(item.index, item);
+        }
+
+        return {
+            userId,
+            items,
+            itemsByIndex,
+            ...(storageAllowanceMax !== undefined
+                ? { storageAllowanceMax }
+                : {}),
+        };
+    }
+
+    async assertStorageAllowanceForPreparedBatch(
+        preparedBatch: PreparedBatchWrite,
+        uploadedItems?: UploadedBatchWriteItem[],
+        storageAllowanceMaxOverride?: number,
+    ): Promise<void> {
+        if (preparedBatch.items.length === 0) {
+            return;
+        }
+
+        const uploadedItemMap = new Map<number, UploadedBatchWriteItem>();
+        if (uploadedItems) {
+            for (const uploadedItem of uploadedItems) {
+                uploadedItemMap.set(uploadedItem.index, uploadedItem);
+            }
+        }
+
+        // One batch can straddle two trees, and each owner pays for its own.
+        const owners = await this.#storageOwnersOf(
+            preparedBatch.items.map((item) => item.normalizedInput.path),
+            preparedBatch.userId,
+        );
+        const sizeChangesByOwner = new Map<
+            number,
+            Array<{ incomingSize: number; existingSize: number }>
+        >();
+        for (const item of preparedBatch.items) {
+            const uploadedItem = uploadedItemMap.get(item.index);
+            const owner =
+                owners.get(item.normalizedInput.path) ?? preparedBatch.userId;
+            const sizeChanges = sizeChangesByOwner.get(owner) ?? [];
+            sizeChanges.push({
+                incomingSize: uploadedItem
+                    ? uploadedItem.uploadedSize
+                    : item.normalizedInput.size,
+                existingSize: item.existingEntry?.size ?? 0,
+            });
+            sizeChangesByOwner.set(owner, sizeChanges);
+        }
+
+        const storageAllowanceMax =
+            storageAllowanceMaxOverride ?? preparedBatch.storageAllowanceMax;
+        for (const [owner, sizeChanges] of sizeChangesByOwner) {
+            await this.#assertStorageAllowanceForBatch(
+                owner,
+                sizeChanges,
+                this.#allowanceOverrideFor(
+                    owner,
+                    preparedBatch.userId,
+                    storageAllowanceMax,
+                ),
+            );
+        }
+    }
+
+    async uploadPreparedBatchItem(
+        input: UploadPreparedBatchItemInput,
+    ): Promise<UploadedBatchWriteItem> {
+        const preparedItem = input.preparedBatch.itemsByIndex.get(
+            input.itemIndex,
+        );
+        if (!preparedItem) {
+            throw new HttpError(
+                400,
+                `Batch metadata was not found for index ${input.itemIndex}`,
+                { legacyCode: 'bad_request' },
+            );
+        }
+
+        const uploadBody = await this.#toUploadBody(
+            input.fileContent,
+            input.encoding,
+            input.uploadTracker,
+        );
+
+        await this.#uploadContent(
+            {
+                bucket: preparedItem.normalizedInput.bucket,
+                objectKey: preparedItem.objectKey,
+                contentType: preparedItem.normalizedInput.contentType,
+                body: uploadBody.body,
+                ...(uploadBody.contentLength !== undefined
+                    ? { contentLength: uploadBody.contentLength }
+                    : {}),
+                ...(Number.isFinite(preparedItem.normalizedInput.size)
+                    ? { sizeHint: preparedItem.normalizedInput.size }
+                    : {}),
+            },
+            preparedItem.normalizedInput.bucketRegion,
+            uploadBody,
+        );
+
+        const uploadedSize = uploadBody.uploadedSize();
+        if (input.uploadTracker) {
+            const currentTrackedSize = Number(
+                input.uploadTracker.progress ?? 0,
+            );
+            if (uploadedSize > currentTrackedSize) {
+                input.uploadTracker.add(uploadedSize - currentTrackedSize);
+            }
+        }
+
+        return {
+            index: preparedItem.index,
+            objectKey: preparedItem.objectKey,
+            uploadedSize,
+            contentHashSha256: uploadBody.finalizeContentHashSha256
+                ? uploadBody.finalizeContentHashSha256()
+                : uploadBody.contentHashSha256,
+        };
+    }
+
+    async finalizePreparedBatchWrites(
+        preparedBatch: PreparedBatchWrite,
+        uploadedItems: UploadedBatchWriteItem[],
+    ): Promise<WriteResponse[]> {
+        try {
+            if (preparedBatch.items.length !== uploadedItems.length) {
+                throw new HttpError(
+                    400,
+                    'Some batch files were missing upload content',
+                    { legacyCode: 'bad_request' },
+                );
+            }
+
+            await this.assertStorageAllowanceForPreparedBatch(
+                preparedBatch,
+                uploadedItems,
+            );
+
+            const uploadedItemMap = new Map<number, UploadedBatchWriteItem>();
+            for (const uploadedItem of uploadedItems) {
+                uploadedItemMap.set(uploadedItem.index, uploadedItem);
+            }
+
+            const createInputs = preparedBatch.items.map((item) => {
+                const uploadedItem = uploadedItemMap.get(item.index);
+                if (!uploadedItem) {
+                    throw new HttpError(
+                        400,
+                        `Missing uploaded file content for index ${item.index}`,
+                        { legacyCode: 'bad_request' },
+                    );
+                }
+                item.normalizedInput.size = uploadedItem.uploadedSize;
+                return this.#toCreateInput(
+                    item.normalizedInput,
+                    uploadedItem.objectKey,
+                );
+            });
+
+            const fsEntries = await this.stores.fsEntry.batchCreateEntries(
+                createInputs,
+                true,
+            );
+            return preparedBatch.items.map((item, index) => {
+                const fsEntry = fsEntries[index];
+                if (!fsEntry) {
+                    throw new Error(
+                        `Failed to resolve batch write result at index ${index}`,
+                    );
+                }
+                const uploadedItem = uploadedItemMap.get(item.index);
+                this.#emitFsEvent(
+                    item.wasOverwrite ? 'fs.write.file' : 'fs.create.file',
+                    fsEntry,
+                );
+                return {
+                    fsEntry,
+                    wasOverwrite: item.wasOverwrite,
+                    requestedThumbnail: item.requestedThumbnail,
+                    contentHashSha256: uploadedItem?.contentHashSha256 ?? null,
+                };
+            });
+        } catch (error) {
+            await this.#cleanupPreparedBatchUploads(
+                preparedBatch,
+                uploadedItems,
+            );
+            throw error;
+        }
+    }
+
+    async startUrlWrite(
+        userId: number,
+        signedWriteRequest: SignedWriteRequest,
+        storageAllowanceMax?: number,
+    ): Promise<SignedWriteResponse> {
+        const result = await this.startUrlWriteWithCreatedDirectories(
+            userId,
+            signedWriteRequest,
+            storageAllowanceMax,
+        );
+        return result.response;
+    }
+
+    async startUrlWriteWithCreatedDirectories(
+        userId: number,
+        signedWriteRequest: SignedWriteRequest,
+        storageAllowanceMax?: number,
+    ): Promise<StartSignedWriteResult> {
+        let normalizedInput = this.#normalizeWriteInput(
+            userId,
+            signedWriteRequest.fileMetadata,
+        );
+        if (signedWriteRequest.directory) {
+            const { entries, createdDirectoryEntries } =
+                await this.stores.fsEntry.ensureDirectoriesForUserWithCreated(
+                    userId,
+                    [
+                        {
+                            path: normalizedInput.path,
+                            createPaths: normalizedInput.createMissingParents,
+                        },
+                    ],
+                );
+            const [directoryEntry] = entries;
+            if (!directoryEntry) {
+                throw new Error(
+                    'Failed to resolve directory entry after start write',
+                );
+            }
+            const createdDirectoryPathSet = new Set(
+                createdDirectoryEntries.map((entry) => entry.path),
+            );
+            return {
+                response: this.#toDirectorySignedWriteResponse(
+                    directoryEntry,
+                    createdDirectoryPathSet.has(normalizedInput.path),
+                ),
+                createdDirectoryEntries,
+            };
+        }
+
+        const [resolvedTarget] = await this.#resolveWriteTargets(userId, [
+            {
+                index: 0,
+                normalizedInput,
+            },
+        ]);
+        if (!resolvedTarget) {
+            throw new Error('Failed to resolve write target');
+        }
+        normalizedInput = resolvedTarget.normalizedInput;
+        const existingEntry = resolvedTarget.existingEntry;
+
+        const existingSize = existingEntry?.size ?? 0;
+        const parentPath = pathPosix.dirname(normalizedInput.path);
+        const sessionId = uuidv4();
+        const expiresInSeconds =
+            signedWriteRequest.expiresInSeconds ??
+            DEFAULT_SIGNED_UPLOAD_EXPIRY_SECONDS;
+
+        // Reserve before creating any parent, so an over-quota start writes
+        // nothing.
+        const reservedLeases = await this.#reserveUploadStorage(
+            userId,
+            [
+                {
+                    sessionId,
+                    path: normalizedInput.path,
+                    incomingSize: normalizedInput.size,
+                    existingSize,
+                    expiresInSeconds,
+                },
+            ],
+            storageAllowanceMax,
+        );
+
+        try {
+            const { parentEntries, createdDirectoryEntries } =
+                await this.stores.fsEntry.resolveParentDirectoriesBatchWithCreated(
+                    userId,
+                    [
+                        {
+                            parentPath,
+                            createPaths: normalizedInput.createMissingParents,
+                        },
+                    ],
+                );
+            const [parentEntry] = parentEntries;
+            if (!parentEntry) {
+                throw new Error(
+                    'Failed to resolve parent directory for signed write',
+                );
+            }
+
+            // Staged: only the authorized completion puts it on the live key.
+            const objectKey = uuidv4();
+            const uploadMode = this.#determineUploadMode(
+                signedWriteRequest.uploadMode,
+                normalizedInput.size,
+            );
+            const createInput = this.#toCreateInput(normalizedInput, objectKey);
+
+            const signedUploadResult =
+                await this.stores.s3Object.createSignedUploadUrl(
+                    {
+                        bucket: normalizedInput.bucket,
+                        objectKey,
+                        size: normalizedInput.size,
+                        contentType: normalizedInput.contentType,
+                        uploadMode,
+                        expiresInSeconds,
+                        multipartPartSize: normalizedInput.multipartPartSize,
+                    },
+                    normalizedInput.bucketRegion,
+                );
+
+            const reservation = reservedLeases.find(
+                (lease) => lease.sessionId === sessionId,
+            );
+            const pendingUploadInput: PendingUploadCreateInput = {
+                sessionId,
+                userId,
+                appId: normalizedInput.associatedAppId ?? null,
+                parentUid: parentEntry.uuid,
+                parentPath: parentEntry.path,
+                targetName: pathPosix.basename(normalizedInput.path),
+                targetPath: normalizedInput.path,
+                overwriteTargetUid: existingEntry?.uuid ?? null,
+                contentType: normalizedInput.contentType,
+                size: normalizedInput.size,
+                checksumSha256: normalizedInput.checksumSha256 ?? null,
+                uploadMode,
+                multipartUploadId: signedUploadResult.multipartUploadId ?? null,
+                multipartPartSize: signedUploadResult.multipartPartSize ?? null,
+                multipartPartCount:
+                    signedUploadResult.multipartPartCount ?? null,
+                storageProvider: 's3',
+                bucket: normalizedInput.bucket,
+                bucketRegion: normalizedInput.bucketRegion,
+                objectKey,
+                metadataJson: JSON.stringify(createInput),
+                expiresAt: signedUploadResult.expiresAt,
+                reservationOwnerId: reservation?.ownerId ?? null,
+                reservedBytes: reservation?.bytes ?? null,
+            };
+
+            try {
+                await this.stores.fsEntry.createPendingEntry(
+                    pendingUploadInput,
+                );
+            } catch (error) {
+                await this.#cleanupSignedMultipartUploads([
+                    {
+                        bucket: normalizedInput.bucket,
+                        bucketRegion: normalizedInput.bucketRegion,
+                        objectKey,
+                        signedUploadResult,
+                    },
+                ]);
+                throw error;
+            }
+
+            return {
+                response: this.#toSignedWriteResponse(
+                    sessionId,
+                    normalizedInput,
+                    objectKey,
+                    signedUploadResult,
+                    existingEntry?.uuid ?? objectKey,
+                ),
+                createdDirectoryEntries,
+            };
+        } catch (error) {
+            await this.#releaseUploadReservations(reservedLeases);
+            throw error;
+        }
+    }
+
+    async batchStartUrlWrites(
+        userId: number,
+        signedWriteRequests: SignedWriteRequest[],
+        storageAllowanceMax?: number,
+    ): Promise<SignedWriteResponse[]> {
+        const result = await this.batchStartUrlWritesWithCreatedDirectories(
+            userId,
+            signedWriteRequests,
+            storageAllowanceMax,
+        );
+        return result.responses;
+    }
+
+    async batchStartUrlWritesWithCreatedDirectories(
+        userId: number,
+        signedWriteRequests: SignedWriteRequest[],
+        storageAllowanceMax?: number,
+    ): Promise<BatchStartSignedWriteResult> {
+        if (signedWriteRequests.length === 0) {
+            return {
+                responses: [],
+                createdDirectoryEntries: [],
+            };
+        }
+
+        const normalizedRequests = signedWriteRequests.map(
+            (signedWriteRequest, index) => ({
+                index,
+                request: signedWriteRequest,
+                isDirectory: Boolean(signedWriteRequest.directory),
+                normalizedInput: this.#normalizeWriteInput(
+                    userId,
+                    signedWriteRequest.fileMetadata,
+                ),
+            }),
+        );
+        const responsesByIndex = new Map<number, SignedWriteResponse>();
+        const createdDirectoryEntriesByPath = new Map<string, FSEntry>();
+
+        const directoryItems = normalizedRequests.filter(
+            (item) => item.isDirectory,
+        );
+        const directoryPathSet = new Set<string>();
+        for (const directoryItem of directoryItems) {
+            const targetPath = directoryItem.normalizedInput.path;
+            if (directoryPathSet.has(targetPath)) {
+                throw new HttpError(
+                    409,
+                    `Batch contains duplicate target path: ${pathPosix.basename(targetPath)}`,
+                    { legacyCode: 'conflict' },
+                );
+            }
+            directoryPathSet.add(targetPath);
+        }
+        // Directories this batch will create, which file targets are resolved
+        // against before they exist.
+        const pendingDirectoryPaths = new Set<string>();
+        for (const directoryItem of directoryItems) {
+            if (!directoryItem.normalizedInput.createMissingParents) {
+                continue;
+            }
+            for (
+                let path = directoryItem.normalizedInput.path;
+                path !== '/';
+                path = pathPosix.dirname(path)
+            ) {
+                pendingDirectoryPaths.add(path);
+            }
+        }
+
+        const fileItems = normalizedRequests.filter(
+            (item) => !item.isDirectory,
+        );
+        const resolvedTargets =
+            fileItems.length > 0
+                ? await this.#resolveWriteTargets(
+                      userId,
+                      fileItems.map((item) => ({
+                          index: item.index,
+                          normalizedInput: item.normalizedInput,
+                      })),
+                      pendingDirectoryPaths,
+                  )
+                : [];
+        const resolvedTargetMap = new Map<number, WriteTargetResolutionResult>(
+            resolvedTargets.map((resolvedTarget) => [
+                resolvedTarget.index,
+                resolvedTarget,
+            ]),
+        );
+        const resolvedFileItems = fileItems.map((item) => {
+            const resolvedTarget = resolvedTargetMap.get(item.index);
+            if (!resolvedTarget) {
+                throw new Error(
+                    `Failed to resolve write target for batch index ${item.index}`,
+                );
+            }
+
+            return {
+                ...item,
+                normalizedInput: resolvedTarget.normalizedInput,
+                existingEntry: resolvedTarget.existingEntry,
+            };
+        });
+
+        const sessionIds = resolvedFileItems.map(() => uuidv4());
+        const claims: UploadReservationClaim[] = resolvedFileItems.map(
+            (item, index) => ({
+                sessionId: sessionIds[index] as string,
+                path: item.normalizedInput.path,
+                incomingSize: item.normalizedInput.size,
+                existingSize: item.existingEntry?.size ?? 0,
+                expiresInSeconds:
+                    item.request.expiresInSeconds ??
+                    DEFAULT_SIGNED_UPLOAD_EXPIRY_SECONDS,
+            }),
+        );
+
+        // Reserve before creating any directory, so an over-quota batch writes
+        // nothing. A directory-only batch has no claims and reserves nothing.
+        const reservedLeases = await this.#reserveUploadStorage(
+            userId,
+            claims,
+            storageAllowanceMax,
+        );
+        try {
+            if (directoryItems.length > 0) {
+                const {
+                    entries: ensuredDirectoryEntries,
+                    createdDirectoryEntries,
+                } =
+                    await this.stores.fsEntry.ensureDirectoriesForUserWithCreated(
+                        userId,
+                        directoryItems.map((item) => ({
+                            path: item.normalizedInput.path,
+                            createPaths:
+                                item.normalizedInput.createMissingParents,
+                        })),
+                    );
+                for (const createdDirectoryEntry of createdDirectoryEntries) {
+                    createdDirectoryEntriesByPath.set(
+                        createdDirectoryEntry.path,
+                        createdDirectoryEntry,
+                    );
+                }
+
+                for (let index = 0; index < directoryItems.length; index++) {
+                    const item = directoryItems[index];
+                    const directoryEntry = ensuredDirectoryEntries[index];
+                    if (!item || !directoryEntry) {
+                        throw new Error(
+                            'Failed to build directory response from batch start data',
+                        );
+                    }
+                    responsesByIndex.set(
+                        item.index,
+                        this.#toDirectorySignedWriteResponse(
+                            directoryEntry,
+                            createdDirectoryEntriesByPath.has(
+                                item.normalizedInput.path,
+                            ),
+                        ),
+                    );
+                }
+            }
+
+            if (resolvedFileItems.length > 0) {
+                const reservationBySessionId = new Map(
+                    reservedLeases.map((lease) => [lease.sessionId, lease]),
+                );
+                const {
+                    parentEntries,
+                    createdDirectoryEntries: createdParentDirectoryEntries,
+                } =
+                    await this.stores.fsEntry.resolveParentDirectoriesBatchWithCreated(
+                        userId,
+                        resolvedFileItems.map((item) => ({
+                            parentPath: pathPosix.dirname(
+                                item.normalizedInput.path,
+                            ),
+                            createPaths:
+                                item.normalizedInput.createMissingParents,
+                        })),
+                    );
+                for (const createdParentDirectoryEntry of createdParentDirectoryEntries) {
+                    createdDirectoryEntriesByPath.set(
+                        createdParentDirectoryEntry.path,
+                        createdParentDirectoryEntry,
+                    );
+                }
+
+                // Staged, as the single path.
+                const objectKeys = resolvedFileItems.map(() => uuidv4());
+                const uploadModes = resolvedFileItems.map((item) => {
+                    return this.#determineUploadMode(
+                        item.request.uploadMode,
+                        item.normalizedInput.size,
+                    );
+                });
+
+                const signedResultsByIndex = new Map<
+                    number,
+                    SignedUploadResult
+                >();
+                const writesByRegion = new Map<
+                    string,
+                    Array<{
+                        requestIndex: number;
+                        input: {
+                            bucket: string;
+                            objectKey: string;
+                            size: number;
+                            contentType: string;
+                            uploadMode: UploadMode;
+                            expiresInSeconds: number;
+                            multipartPartSize?: number;
+                        };
+                    }>
+                >();
+                for (let index = 0; index < resolvedFileItems.length; index++) {
+                    const item = resolvedFileItems[index];
+                    const objectKey = objectKeys[index];
+                    const uploadMode = uploadModes[index];
+                    if (!item || !objectKey || !uploadMode) {
+                        throw new Error(
+                            'Failed to build batch signed upload request',
+                        );
+                    }
+                    const regionEntries =
+                        writesByRegion.get(item.normalizedInput.bucketRegion) ??
+                        [];
+                    regionEntries.push({
+                        requestIndex: item.index,
+                        input: {
+                            bucket: item.normalizedInput.bucket,
+                            objectKey,
+                            size: item.normalizedInput.size,
+                            contentType: item.normalizedInput.contentType,
+                            uploadMode,
+                            expiresInSeconds:
+                                item.request.expiresInSeconds ??
+                                DEFAULT_SIGNED_UPLOAD_EXPIRY_SECONDS,
+                            multipartPartSize:
+                                item.normalizedInput.multipartPartSize,
+                        },
+                    });
+                    writesByRegion.set(
+                        item.normalizedInput.bucketRegion,
+                        regionEntries,
+                    );
+                }
+
+                const regionResults = await Promise.allSettled(
+                    Array.from(writesByRegion.entries()).map(
+                        async ([region, regionWrites]) => {
+                            const signedResults =
+                                await this.stores.s3Object.batchCreateSignedUploadUrls(
+                                    regionWrites.map((item) => item.input),
+                                    region,
+                                );
+                            for (
+                                let index = 0;
+                                index < regionWrites.length;
+                                index++
+                            ) {
+                                const regionWrite = regionWrites[index];
+                                const signedResult = signedResults[index];
+                                if (!regionWrite || !signedResult) {
+                                    throw new Error(
+                                        'Failed to map signed upload result to request',
+                                    );
+                                }
+                                signedResultsByIndex.set(
+                                    regionWrite.requestIndex,
+                                    signedResult,
+                                );
+                            }
+                        },
+                    ),
+                );
+                const signedMultipartCleanupTargets =
+                    this.#toSignedMultipartCleanupTargets(
+                        resolvedFileItems,
+                        objectKeys,
+                        signedResultsByIndex,
+                    );
+
+                const failedRegionResult = regionResults.find(
+                    (result) => result.status === 'rejected',
+                );
+                if (failedRegionResult?.status === 'rejected') {
+                    await this.#cleanupSignedMultipartUploads(
+                        signedMultipartCleanupTargets,
+                    );
+
+                    throw this.#toError(
+                        failedRegionResult.reason,
+                        'Failed to create batch signed upload urls',
+                    );
+                }
+
+                try {
+                    const pendingInputs: PendingUploadCreateInput[] = [];
+                    for (
+                        let index = 0;
+                        index < resolvedFileItems.length;
+                        index++
+                    ) {
+                        const item = resolvedFileItems[index];
+                        const parentEntry = parentEntries[index];
+                        const objectKey = objectKeys[index];
+                        const sessionId = sessionIds[index];
+                        const uploadMode = uploadModes[index];
+                        const existingEntry = item?.existingEntry;
+                        if (
+                            !item ||
+                            !parentEntry ||
+                            !objectKey ||
+                            !sessionId ||
+                            !uploadMode
+                        ) {
+                            throw new Error(
+                                'Failed to build pending upload input from batch start data',
+                            );
+                        }
+                        const signedUploadResult = signedResultsByIndex.get(
+                            item.index,
+                        );
+                        if (!signedUploadResult) {
+                            throw new Error(
+                                'Failed to resolve signed upload result for batch start data',
+                            );
+                        }
+
+                        const createInput = this.#toCreateInput(
+                            item.normalizedInput,
+                            objectKey,
+                        );
+                        const reservation =
+                            reservationBySessionId.get(sessionId);
+                        pendingInputs.push({
+                            sessionId,
+                            userId,
+                            appId: item.normalizedInput.associatedAppId ?? null,
+                            parentUid: parentEntry.uuid,
+                            parentPath: parentEntry.path,
+                            targetName: pathPosix.basename(
+                                item.normalizedInput.path,
+                            ),
+                            targetPath: item.normalizedInput.path,
+                            overwriteTargetUid: existingEntry?.uuid ?? null,
+                            contentType: item.normalizedInput.contentType,
+                            size: item.normalizedInput.size,
+                            checksumSha256:
+                                item.normalizedInput.checksumSha256 ?? null,
+                            uploadMode,
+                            multipartUploadId:
+                                signedUploadResult.multipartUploadId ?? null,
+                            multipartPartSize:
+                                signedUploadResult.multipartPartSize ?? null,
+                            multipartPartCount:
+                                signedUploadResult.multipartPartCount ?? null,
+                            storageProvider: 's3',
+                            bucket: item.normalizedInput.bucket,
+                            bucketRegion: item.normalizedInput.bucketRegion,
+                            objectKey,
+                            metadataJson: JSON.stringify(createInput),
+                            expiresAt: signedUploadResult.expiresAt,
+                            reservationOwnerId: reservation?.ownerId ?? null,
+                            reservedBytes: reservation?.bytes ?? null,
+                        });
+                    }
+
+                    await this.stores.fsEntry.batchCreatePendingEntries(
+                        pendingInputs,
+                    );
+
+                    for (
+                        let index = 0;
+                        index < resolvedFileItems.length;
+                        index++
+                    ) {
+                        const item = resolvedFileItems[index];
+                        const sessionId = sessionIds[index];
+                        const objectKey = objectKeys[index];
+                        if (!item || !sessionId || !objectKey) {
+                            throw new Error(
+                                'Failed to build signed write response from batch start data',
+                            );
+                        }
+                        const signedUploadResult = signedResultsByIndex.get(
+                            item.index,
+                        );
+                        if (!signedUploadResult) {
+                            throw new Error(
+                                'Failed to resolve signed upload result for batch response data',
+                            );
+                        }
+                        responsesByIndex.set(
+                            item.index,
+                            this.#toSignedWriteResponse(
+                                sessionId,
+                                item.normalizedInput,
+                                objectKey,
+                                signedUploadResult,
+                                item.existingEntry?.uuid ?? objectKey,
+                            ),
+                        );
+                    }
+                } catch (error) {
+                    await this.#cleanupSignedMultipartUploads(
+                        signedMultipartCleanupTargets,
+                    );
+                    throw error;
+                }
+            }
+        } catch (error) {
+            await this.#releaseUploadReservations(reservedLeases);
+            throw error;
+        }
+
+        const responses = normalizedRequests.map((request) => {
+            const response = responsesByIndex.get(request.index);
+            if (!response) {
+                throw new Error(
+                    `Failed to resolve signed batch response for index ${request.index}`,
+                );
+            }
+            return response;
+        });
+        return {
+            responses,
+            createdDirectoryEntries: Array.from(
+                createdDirectoryEntriesByPath.values(),
+            ),
+        };
+    }
+
+    /**
+     * Read-only lookup of pending upload sessions, one per id in request order.
+     * Callers use it to re-authorize a session's target path before resuming or
+     * completing an upload, since the session outlives the access check
+     * `startWrite` made.
+     */
+    async getUploadSessions(
+        userId: number,
+        uploadIds: string[],
+    ): Promise<PendingUploadSession[]> {
+        if (uploadIds.length === 0) {
+            return [];
+        }
+        const sessions =
+            await this.stores.fsEntry.getPendingEntriesBySessionIds(uploadIds);
+        return sessions.map((session) => {
+            if (!session) {
+                throw new HttpError(404, 'Upload session was not found', {
+                    legacyCode: 'not_found',
+                });
+            }
+            if (session.userId !== userId) {
+                throw new HttpError(403, 'Upload session access denied', {
+                    legacyCode: 'forbidden',
+                });
+            }
+            return session;
+        });
+    }
+
+    /** `preloadedSession`: the caller's read of `request.uploadId`, reused. */
+    async signMultipartParts(
+        userId: number,
+        request: SignMultipartPartsRequest,
+        preloadedSession?: PendingUploadSession,
+    ): Promise<SignMultipartPartsResponse> {
+        if (!request?.uploadId) {
+            throw new HttpError(400, 'Missing uploadId', {
+                legacyCode: 'bad_request',
+            });
+        }
+        if (
+            !Array.isArray(request.partNumbers) ||
+            request.partNumbers.length === 0
+        ) {
+            throw new HttpError(400, 'Missing partNumbers', {
+                legacyCode: 'bad_request',
+            });
+        }
+
+        const uniquePartNumbers = Array.from(
+            new Set(request.partNumbers.map((value) => Number(value))),
+        );
+        if (
+            uniquePartNumbers.some(
+                (partNumber) =>
+                    !Number.isInteger(partNumber) || partNumber <= 0,
+            )
+        ) {
+            throw new HttpError(400, 'Invalid partNumbers', {
+                legacyCode: 'bad_request',
+            });
+        }
+
+        const session =
+            preloadedSession ??
+            (await this.stores.fsEntry.getPendingEntryBySessionId(
+                request.uploadId,
+            ));
+        if (!session) {
+            throw new HttpError(404, 'Upload session was not found', {
+                legacyCode: 'not_found',
+            });
+        }
+        if (session.userId !== userId) {
+            throw new HttpError(403, 'Upload session access denied', {
+                legacyCode: 'forbidden',
+            });
+        }
+        if (session.status !== 'pending') {
+            throw new HttpError(
+                409,
+                `Upload session is not pending (status=${session.status})`,
+                { legacyCode: 'conflict' },
+            );
+        }
+        if (session.expiresAt < Date.now()) {
+            try {
+                await this.stores.fsEntry.markPendingEntryFailed(
+                    session.sessionId,
+                    'Upload session expired',
+                );
+            } finally {
+                await this.#releaseSessionUploadReservations([session]);
+            }
+            throw new HttpError(400, 'Upload session expired', {
+                legacyCode: 'session_required',
+            });
+        }
+        if (session.uploadMode !== 'multipart') {
+            throw new HttpError(400, 'Upload session is not multipart', {
+                legacyCode: 'bad_request',
+            });
+        }
+        if (!session.multipartUploadId) {
+            throw new HttpError(
+                400,
+                'Multipart upload id missing from session',
+                { legacyCode: 'bad_request' },
+            );
+        }
+        const multipartPartCount = session.multipartPartCount;
+        if (
+            multipartPartCount !== null &&
+            uniquePartNumbers.some(
+                (partNumber) => partNumber > multipartPartCount,
+            )
+        ) {
+            throw new HttpError(
+                400,
+                'Part number exceeds multipart part count',
+                { legacyCode: 'bad_request' },
+            );
+        }
+        if (!session.bucket || !session.bucketRegion) {
+            throw new HttpError(
+                500,
+                'Upload session storage metadata is missing',
+                { legacyCode: 'internal_error' },
+            );
+        }
+
+        const expiresInSeconds =
+            request.expiresInSeconds ?? DEFAULT_SIGNED_UPLOAD_EXPIRY_SECONDS;
+        const multipartPartUrls =
+            await this.stores.s3Object.createSignedMultipartPartUrls(
+                {
+                    bucket: session.bucket,
+                    objectKey: session.objectKey,
+                    multipartUploadId: session.multipartUploadId,
+                    partNumbers: uniquePartNumbers,
+                    expiresInSeconds,
+                    // Re-signed parts need the same size binding the
+                    // originals got, or this route hands out unbounded URLs
+                    // for a session that was already quota-checked.
+                    declaredTotalSize: session.size,
+                    ...(session.multipartPartSize !== null
+                        ? { multipartPartSize: session.multipartPartSize }
+                        : {}),
+                },
+                session.bucketRegion,
+            );
+
+        const expiresAt =
+            Date.now() +
+            clampSignedUploadExpirySeconds(expiresInSeconds) * 1000;
+
+        return {
+            uploadId: session.sessionId,
+            multipartUploadId: session.multipartUploadId,
+            objectKey: session.objectKey,
+            bucket: session.bucket,
+            bucketRegion: session.bucketRegion,
+            expiresAt,
+            multipartPartUrls,
+        };
+    }
+
+    // Object size once landed, 'missing' when the store says it isn't there,
+    // null when the check failed or gave no length.
+    async #probeObjectSize(
+        bucket: string,
+        objectKey: string,
+        region: string,
+    ): Promise<number | 'missing' | null> {
+        try {
+            return await this.stores.s3Object.headObjectSize(
+                bucket,
+                objectKey,
+                region,
+            );
+        } catch (error) {
+            if (isMissingObjectError(error)) return 'missing';
+            console.warn(
+                `[fs] object size check failed for ${objectKey}: ${this.#toErrorMessage(error)}`,
+            );
+            return null;
+        }
+    }
+
+    #logUnreceivedUploads(sessions: PendingUploadSession[]): void {
+        for (const session of sessions) {
+            console.warn('[fs] signed upload refused: object not received', {
+                sessionId: session.sessionId,
+                userId: session.userId,
+                appId: session.appId,
+                uploadMode: session.uploadMode,
+                overwrite: Boolean(session.overwriteTargetUid),
+            });
+        }
+    }
+
+    // Marks the sessions failed, releases their leases, and refuses the batch.
+    async #refuseUnreceivedUploads(
+        sessions: PendingUploadSession[],
+    ): Promise<never> {
+        this.#logUnreceivedUploads(sessions);
+        try {
+            await this.stores.fsEntry.markPendingEntriesFailed(
+                sessions.map((session) => session.sessionId),
+                UPLOAD_NOT_RECEIVED,
+            );
+        } finally {
+            await this.#releaseSessionUploadReservations(sessions);
+        }
+        throw uploadNotReceivedError();
+    }
+
+    // Probes each item's size into `sizes`; refuses the batch if any object never arrived.
+    async #probeBatchUploads(
+        items: BatchCompletionProbeItem[],
+        sizes: Map<string, number | null>,
+    ): Promise<void> {
+        if (items.length === 0) return;
+        const missing: PendingUploadSession[] = [];
+        await Promise.all(
+            items.map(async (item) => {
+                const bucket =
+                    item.session.bucket ??
+                    item.finalData.bucket ??
+                    this.#resolveBucket();
+                const region =
+                    item.session.bucketRegion ??
+                    item.finalData.bucketRegion ??
+                    this.#resolveBucketRegion();
+                const uploaded = await this.#probeObjectSize(
+                    bucket,
+                    item.session.objectKey,
+                    region,
+                );
+                if (uploaded === 'missing') {
+                    missing.push(item.session);
+                    return;
+                }
+                sizes.set(item.session.sessionId, uploaded);
+            }),
+        );
+        if (missing.length > 0) {
+            await this.#refuseUnreceivedUploads(missing);
+        }
+    }
+
+    /** Puts a staged overwrite in place, the completion having been allowed. */
+    async #promoteStagedOverwrite(
+        session: PendingUploadSession,
+        size: number,
+        bucket: string,
+        region: string,
+    ): Promise<void> {
+        const liveKey = session.overwriteTargetUid;
+        if (!liveKey || liveKey === session.objectKey) return;
+        // The completion was allowed against a path, so that is where the
+        // entry has to still be; a move since would put the bytes elsewhere.
+        const target =
+            await this.stores.fsEntry.getEntryByUuidFromPrimary(liveKey);
+        if (!target || target.path !== session.targetPath) {
+            throw new HttpError(409, 'Upload target has moved', {
+                legacyCode: 'conflict',
+            });
+        }
+        await this.stores.s3Object.copyObjectOfAnySize(
+            {
+                sourceBucket: bucket,
+                sourceKey: session.objectKey,
+                destinationBucket: bucket,
+                destinationKey: liveKey,
+                contentType: session.contentType,
+                metadataDirective: 'REPLACE',
+            },
+            region,
+            size,
+        );
+        try {
+            await this.stores.s3Object.deleteObject(
+                bucket,
+                session.objectKey,
+                region,
+            );
+        } catch (e) {
+            // The live object is already right; the staged one is only litter.
+            console.warn('[fs] staged overwrite left behind:', e);
+        }
+    }
+
+    async completeUrlWrite(
+        userId: number,
+        completeWriteRequest: CompleteWriteRequest,
+    ): Promise<CompleteWriteResponse> {
+        // Read here, not taken from the caller's access check: an abort or a
+        // second completion landing during that check must still get a 409.
+        const session = await this.stores.fsEntry.getPendingEntryBySessionId(
+            completeWriteRequest.uploadId,
+        );
+        if (!session) {
+            throw new HttpError(404, 'Upload session was not found', {
+                legacyCode: 'not_found',
+            });
+        }
+        if (session.userId !== userId) {
+            throw new HttpError(403, 'Upload session access denied', {
+                legacyCode: 'forbidden',
+            });
+        }
+        assertSessionCompletable(session);
+        if (session.expiresAt < Date.now()) {
+            try {
+                await this.stores.fsEntry.markPendingEntryFailed(
+                    session.sessionId,
+                    'Upload session expired',
+                );
+            } finally {
+                await this.#releaseSessionUploadReservations([session]);
+            }
+            throw new HttpError(400, 'Upload session expired', {
+                legacyCode: 'session_required',
+            });
+        }
+
+        const createInput = this.#parseSessionMetadata(session);
+        const requestedThumbnail =
+            completeWriteRequest.thumbnailData ?? createInput.thumbnail ?? null;
+        createInput.thumbnail = null;
+
+        try {
+            if (session.uploadMode === 'multipart') {
+                if (!session.multipartUploadId) {
+                    throw new HttpError(
+                        400,
+                        'Multipart upload id missing from session',
+                        { legacyCode: 'bad_request' },
+                    );
+                }
+
+                const completeParts = this.#toMultipartParts(
+                    completeWriteRequest.parts,
+                );
+                if (completeParts.length === 0) {
+                    throw new HttpError(
+                        400,
+                        'Multipart upload completion requires parts',
+                        { legacyCode: 'bad_request' },
+                    );
+                }
+
+                await this.stores.s3Object.completeMultipartUpload(
+                    {
+                        bucket:
+                            session.bucket ??
+                            createInput.bucket ??
+                            this.#resolveBucket(),
+                        objectKey: session.objectKey,
+                        multipartUploadId: session.multipartUploadId,
+                        parts: completeParts,
+                    },
+                    session.bucketRegion ??
+                        createInput.bucketRegion ??
+                        this.#resolveBucketRegion(),
+                );
+            }
+
+            // The size recorded so far is the client-declared value from the
+            // start-write request. The presigned URL binds that size as
+            // `Content-Length`, but the stored object is still the authority
+            // on what landed, so reconcile before persisting — sessions signed
+            // before the binding, and stores that don't enforce it, would
+            // otherwise understate SUM(size). Mirrors /write.
+            const reconcileBucket =
+                session.bucket ?? createInput.bucket ?? this.#resolveBucket();
+            const reconcileRegion =
+                session.bucketRegion ??
+                createInput.bucketRegion ??
+                this.#resolveBucketRegion();
+            const uploaded = await this.#probeObjectSize(
+                reconcileBucket,
+                session.objectKey,
+                reconcileRegion,
+            );
+            if (uploaded === 'missing') {
+                this.#logUnreceivedUploads([session]);
+                throw uploadNotReceivedError();
+            }
+            await this.#promoteStagedOverwrite(
+                session,
+                typeof uploaded === 'number' && uploaded >= 0
+                    ? uploaded
+                    : session.size,
+                reconcileBucket,
+                reconcileRegion,
+            );
+            if (typeof uploaded === 'number' && uploaded >= 0) {
+                // Record the true size only — do not re-assert the quota
+                // here. The bytes are already in the object store, so a
+                // completion-time reject can't reclaim them; it only
+                // false-rejects (the start-check may have used a higher
+                // storageAllowanceMax override that isn't persisted in the
+                // session) and deletes within-quota uploads. Over-declaration
+                // is closed at signing time now, so what's left is the
+                // bounded check-then-act window the start-check already has.
+                createInput.size = uploaded;
+            }
+
+            const fsEntry = await this.stores.fsEntry.completePendingEntry(
+                session,
+                createInput,
+            );
+            await this.#settleSessionUploadReservations([session]);
+            this.#emitFsEvent(
+                session.overwriteTargetUid ? 'fs.write.file' : 'fs.create.file',
+                fsEntry,
+            );
+            return {
+                sessionId: session.sessionId,
+                fsEntry,
+                wasOverwrite: Boolean(session.overwriteTargetUid),
+                requestedThumbnail,
+            };
+        } catch (error) {
+            try {
+                await this.stores.fsEntry.markPendingEntryFailed(
+                    session.sessionId,
+                    error instanceof Error
+                        ? error.message
+                        : 'Unknown error while completing upload',
+                );
+            } finally {
+                await this.#releaseSessionUploadReservations([session]);
+            }
+            throw error;
+        }
+    }
+
+    async batchCompleteUrlWrite(
+        userId: number,
+        completeWriteRequests: CompleteWriteRequest[],
+    ): Promise<CompleteWriteResponse[]> {
+        if (completeWriteRequests.length === 0) {
+            return [];
+        }
+
+        const uploadIds = completeWriteRequests.map(
+            (request) => request.uploadId,
+        );
+        const uniqueUploadIds = new Set(uploadIds);
+        if (uniqueUploadIds.size !== uploadIds.length) {
+            throw new HttpError(
+                409,
+                'Batch contains duplicate upload session ids',
+                { legacyCode: 'conflict' },
+            );
+        }
+
+        // Read fresh for the same reason as completeUrlWrite.
+        const sessions =
+            await this.stores.fsEntry.getPendingEntriesBySessionIds(uploadIds);
+        const completionItems: Array<{
+            index: number;
+            request: CompleteWriteRequest;
+            session: PendingUploadSession;
+            finalData: FSEntryCreateInput;
+            requestedThumbnail: string | null | undefined;
+        }> = [];
+        const expiredSessions: PendingUploadSession[] = [];
+
+        for (let index = 0; index < completeWriteRequests.length; index++) {
+            const request = completeWriteRequests[index];
+            const session = sessions[index];
+            if (!request || !session) {
+                throw new HttpError(404, 'Upload session was not found', {
+                    legacyCode: 'not_found',
+                });
+            }
+            if (session.userId !== userId) {
+                throw new HttpError(403, 'Upload session access denied', {
+                    legacyCode: 'forbidden',
+                });
+            }
+            assertSessionCompletable(session);
+            if (session.expiresAt < Date.now()) {
+                expiredSessions.push(session);
+                continue;
+            }
+
+            const finalData = this.#parseSessionMetadata(session);
+            const requestedThumbnail =
+                request.thumbnailData ?? finalData.thumbnail ?? null;
+            finalData.thumbnail = null;
+            completionItems.push({
+                index,
+                request,
+                session,
+                finalData,
+                requestedThumbnail,
+            });
+        }
+
+        if (expiredSessions.length > 0) {
+            try {
+                await this.stores.fsEntry.markPendingEntriesFailed(
+                    expiredSessions.map((session) => session.sessionId),
+                    'Upload session expired',
+                );
+            } finally {
+                await this.#releaseSessionUploadReservations(expiredSessions);
+            }
+            throw new HttpError(400, 'Upload session expired', {
+                legacyCode: 'session_required',
+            });
+        }
+
+        const uploadedSizes = new Map<string, number | null>();
+        const singleItems = completionItems.filter(
+            (item) => item.session.uploadMode !== 'multipart',
+        );
+        // Probe the single-mode items before any multipart completion runs —
+        // a multipart completion can't be undone if a sibling is refused.
+        await this.#probeBatchUploads(singleItems, uploadedSizes);
+
+        const multipartItems = completionItems.filter(
+            (item) => item.session.uploadMode === 'multipart',
+        );
+        const multipartCompletions = await Promise.allSettled(
+            multipartItems.map(async (item) => {
+                if (!item.session.multipartUploadId) {
+                    throw new HttpError(
+                        400,
+                        'Multipart upload id missing from session',
+                        { legacyCode: 'bad_request' },
+                    );
+                }
+
+                const completeParts = this.#toMultipartParts(
+                    item.request.parts,
+                );
+                if (completeParts.length === 0) {
+                    throw new HttpError(
+                        400,
+                        'Multipart upload completion requires parts',
+                        { legacyCode: 'bad_request' },
+                    );
+                }
+
+                await this.stores.s3Object.completeMultipartUpload(
+                    {
+                        bucket:
+                            item.session.bucket ??
+                            item.finalData.bucket ??
+                            this.#resolveBucket(),
+                        objectKey: item.session.objectKey,
+                        multipartUploadId: item.session.multipartUploadId,
+                        parts: completeParts,
+                    },
+                    item.session.bucketRegion ??
+                        item.finalData.bucketRegion ??
+                        this.#resolveBucketRegion(),
+                );
+            }),
+        );
+
+        const failedMultipartItems: Array<{
+            sessionId: string;
+            session: PendingUploadSession;
+            reason: unknown;
+        }> = [];
+        for (let index = 0; index < multipartCompletions.length; index++) {
+            const completion = multipartCompletions[index];
+            const multipartItem = multipartItems[index];
+            if (completion?.status === 'rejected' && multipartItem) {
+                failedMultipartItems.push({
+                    sessionId: multipartItem.session.sessionId,
+                    session: multipartItem.session,
+                    reason: completion.reason,
+                });
+            }
+        }
+
+        if (failedMultipartItems.length > 0) {
+            try {
+                await Promise.all(
+                    failedMultipartItems.map((item) => {
+                        return this.stores.fsEntry.markPendingEntryFailed(
+                            item.sessionId,
+                            this.#toErrorMessage(item.reason),
+                        );
+                    }),
+                );
+            } finally {
+                await this.#releaseSessionUploadReservations(
+                    failedMultipartItems.map((item) => item.session),
+                );
+            }
+
+            const firstReason = failedMultipartItems[0]?.reason;
+            if (firstReason instanceof HttpError) {
+                throw firstReason;
+            }
+            if (firstReason instanceof Error) {
+                throw firstReason;
+            }
+            throw new Error('Failed to complete multipart upload');
+        }
+
+        // Also records the multipart sizes.
+        await this.#probeBatchUploads(multipartItems, uploadedSizes);
+
+        // Record the true sizes only — do not re-assert the quota here. See
+        // completeUrlWrite: the bytes are already in the object store so a
+        // completion-time reject can't reclaim them, and per-item deletes
+        // would destroy the bytes of correctly-declared, within-quota
+        // siblings in the batch. Recording real sizes keeps SUM(size)
+        // accurate so the next signed-write start-check blocks an
+        // over-quota user.
+        for (const item of completionItems) {
+            const uploaded = uploadedSizes.get(item.session.sessionId);
+            if (typeof uploaded !== 'number' || uploaded < 0) continue;
+            item.finalData.size = uploaded;
+        }
+
+        // Each staged overwrite goes onto its live key before any row moves.
+        // A failure here leaves the sessions as any other one does, rather
+        // than pending with their leases still held.
+        try {
+            await Promise.all(
+                completionItems.map((item) =>
+                    this.#promoteStagedOverwrite(
+                        item.session,
+                        item.finalData.size ?? item.session.size,
+                        item.session.bucket ??
+                            item.finalData.bucket ??
+                            this.#resolveBucket(),
+                        item.session.bucketRegion ??
+                            item.finalData.bucketRegion ??
+                            this.#resolveBucketRegion(),
+                    ),
+                ),
+            );
+        } catch (error) {
+            try {
+                await this.stores.fsEntry.markPendingEntriesFailed(
+                    completionItems.map((item) => item.session.sessionId),
+                    this.#toErrorMessage(error),
+                );
+            } finally {
+                await this.#releaseSessionUploadReservations(
+                    completionItems.map((item) => item.session),
+                );
+            }
+            throw error;
+        }
+
+        const completedEntries =
+            await this.stores.fsEntry.batchCompletePendingEntries(
+                completionItems.map((item) => ({
+                    session: item.session,
+                    finalData: item.finalData,
+                })),
+            );
+        await this.#settleSessionUploadReservations(
+            completionItems.map((item) => item.session),
+        );
+
+        const responseByIndex = new Map<number, CompleteWriteResponse>();
+        for (let index = 0; index < completionItems.length; index++) {
+            const completionItem = completionItems[index];
+            const completedEntry = completedEntries[index];
+            if (!completionItem || !completedEntry) {
+                throw new Error(
+                    'Failed to build completed batch write response',
+                );
+            }
+
+            this.#emitFsEvent(
+                completionItem.session.overwriteTargetUid
+                    ? 'fs.write.file'
+                    : 'fs.create.file',
+                completedEntry,
+            );
+            responseByIndex.set(completionItem.index, {
+                sessionId: completionItem.session.sessionId,
+                fsEntry: completedEntry,
+                wasOverwrite: Boolean(
+                    completionItem.session.overwriteTargetUid,
+                ),
+                requestedThumbnail: completionItem.requestedThumbnail,
+            });
+        }
+
+        const response: CompleteWriteResponse[] = [];
+        for (let index = 0; index < completeWriteRequests.length; index++) {
+            const result = responseByIndex.get(index);
+            if (!result) {
+                throw new Error(
+                    `Failed to resolve completed batch response for index ${index}`,
+                );
+            }
+            response.push(result);
+        }
+        return response;
+    }
+
+    async abortUrlWrite(userId: number, uploadId: string): Promise<void> {
+        const session =
+            await this.stores.fsEntry.getPendingEntryBySessionId(uploadId);
+        if (!session) {
+            return;
+        }
+        if (session.userId !== userId) {
+            throw new HttpError(403, 'Upload session access denied', {
+                legacyCode: 'forbidden',
+            });
+        }
+        // A completed session's object now backs a live entry, and its
+        // reservation is already settled — nothing left for abort to undo.
+        if (session.status === 'completed') return;
+
+        try {
+            const bucket = session.bucket;
+            const bucketRegion = session.bucketRegion;
+            if (bucket && bucketRegion) {
+                if (
+                    session.uploadMode === 'multipart' &&
+                    session.multipartUploadId
+                ) {
+                    await this.stores.s3Object.abortMutipartUpload(
+                        session.multipartUploadId,
+                        bucketRegion,
+                        bucket,
+                        session.objectKey,
+                    );
+                } else if (session.objectKey !== session.overwriteTargetUid) {
+                    // Never the live key, unless the session predates staging.
+                    await this.stores.s3Object.deleteObject(
+                        bucket,
+                        session.objectKey,
+                        bucketRegion,
+                    );
+                }
+            }
+        } finally {
+            try {
+                await this.stores.fsEntry.abortPendingEntry(
+                    session.sessionId,
+                    'Upload aborted by caller',
+                );
+            } finally {
+                await this.#releaseSessionUploadReservations([session]);
+            }
+        }
+    }
+
+    async write(
+        userId: number,
+        writeRequest: WriteRequest,
+        uploadTracker?: UploadProgressTrackerLike,
+        storageAllowanceMax?: number,
+        homeRegion?: string,
+    ): Promise<WriteResponse> {
+        // Server-only, and a positional argument for that reason: the
+        // controllers build `writeRequest` out of the parsed request body, so a
+        // field there would let a caller choose its own bucket.
+        let normalizedInput = this.#normalizeWriteInput(
+            userId,
+            writeRequest.fileMetadata,
+            homeRegion,
+        );
+        const [resolvedTarget] = await this.#resolveWriteTargets(userId, [
+            {
+                index: 0,
+                normalizedInput,
+            },
+        ]);
+        if (!resolvedTarget) {
+            throw new Error('Failed to resolve write target');
+        }
+        normalizedInput = resolvedTarget.normalizedInput;
+        const existingEntry = resolvedTarget.existingEntry;
+        const requestedThumbnail =
+            writeRequest.thumbnailData ?? normalizedInput.thumbnail ?? null;
+        normalizedInput.thumbnail = null;
+
+        const existingSize = existingEntry?.size ?? 0;
+        const storageOwner = await this.#storageOwnerOf(
+            normalizedInput.path,
+            userId,
+        );
+        const ownerAllowanceMax = this.#allowanceOverrideFor(
+            storageOwner,
+            userId,
+            storageAllowanceMax,
+        );
+        await this.#assertStorageAllowance(
+            storageOwner,
+            normalizedInput.size,
+            existingSize,
+            ownerAllowanceMax,
+        );
+
+        const uploadBody = await this.#toUploadBody(
+            writeRequest.fileContent,
+            writeRequest.encoding,
+            uploadTracker,
+        );
+        const objectKey = existingEntry?.uuid ?? uuidv4();
+        await this.#uploadContent(
+            {
+                bucket: normalizedInput.bucket,
+                objectKey,
+                contentType: normalizedInput.contentType,
+                body: uploadBody.body,
+                ...(uploadBody.contentLength !== undefined
+                    ? { contentLength: uploadBody.contentLength }
+                    : {}),
+                ...(Number.isFinite(normalizedInput.size)
+                    ? { sizeHint: normalizedInput.size }
+                    : {}),
+            },
+            normalizedInput.bucketRegion,
+            uploadBody,
+        );
+
+        const uploadedSize = uploadBody.uploadedSize();
+        if (uploadTracker) {
+            const currentTrackedSize = Number(uploadTracker.progress ?? 0);
+            if (uploadedSize > currentTrackedSize) {
+                uploadTracker.add(uploadedSize - currentTrackedSize);
+            }
+        }
+        if (uploadedSize > normalizedInput.size) {
+            await this.#assertStorageAllowance(
+                storageOwner,
+                uploadedSize,
+                existingSize,
+                ownerAllowanceMax,
+            );
+        }
+        normalizedInput.size = uploadedSize;
+        const contentHashSha256 = uploadBody.finalizeContentHashSha256
+            ? uploadBody.finalizeContentHashSha256()
+            : uploadBody.contentHashSha256;
+
+        const createInput = this.#toCreateInput(normalizedInput, objectKey);
+        const fsEntry = await this.stores.fsEntry.createEntry(
+            createInput,
+            normalizedInput.createMissingParents,
+        );
+
+        this.#emitFsEvent(
+            existingEntry ? 'fs.write.file' : 'fs.create.file',
+            fsEntry,
+        );
+
+        return {
+            fsEntry,
+            wasOverwrite: Boolean(existingEntry),
+            requestedThumbnail,
+            contentHashSha256,
+        };
+    }
+
+    async batchWrites(
+        userId: number,
+        writeRequests: WriteRequest[],
+        storageAllowanceMax?: number,
+    ): Promise<WriteResponse[]> {
+        if (writeRequests.length === 0) {
+            return [];
+        }
+        const preparedBatch = await this.prepareBatchWrites(
+            userId,
+            writeRequests.map((writeRequest) => ({
+                fileMetadata: writeRequest.fileMetadata,
+                thumbnailData: writeRequest.thumbnailData,
+                guiMetadata: writeRequest.guiMetadata,
+            })),
+            storageAllowanceMax,
+        );
+        await this.assertStorageAllowanceForPreparedBatch(
+            preparedBatch,
+            undefined,
+            storageAllowanceMax,
+        );
+
+        const uploadResults = await runWithConcurrencyLimitSettled(
+            writeRequests,
+            8,
+            async (writeRequest, index) => {
+                return this.uploadPreparedBatchItem({
+                    preparedBatch,
+                    itemIndex: index,
+                    fileContent: writeRequest.fileContent,
+                    encoding: writeRequest.encoding,
+                });
+            },
+        );
+        const uploadedItems = uploadResults
+            .filter(
+                (
+                    result,
+                ): result is PromiseFulfilledResult<UploadedBatchWriteItem> =>
+                    result.status === 'fulfilled',
+            )
+            .map((result) => result.value);
+        const failedUpload = uploadResults.find(
+            (result) => result.status === 'rejected',
+        );
+        if (failedUpload?.status === 'rejected') {
+            await this.#cleanupPreparedBatchUploads(
+                preparedBatch,
+                uploadedItems,
+            );
+            throw this.#toError(
+                failedUpload.reason,
+                'Failed to upload batch write item',
+            );
+        }
+
+        return this.finalizePreparedBatchWrites(preparedBatch, uploadedItems);
+    }
+
+    async cleanupPreparedBatchUploads(
+        preparedBatch: PreparedBatchWrite,
+        uploadedItems: UploadedBatchWriteItem[],
+    ): Promise<void> {
+        await this.#cleanupPreparedBatchUploads(preparedBatch, uploadedItems);
+    }
+
+    /**
+     * Set thumbnails on entries `userId` owns, each result in input order: the
+     * updated entry, or why that one failed.
+     */
+    async updateEntryThumbnails(
+        userId: number,
+        updates: Array<{ uuid: string; thumbnail: string | null }>,
+    ): Promise<PromiseSettledResult<FSEntry>[]> {
+        const isValid = ({ uuid }: { uuid: string }) =>
+            typeof uuid === 'string' && uuid.length > 0;
+        const stored =
+            await this.stores.fsEntry.updateEntryThumbnailsByUuidForUser(
+                userId,
+                updates.filter(isValid),
+            );
+        let next = 0;
+        return updates.map(
+            (update): PromiseSettledResult<FSEntry> =>
+                isValid(update)
+                    ? stored[next++]
+                    : {
+                          status: 'rejected',
+                          reason: new HttpError(
+                              400,
+                              'Invalid file entry identifier for thumbnail update',
+                              { legacyCode: 'bad_request' },
+                          ),
+                      },
+        );
+    }
+
+    async getUsersStorageAllowance(
+        userId: string | number,
+    ): Promise<{ curr: number; max: number }> {
+        const numericUserId =
+            typeof userId === 'string' ? Number(userId) : userId;
+        if (Number.isNaN(numericUserId)) {
+            throw new HttpError(400, 'Invalid user id', {
+                legacyCode: 'bad_request',
+            });
+        }
+        return this.stores.fsEntry.getUserStorageAllowance(numericUserId);
+    }
+
+    // -- Reads -----------------------------------------------------------
+
+    /**
+     * List direct children of a directory. Caller is responsible for any ACL
+     * check on the parent (usually 'list' mode). Returns entries in the
+     * requested sort order.
+     */
+    async listDirectory(
+        parentUid: string,
+        options: {
+            limit?: number;
+            offset?: number;
+            sortBy?: 'name' | 'modified' | 'type' | 'size' | null;
+            sortOrder?: 'asc' | 'desc' | null;
+        } = {},
+    ): Promise<FSEntry[]> {
+        return this.stores.fsEntry.listChildren(parentUid, options);
+    }
+
+    async listDirectoryPage(
+        parentUid: string,
+        options: {
+            limit?: number;
+            cursor?: string | null;
+            sortBy?: 'name' | 'modified' | 'type' | 'size' | null;
+            sortOrder?: 'asc' | 'desc' | null;
+        } = {},
+    ): Promise<{ entries: FSEntry[]; cursor?: string }> {
+        return this.stores.fsEntry.listChildrenPage(parentUid, options);
+    }
+
+    async countDirectory(parentUid: string): Promise<number> {
+        return this.stores.fsEntry.countChildren(parentUid);
+    }
+
+    /**
+     * Cursor-paginated nested listing: descendants of `path` up to `maxDepth`
+     * levels deep. Owner-scoped by `userId` + path prefix. Sorts as asked; a
+     * `name` sort orders by full path so subtrees stay grouped.
+     */
+    async listDirectoryTreePage(
+        userId: number,
+        path: string,
+        options: {
+            limit?: number;
+            cursor?: string | null;
+            maxDepth: number;
+            sortBy?: 'name' | 'modified' | 'type' | 'size' | null;
+            sortOrder?: 'asc' | 'desc' | null;
+        },
+    ): Promise<{ entries: FSEntry[]; cursor?: string }> {
+        const page = await this.stores.fsEntry.listDescendantsPage(
+            userId,
+            path,
+            options,
+        );
+        // Listing a home or AppData reaches into every app's AppData.
+        const app = (Context.get('actor') as Actor | undefined)?.effectiveApp;
+        if (!app) return page;
+        const closed = await closedAppDataOwners(
+            this.stores.app,
+            page.entries.map((entry) => entry.path),
+            app.uid,
+        );
+        if (closed.size === 0) return page;
+        return {
+            ...page,
+            entries: page.entries.filter(
+                (entry) =>
+                    !closed.has(
+                        appDataOwnerOf(entry.path)?.toLowerCase() ?? '',
+                    ),
+            ),
+        };
+    }
+
+    async countDirectoryTree(
+        userId: number,
+        path: string,
+        maxDepth: number,
+    ): Promise<number> {
+        return this.stores.fsEntry.countDescendantsToDepth(
+            userId,
+            path,
+            maxDepth,
+        );
+    }
+
+    /**
+     * Search by file name for a user. Linear-scan with LIKE — cheap for typical
+     * library sizes, revisit if we need full-text.
+     *
+     * `pathScope` restricts results to entries at or under that path.
+     * App-under-user callers pass their AppData root so search can't leak paths
+     * the actor isn't allowed to read.
+     */
+    async searchByName(
+        userId: number,
+        query: string,
+        limit = 200,
+        pathScope?: string,
+    ): Promise<FSEntry[]> {
+        return this.stores.fsEntry.searchByNameForUser(
+            userId,
+            query,
+            limit,
+            pathScope,
+        );
+    }
+
+    /**
+     * Recursively compute total byte size under a directory. Called on demand
+     * from `stat` when the client asks for `size: true`. See the repository
+     * method for the perf caveat — this is O(descendants) and should get a
+     * materialized counter eventually.
+     */
+    async getSubtreeSize(userId: number, path: string): Promise<number> {
+        return this.stores.fsEntry.getSubtreeSize(userId, path);
+    }
+
+    /**
+     * Stream bytes of a file entry from S3. The returned stream is a Node
+     * Readable; caller pipes it into the HTTP response and emits metering once
+     * the stream ends. Honours HTTP Range when provided.
+     *
+     * Throws 400 if the entry isn't a file, 500 if the entry has no backing
+     * bucket (should never happen for real files).
+     */
+    async readContent(
+        entry: FSEntry,
+        options: { range?: string } = {},
+    ): Promise<{
+        body: Readable;
+        contentLength: number | null;
+        contentType: string | null;
+        contentRange: string | null;
+        etag: string | null;
+        lastModified: Date | null;
+    }> {
+        if (entry.isDir) {
+            throw new HttpError(400, 'Cannot read content of a directory', {
+                legacyCode: 'bad_request',
+            });
+        }
+        if (entry.isSymlink || entry.isShortcut) {
+            // Caller should resolve the link target before calling readContent.
+            throw new HttpError(
+                400,
+                'Cannot read content of a symlink or shortcut directly',
+                { legacyCode: 'shortcut_target_not_found' },
+            );
+        }
+        // Empty files (created via `touch`/`createNonFileEntry` with kind
+        // 'empty-file') have no backing S3 object — `bucket` is null. Reading
+        // one would throw NoSuchKey and, worse, trip #handleGhostFile, which
+        // deletes the entry as if it were an orphan. Return an empty stream
+        // instead. (A real file whose object is genuinely missing keeps a
+        // non-null bucket, so it still falls through to the ghost path below.)
+        if (hasNoBackingS3Object(entry)) {
+            return {
+                body: Readable.from([]),
+                contentLength: 0,
+                contentType: null,
+                contentRange: null,
+                etag: null,
+                lastModified: entry.modified
+                    ? new Date(entry.modified * 1000)
+                    : null,
+            };
+        }
+        const objectKey = entry.uuid;
+        try {
+            return await this.stores.s3Object.getObjectStream(
+                {
+                    bucket: this.stores.s3Object.resolveBucket(entry.bucket),
+                    objectKey,
+                    range: options.range,
+                },
+                this.stores.s3Object.resolveRegion(entry.bucketRegion),
+            );
+        } catch (err) {
+            if (isNoSuchKeyError(err)) {
+                await this.#handleGhostFile(entry, objectKey);
+                throw new HttpError(404, 'File contents are missing', {
+                    legacyCode: 'subject_does_not_exist',
+                    cause: err,
+                    // No path: a recipient addresses this entry by uuid.
+                    fields: {
+                        uid: entry.uuid,
+                    },
+                });
+            }
+            throw err;
+        }
+    }
+
+    // Only a second, definitive not-found from the entry's own recorded
+    // location removes it — a spurious miss elsewhere must not destroy data.
+    async #isObjectConfirmedMissing(
+        entry: FSEntry,
+        objectKey: string,
+    ): Promise<boolean> {
+        if (!entry.bucket || !entry.bucketRegion) return false;
+        try {
+            await this.stores.s3Object.headObjectSize(
+                entry.bucket,
+                objectKey,
+                entry.bucketRegion,
+            );
+            return false;
+        } catch (error) {
+            return isMissingObjectError(error);
+        }
+    }
+
+    // Called after NoSuchKey against an entry the DB still has. Confirm at
+    // the entry's own recorded location before deleting the row (and
+    // emitting fs.remove.node) — best-effort: the caller must not fail
+    // because cleanup failed.
+    async #handleGhostFile(entry: FSEntry, objectKey: string): Promise<void> {
+        const confirmed = await this.#isObjectConfirmedMissing(
+            entry,
+            objectKey,
+        );
+        console.error('prodfsv2 ghost fsentry — backing S3 object missing', {
+            userId: entry.userId,
+            uuid: entry.uuid,
+            path: entry.path,
+            bucket: entry.bucket,
+            bucketRegion: entry.bucketRegion,
+            objectKey,
+            removed: confirmed,
+        });
+        if (!confirmed) return;
+        try {
+            await this.remove(entry.userId, { entry, systemInitiated: true });
+        } catch (cleanupErr) {
+            console.error(
+                'prodfsv2 ghost fsentry cleanup failed',
+                { uuid: entry.uuid },
+                cleanupErr,
+            );
+        }
+    }
+
+    // -- Mutation: mkdir / touch / rename / mkshortcut ---------
+
+    /**
+     * Resolve a free child name under `parentEntry` by appending ` (N)` when
+     * `name` already exists. Mirrors the deduping convention used by
+     * `#findDedupedPath` but operates on the parent+name shape.
+     */
+    async #findDedupedName(
+        parentEntry: FSEntry,
+        name: string,
+    ): Promise<string> {
+        const repo = this.stores.fsEntry;
+        const parentPath = parentEntry.path;
+        const ext = pathPosix.extname(name);
+        const base = pathPosix.basename(name, ext);
+        for (let suffix = 1; suffix < 100_000; suffix++) {
+            const candidate = `${base} (${suffix})${ext}`;
+            const candidatePath =
+                parentPath === '/'
+                    ? `/${candidate}`
+                    : `${parentPath}/${candidate}`;
+            const existing = await repo.getEntryByPath(candidatePath);
+            if (!existing) return candidate;
+        }
+        throw new HttpError(
+            500,
+            'Could not dedupe name within 100000 attempts',
+            { legacyCode: 'internal_error' },
+        );
+    }
+
+    /**
+     * Resolve or create a parent directory for a given target path. Returns the
+     * parent entry. Throws 400 synchronously if the path has no parent (root),
+     * and rejects with 404 when parents are missing and create is disabled.
+     */
+    #resolveOrCreateParent(
+        userId: number,
+        targetPath: string,
+        createMissingParents: boolean,
+    ): Promise<FSEntry> {
+        const normalized = targetPath.trim();
+        if (normalized === '/')
+            throw new HttpError(400, 'Cannot operate on root', {
+                legacyCode: 'bad_request',
+            });
+        const parentPath = pathPosix.dirname(normalized);
+        if (parentPath === '/')
+            throw new HttpError(400, 'Cannot operate at root', {
+                legacyCode: 'bad_request',
+            });
+        return this.stores.fsEntry.resolveParentDirectory(
+            userId,
+            parentPath,
+            createMissingParents,
+        );
+    }
+
+    /**
+     * Create a directory at `path`. Options:
+     *
+     * - Overwrite: if a non-directory exists, remove it and create dir
+     * - DedupeName: if conflict, append ` (N)`
+     * - CreateMissingParents: create intermediate dirs
+     *
+     * Returns the created (or existing-on-dedupe-false-no-conflict) entry.
+     */
+    async mkdir(
+        userId: number,
+        input: {
+            path: string;
+            overwrite?: boolean;
+            dedupeName?: boolean;
+            createMissingParents?: boolean;
+            thumbnail?: string | null;
+        },
+    ): Promise<FSEntry> {
+        const targetPath = input.path.trim();
+        const parentLookup = this.#resolveOrCreateParent(
+            userId,
+            targetPath,
+            !!input.createMissingParents,
+        );
+        // Looked up alongside the parent, but awaited after it so the parent's
+        // error still comes first. A target whose parent is still being created
+        // reads as missing; a concurrent create lands in the unique-violation
+        // handler below.
+        const existingLookup = awaitLater(
+            this.stores.fsEntry.getEntryByPath(targetPath),
+        );
+        const parent = await parentLookup;
+
+        let name = pathPosix.basename(targetPath);
+        const existing = await existingLookup;
+        if (existing) {
+            if (existing.isDir) {
+                if (input.dedupeName) {
+                    name = await this.#findDedupedName(parent, name);
+                } else {
+                    // A directory already exists at path: idempotent success.
+                    return existing;
+                }
+            } else if (input.overwrite) {
+                // Remove the non-directory occupant then create the dir.
+                await this.remove(userId, {
+                    entry: existing,
+                    recursive: false,
+                });
+            } else if (input.dedupeName) {
+                name = await this.#findDedupedName(parent, name);
+            } else {
+                throw new HttpError(
+                    409,
+                    `An entry named \`${name}\` already exists`,
+                    { legacyCode: 'conflict' },
+                );
+            }
+        }
+
+        let created: FSEntry;
+        try {
+            created = await this.stores.fsEntry.createNonFileEntry({
+                parent,
+                name,
+                kind: 'directory',
+                thumbnail: input.thumbnail ?? null,
+            });
+        } catch (err) {
+            // Concurrent mkdir race: another caller inserted the same
+            // (parent_id, name) between our existence check above and the
+            // INSERT, tripping the unique key. mkdir on an existing dir is
+            // documented as idempotent — re-fetch and return the winner if
+            // it's a directory; otherwise surface the same 409 the pre-INSERT
+            // check would have produced.
+            if (!isUniqueViolation(err)) throw err;
+            const insertedPath =
+                parent.path === '/' ? `/${name}` : `${parent.path}/${name}`;
+            // The dup violation proves a row exists, so a replica miss here
+            // would surface the raw ER_DUP_ENTRY as a 500. Read primary too.
+            const raced = await this.stores.fsEntry.getEntryByPath(
+                insertedPath,
+                { useTryHardRead: true },
+            );
+            if (raced?.isDir) return raced;
+            if (raced) {
+                throw new HttpError(
+                    409,
+                    `An entry named \`${name}\` already exists`,
+                    { legacyCode: 'conflict' },
+                );
+            }
+            throw err;
+        }
+        this.#emitFsEvent('fs.create.directory', created);
+        return created;
+    }
+
+    /**
+     * Touch: create an empty file at `path` if missing; otherwise bump
+     * timestamps.
+     */
+    async touch(
+        userId: number,
+        input: {
+            path: string;
+            setAccessed?: boolean;
+            setModified?: boolean;
+            setCreated?: boolean;
+            createMissingParents?: boolean;
+        },
+    ): Promise<FSEntry> {
+        const targetPath = input.path.trim();
+        const parent = await this.#resolveOrCreateParent(
+            userId,
+            targetPath,
+            !!input.createMissingParents,
+        );
+        const name = pathPosix.basename(targetPath);
+        const existing = await this.stores.fsEntry.getEntryByPath(targetPath);
+        if (existing) {
+            return this.stores.fsEntry.touchEntryTimestamps(existing.uuid, {
+                setAccessed: input.setAccessed,
+                setModified: input.setModified,
+                setCreated: input.setCreated,
+            });
+        }
+        const created = await this.stores.fsEntry.createNonFileEntry({
+            parent,
+            name,
+            kind: 'empty-file',
+        });
+        this.#emitFsEvent('fs.create.file', created);
+        return created;
+    }
+
+    /**
+     * Rename an entry in place. The name changes and path rewrites; if the
+     * entry is a directory, descendant paths are rewritten too.
+     */
+    async rename(
+        userId: number,
+        entry: FSEntry,
+        newName: string,
+    ): Promise<FSEntry> {
+        this.#assertNotUserRoot(entry, 'rename');
+        await this.#assertCanRename(entry, userId);
+        this.#assertUsableName(newName);
+        if (entry.name === newName) return entry;
+        this.#assertAppDataRootsStay(entry.path);
+        await this.#assertCrossAppDeleteAllowed(entry.path);
+        await this.#assertCarriesNoClosedAppData(entry, 'rename');
+
+        const parentPath = pathPosix.dirname(entry.path);
+        const newPath =
+            parentPath === '/' ? `/${newName}` : `${parentPath}/${newName}`;
+
+        // Reject if another entry already owns the target path.
+        const collision = await this.stores.fsEntry.getEntryByPath(newPath);
+        if (collision && collision.uuid !== entry.uuid) {
+            throw new HttpError(
+                409,
+                `An entry named \`${newName}\` already exists`,
+                { legacyCode: 'conflict' },
+            );
+        }
+
+        const updated = await this.stores.fsEntry.updateEntry(entry.uuid, {
+            name: newName,
+            path: newPath,
+        });
+
+        if (entry.isDir) {
+            await this.stores.fsEntry.updatePathPrefixForUser(
+                entry.userId,
+                entry.path,
+                newPath,
+            );
+        }
+        this.#emitFsEvent(
+            'fs.rename',
+            updated,
+            {
+                old_name: entry.name,
+                new_name: newName,
+                old_path: entry.path,
+                new_path: newPath,
+            },
+            { path: entry.path },
+        );
+        return updated;
+    }
+
+    /**
+     * Create a shortcut pointing at `target`. Shortcuts are FS entries with
+     * `is_shortcut = 1` and `shortcut_to = target.id`.
+     */
+    async mkshortcut(
+        userId: number,
+        input: {
+            parent: FSEntry;
+            name: string;
+            target: FSEntry;
+            dedupeName?: boolean;
+        },
+    ): Promise<FSEntry> {
+        let name = input.name;
+        this.#assertUsableName(name);
+        const childPath =
+            input.parent.path === '/'
+                ? `/${name}`
+                : `${input.parent.path}/${name}`;
+        const collision = await this.stores.fsEntry.getEntryByPath(childPath);
+        if (collision) {
+            if (input.dedupeName) {
+                name = await this.#findDedupedName(input.parent, name);
+            } else {
+                throw new HttpError(
+                    409,
+                    `An entry named \`${name}\` already exists`,
+                    { legacyCode: 'conflict' },
+                );
+            }
+        }
+        const created = await this.stores.fsEntry.createNonFileEntry({
+            parent: input.parent,
+            name,
+            kind: 'shortcut',
+            shortcutTo: input.target.id,
+        });
+        this.#emitFsEvent('fs.create.shortcut', created);
+        return created;
+    }
+
+    // -- Mutation: remove / move / copy ---------------------------------
+
+    /**
+     * Delete, move, and rename all ask ACL for `fs:write`, which cannot tell
+     * them apart from an ordinary write — so the delete class is enforced here
+     * instead, at the only choke point both FS controllers and the `/batch`
+     * dispatcher go through.
+     *
+     * Reads the actor from context: these methods take a `userId`, not an
+     * actor, and a caller with no actor (provisioning, internal mkdir, the
+     * system actor) is unaffected.
+     */
+    async #assertCrossAppDeleteAllowed(path: string): Promise<void> {
+        const actor = Context.get('actor') as Actor | undefined;
+        if (!actor) return;
+        // The app the caller acts as, not the one it carries directly: a token
+        // actor has no `app` of its own and would skip the guard.
+        const app = actor.effectiveApp;
+        if (!app) return;
+        const username = actor.user?.username;
+        if (!username) return;
+
+        const targetAppUid = foreignAppDataOwner(path, username, app.uid);
+        if (!targetAppUid) return;
+
+        const granted = await this.services.permission.check(
+            actor,
+            appDataPermission(targetAppUid, 'fs', 'delete'),
+        );
+        if (!granted) {
+            throw new HttpError(403, 'Forbidden', { legacyCode: 'forbidden' });
+        }
+    }
+
+    /**
+     * A name has to be one path segment. Rename, move and copy all splice the
+     * caller's name straight into the parent's path, so a slash or a `.`/`..`
+     * segment would name a row outside the directory the caller was authorized
+     * against — and `move` into the owner's Trash is authorized without a write
+     * check on the destination at all.
+     */
+    #assertUsableName(name: string): void {
+        if (typeof name !== 'string' || name.trim().length === 0)
+            throw new HttpError(400, 'Name cannot be empty', {
+                legacyCode: 'bad_request',
+            });
+        if (name.includes('/'))
+            throw new HttpError(400, 'Name cannot contain a slash', {
+                legacyCode: 'bad_request',
+            });
+        if (name === '.' || name === '..')
+            throw new HttpError(400, 'Name cannot be `.` or `..`', {
+                legacyCode: 'bad_request',
+            });
+    }
+
+    /**
+     * A home's name is the account's username, and ACL authorizes by matching
+     * the first path segment against it — so a root free to be renamed or moved
+     * can be parked on a name another account later claims, leaving two trees
+     * at one path. `renameUserHome` is the only writer of a home's name.
+     *
+     * Both parent columns have to be NULL: `parent_uid` alone is NULL on legacy
+     * rows that only ever carried `parent_id`.
+     */
+    #assertNotUserRoot(entry: FSEntry, verb: string): void {
+        if (entry.parentUid === null && entry.parentId === null) {
+            throw new HttpError(
+                403,
+                `Cannot ${verb} a home directory — its name follows the account username.`,
+                { legacyCode: 'forbidden' },
+            );
+        }
+    }
+
+    /**
+     * An AppData root's name is its app's uid, launch adopts whatever directory
+     * holds that name, and grants on an entry follow it when it moves. So only
+     * the account itself may rename or move a root, or move an entry into a
+     * root's place.
+     */
+    #assertAppDataRootsStay(...paths: string[]): void {
+        if (!paths.some(isAppDataRootPath)) return;
+        const actor = Context.get('actor') as Actor | undefined;
+        if (!actor || isAccountContext(actor)) return;
+        throw new HttpError(
+            403,
+            'Only the account owner can rename or move AppData folders',
+            { legacyCode: 'forbidden' },
+        );
+    }
+
+    /** An app may not carry another app's closed AppData out of AppData. */
+    async #assertCarriesNoClosedAppData(
+        source: FSEntry,
+        verb: string,
+    ): Promise<void> {
+        const app = (Context.get('actor') as Actor | undefined)?.effectiveApp;
+        if (!app) return;
+        if (await carriesClosedAppData(this.stores, source, app.uid)) {
+            throw new HttpError(
+                403,
+                `Cannot ${verb} a folder holding another app's private data`,
+                { legacyCode: 'forbidden' },
+            );
+        }
+    }
+
+    /**
+     * Only the account moving within its own tree (source _and_ destination
+     * both its own) may set these freely; anyone else gets them stripped, or
+     * recomputed from the entry if landing in the owner's Trash.
+     */
+    #reconcileTrashMetadata(
+        source: FSEntry,
+        destinationParent: FSEntry,
+        newMetadata: Record<string, unknown> | null | undefined,
+    ): Record<string, unknown> | null | undefined {
+        const actor = Context.get('actor') as Actor | undefined;
+        const isOwner =
+            !actor ||
+            (isAccountContext(actor) &&
+                actor.user?.id === source.userId &&
+                actor.user?.id === destinationParent.userId);
+        if (isOwner) return newMetadata;
+
+        const effective =
+            newMetadata !== undefined
+                ? newMetadata
+                : this.#parseStoredMetadata(source.metadata);
+
+        if (!isOwnersTrash(source, destinationParent)) {
+            if (
+                !effective ||
+                typeof effective !== 'object' ||
+                !CLIENT_TRASH_METADATA_KEYS.some((key) => key in effective)
+            ) {
+                return newMetadata;
+            }
+            const cleaned = { ...effective };
+            for (const key of CLIENT_TRASH_METADATA_KEYS) {
+                delete cleaned[key];
+            }
+            return cleaned;
+        }
+
+        const base =
+            effective && typeof effective === 'object' ? effective : {};
+        return {
+            ...base,
+            original_path: source.path,
+            original_name: source.name,
+            trashed_ts: Math.round(Date.now() / 1000),
+        };
+    }
+
+    /** Parses stored metadata back into a record, or null if it isn't one. */
+    #parseStoredMetadata(
+        metadata: string | null,
+    ): Record<string, unknown> | null {
+        if (!metadata) return null;
+        try {
+            const parsed = JSON.parse(metadata);
+            return parsed &&
+                typeof parsed === 'object' &&
+                !Array.isArray(parsed)
+                ? (parsed as Record<string, unknown>)
+                : null;
+        } catch {
+            return null;
+        }
+    }
+
+    /**
+     * A FILE shared directly with you is renameable with `write` on it — the
+     * name is the file's own, and rename stays in place. A folder's name is
+     * structure the owner's whole subtree hangs off, so folders (and anything
+     * reached inside a shared folder) go by the parent-write restructure rule
+     * instead.
+     */
+    async #assertCanRename(entry: FSEntry, userId: number): Promise<void> {
+        if (entry.userId !== userId && !entry.isDir) {
+            const actor = Context.get('actor') as Actor | undefined;
+            if (actor) {
+                const allowed = await this.services.acl.check(
+                    actor,
+                    this.services.acl.fsDescriptor(entry.path),
+                    'write',
+                );
+                if (allowed) return;
+            }
+        }
+
+        await this.#assertCanRestructure(entry, userId);
+    }
+
+    /**
+     * Move and delete are authorized by `write` on the parent, not on the entry
+     * — which is what lets a share recipient reorganize inside a shared folder
+     * without reaching the shared folder itself.
+     */
+    async #assertCanRestructure(entry: FSEntry, userId: number): Promise<void> {
+        if (entry.userId === userId) return;
+
+        const actor = Context.get('actor') as Actor | undefined;
+        const parentPath = pathPosix.dirname(entry.path);
+        if (actor && parentPath !== '/') {
+            const allowed = await this.services.acl.check(
+                actor,
+                this.services.acl.fsDescriptor(parentPath),
+                'write',
+            );
+            if (allowed) return;
+        }
+
+        throw new HttpError(
+            403,
+            'Cannot restructure an entry owned by another user',
+            { legacyCode: 'forbidden' },
+        );
+    }
+
+    /**
+     * Remove an entry. For directories, descendants are walked and removed
+     * (both DB rows and S3 objects). Emits `fs.remove.node` once per removed
+     * entry, after its row is deleted, so listeners can clean up side state.
+     *
+     * The caller checks `write` on the entry; the parent check that governs
+     * restructuring is enforced here.
+     */
+    async remove(
+        userId: number,
+        input: {
+            entry: FSEntry;
+            recursive?: boolean;
+            descendantsOnly?: boolean;
+            /**
+             * Set by internal repair (ghost-fsentry cleanup), which runs during
+             * an unrelated caller's read and is not that caller's action —
+             * otherwise the guard refuses it and the orphan is never reaped.
+             */
+            systemInitiated?: boolean;
+        },
+    ): Promise<void> {
+        const { entry } = input;
+        if (!input.systemInitiated) {
+            await this.#assertCrossAppDeleteAllowed(entry.path);
+            // Emptying a home leaves it in place; only removing it is refused.
+            if (!input.descendantsOnly) {
+                this.#assertNotUserRoot(entry, 'delete');
+            }
+        }
+        await this.#assertCanRestructure(entry, userId);
+
+        // What is left above a removed entry, read at most once for the whole
+        // subtree and only if a subscriber needs it.
+        const survivors = this.#memoizedChain(
+            input.descendantsOnly ? entry.path : pathPosix.dirname(entry.path),
+        );
+
+        if (entry.isDir) {
+            if (!input.recursive) {
+                if (await this.stores.fsEntry.hasChildren(entry)) {
+                    throw new HttpError(409, 'Directory is not empty', {
+                        legacyCode: 'conflict',
+                    });
+                }
+            } else {
+                await this.#removeDescendants(entry, survivors);
+            }
+
+            if (!input.descendantsOnly) {
+                await this.stores.fsEntry.deleteEntry(entry);
+                this.#emitRemoveEvents([entry], survivors);
+            }
+            return;
+        }
+
+        // File / shortcut / symlink: delete backing S3 object (if any) then the row.
+        if (
+            entry.bucket &&
+            entry.bucketRegion &&
+            !entry.isShortcut &&
+            !entry.isSymlink
+        ) {
+            try {
+                await this.stores.s3Object.deleteObject(
+                    entry.bucket,
+                    entry.uuid,
+                    entry.bucketRegion,
+                );
+            } catch {
+                // Best effort — DB row is the source of truth. Extensions
+                // will get the `fs.remove.node` event regardless.
+            }
+        }
+        await this.stores.fsEntry.deleteEntry(entry);
+        this.#emitRemoveEvents([entry], survivors);
+    }
+
+    /**
+     * Delete a directory's contents a page at a time, leaves first, so neither
+     * memory nor a single statement grows with the subtree: a page's files go
+     * as it is read, a directory once everything under it has.
+     */
+    async #removeDescendants(
+        root: FSEntry,
+        survivors: () => Promise<AncestorChain>,
+    ): Promise<void> {
+        const removeEntries = async (entries: FSEntry[]) => {
+            if (entries.length === 0) return;
+            // S3 objects are batched per bucket+region.
+            await this.#removeDescendantsStorage(entries);
+            await this.stores.fsEntry.deleteEntries(entries);
+            this.#emitRemoveEvents(entries, survivors);
+        };
+        await this.#walkSubtree(
+            root,
+            async (page) => {
+                await removeEntries(page.filter((entry) => !entry.isDir));
+                return page.filter((entry) => entry.isDir);
+            },
+            removeEntries,
+        );
+    }
+
+    /**
+     * Walk `root`'s subtree a page of children at a time, depth first over
+     * batches of sibling directories, so memory stays within depth × page.
+     * `visit` gets each page after the page holding its parents and returns the
+     * directories to descend into; `leave` gets each such batch once everything
+     * under it has been visited.
+     */
+    async #walkSubtree(
+        root: FSEntry,
+        visit: (page: FSEntry[]) => Promise<FSEntry[]>,
+        leave: (dirs: FSEntry[]) => Promise<void>,
+    ): Promise<void> {
+        const limit = FSService.SUBTREE_PAGE_SIZE;
+        const batchSize = FSService.SUBTREE_WALK_PARENTS;
+        const stack: Array<{
+            dirs: FSEntry[];
+            after?: FSEntry;
+            done: boolean;
+        }> = [{ dirs: [root], done: false }];
+        while (stack.length > 0) {
+            const frame = stack[stack.length - 1]!;
+            if (frame.done) {
+                stack.pop();
+                // The root itself is the caller's.
+                if (stack.length > 0) await leave(frame.dirs);
+                continue;
+            }
+            const page = await this.stores.fsEntry.listChildrenOfParents(
+                frame.dirs,
+                { limit, after: frame.after },
+            );
+            frame.done = page.length < limit;
+            if (page.length === 0) continue;
+            frame.after = page[page.length - 1];
+            const dirs = await visit(page);
+            let batches: FSEntry[][] = [];
+            for (let i = 0; i < dirs.length; i += batchSize) {
+                batches.push(dirs.slice(i, i + batchSize));
+            }
+            if (batches.length > 1) {
+                // Probe sibling batches together, so the ones holding nothing
+                // finish without a round trip each.
+                const probes = await Promise.all(
+                    batches.map((batch) =>
+                        this.stores.fsEntry.listChildrenOfParents(batch, {
+                            limit: 1,
+                        }),
+                    ),
+                );
+                const empty = batches.filter((_, i) => !probes[i]?.length);
+                if (empty.length > 0) await leave(empty.flat());
+                batches = batches.filter((_, i) => probes[i]?.length);
+            }
+            for (const batch of batches)
+                stack.push({ dirs: batch, done: false });
+        }
+    }
+
+    /**
+     * Hard-delete every FS entry owned by `userId`: S3 objects first, then
+     * every `fsentries` row. Used by account deletion. Paginates through files
+     * (5k at a time) so large users don't blow the heap, batches S3 deletes per
+     * bucket+region, and finishes with one bulk DELETE to sweep
+     * dirs/shortcuts/symlinks that don't have backing objects.
+     *
+     * Safe to call concurrently with other ops on the same user only in the
+     * sense that orphaned S3 objects may linger if a write races us; the DB
+     * state always converges to "user has no entries".
+     */
+    async removeAllForUser(userId: number): Promise<void> {
+        const pageSize = 5000;
+        const falseLiteral = this.clients.db.booleanLiteral(false);
+        // Files-first loop: delete backing S3 objects in batches, then DB rows.
+        for (;;) {
+            const files = (await this.clients.db.read(
+                `SELECT uuid, bucket, bucket_region FROM fsentries
+                 WHERE user_id = ? AND is_dir = ${falseLiteral} AND (is_shortcut = ${falseLiteral} OR is_shortcut IS NULL) AND (is_symlink = ${falseLiteral} OR is_symlink IS NULL)
+                 LIMIT ${pageSize}`,
+                [userId],
+            )) as Array<{
+                uuid: string;
+                bucket: string | null;
+                bucket_region: string | null;
+            }>;
+
+            if (files.length === 0) break;
+
+            // Group by bucket+region so one S3 DeleteObjects call covers each.
+            const grouped = new Map<
+                string,
+                { bucket: string; region: string; keys: string[] }
+            >();
+            for (const f of files) {
+                if (!f.bucket || !f.bucket_region) continue;
+                const groupKey = `${f.bucket_region}::${f.bucket}`;
+                const group = grouped.get(groupKey) ?? {
+                    bucket: f.bucket,
+                    region: f.bucket_region,
+                    keys: [],
+                };
+                group.keys.push(f.uuid);
+                grouped.set(groupKey, group);
+            }
+            await Promise.allSettled(
+                Array.from(grouped.values()).map((g) =>
+                    this.stores.s3Object.deleteObjects(
+                        { bucket: g.bucket, objectKeys: g.keys },
+                        g.region,
+                    ),
+                ),
+            );
+
+            const uuidPlaceholders = files.map(() => '?').join(', ');
+            await this.clients.db.write(
+                `DELETE FROM fsentries WHERE user_id = ? AND uuid IN (${uuidPlaceholders})`,
+                [userId, ...files.map((f) => f.uuid)],
+            );
+        }
+
+        // Sweep remaining non-file rows (dirs, shortcuts, symlinks).
+        await this.clients.db.write('DELETE FROM fsentries WHERE user_id = ?', [
+            userId,
+        ]);
+    }
+
+    async #removeDescendantsStorage(descendants: FSEntry[]): Promise<void> {
+        // Group file descendants by bucket+region for batch delete.
+        const grouped = new Map<
+            string,
+            { bucket: string; region: string; keys: string[] }
+        >();
+        for (const child of descendants) {
+            if (child.isDir || child.isShortcut || child.isSymlink) continue;
+            if (!child.bucket || !child.bucketRegion) continue;
+            const groupKey = `${child.bucketRegion}::${child.bucket}`;
+            const group = grouped.get(groupKey) ?? {
+                bucket: child.bucket,
+                region: child.bucketRegion,
+                keys: [],
+            };
+            group.keys.push(child.uuid);
+            grouped.set(groupKey, group);
+        }
+        await Promise.allSettled(
+            Array.from(grouped.values()).map((group) =>
+                this.stores.s3Object.deleteObjects(
+                    { bucket: group.bucket, objectKeys: group.keys },
+                    group.region,
+                ),
+            ),
+        );
+    }
+
+    /**
+     * Removed entries publish with `survivors` as their ancestors: the
+     * directories that still exist above them once the delete is done.
+     */
+    #emitRemoveEvents(
+        entries: FSEntry[],
+        survivors: () => Promise<AncestorChain>,
+    ): void {
+        for (const entry of entries) {
+            // Ship the entry under every alias existing handlers use — `node`,
+            // `entry`, `target`. The thumbnails extension destructures
+            // `{ target }`, and the bare `{ node, entry }` shape landed
+            // `target: undefined` → crash on `target.thumbnail`.
+            try {
+                this.clients.event.emit(
+                    'fs.remove.node',
+                    { node: entry, entry, target: entry },
+                    {},
+                );
+            } catch {
+                // Non-critical.
+            }
+        }
+        this.#dispatchEvents('fs.remove.node', entries, {
+            ancestors: survivors,
+        });
+    }
+
+    /** A chain read on first use and shared by every caller after. */
+    #memoizedChain(path: string): () => Promise<AncestorChain> {
+        let chain: Promise<AncestorChain> | null = null;
+        return () => (chain ??= this.stores.fsEntry.getAncestorChain(path));
+    }
+
+    /**
+     * Publish committed changes to whoever subscribed to them.
+     *
+     * Post-commit and fire-and-forget: the write already happened, so nothing
+     * here may fail it or slow it down. A batch runs at bounded concurrency in
+     * one background task. The ancestor walk is a thunk because almost every
+     * write belongs to a user with no subscriptions, and that user must not pay
+     * for the walk to find out.
+     *
+     * `movedFrom` is a move only: the folder `entry` left needs its own
+     * ancestor walk, taken from where it used to live, or its subscribers would
+     * never hear the node went.
+     *
+     * `ancestors` lets a caller that already knows the chain supply it instead
+     * of walking from each entry's path.
+     */
+    #dispatchEvents(
+        key: EventKey,
+        entries: FSEntry | FSEntry[],
+        options: {
+            movedFrom?: { path: string };
+            ancestors?: (entry: FSEntry) => Promise<AncestorChain>;
+        } = {},
+    ): void {
+        const events = this.services.events;
+        if (!events?.enabled) return;
+        const batch = Array.isArray(entries) ? entries : [entries];
+        if (batch.length === 0) return;
+        const { movedFrom } = options;
+        const fsEntry = this.stores.fsEntry;
+        const ancestors =
+            options.ancestors ??
+            ((entry: FSEntry) => fsEntry.getAncestorChain(entry.path));
+        const actor = Context.get('actor') as Actor | undefined;
+        const actingUserId = actor?.user?.id;
+        const handlerDepth = handlerDepthOf(actor);
+        const movedFromChain = movedFrom && {
+            path: movedFrom.path,
+            ancestors: () => fsEntry.getAncestorChain(movedFrom.path),
+        };
+        void (async () => {
+            try {
+                const results = await runWithConcurrencyLimitSettled(
+                    batch,
+                    EVENT_DISPATCH_CONCURRENCY,
+                    (entry) =>
+                        events.dispatchFs(key, entry, {
+                            actingUserId,
+                            handlerDepth,
+                            ancestors: () => ancestors(entry),
+                            ...(movedFromChain
+                                ? { movedFrom: movedFromChain }
+                                : {}),
+                        }),
+                );
+                for (const result of results) {
+                    if (result.status === 'rejected')
+                        console.warn(
+                            '[fs] event dispatch failed',
+                            result.reason,
+                        );
+                }
+            } catch (err) {
+                console.warn('[fs] event dispatch failed', err);
+            }
+        })();
+    }
+
+    /**
+     * Publish entries a copy created as a plain `add` — the same thing a write
+     * or an upload publishes. Events-API dispatch only: `fs.create.*` on the
+     * internal bus has consumers a copy has never reached, and the copy's own
+     * bus event stays `fs.copy.node`.
+     *
+     * Links are left out: a shortcut names another node, so what a subscriber
+     * should be told about one is unsettled.
+     *
+     * `above` gives the new entries between one and the destination parent,
+     * innermost first, so a tree copy costs one ancestor walk rather than one
+     * per entry.
+     */
+    #publishCopiedEntries(
+        entries: FSEntry[],
+        above: (entry: FSEntry) => AncestorChain,
+        destinationChain: () => Promise<AncestorChain>,
+    ): void {
+        const ancestors = async (entry: FSEntry) => [
+            { uid: entry.uid, path: entry.path },
+            ...above(entry),
+            ...(await destinationChain()),
+        ];
+        const nodes = entries.filter((e) => !e.isSymlink && !e.isShortcut);
+        const dirs = nodes.filter((e) => e.isDir);
+        const files = nodes.filter((e) => !e.isDir);
+        this.#dispatchEvents('fs.create.directory', dirs, { ancestors });
+        this.#dispatchEvents('fs.create.file', files, { ancestors });
+    }
+
+    /**
+     * Emit one of the lifecycle events that `extension.on('fs.…')` consumers
+     * expect (cf-file-cache, future thumbnails-style extensions). Payload
+     * carries multiple aliases (`node` / `entry` / `uid`) so handlers using any
+     * existing calling convention just work.
+     *
+     * Currently emitted: fs.create.{file,directory,shortcut,symlink}
+     * fs.write.file — overwrite of an existing file fs.rename — in-place name
+     * change (move emits fs.move.node separately); both carry the path the node
+     * left via `movedFrom`.
+     *
+     * Skipped intentionally: `fs.pending.*` (no real entry yet at signed-URL
+     * issue time) and per-flavor `fs.move.file` (move already emits
+     * `fs.move.node`).
+     */
+    #emitFsEvent<T extends EventKey>(
+        name: T,
+        entry: FSEntry,
+        extras: Record<string, unknown> = {},
+        movedFrom?: { path: string },
+    ): void {
+        try {
+            this.clients.event.emit(
+                name,
+                // The aliases are what existing handlers destructure; the cast
+                // is what lets one helper serve every key that carries them.
+                {
+                    node: entry,
+                    entry,
+                    uid: entry.uuid,
+                    ...extras,
+                } as EventMap[T],
+                {},
+            );
+        } catch {
+            console.warn('missing event emissions');
+        }
+        this.#dispatchEvents(name, entry, { movedFrom });
+    }
+
+    /**
+     * Move an entry to a new parent (and optionally rename in the same op).
+     * Works for files and directories. Updates descendant paths when moving a
+     * directory.
+     */
+    async move(
+        userId: number,
+        input: {
+            source: FSEntry;
+            destinationParent: FSEntry;
+            newName?: string;
+            overwrite?: boolean;
+            dedupeName?: boolean;
+            /**
+             * Optional metadata to overwrite on the moved entry. Callers use
+             * this for trash/restore: when moving into Trash the GUI stores `{
+             * original_name, original_path, trashed_ts }` here so the restore
+             * path and trash listing can recover the pre-trash name.
+             */
+            newMetadata?: Record<string, unknown> | null;
+        },
+    ): Promise<FSEntry> {
+        const { source, destinationParent } = input;
+        this.#assertNotUserRoot(source, 'move');
+        // The source only: moving *into* another app's AppData is a write, and
+        // ACL plus the fs:write class already cover that.
+        await this.#assertCrossAppDeleteAllowed(source.path);
+        await this.#assertCarriesNoClosedAppData(source, 'move');
+        await this.#assertCanRestructure(source, userId);
+        // Write inside a shared folder reorganizes it, it does not empty it.
+        if (
+            source.userId !== userId &&
+            source.userId !== destinationParent.userId
+        ) {
+            throw new HttpError(
+                403,
+                "Cannot move an entry out of its owner's tree",
+                { legacyCode: 'forbidden' },
+            );
+        }
+        if (!destinationParent.isDir) {
+            throw new HttpError(400, 'Destination parent is not a directory', {
+                legacyCode: 'dest_is_not_a_directory',
+            });
+        }
+        if (
+            source.isDir &&
+            (destinationParent.uuid === source.uuid ||
+                destinationParent.path.startsWith(`${source.path}/`))
+        ) {
+            throw new HttpError(400, 'Cannot move a directory into itself', {
+                legacyCode: 'cannot_move_directory_into_itself',
+            });
+        }
+
+        // Authorized without write there, so a collision must not answer.
+        const intoSomeoneElsesTrash =
+            isOwnersTrash(source, destinationParent) &&
+            destinationParent.userId !== userId;
+
+        let name = input.newName ?? source.name;
+        this.#assertUsableName(name);
+        // Always, not only on a collision, or the name answers it instead.
+        if (intoSomeoneElsesTrash) {
+            const ext = pathPosix.extname(name);
+            const stem = ext ? name.slice(0, -ext.length) : name;
+            name = `${stem} (${source.uuid.slice(0, 8)})${ext}`;
+        }
+        const pathIn = (entryName: string) =>
+            destinationParent.path === '/'
+                ? `/${entryName}`
+                : `${destinationParent.path}/${entryName}`;
+        const targetPath = pathIn(name);
+        // Ahead of the overwrite below. A deduped name keeps the parent, so it
+        // is covered too.
+        this.#assertAppDataRootsStay(source.path, targetPath);
+        const newMetadata = this.#reconcileTrashMetadata(
+            source,
+            destinationParent,
+            input.newMetadata,
+        );
+
+        const collision = await this.stores.fsEntry.getEntryByPath(targetPath);
+        if (collision && collision.uuid !== source.uuid) {
+            name = await this.#resolveMoveCollision(
+                userId,
+                collision,
+                destinationParent,
+                name,
+                input,
+                { intoSomeoneElsesTrash },
+            );
+        }
+
+        let metadataPatch: string | null | undefined;
+        if (newMetadata === null) metadataPatch = null;
+        else if (newMetadata && typeof newMetadata === 'object')
+            metadataPatch = JSON.stringify(
+                this.#stripReservedMetadataKeys(newMetadata),
+            );
+
+        // Moving your entry into another tree hands it over, bytes included,
+        // so they have to fit the new owner's allowance.
+        const newOwnerId = destinationParent.userId;
+        if (newOwnerId !== source.userId) {
+            await this.#assertStorageAllowance(
+                newOwnerId,
+                await this.#entryStorageSize(source),
+            );
+        }
+
+        const applyMove = (entryName: string) =>
+            this.stores.fsEntry.updateEntry(source.uuid, {
+                name: entryName,
+                path: pathIn(entryName),
+                userId: newOwnerId,
+                parentId: destinationParent.id,
+                parentUid: destinationParent.uuid,
+                ...(metadataPatch !== undefined
+                    ? { metadata: metadataPatch }
+                    : {}),
+            });
+
+        let updated: FSEntry;
+        try {
+            updated = await applyMove(name);
+        } catch (err) {
+            // The name was taken after the probe above: a concurrent move, or
+            // an occupant the replica hadn't seen yet. Resolve it as if the
+            // probe had found it, then try once more.
+            if (!isUniqueViolation(err)) throw err;
+            const raced = await this.stores.fsEntry.getEntryByPath(
+                pathIn(name),
+                { useTryHardRead: true },
+            );
+            if (raced && raced.uuid !== source.uuid) {
+                name = await this.#resolveMoveCollision(
+                    userId,
+                    raced,
+                    destinationParent,
+                    name,
+                    input,
+                    { intoSomeoneElsesTrash },
+                );
+            }
+            updated = await applyMove(name);
+        }
+        const finalPath = pathIn(name);
+
+        if (source.isDir && source.path !== finalPath) {
+            await this.stores.fsEntry.updatePathPrefixForUser(
+                source.userId,
+                source.path,
+                finalPath,
+                newOwnerId,
+            );
+        }
+
+        // The subtree changed hands, so the owner recorded on its shares did
+        // too. Stale there drops them from the new owner's outbound listing.
+        if (newOwnerId !== source.userId) {
+            await this.stores.share.reassignEntryOwnerUnder(
+                newOwnerId,
+                finalPath,
+            );
+        }
+
+        try {
+            this.clients.event.emit(
+                'fs.move.node',
+                {
+                    node: updated,
+                    fromPath: source.path,
+                    toPath: finalPath,
+                    fromUserId: source.userId,
+                },
+                {},
+            );
+        } catch {
+            // ignore — non-critical.
+        }
+        this.#dispatchEvents('fs.move.node', updated, {
+            movedFrom: { path: source.path },
+        });
+
+        // Deleting is a move into Trash, and a grant follows its entry there,
+        // so recipients keep their access unless it is withdrawn here. Awaited,
+        // and after the events, so the holders still hear the item go.
+        if (isOwnersTrash(source, destinationParent)) {
+            await this.services.share.onEntryTrashed(updated);
+        }
+        return updated;
+    }
+
+    /**
+     * Clear the way for a move whose name is held by `occupant`: replace it,
+     * pick a deduped name, or refuse. Returns the name to move to.
+     */
+    async #resolveMoveCollision(
+        userId: number,
+        occupant: FSEntry,
+        destinationParent: FSEntry,
+        name: string,
+        input: { overwrite?: boolean; dedupeName?: boolean },
+        opts: { intoSomeoneElsesTrash?: boolean } = {},
+    ): Promise<string> {
+        // Ahead of `overwrite`: no write here, so a collision destroys nothing.
+        if (opts.intoSomeoneElsesTrash) {
+            return this.#findDedupedName(destinationParent, name);
+        }
+        if (input.overwrite) {
+            await this.remove(userId, { entry: occupant, recursive: true });
+            return name;
+        }
+        if (input.dedupeName) {
+            return this.#findDedupedName(destinationParent, name);
+        }
+        // v1 wire contract: clients (the GUI's move/paste flows among them)
+        // key on `item_with_same_name_exists` + `entry_name` to offer a
+        // replace/skip prompt.
+        throw new HttpError(409, `An entry named \`${name}\` already exists`, {
+            legacyCode: 'item_with_same_name_exists',
+            fields: { entry_name: name },
+        });
+    }
+
+    /**
+     * Copy an entry to a new parent. For directories, walks descendants and
+     * issues S3 CopyObject + DB inserts. Thumbnail URLs on entries ride along
+     * in the DB column — the thumbnail extension is notified via `fs.copy.node`
+     * so it can duplicate the backing S3 object (otherwise deleting one copy
+     * would nuke the other's thumbnail). Each entry the copy creates publishes
+     * as `add`; a copied shortcut or symlink does not.
+     */
+    async copy(
+        userId: number,
+        input: {
+            source: FSEntry;
+            destinationParent: FSEntry;
+            newName?: string;
+            overwrite?: boolean;
+            dedupeName?: boolean;
+            storageAllowanceMax?: number;
+        },
+    ): Promise<FSEntry> {
+        const { source, destinationParent } = input;
+        if (!destinationParent.isDir) {
+            throw new HttpError(400, 'Destination parent is not a directory', {
+                legacyCode: 'dest_is_not_a_directory',
+            });
+        }
+        if (
+            source.isDir &&
+            (destinationParent.path === source.path ||
+                destinationParent.path.startsWith(`${source.path}/`))
+        ) {
+            throw new HttpError(
+                400,
+                'Cannot copy a directory into itself or a descendant',
+                { legacyCode: 'cannot_copy_directory_into_itself' },
+            );
+        }
+        await this.#assertCarriesNoClosedAppData(source, 'copy');
+
+        let name = input.newName ?? source.name;
+        this.#assertUsableName(name);
+        const targetPath =
+            destinationParent.path === '/'
+                ? `/${name}`
+                : `${destinationParent.path}/${name}`;
+
+        const collision = await this.stores.fsEntry.getEntryByPath(targetPath);
+
+        // A copy duplicates the bytes for real, so it costs the same against
+        // the allowance as writing them. Check before the overwrite below
+        // removes anything, and credit what that removal frees.
+        const allowance: CopyAllowance = {
+            ownerId: destinationParent.userId,
+            max: this.#allowanceOverrideFor(
+                destinationParent.userId,
+                userId,
+                input.storageAllowanceMax,
+            ),
+        };
+        await this.#assertStorageAllowance(
+            allowance.ownerId,
+            await this.#entryStorageSize(source),
+            collision && input.overwrite
+                ? await this.#entryStorageSize(collision)
+                : 0,
+            allowance.max,
+        );
+
+        if (collision) {
+            if (input.overwrite) {
+                await this.remove(userId, {
+                    entry: collision,
+                    recursive: true,
+                });
+            } else if (input.dedupeName) {
+                name = await this.#findDedupedName(destinationParent, name);
+            } else {
+                // v1 wire contract, as in move() above.
+                throw new HttpError(
+                    409,
+                    `An entry named \`${name}\` already exists`,
+                    {
+                        legacyCode: 'item_with_same_name_exists',
+                        fields: { entry_name: name },
+                    },
+                );
+            }
+        }
+
+        // One ancestor walk for the whole copy, run only if something needs
+        // it — the destination parent's own chain is the same for every
+        // entry the copy creates.
+        const destinationChain = this.#memoizedChain(destinationParent.path);
+        // The new entries above a given new directory, innermost first, so a
+        // descendant's chain can be built without reading anything back.
+        const aboveByNewPath = new Map<string, AncestorChain>();
+        const publish = (copied: FSEntry[]) =>
+            this.#publishCopiedEntries(
+                copied,
+                (entry) =>
+                    aboveByNewPath.get(pathPosix.dirname(entry.path)) ?? [],
+                destinationChain,
+            );
+
+        const [newRoot] = await this.#copyEntries(
+            userId,
+            [{ source, parent: destinationParent, name }],
+            publish,
+            allowance,
+        );
+        if (!newRoot) {
+            throw new HttpError(500, 'Failed to copy entry', {
+                legacyCode: 'internal_error',
+            });
+        }
+        if (!source.isDir) return newRoot;
+        aboveByNewPath.set(newRoot.path, [
+            { uid: newRoot.uid, path: newRoot.path },
+        ]);
+
+        // A page holds children of directories already copied, so it is one
+        // batch of inserts and S3 copies. Copies are keyed by source uuid and
+        // dropped once nothing under them is left to copy.
+        const copyOf = new Map<string, FSEntry>([[source.uuid, newRoot]]);
+        await this.#walkSubtree(
+            source,
+            async (page) => {
+                const items = page.flatMap((descendant): CopyItem[] => {
+                    const parent = copyOf.get(descendant.parentUid ?? '');
+                    return parent
+                        ? [
+                              {
+                                  source: descendant,
+                                  parent,
+                                  name: descendant.name,
+                              },
+                          ]
+                        : [];
+                });
+                const copied = await this.#copyEntries(
+                    userId,
+                    items,
+                    publish,
+                    allowance,
+                );
+                const dirs: FSEntry[] = [];
+                items.forEach((item, index) => {
+                    const entry = copied[index];
+                    if (!entry?.isDir) return;
+                    copyOf.set(item.source.uuid, entry);
+                    aboveByNewPath.set(entry.path, [
+                        { uid: entry.uid, path: entry.path },
+                        ...(aboveByNewPath.get(item.parent.path) ?? []),
+                    ]);
+                    dirs.push(item.source);
+                });
+                return dirs;
+            },
+            async (dirs) => {
+                for (const dir of dirs) {
+                    const copy = copyOf.get(dir.uuid);
+                    copyOf.delete(dir.uuid);
+                    if (copy) aboveByNewPath.delete(copy.path);
+                }
+            },
+        );
+
+        return newRoot;
+    }
+
+    /**
+     * Copy `items` into parents that already exist, keeping their order, and
+     * `publish` what was made. Directories, links and empty files are a row
+     * each; files are S3 copies at bounded concurrency followed by one batched
+     * insert.
+     *
+     * A failed S3 copy fails the call, but only after the objects that did copy
+     * have their rows, so nothing is left in the bucket unreferenced.
+     */
+    async #copyEntries(
+        userId: number,
+        items: CopyItem[],
+        publish: (copied: FSEntry[]) => void,
+        allowance: CopyAllowance,
+    ): Promise<FSEntry[]> {
+        const copied = new Array<FSEntry>(items.length);
+        const files: Array<{ item: CopyItem; index: number; key: string }> = [];
+        const rows = await runWithConcurrencyLimitSettled(
+            items,
+            COPY_CONCURRENCY,
+            async (item, index) => {
+                const input = this.#rowCopyInput(item);
+                if (input) {
+                    copied[index] =
+                        await this.stores.fsEntry.createNonFileEntry(input);
+                    return;
+                }
+                files.push({ item, index, key: uuidv4() });
+            },
+        );
+        const rowFailure = rows.find((r) => r.status === 'rejected');
+        if (rowFailure) {
+            publish(copied.filter(Boolean));
+            throw (rowFailure as PromiseRejectedResult).reason;
+        }
+        if (files.length === 0) {
+            publish(copied);
+            return copied;
+        }
+
+        const results = await runWithConcurrencyLimitSettled(
+            files,
+            COPY_CONCURRENCY,
+            async ({ item, key }) => {
+                const bucket = this.stores.s3Object.resolveBucket(
+                    item.source.bucket,
+                );
+                const region = this.stores.s3Object.resolveRegion(
+                    item.source.bucketRegion,
+                );
+                await this.stores.s3Object.copyObject(
+                    {
+                        sourceBucket: bucket,
+                        sourceKey: item.source.uuid,
+                        destinationBucket: bucket,
+                        destinationKey: key,
+                    },
+                    region,
+                );
+                return this.#settleCopiedSize(
+                    item.source,
+                    bucket,
+                    key,
+                    region,
+                    allowance,
+                );
+            },
+        );
+        const landed = files.filter(
+            (_, i) => results[i]?.status === 'fulfilled',
+        );
+        const copiedSizes = new Map<string, number>();
+        files.forEach(({ key }, i) => {
+            const result = results[i];
+            if (result?.status === 'fulfilled') {
+                copiedSizes.set(key, result.value);
+            }
+        });
+
+        const created = await this.stores.fsEntry.batchCreateEntries(
+            landed.map(
+                ({ item: { source, parent, name }, key }) =>
+                    ({
+                        userId,
+                        uuid: key,
+                        path: childPath(parent.path, name),
+                        size: copiedSizes.get(key) ?? source.size ?? 0,
+                        contentType: undefined,
+                        metadata: this.#sanitizeClientMetadata(source.metadata),
+                        thumbnail: source.thumbnail,
+                        associatedAppId: source.associatedAppId,
+                        immutable: source.immutable,
+                        isPublic: source.isPublic,
+                        bucket: source.bucket,
+                        bucketRegion: source.bucketRegion,
+                    }) as FSEntryCreateInput,
+            ),
+            false,
+        );
+        const createdByUuid = new Map(
+            created.map((entry) => [entry.uuid, entry]),
+        );
+        for (const { item, index, key } of landed) {
+            const entry = createdByUuid.get(key);
+            if (!entry) {
+                throw new HttpError(500, 'Failed to copy file entry', {
+                    legacyCode: 'internal_error',
+                });
+            }
+            copied[index] = entry;
+            try {
+                this.clients.event.emit(
+                    'fs.copy.node',
+                    {
+                        source: item.source,
+                        copy: entry,
+                        sourceObjectKey: item.source.uuid,
+                        copyObjectKey: key,
+                    },
+                    {},
+                );
+            } catch {
+                // ignore — non-critical.
+            }
+        }
+
+        publish(copied.filter(Boolean));
+        const failedAt = results.findIndex((r) => r?.status === 'rejected');
+        if (failedAt === -1) return copied;
+        const failed = files[failedAt] as (typeof files)[number];
+        const reason = (results[failedAt] as PromiseRejectedResult).reason;
+        // A ghost file — DB row present with a non-null bucket but its backing
+        // S3 object gone. Mirror `readContent`: clean up the orphan and surface
+        // a 404 instead of the copy's NoSuchKey.
+        if (isNoSuchKeyError(reason)) {
+            await this.#handleGhostFile(
+                failed.item.source,
+                failed.item.source.uuid,
+            );
+            throw new HttpError(404, 'File contents are missing', {
+                legacyCode: 'subject_does_not_exist',
+                cause: reason,
+                // No path: a recipient addresses this entry by uuid.
+                fields: { uid: failed.item.source.uuid },
+            });
+        }
+        throw reason;
+    }
+
+    /**
+     * The row a copy of a directory, link or empty file is, or null for a file
+     * with an object to copy. Empty files have no backing object — `bucket` is
+     * null — so a CopyObject for one would throw NoSuchKey.
+     */
+    /**
+     * The size a just-copied object really has. The source row can predate an
+     * overwrite whose bytes CopyObject picked up, so record what was copied and
+     * charge any excess; a copy that no longer fits is deleted and refused.
+     */
+    async #settleCopiedSize(
+        source: FSEntry,
+        bucket: string,
+        key: string,
+        region: string,
+        allowance: CopyAllowance,
+    ): Promise<number> {
+        const recordedSize = source.size ?? 0;
+        const probed = await this.#probeObjectSize(bucket, key, region);
+        const copiedSize = typeof probed === 'number' ? probed : recordedSize;
+        if (copiedSize <= recordedSize) return copiedSize;
+        try {
+            await this.#assertStorageAllowance(
+                allowance.ownerId,
+                copiedSize,
+                0,
+                allowance.max,
+            );
+        } catch (error) {
+            try {
+                await this.stores.s3Object.deleteObject(bucket, key, region);
+            } catch (deleteError) {
+                console.warn(
+                    `[fs] failed to delete rejected copy ${key}: ${this.#toErrorMessage(deleteError)}`,
+                );
+            }
+            throw error;
+        }
+        return copiedSize;
+    }
+
+    #rowCopyInput({
+        source,
+        parent,
+        name,
+    }: CopyItem): Parameters<FSEntryStore['createNonFileEntry']>[0] | null {
+        const metadata = this.#sanitizeStoredMetadata(source.metadata);
+        const associatedAppId = source.associatedAppId;
+        if (source.isDir) {
+            return {
+                parent,
+                name,
+                kind: 'directory',
+                metadata,
+                thumbnail: source.thumbnail,
+                associatedAppId,
+                isPublic: source.isPublic,
+            };
+        }
+        if (source.isSymlink) {
+            return {
+                parent,
+                name,
+                kind: 'symlink',
+                symlinkPath: source.symlinkPath,
+                metadata,
+                associatedAppId,
+            };
+        }
+        if (source.isShortcut) {
+            return {
+                parent,
+                name,
+                kind: 'shortcut',
+                shortcutTo: source.shortcutTo,
+                metadata,
+                associatedAppId,
+            };
+        }
+        if (hasNoBackingS3Object(source)) {
+            return {
+                parent,
+                name,
+                kind: 'empty-file',
+                metadata,
+                thumbnail: source.thumbnail,
+                associatedAppId,
+                isPublic: source.isPublic,
+                immutable: source.immutable,
+            };
+        }
+        return null;
+    }
+
+    /**
+     * This method checks if the specified actor has permission to access the
+     * entry provided. It will throw an error if the actor is not permitted
+     */
+    async checkFSAccess(
+        entry: FSEntry,
+        actor: Actor,
+        mode: AclMode = 'write',
+    ): Promise<void> {
+        if (!entry) {
+            throw new HttpError(400, 'Invalid FS Entry provided', {
+                legacyCode: 'bad_request',
+            });
+        }
+
+        await this.services.acl.assertFsAccess(actor, entry.path, mode, {
+            forbiddenCode: 'access_denied',
+        });
+    }
+}

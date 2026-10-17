@@ -1,5 +1,5 @@
-/**
- * Copyright (C) 2024 Puter Technologies Inc.
+/*
+ * Copyright (C) 2024-present Puter Technologies Inc.
  *
  * This file is part of Puter.
  *
@@ -17,11 +17,10 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-
-function changeLanguage(lang) {
+function changeLanguage (lang) {
     window.locale = lang;
     window.mutate_user_preferences({
-        language : lang,
+        language: lang,
     });
 }
 

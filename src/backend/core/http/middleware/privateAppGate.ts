@@ -1,0 +1,809 @@
+/*
+ * Copyright (C) 2024-present Puter Technologies Inc.
+ *
+ * This file is part of Puter.
+ *
+ * Puter is free software: you can redistribute it and/or modify it under the
+ * terms of the GNU Affero General Public License as published by the Free
+ * Software Foundation, either version 3 of the License, or (at your option) any
+ * later version.
+ *
+ * This program is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+ * FOR A PARTICULAR PURPOSE. See the GNU Affero General Public License for more
+ * details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program. If not, see
+ * [https://www.gnu.org/licenses/](https://www.gnu.org/licenses/).
+ */
+
+import type { Request } from 'express';
+import {
+    HOSTED_ASSET_COOKIES,
+    type AuthService,
+} from '../../../services/auth/AuthService';
+import type { AppStore } from '../../../stores/app/AppStore.js';
+import type { IConfig } from '../../../types';
+import type { Actor } from '../../actor';
+
+/**
+ * Support helpers for the private-app access gate — ported from v1's
+ * `puterSiteMiddleware.js` (see `origin/main:src/backend/src/routers/
+ * hosting/puterSiteMiddleware.js`). Split out because the middleware file was
+ * getting long.
+ *
+ * Covers:
+ *
+ * - Host/subdomain parsing against `private_app_hosting_domain(_alt)`.
+ * - Owned-app detection for hosted sites: matches the subdomain owner's apps by
+ *   `index_url` against the request host. Replaces the older
+ *   `associated_app_id`-trusting path, which was user-writable without an
+ *   ownership check.
+ * - Bootstrap-token identity resolution (`Authorization: Bearer`,
+ *   `?puter.auth.token=`, `X-Puter-Auth-Token`, referrer query) so private-app
+ *   visitors with a valid session token (but no cookie on the private host) can
+ *   still be identified.
+ * - Building the redirect URL from a public hosting host (`puter.site`) to the
+ *   private host (`puter.app`) when a private app is being served off the wrong
+ *   domain.
+ *
+ * Sticky cookies (`puter.private.asset.token` for private apps,
+ * `puter.public.hosted.actor.token` for public-hosted actors) are set after a
+ * visitor passes the gate, and honored on subsequent requests to skip the full
+ * entitlement lookup. See AuthService `createHostedAssetToken`.
+ */
+
+export interface PrivateHostingConfig {
+    domain: string | null;
+    staticDomains: string[];
+    privateDomains: string[];
+    /**
+     * Raw hosting domain values (preserving port, if configured). Used for
+     * `index_url` candidate generation — the DB stores URLs exactly as the app
+     * was created, so dev setups with explicit ports like
+     * `app.puter.localhost:4100` must be matched verbatim.
+     */
+    staticDomainsRaw: string[];
+    privateDomainsRaw: string[];
+    /** Configured protocol (e.g. `http` in dev, `https` in prod). */
+    protocol: string;
+}
+
+export interface PrivateIdentity {
+    source:
+        | 'private-cookie'
+        | 'public-cookie'
+        | 'session-cookie'
+        | 'bootstrap-token'
+        | 'authorization'
+        | 'query'
+        | 'referrer'
+        | 'none';
+    userUid?: string;
+    sessionUuid?: string;
+    /** True when resolved from the sticky private-asset cookie. */
+    hasValidPrivateCookie?: boolean;
+}
+
+interface SubdomainLike {
+    user_id?: number | null;
+}
+
+interface AppLike {
+    id?: number;
+    uid?: string;
+    name?: string;
+    title?: string;
+    owner_user_id?: number;
+    is_private?: boolean | number | null;
+    index_url?: string | null;
+}
+
+// -- Host helpers ----------------------------------------------------
+
+export function normalizeHost(value: string | undefined | null): string | null {
+    if (typeof value !== 'string') return null;
+    const trimmed = value.trim().toLowerCase().replace(/^\./, '');
+    if (!trimmed) return null;
+    return trimmed.split(':')[0] || null;
+}
+
+/** Like `normalizeHost` but preserves port when present. */
+export function normalizeHostRaw(
+    value: string | undefined | null,
+): string | null {
+    if (typeof value !== 'string') return null;
+    const trimmed = value.trim().toLowerCase().replace(/^\./, '');
+    return trimmed || null;
+}
+
+export function buildHostingConfig(config: IConfig): PrivateHostingConfig {
+    const staticRaw = [
+        normalizeHostRaw(config.static_hosting_domain),
+        normalizeHostRaw(config.static_hosting_domain_alt),
+    ].filter((d): d is string => !!d);
+    const privateRaw = [
+        normalizeHostRaw(config.private_app_hosting_domain),
+        normalizeHostRaw(config.private_app_hosting_domain_alt),
+    ].filter((d): d is string => !!d);
+    const rawProtocol =
+        typeof config.protocol === 'string'
+            ? config.protocol.trim().replace(/:$/, '')
+            : '';
+    return {
+        domain: normalizeHost(config.domain),
+        staticDomains: [
+            normalizeHost(config.static_hosting_domain),
+            normalizeHost(config.static_hosting_domain_alt),
+        ].filter((d): d is string => !!d),
+        privateDomains: [
+            normalizeHost(config.private_app_hosting_domain),
+            normalizeHost(config.private_app_hosting_domain_alt),
+        ].filter((d): d is string => !!d),
+        staticDomainsRaw: staticRaw,
+        privateDomainsRaw: privateRaw,
+        protocol: rawProtocol || 'https',
+    };
+}
+
+export function hostMatchesPrivateDomain(
+    host: string,
+    privateDomains: string[],
+): boolean {
+    return privateDomains.some((pd) => host === pd || host.endsWith(`.${pd}`));
+}
+
+// -- Subdomain extraction from a hosted request ---------------------
+
+export function subdomainFromHost(
+    host: string,
+    hostingDomains: string[],
+): string {
+    // Longest-first so `foo.bar.puter.app` matches `bar.puter.app` before
+    // falling back to `puter.app`.
+    const sorted = [...hostingDomains].sort((a, b) => b.length - a.length);
+    for (const d of sorted) {
+        const suffix = `.${d}`;
+        if (host === d) return '';
+        if (host.endsWith(suffix)) {
+            const prefix = host.slice(0, host.length - suffix.length);
+            return prefix.split('.')[0] || '';
+        }
+    }
+    return host.split('.')[0] || '';
+}
+
+// -- Hosted-site → owned-app resolution -----------------------------
+
+/**
+ * Resolve "what app does the subdomain owner run on this host?" by matching
+ * apps owned by `site.user_id` against the request's host variants. Used by the
+ * puter-site middleware to decide whether the request hits a private app (gate)
+ * or a public app (sticky cookie), and by the subdomain driver to populate the
+ * `associated_app` field in API responses.
+ *
+ * Ownership-anchored on `apps.owner_user_id = site.user_id` so a subdomain can
+ * never "claim" an app belonging to a different user. The `subdomains` row's
+ * own `associated_app_id` column is intentionally ignored — it was previously
+ * user-writable without an ownership check, so any value there is either legacy
+ * or planted; deriving from `index_url` makes the answer fall out of facts the
+ * system already verifies at app-create time.
+ */
+export async function resolveOwnedAppForHostedSite(opts: {
+    req: Request;
+    site: SubdomainLike;
+    appStore: Pick<AppStore, 'listOwnedByIndexUrlCandidates'>;
+    config: PrivateHostingConfig;
+    requirePrivate?: boolean;
+}): Promise<AppLike | null> {
+    if (!opts.site?.user_id) return null;
+
+    const host = normalizeHost(opts.req.hostname);
+    if (!host) return null;
+
+    const hostedSubdomain = subdomainFromHost(host, [
+        ...opts.config.staticDomains,
+        ...opts.config.privateDomains,
+    ]);
+    if (!hostedSubdomain) return null;
+
+    // Build host variants with AND without port, then cross each with both
+    // protocols. Apps store whatever URL the user typed at create time, so
+    // we match liberally: ports-in-config (dev), the request's own header
+    // host, and every configured hosting variant all count as equivalent.
+    const hostCandidates = new Set<string>();
+    hostCandidates.add(host);
+    const headerHost =
+        typeof opts.req.headers?.host === 'string'
+            ? opts.req.headers.host.trim().toLowerCase()
+            : '';
+    if (headerHost) hostCandidates.add(headerHost);
+    const hostingDomainVariants = [
+        ...opts.config.staticDomains,
+        ...opts.config.privateDomains,
+        ...opts.config.staticDomainsRaw,
+        ...opts.config.privateDomainsRaw,
+    ];
+    for (const d of hostingDomainVariants) {
+        if (!d) continue;
+        hostCandidates.add(`${hostedSubdomain}.${d}`);
+    }
+
+    const protocolCandidates = new Set<string>([
+        opts.req.protocol || 'https',
+        opts.config.protocol,
+        'https',
+        'http',
+    ]);
+
+    const urlCandidates: string[] = [];
+    for (const hc of hostCandidates) {
+        for (const protocol of protocolCandidates) {
+            const base = `${protocol}://${hc}`;
+            urlCandidates.push(base, `${base}/`, `${base}/index.html`);
+        }
+    }
+    const uniqueCandidates = [...new Set(urlCandidates)];
+    if (uniqueCandidates.length === 0) return null;
+
+    // Ambiguity fails closed: a private row wins; `id` keeps it deterministic.
+    const rows = await opts.appStore.listOwnedByIndexUrlCandidates(
+        opts.site.user_id,
+        uniqueCandidates,
+        { requirePrivate: opts.requirePrivate },
+    );
+    if (rows.length === 0) return null;
+    if (rows.length > 1) {
+        console.warn('[puter-site] hosted_site_app_match_ambiguous', {
+            requestHost: host,
+            matchCount: rows.length,
+        });
+    }
+    return rows[0] as unknown as AppLike;
+}
+
+// -- Bootstrap token resolution --------------------------------------
+
+function getAuthorizationToken(req: Request): string | null {
+    const header = req.headers?.authorization;
+    if (typeof header !== 'string') return null;
+    const match = header.match(/^Bearer\s+(.+)$/i);
+    return match?.[1]?.trim() || null;
+}
+
+function getQueryToken(req: Request): string | null {
+    const q = req.query as Record<string, unknown> | undefined;
+    const candidates = [q?.['puter.auth.token'], q?.auth_token];
+    for (const v of candidates) {
+        if (typeof v === 'string' && v.trim()) return v.trim();
+    }
+    return null;
+}
+
+function getHeaderToken(req: Request): string | null {
+    const raw = req.headers?.['x-puter-auth-token'];
+    if (typeof raw === 'string' && raw.trim()) return raw.trim();
+    return null;
+}
+
+function getReferrerToken(req: Request): string | null {
+    const ref = req.headers?.referer || req.headers?.referrer;
+    if (typeof ref !== 'string' || !ref.trim()) return null;
+    try {
+        const url = new URL(ref);
+        return (
+            url.searchParams.get('puter.auth.token') ||
+            url.searchParams.get('auth_token')
+        );
+    } catch {
+        return null;
+    }
+}
+
+export function getBootstrapToken(
+    req: Request,
+): { token: string; source: PrivateIdentity['source'] } | null {
+    const auth = getAuthorizationToken(req);
+    if (auth) return { token: auth, source: 'authorization' };
+    const q = getQueryToken(req);
+    if (q) return { token: q, source: 'query' };
+    const h = getHeaderToken(req);
+    if (h) return { token: h, source: 'authorization' };
+    const r = getReferrerToken(req);
+    if (r) return { token: r, source: 'referrer' };
+    return null;
+}
+
+/**
+ * Resolve the acting user for a private-app hosted request. Lookup order (first
+ * hit wins):
+ *
+ * 1. `puter.private.asset.token` cookie — the sticky cookie set after a previous
+ *    successful entitlement check. Must match the expected app + subdomain +
+ *    private host.
+ * 2. `req.actor` from the auth probe (e.g. main session cookie on same-site
+ *    requests).
+ * 3. Raw session cookie fallback (cross-site drops the probe's read).
+ * 4. Bootstrap token from Authorization / query / header / referrer.
+ *
+ * Returns `{source: 'none'}` when no identity can be established — the caller
+ * then renders the login bootstrap page.
+ */
+export async function resolvePrivateIdentity(opts: {
+    req: Request;
+    authService: AuthService;
+    sessionCookieName: string | undefined;
+    expectedAppUid?: string;
+    expectedSubdomain?: string;
+    expectedPrivateHost?: string;
+}): Promise<PrivateIdentity> {
+    const {
+        req,
+        authService,
+        sessionCookieName,
+        expectedAppUid,
+        expectedSubdomain,
+        expectedPrivateHost,
+    } = opts;
+
+    const cookies = (req as Request & { cookies?: Record<string, string> })
+        .cookies;
+
+    // 1. Sticky private-asset cookie. Prefer the v2 cookie name; fall
+    // back to the legacy dot-style name while the deprecation window
+    // is open. A v1-signed token no longer verifies at all, so it lands
+    // in the catch below and the chain re-mints under v2 on this response.
+    const { name: v2CookieName, legacyName: legacyCookieName } =
+        HOSTED_ASSET_COOKIES.private;
+    const privateCookieToken =
+        (typeof cookies?.[v2CookieName] === 'string'
+            ? cookies[v2CookieName]
+            : null) ??
+        (typeof cookies?.[legacyCookieName] === 'string'
+            ? cookies[legacyCookieName]
+            : null);
+    if (privateCookieToken) {
+        try {
+            const claims = await authService.verifyHostedAssetToken(
+                'private',
+                privateCookieToken,
+                {
+                    appUid: expectedAppUid,
+                    subdomain: expectedSubdomain,
+                    host: expectedPrivateHost,
+                },
+            );
+            return {
+                source: 'private-cookie',
+                userUid: claims.userUid,
+                sessionUuid: claims.sessionUuid,
+                hasValidPrivateCookie: true,
+            };
+        } catch {
+            /* fall through — stale / mismatched / logged-out cookie */
+        }
+    }
+
+    // 2. Auth probe actor.
+    const existingActor = req.actor;
+    if (
+        existingActor?.user?.uuid &&
+        actorMatchesExpectedApp(existingActor, expectedAppUid)
+    ) {
+        return {
+            source: 'session-cookie',
+            userUid: existingActor.user.uuid,
+            sessionUuid: existingActor.session?.uid,
+        };
+    }
+
+    // 3. Raw session cookie fallback.
+    const sessionToken =
+        sessionCookieName && typeof cookies?.[sessionCookieName] === 'string'
+            ? cookies[sessionCookieName]
+            : null;
+    if (sessionToken) {
+        try {
+            const actor = await authService.authenticateFromToken(sessionToken);
+            if (
+                actor?.user?.uuid &&
+                actorMatchesExpectedApp(actor, expectedAppUid)
+            ) {
+                return {
+                    source: 'session-cookie',
+                    userUid: actor.user.uuid,
+                    sessionUuid: actor.session?.uid,
+                };
+            }
+        } catch {
+            /* fall through */
+        }
+    }
+
+    // 4. Bootstrap token.
+    const bootstrap = getBootstrapToken(req);
+    if (bootstrap) {
+        try {
+            const actor = await authService.authenticateFromToken(
+                bootstrap.token,
+            );
+            if (
+                actor?.user?.uuid &&
+                actorMatchesExpectedApp(actor, expectedAppUid)
+            ) {
+                return {
+                    source: bootstrap.source,
+                    userUid: actor.user.uuid,
+                    sessionUuid: actor.session?.uid,
+                };
+            }
+        } catch {
+            /* fall through */
+        }
+    }
+
+    return { source: 'none' };
+}
+
+/**
+ * Guard against token confusion across private-app boundaries: an actor derived
+ * from an app-under-user token carries the _issuing_ app's uid, which must
+ * match the host the request is being made against. A token minted for app A —
+ * e.g. when the visitor authorized a third-party app — must not be honored as
+ * identity on app B's private host, even when the underlying user happens to
+ * have entitlement to B. User-only actors are unaffected: a plain session token
+ * is portable by design.
+ *
+ * "No app anywhere in the chain" is the portable case, so read `effectiveApp` —
+ * an app-issued access token has no `app` of its own and would otherwise pass
+ * as a plain session on any private host.
+ */
+function actorMatchesExpectedApp(
+    actor: Actor,
+    expectedAppUid: string | undefined,
+): boolean {
+    if (!expectedAppUid) return true;
+    const app = actor.effectiveApp;
+    if (!app) return true;
+    return app.uid === expectedAppUid;
+}
+
+/**
+ * Mirror of `resolvePrivateIdentity` for public hosted apps. Reads the sticky
+ * `puter.public.hosted.actor.token` cookie first, then the same
+ * session/bootstrap fallbacks.
+ */
+export async function resolvePublicHostedIdentity(opts: {
+    req: Request;
+    authService: AuthService;
+    sessionCookieName: string | undefined;
+    expectedAppUid?: string;
+    expectedSubdomain?: string;
+    expectedHost?: string;
+}): Promise<PrivateIdentity & { hasValidPublicCookie?: boolean }> {
+    const {
+        req,
+        authService,
+        sessionCookieName,
+        expectedAppUid,
+        expectedSubdomain,
+        expectedHost,
+    } = opts;
+
+    const cookies = (req as Request & { cookies?: Record<string, string> })
+        .cookies;
+
+    const { name: publicCookieNameV2, legacyName: publicCookieNameLegacy } =
+        HOSTED_ASSET_COOKIES.public;
+    const publicCookieToken =
+        (typeof cookies?.[publicCookieNameV2] === 'string'
+            ? cookies[publicCookieNameV2]
+            : null) ??
+        (typeof cookies?.[publicCookieNameLegacy] === 'string'
+            ? cookies[publicCookieNameLegacy]
+            : null);
+    if (publicCookieToken) {
+        try {
+            const claims = await authService.verifyHostedAssetToken(
+                'public',
+                publicCookieToken,
+                {
+                    appUid: expectedAppUid,
+                    subdomain: expectedSubdomain,
+                    host: expectedHost,
+                },
+            );
+            return {
+                source: 'public-cookie',
+                userUid: claims.userUid,
+                sessionUuid: claims.sessionUuid,
+                hasValidPublicCookie: true,
+            };
+        } catch {
+            /* fall through — v1-signed cookies land here and get re-minted */
+        }
+    }
+
+    const existingActor = req.actor;
+    if (
+        existingActor?.user?.uuid &&
+        actorMatchesExpectedApp(existingActor, expectedAppUid)
+    ) {
+        return {
+            source: 'session-cookie',
+            userUid: existingActor.user.uuid,
+            sessionUuid: existingActor.session?.uid,
+        };
+    }
+
+    const sessionToken =
+        sessionCookieName && typeof cookies?.[sessionCookieName] === 'string'
+            ? cookies[sessionCookieName]
+            : null;
+    if (sessionToken) {
+        try {
+            const actor = await authService.authenticateFromToken(sessionToken);
+            if (
+                actor?.user?.uuid &&
+                actorMatchesExpectedApp(actor, expectedAppUid)
+            ) {
+                return {
+                    source: 'session-cookie',
+                    userUid: actor.user.uuid,
+                    sessionUuid: actor.session?.uid,
+                };
+            }
+        } catch {
+            /* fall through */
+        }
+    }
+
+    const bootstrap = getBootstrapToken(req);
+    if (bootstrap) {
+        try {
+            const actor = await authService.authenticateFromToken(
+                bootstrap.token,
+            );
+            if (
+                actor?.user?.uuid &&
+                actorMatchesExpectedApp(actor, expectedAppUid)
+            ) {
+                return {
+                    source: bootstrap.source,
+                    userUid: actor.user.uuid,
+                    sessionUuid: actor.session?.uid,
+                };
+            }
+        } catch {
+            /* fall through */
+        }
+    }
+
+    return { source: 'none' };
+}
+
+// -- Redirect helpers ------------------------------------------------
+
+/**
+ * Turn a request path into a safe reference for `new URL(path, base)`.
+ * Collapses any run of leading slashes/backslashes into a single `/` so a
+ * scheme-relative path (`//evil.com`, `/\evil.com`, which the URL parser folds
+ * to `//`) can't override the base authority and turn the redirect into an open
+ * redirect. Guarantees exactly one leading slash.
+ */
+function normalizeRedirectPath(originalUrl: string | undefined): string {
+    return '/' + (originalUrl || '/').replace(/^[/\\]+/, '');
+}
+
+/** A GET for a top-level page, as opposed to a frame, subresource or fetch. */
+export function isTopLevelNavigation(req: Request): boolean {
+    return (
+        req.method === 'GET' && req.headers?.['sec-fetch-dest'] === 'document'
+    );
+}
+
+/**
+ * Same-host path of this request with every `name` query parameter removed, or
+ * null when it has none. The parameters that stay keep their exact encoding.
+ */
+export function pathWithoutQueryParam(
+    originalUrl: string | undefined,
+    name: string,
+): string | null {
+    const base = 'http://gate.invalid';
+    let url: URL;
+    try {
+        url = new URL(normalizeRedirectPath(originalUrl), base);
+    } catch {
+        return null;
+    }
+    if (url.origin !== base) return null;
+    const isTarget = (part: string) => {
+        const rawKey = part.split('=', 1)[0].replace(/\+/g, ' ');
+        try {
+            return decodeURIComponent(rawKey) === name;
+        } catch {
+            return rawKey === name;
+        }
+    };
+    const parts = url.search.slice(1).split('&');
+    if (!parts.some(isTarget)) return null;
+    const kept = parts.filter((part) => part && !isTarget(part));
+    return url.pathname + (kept.length ? `?${kept.join('&')}` : '');
+}
+
+/** Build the URL to redirect a private-app request to its private host. */
+export function buildPrivateHostRedirect(
+    req: Request,
+    app: AppLike,
+    config: PrivateHostingConfig,
+): string | null {
+    // Prefer the raw configured value so dev setups that include a port
+    // (`app.puter.localhost:4100`) produce a working redirect target.
+    const privateDomain =
+        config.privateDomainsRaw[0] ?? config.privateDomains[0];
+    if (!privateDomain) return null;
+    const host = normalizeHost(req.hostname);
+    if (!host) return null;
+    const subdomain = subdomainFromHost(host, [
+        ...config.staticDomains,
+        ...config.privateDomains,
+    ]);
+    if (!subdomain) return null;
+    try {
+        const protocol = config.protocol || req.protocol || 'https';
+        const base = `${protocol}://${subdomain}.${privateDomain}`;
+        const reqPath = normalizeRedirectPath(req.originalUrl);
+        return new URL(reqPath, base).toString();
+    } catch {
+        return null;
+    }
+    void app; // reserved for future use (logging)
+}
+
+/**
+ * Mirror of {@link buildPrivateHostRedirect} — produces the public-host
+ * equivalent URL for a request that landed on the private hosting domain but
+ * doesn't belong there (non-private app, or no app at all). Used so a
+ * formerly-paid app that's now free (or a plain hosted site) resolves on
+ * `puter.site` instead of 404ing on `puter.app`.
+ */
+export function buildPublicHostRedirect(
+    req: Request,
+    config: PrivateHostingConfig,
+): string | null {
+    const publicDomain = config.staticDomainsRaw[0] ?? config.staticDomains[0];
+    if (!publicDomain) return null;
+    const host = normalizeHost(req.hostname);
+    if (!host) return null;
+    const subdomain = subdomainFromHost(host, [
+        ...config.staticDomains,
+        ...config.privateDomains,
+    ]);
+    if (!subdomain) return null;
+    try {
+        const protocol = config.protocol || req.protocol || 'https';
+        const base = `${protocol}://${subdomain}.${publicDomain}`;
+        const reqPath = normalizeRedirectPath(req.originalUrl);
+        return new URL(reqPath, base).toString();
+    } catch {
+        return null;
+    }
+}
+
+/** Redirect URL when private access is denied — lands on the app-center listing. */
+export function buildAppCenterFallback(
+    app: AppLike,
+    config: PrivateHostingConfig,
+): string {
+    if (!config.domain) return '/';
+    const appName =
+        typeof app?.name === 'string' && app.name.trim()
+            ? app.name.trim()
+            : null;
+    if (!appName) {
+        return `https://${config.domain}/app/app-center/?item=${encodeURIComponent(app?.uid ?? '')}`;
+    }
+    return `https://${config.domain}/app/app-center/?item=${encodeURIComponent(appName)}`;
+}
+
+// -- Login bootstrap HTML --------------------------------------------
+
+/**
+ * Minimal HTML page that prompts the visitor to sign in with Puter. Uses
+ * puter.js's `auth.signIn` to get a token, then redirects back to the same URL
+ * with `?puter.auth.token=…` so the middleware can resolve identity on the next
+ * request.
+ *
+ * Kept inline (no template engine dependency). Ported from v1's
+ * `respondPrivateLoginBootstrap` with non-essential bells removed.
+ */
+export function renderLoginBootstrapHtml(app: AppLike): string {
+    const escape = (value: unknown): string =>
+        String(value ?? '')
+            .replaceAll('&', '&amp;')
+            .replaceAll('<', '&lt;')
+            .replaceAll('>', '&gt;')
+            .replaceAll('"', '&quot;')
+            .replaceAll("'", '&#39;');
+    const title = escape(app?.title ?? app?.name ?? 'this app');
+    const name = escape(app?.name ?? 'this app');
+    return `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Sign In Required | ${title}</title>
+<meta name="robots" content="noindex,nofollow" />
+<style>
+:root{color-scheme:light}
+body{margin:0;min-height:100vh;display:grid;place-items:center;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:linear-gradient(145deg,#f5f7fb,#eef2ff);color:#1f2937}
+.card{width:min(480px,calc(100vw - 32px));background:#fff;border:1px solid #e5e7eb;border-radius:12px;box-shadow:0 16px 40px rgba(15,23,42,.08);padding:24px}
+h1{margin:0 0 12px;font-size:22px;line-height:1.2}
+p{margin:0 0 16px;line-height:1.45}
+#status{font-size:14px;color:#4b5563;min-height:20px}
+.actions{display:flex;flex-wrap:wrap;gap:12px;margin-top:20px}
+button{border:0;border-radius:10px;font-size:15px;font-weight:600;padding:10px 16px;cursor:pointer}
+#loginButton{background:#111827;color:#fff}
+#retryButton{background:#e5e7eb;color:#111827}
+#loginButton:disabled{opacity:.7;cursor:progress}
+</style>
+</head>
+<body>
+<main class="card">
+<h1>Sign in required</h1>
+<p>${name} requires Puter authentication before private files can load.</p>
+<p id="status">Click "Sign In with Puter" to continue.</p>
+<div class="actions">
+<button id="loginButton" type="button">Sign In with Puter</button>
+<button id="retryButton" type="button">Retry</button>
+</div>
+</main>
+<script src="https://js.puter.com/v2/"></script>
+<script>
+(() => {
+const status = document.getElementById('status');
+const loginBtn = document.getElementById('loginButton');
+const retryBtn = document.getElementById('retryButton');
+const storageKey = 'puter.privateAppBootstrap.lastAttemptedToken';
+const setStatus = m => { status.textContent = m; };
+const getStored = () => globalThis.puter?.authToken || localStorage.getItem('auth_token') || localStorage.getItem('puter.auth.token');
+const redirectWithToken = t => {
+if (typeof t !== 'string' || !t) throw new Error('missing_auth_token');
+sessionStorage.setItem(storageKey, t);
+const u = new URL(location.href);
+u.searchParams.set('puter.auth.token', t);
+location.replace(u.toString());
+};
+const tryStored = () => {
+const u = new URL(location.href);
+if (u.searchParams.get('puter.auth.token')) return false;
+const t = getStored();
+if (!t) return false;
+const last = sessionStorage.getItem(storageKey);
+if (last === t) return false;
+setStatus('Using saved Puter session...');
+redirectWithToken(t);
+return true;
+};
+loginBtn.addEventListener('click', async () => {
+loginBtn.disabled = true;
+setStatus('Authenticating with Puter...');
+try {
+if (tryStored()) return;
+const r = await globalThis.puter.auth.signIn();
+redirectWithToken(r?.token || getStored());
+} catch (e) {
+console.error(e);
+loginBtn.disabled = false;
+setStatus('Sign in was not completed. Click to try again.');
+}
+});
+retryBtn.addEventListener('click', () => location.reload());
+if (tryStored()) return;
+})();
+</script>
+</body>
+</html>`;
+}

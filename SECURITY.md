@@ -14,7 +14,8 @@ If you believe you've found a security issue in software that is maintained in t
 
 To submit a vulnerability report, please contact us at security@puter.com. Your submission will be reviewed and validated by a member of our team.
 
-**⚠ Please do not report security vulnerabilities through public GitHub issues, discussions, or pull requests. ⚠**
+> [!WARNING]  
+> Please do not report security vulnerabilities through public GitHub issues, discussions, or pull requests.
 
 <br>
 
@@ -37,4 +38,3 @@ Please submit a report to us before engaging in conduct that may be inconsistent
 * Please provide detailed reports with reproducible steps and a clearly defined impact.
 * Include the version number of the vulnerable package in your report
 * Social engineering (e.g. phishing, vishing, smishing) is prohibited.
-

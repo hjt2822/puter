@@ -1,5 +1,5 @@
-/**
- * Copyright (C) 2024 Puter Technologies Inc.
+/*
+ * Copyright (C) 2024-present Puter Technologies Inc.
  *
  * This file is part of Puter.
  *
@@ -7,38 +7,46 @@
  * it under the terms of the GNU Affero General Public License as published
  * by the Free Software Foundation, either version 3 of the License, or
  * (at your option) any later version.
- * 
+ *
  * This program is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
  * GNU Affero General Public License for more details.
- * 
+ *
  * You should have received a copy of the GNU Affero General Public License
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-import UIWindow from './UIWindow.js'
-import update_username_in_gui from '../helpers/update_username_in_gui.js'
+import update_username_in_gui from '../helpers/updateUsernameInGui.js';
+import { openRevalidatePopup } from '../util/openid.js';
+import { fetchWithSessionCookieRetry, isSessionAuthError } from '../util/sessionAuth.js';
+import UIWindow from './UIWindow.js';
 
-async function UIWindowChangeUsername(options){
+async function UIWindowChangeUsername (options) {
     options = options ?? {};
 
     const internal_id = window.uuidv4();
     let h = '';
-    h += `<div class="change-username" style="padding: 20px; border-bottom: 1px solid #ced7e1;">`;
-        // error msg
-        h += `<div class="form-error-msg"></div>`;
-        // success msg
-        h += `<div class="form-success-msg"></div>`;
-        // new username
-        h += `<div style="overflow: hidden; margin-top: 10px; margin-bottom: 30px;">`;
-            h += `<label for="confirm-new-username-${internal_id}">${i18n('new_username')}</label>`;
-            h += `<input id="confirm-new-username-${internal_id}" type="text" name="new-username" class="new-username" autocomplete="off" />`;
-        h += `</div>`;
-
-        // Change Username
-        h += `<button class="change-username-btn button button-primary button-block button-normal">${i18n('change_username')}</button>`;
-    h += `</div>`;
+    h += '<div class="change-username" style="padding: 20px; border-bottom: 1px solid #ced7e1;">';
+    h += '<div class="form-error-msg"></div>';
+    h += '<div class="form-success-msg"></div>';
+    h += '<div style="overflow: hidden; margin-top: 10px; margin-bottom: 30px;">';
+    h += `<label for="confirm-new-username-${internal_id}">${i18n('new_username')}</label>`;
+    h += `<input id="confirm-new-username-${internal_id}" type="text" name="new-username" class="new-username" autocomplete="off" />`;
+    h += '</div>';
+    h += '<div class="change-username-auth-row" style="overflow: hidden; margin-top: 10px; margin-bottom: 30px;">';
+    h += '<div class="change-username-password-wrap">';
+    h += `<label for="change-username-password-${internal_id}">${i18n('account_password')}</label>`;
+    h += `<input id="change-username-password-${internal_id}" type="password" name="password" class="change-username-password" autocomplete="current-password" placeholder="" />`;
+    h += '</div>';
+    h += '<div class="change-username-oidc-wrap" style="display:none;">';
+    h += '<p class="change-username-oidc-flow-notice" style="margin:0;font-size:12px;color:#666;"></p>';
+    h += '<span class="change-username-revalidated-msg" style="display:none;"></span>';
+    h += '</div>';
+    h += '<p class="change-username-oidc-hint" style="margin-top:6px;font-size:12px;color:#666;display:none;"></p>';
+    h += '</div>';
+    h += `<button class="change-username-btn button button-primary button-block button-normal">${i18n('change_username')}</button>`;
+    h += '</div>';
 
     const el_window = await UIWindow({
         title: i18n('change_username'),
@@ -61,8 +69,16 @@ async function UIWindowChangeUsername(options){
         height: 'auto',
         dominant: true,
         show_in_taskbar: false,
-        onAppend: function(this_window){
-            $(this_window).find(`.new-username`).get(0)?.focus({preventScroll:true});
+        onAppend: function (this_window) {
+            $(this_window).find('.new-username').get(0)?.focus({ preventScroll: true });
+            const oidc_only = !!(window.user && window.user.oidc_only);
+            const authRow = $(this_window).find('.change-username-auth-row');
+            if ( oidc_only ) {
+                authRow.find('.change-username-password-wrap').hide();
+                // OIDC: no notice box; user will see revalidation when they continue
+            } else {
+                authRow.find('.change-username-oidc-wrap').hide();
+            }
         },
         window_class: 'window-publishWebsite',
         body_css: {
@@ -72,61 +88,124 @@ async function UIWindowChangeUsername(options){
             'backdrop-filter': 'blur(3px)',
         },
         ...options.window_options,
-    })
+    });
 
-    $(el_window).find('.change-username-btn').on('click', function(e){
-        // hide previous error/success msg
-        $(el_window).find('.form-success-msg, .form-success-msg').hide();
+    const origin = window.gui_origin || window.api_origin || '';
+    const apiUrl = `${origin}/user-protected/change-username`;
+    let revalidated = false;
 
+    const hint = $(el_window).find('.change-username-oidc-hint');
+    const REVALIDATE_POPUP_TEXT = i18n('revalidate_sign_in_popup') || 'Sign in with your linked account in the popup.';
+
+    const myOpenRevalidatePopup = async (revalidateUrl) => {
+        revalidateUrl = revalidateUrl || (window.user && window.user.oidc_revalidate_url);
+        $(el_window).find('.change-username-btn').addClass('disabled');
+        hint.text(REVALIDATE_POPUP_TEXT).show();
+        try {
+            await openRevalidatePopup(revalidateUrl);
+        } catch (e) {
+            onError(e.message || 'Authentication failed');
+            return;
+        } finally {
+            hint.hide();
+        }
+    };
+
+    $(el_window).find('.change-username-btn').on('click', async function (e) {
+        $(el_window).find('.form-success-msg, .form-error-msg').hide();
         const new_username = $(el_window).find('.new-username').val();
+        const password = $(el_window).find('.change-username-password').val();
+        const oidc_only = !!(window.user && window.user.oidc_only);
 
-        if(!new_username){
+        if ( ! new_username ) {
             $(el_window).find('.form-error-msg').html(i18n('all_fields_required'));
             $(el_window).find('.form-error-msg').fadeIn();
             return;
         }
+        if ( oidc_only && !revalidated && !password ) {
+            $(el_window).find('.change-username-btn').addClass('disabled');
+            await myOpenRevalidatePopup();
 
+            const res = await doSubmit();
+            const data = await res.json().catch(() => ({}));
+            if ( res.ok ) onSuccess();
+            else if ( isSessionAuthError(res, data) ) onReauthRequired(data);
+            else onError(data.message || 'Request failed');
+            return;
+        }
         $(el_window).find('.form-error-msg').hide();
-
-        // disable button
         $(el_window).find('.change-username-btn').addClass('disabled');
-        // disable input
-        $(el_window).find('.new-username').attr('disabled', true);
-    
-        $.ajax({
-            url: window.api_origin + "/change_username",
-            type: 'POST',
-            async: true,
-            headers: {
-                "Authorization": "Bearer "+window.auth_token
-            },
-            contentType: "application/json",
-            data: JSON.stringify({ 
-                new_username: new_username, 
-            }),				
-            success: function (data){
-                $(el_window).find('.form-success-msg').html(i18n('username_changed'));
-                $(el_window).find('.form-success-msg').fadeIn();
-                $(el_window).find('input').val('');
-                // update auth data
-                update_username_in_gui(new_username);
-                // update username
-                window.user.username = new_username;
-                // enable button
-                $(el_window).find('.change-username-btn').removeClass('disabled');
-                // enable input
-                $(el_window).find('.new-username').attr('disabled', false);
-            },
-            error: function (err){
-                $(el_window).find('.form-error-msg').html(html_encode(err.responseJSON?.message));
-                $(el_window).find('.form-error-msg').fadeIn();
-                // enable button
-                $(el_window).find('.change-username-btn').removeClass('disabled');
-                // enable input
-                $(el_window).find('.new-username').attr('disabled', false);
+        $(el_window).find('.new-username, .change-username-password').attr('disabled', true);
+
+        let res = await doSubmit(password);
+        const data = await res.json().catch(() => ({}));
+
+        if ( res.ok ) {
+            onSuccess();
+            return;
+        }
+        if ( isSessionAuthError(res, data) ) {
+            onReauthRequired(data);
+            return;
+        }
+        if ( data.code === 'oidc_revalidation_required' && data.revalidate_url ) {
+            await myOpenRevalidatePopup(data.revalidate_url);
+            const r = await doSubmit();
+            if ( r.ok ) {
+                onSuccess();
+                return;
             }
-        });	
-    })
+            const d = await r.json().catch(() => ({}));
+            if ( isSessionAuthError(r, d) ) onReauthRequired(d);
+            else onError(d.message || 'Request failed');
+            return;
+        }
+        onError(data.message || 'Request failed');
+    });
+
+    function doSubmit (password) {
+        const new_username = $(el_window).find('.new-username').val();
+        const body = { new_username };
+        if ( password !== undefined && password !== '' ) body.password = password;
+        // Do not send Authorization: user-protected endpoints use session cookie (hasHttpOnlyCookie).
+        // On a 401 caused by a missing/bad cookie the wrapper mints the cookie
+        // from the GUI bearer token via /session/sync-cookie and retries once.
+        const send = () => fetch(apiUrl, {
+            method: 'POST',
+            credentials: 'include',
+            headers: {
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify(body),
+        });
+        return fetchWithSessionCookieRetry(send, { origin, authToken: window.auth_token });
+    }
+
+    function onSuccess () {
+        const new_username = $(el_window).find('.new-username').val();
+        $(el_window).find('.form-success-msg').html(i18n('username_changed'));
+        $(el_window).find('.form-success-msg').fadeIn();
+        $(el_window).find('input').val('');
+        update_username_in_gui(new_username);
+        window.user.username = new_username;
+        $(el_window).find('.change-username-btn').removeClass('disabled');
+        $(el_window).find('.new-username, .change-username-password').attr('disabled', false);
+    }
+
+    function onError (message) {
+        $(el_window).find('.form-error-msg').html(html_encode(message));
+        $(el_window).find('.form-error-msg').fadeIn();
+        $(el_window).find('.change-username-btn').removeClass('disabled');
+        $(el_window).find('.new-username, .change-username-password').attr('disabled', false);
+    }
+
+    // Session cookie is absent and couldn't be minted from the bearer
+    // token — force the sign-in flow so it gets set, then the user can
+    // retry the change.
+    function onReauthRequired (data) {
+        onError(i18n('reauth_required_message'));
+        window.handleReauthRequired({ reason: data.reason, auth_id: data.auth_id });
+    }
 }
 
-export default UIWindowChangeUsername
+export default UIWindowChangeUsername;

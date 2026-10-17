@@ -1,0 +1,907 @@
+/*
+ * Copyright (C) 2024-present Puter Technologies Inc.
+ *
+ * This file is part of Puter.
+ *
+ * Puter is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published
+ * by the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+import type { Actor } from '../../core/actor.js';
+import {
+    PRESENCE_NO_APP,
+    type PresenceRow,
+} from '../../stores/events/PresenceStore.js';
+import { runWithConcurrencyLimitSettled } from '../../util/concurrency.js';
+import {
+    appSocketRoom,
+    type SocketSpecifier,
+} from '../socket/SocketService.js';
+import { PuterService } from '../types.js';
+import {
+    FORWARD_MAX_QUEUED,
+    FORWARD_MAX_QUEUED_BYTES,
+    PeerForwardQueue,
+    type ForwardAck,
+    type ForwardBatch,
+    type ForwardBump,
+    type ForwardDelivery,
+    type ForwardEvent,
+    type ForwardItem,
+    type ForwardReply,
+    type ForwardWatch,
+} from './forwardQueue.js';
+import {
+    forwardReceived,
+    forwardSent,
+    presenceWrite,
+    sessionForward,
+} from './metrics.js';
+import { PresenceCache, remoteRegions } from './presenceCache.js';
+import type { DeliverableEvent, GapMarker } from './registry.js';
+
+/**
+ * Getting a socket delivery to the region that holds the socket.
+ *
+ * Cross-region traffic here is proportional to matched socket deliveries with a
+ * live client somewhere else — never to event volume, and never to connected
+ * population. Three things hold that line:
+ *
+ * - **Presence says where to send**, and is read through a generation-keyed
+ *   region-local cache, so a busy subscription against a settled row reads the
+ *   table once.
+ * - **Nothing is broadcast on the chance someone is listening.** An empty row is
+ *   no hop at all, which is the common case, and a deployment with no peers
+ *   configured never gets as far as reading one.
+ * - **Wrong rows are corrected by the region they name.** A region that receives
+ *   a forward for a pair it holds nothing for retires its own item; no region
+ *   writes another's, since a compare-and-set against a stale replica could
+ *   replace a fresher join. A peer that never answers stays in the row until
+ *   its item ages out: a timeout is ambiguous, and evicting on it would
+ *   blackhole a healthy region for the length of a partition.
+ *
+ * No delivery state crosses a region. A `single`'s lease, retry counter and
+ * queue live where it was emitted; a peer holding the socket relays the
+ * client's ack home, and that is the whole of what it knows.
+ */
+
+/** Path peers accept addressed event batches on. */
+export const FORWARD_WEBHOOK_PATH = '/broadcast/events';
+
+/** Identities held so a delivery need not look one up to address a row. */
+const UUID_CACHE_MAX = 10_000;
+
+/** Where a delivery is put down once it reaches the region holding the socket. */
+export const forwardTarget = (
+    userId: number,
+    appUid: string | null,
+): SocketSpecifier =>
+    appUid ? { room: appSocketRoom(userId, appUid) } : { room: String(userId) };
+
+/** The presence pair a socket, or a subscription row, belongs to. */
+export const presenceApp = (appUid: string | null | undefined): string =>
+    appUid ?? PRESENCE_NO_APP;
+
+/** One delivery, in the terms this service addresses it by. */
+export interface ForwardableDelivery {
+    holderUserId: number;
+    appUid: string | null;
+    subId: string;
+    event: DeliverableEvent;
+    ackRequired?: true;
+    ackId?: string;
+    /** Client skips its handler: the worker has it, or it is too deep. */
+    skipHandler?: true;
+}
+
+/** What stands in for events a full queue could not carry across. */
+const overflowGap = (event: DeliverableEvent): GapMarker => ({
+    id: event.id,
+    subject: event.subject,
+    op: 'gap',
+    reason: 'backlog_overflow',
+    ts: event.ts,
+});
+
+export class EventForwardService extends PuterService {
+    readonly #cache = new PresenceCache();
+    /** UserId → uuid, which is what the presence row is keyed by. */
+    readonly #uuids = new Map<number, string>();
+    readonly #leaveTimers = new Map<string, ReturnType<typeof setTimeout>>();
+    /** Peer → subscriptions with a gap marker still queued for it. */
+    readonly #pendingMarkers = new Map<string, Set<string>>();
+    #queue: PeerForwardQueue | null = null;
+    #draining = false;
+
+    /**
+     * How long a region waits before taking itself out of a row. Reloads, flaky
+     * networks and rolling deploys all reconnect inside it and write nothing at
+     * all, which is the point — the write is an optimisation, since lazy repair
+     * is what actually keeps rows honest.
+     */
+    static LEAVE_DELAY_MIN_MS = 30_000;
+    static LEAVE_DELAY_MAX_MS = 60_000;
+
+    /** Deliveries held for one peer before the oldest are shed with markers. */
+    static MAX_QUEUED = FORWARD_MAX_QUEUED;
+    /** Bytes held for one peer before the oldest are shed with markers. */
+    static MAX_QUEUED_BYTES = FORWARD_MAX_QUEUED_BYTES;
+
+    /** Concurrency `receive()` settles a peer's relayed acks under. */
+    static RECEIVE_CONCURRENCY = 16;
+
+    override onServerStart(): void {
+        this.clients.event.on(
+            'outer.pubsub.events.presenceBumped',
+            (_key, data, meta) => {
+                // Our own emit reaches local listeners too, and that half has
+                // already been applied.
+                if (!(meta as { from_outside?: boolean })?.from_outside) return;
+                const { userId } = (data ?? {}) as { userId?: number };
+                if (typeof userId === 'number') this.#cache.bump(userId);
+            },
+        );
+    }
+
+    override async onServerPrepareShutdown(): Promise<void> {
+        // A drain is not a disconnect: every socket on this node is going at
+        // once, and writing a row for each would be the burst the transition-
+        // only rule exists to avoid. Lazy repair corrects what is left.
+        this.#draining = true;
+        for (const timer of this.#leaveTimers.values()) clearTimeout(timer);
+        this.#leaveTimers.clear();
+        await this.#queue?.flushAll();
+        this.#queue?.stop();
+    }
+
+    /**
+     * Whether anything here has work to do. A deployment with no peers has
+     * nowhere to forward and nobody to read its rows, so it takes no part in
+     * presence at all — not a write, not a read, not a timer.
+     */
+    get active(): boolean {
+        return (
+            this.config.events?.enabled === true &&
+            this.services.broadcast.addressablePeers.length > 0
+        );
+    }
+
+    /**
+     * Whether session (`onLocal`) subscriptions are forwarded across regions.
+     * On wherever peers exist, since it is what makes the documented `onLocal`
+     * promise true; a separate switch from {@link active} only so a deployment
+     * can hold back the standing per-write index it adds. Explicitly `false` ⇒
+     * no announcements, no `ev:rw` writes on either side, and
+     * `dispatchFs`/`dispatchKv`'s remote arm is never forwarded against.
+     */
+    get forwardSessionActive(): boolean {
+        return this.active && this.config.events?.forwardSession !== false;
+    }
+
+    /** What this deployment calls itself in a presence row. */
+    get region(): string {
+        return this.services.broadcast.regionId;
+    }
+
+    // -- Presence transitions ----------------------------------------
+
+    /**
+     * One more connection for the pair. Only a connect that finds the
+     * region-shared pin free writes: normally the first, since every reconnect
+     * after it finds the pin held, but also the next one after a join that
+     * failed and gave the pin back.
+     */
+    async noteConnect(actor: Actor, socketId: string): Promise<void> {
+        if (!this.active) return;
+        const pair = this.#pairOf(actor);
+        if (!pair) return;
+
+        // A reconnect inside the window cancels the write the disconnect owed
+        // — and owes none of its own when the row still holds this region. A
+        // reload, a flaky network and a rolling deploy all land here.
+        const pending = this.#leaveTimers.get(pair.key);
+        if (pending) {
+            clearTimeout(pending);
+            this.#leaveTimers.delete(pair.key);
+        }
+
+        await this.stores.presence.addConnection(
+            pair.userId,
+            pair.appUid,
+            socketId,
+        );
+        if (!(await this.#join(pair))) return;
+        await this.#bump(pair.userId);
+    }
+
+    /**
+     * Write this region into the pair's row if no node here already has. The
+     * pin goes back when the write fails, or every later connect would skip
+     * it.
+     */
+    async #join(pair: PresencePair): Promise<boolean> {
+        if (
+            !(await this.stores.presence.acquireJoinPin(
+                pair.userId,
+                pair.appUid,
+            ))
+        )
+            return false;
+        try {
+            await this.stores.presence.join(
+                pair.userUuid,
+                pair.appUid,
+                this.region,
+            );
+        } catch (err) {
+            await this.stores.presence.releaseJoinPin(pair.userId, pair.appUid);
+            throw err;
+        }
+        presenceWrite.add(1, { op: 'join' });
+        return true;
+    }
+
+    /**
+     * One connection gone. The last one owes the region's removal, but not yet:
+     * a reload is a disconnect followed immediately by a connect, and both
+     * writes are avoidable. The grace window is marked region-wide, so a
+     * forward landing on another node inside it does not retire the item.
+     */
+    async noteDisconnect(actor: Actor, socketId: string): Promise<void> {
+        if (!this.active) return;
+        const pair = this.#pairOf(actor);
+        if (!pair) return;
+
+        const delay =
+            EventForwardService.LEAVE_DELAY_MIN_MS +
+            Math.random() *
+                Math.max(
+                    0,
+                    EventForwardService.LEAVE_DELAY_MAX_MS -
+                        EventForwardService.LEAVE_DELAY_MIN_MS,
+                );
+        const count = await this.stores.presence.removeConnection(
+            pair.userId,
+            pair.appUid,
+            socketId,
+            delay,
+        );
+        if (count > 0 || this.#draining) return;
+
+        const timer = setTimeout(() => {
+            this.#leaveTimers.delete(pair.key);
+            void this.#leaveIfStillGone(pair).catch((err: unknown) => {
+                console.warn('[events] presence leave failed', err);
+            });
+        }, delay);
+        timer.unref?.();
+        this.#leaveTimers.set(pair.key, timer);
+    }
+
+    async #leaveIfStillGone(
+        pair: PresencePair,
+        op: 'leave' | 'retire' = 'leave',
+    ): Promise<void> {
+        if (this.#draining) return;
+        if (
+            await this.stores.presence.holdsConnection(pair.userId, pair.appUid)
+        )
+            return;
+        const row = await this.stores.presence.read(pair.userUuid, pair.appUid);
+        const connectedAt = row.regions[this.region];
+        if (connectedAt === undefined) {
+            // Already gone — a repair likely got there first. Release the pin
+            // regardless, so a reconnect that lost its own join race while
+            // this was still deciding is not left permanently unpinned.
+            await this.stores.presence.releaseJoinPin(pair.userId, pair.appUid);
+            return;
+        }
+        const left = await this.stores.presence.leave(
+            pair.userUuid,
+            pair.appUid,
+            this.region,
+            connectedAt,
+        );
+        presenceWrite.add(1, { op });
+        if (!left) return; // a fresher join already replaced this one
+
+        await this.stores.presence.releaseJoinPin(pair.userId, pair.appUid);
+        // A connect that lost the join-pin race while this leave was still in
+        // flight has nothing written for it now that the pin is free. Close
+        // that gap immediately instead of waiting for the pair's next
+        // transition, which for a long-lived tab may never come.
+        if (
+            await this.stores.presence.holdsConnection(pair.userId, pair.appUid)
+        )
+            await this.#join(pair);
+        await this.#bump(pair.userId);
+    }
+
+    /**
+     * Renew one socket, and this region's item for a socket that has stayed
+     * connected without a transition. `touchConnection` gates its item write
+     * behind a region-shared claim, so calling it on every renewal only costs
+     * Redis commands; a table write happens for whichever caller wins the
+     * claim, at most once per pair per region per refresh window.
+     */
+    async touchPresence(
+        userId: number,
+        appUid: string,
+        socketId: string,
+    ): Promise<void> {
+        if (!this.active) return;
+        const userUuid = await this.#uuidOf(userId);
+        if (!userUuid) return;
+        const refreshed = await this.stores.presence.touchConnection(
+            userId,
+            appUid,
+            socketId,
+            { userUuid, region: this.region },
+        );
+        if (refreshed) presenceWrite.add(1, { op: 'refresh' });
+    }
+
+    // -- Forwarding --------------------------------------------------
+
+    /**
+     * Hand one `broadcast` delivery to every other region holding a socket for
+     * the pair. The emitting region has already delivered its own copy and
+     * never asks presence about itself.
+     */
+    async fanOut(delivery: ForwardableDelivery): Promise<void> {
+        if (!this.active) return;
+        const regions = await this.regionsFor(
+            delivery.holderUserId,
+            delivery.appUid,
+        );
+        for (const region of regions) this.#send(region, delivery);
+    }
+
+    /**
+     * The region to try for one `single` attempt, or `null` when the candidates
+     * are spent. Ordered most-recently-connected first, which is the socket
+     * most likely to still be there. Skips by name rather than by position: the
+     * row can change between attempts.
+     */
+    async candidateRegion(
+        holderUserId: number,
+        appUid: string | null,
+        tried: readonly string[],
+    ): Promise<string | null> {
+        if (!this.active) return null;
+        const regions = await this.regionsFor(holderUserId, appUid);
+        return regions.find((region) => !tried.includes(region)) ?? null;
+    }
+
+    /**
+     * Whether any node in this region holds a socket for the pair. The socket
+     * registry only knows this node's. False where presence is not kept.
+     */
+    async heldInRegion(
+        userId: number,
+        appUid: string | null,
+    ): Promise<boolean> {
+        if (!this.active) return false;
+        try {
+            return await this.stores.presence.holdsConnection(
+                userId,
+                presenceApp(appUid),
+            );
+        } catch (err) {
+            console.warn('[events] presence count read failed', err);
+            return false;
+        }
+    }
+
+    /** Send one `single` to a named region, carrying what settles it. */
+    handOff(region: string, delivery: ForwardableDelivery): void {
+        this.#send(region, delivery);
+    }
+
+    /**
+     * Relay a client's settle to the region that owns the lease. Nothing is
+     * settled locally: the queue it belongs to is not here.
+     */
+    relayAck(
+        region: string,
+        userId: number,
+        subId: string,
+        entryId: string,
+    ): void {
+        if (!this.active) return;
+        if (!this.services.broadcast.addressablePeers.includes(region)) return;
+        this.#queueFor().push(region, {
+            kind: 'ack',
+            userId,
+            subId,
+            entryId,
+        });
+    }
+
+    /** Whether a region name is a peer this node can address. */
+    isPeer(region: string): boolean {
+        return this.services.broadcast.addressablePeers.includes(region);
+    }
+
+    /**
+     * Tell every peer this region now has (or no longer has) a session watcher
+     * on one anchor token. Fires only on the transition — the first session row
+     * for a token, or the last one going — never per subscribe.
+     */
+    announceWatch(
+        ownerUserId: number,
+        token: string,
+        op: 'add' | 'drop',
+    ): void {
+        if (!this.forwardSessionActive) return;
+        for (const region of this.services.broadcast.addressablePeers) {
+            forwardSent.add(1, {
+                from: this.region,
+                to: region,
+                class: 'watch',
+            });
+            const item: ForwardWatch = {
+                kind: 'watch',
+                op,
+                userId: ownerUserId,
+                token,
+            };
+            this.#queueFor().push(region, item);
+        }
+    }
+
+    /**
+     * Replay one committed change against named regions' session rows. Only
+     * regions that announced a session watcher on one of the event's tokens are
+     * named — see `EventsService#dispatchFs`/`#dispatchKv`, which read the
+     * remote-watch index this answers to.
+     */
+    forwardEvent(
+        regions: readonly string[],
+        item: Omit<ForwardEvent, 'kind' | 'sessionOnly' | 'hop'>,
+    ): void {
+        if (!this.forwardSessionActive) return;
+        for (const region of regions) {
+            if (!this.isPeer(region)) continue;
+            forwardSent.add(1, {
+                from: this.region,
+                to: region,
+                class: 'session',
+            });
+            this.#queueFor().push(region, {
+                ...item,
+                kind: 'event',
+                sessionOnly: true,
+                hop: 1,
+            });
+        }
+    }
+
+    /**
+     * Fan a subscription-set or presence generation bump to every peer over the
+     * addressed channel, so a cold region there marks itself so within one
+     * queue window instead of waiting for the slower all-peers webhook. That
+     * webhook stays as the backstop for a peer that drops this, or is still
+     * running old code that does not know the `bump` kind.
+     */
+    announceGeneration(
+        bump: { userId: number; generation: number },
+        durable: boolean,
+        scope: 'subscription' | 'presence' = 'subscription',
+    ): void {
+        if (!this.active) return;
+        for (const region of this.services.broadcast.addressablePeers) {
+            forwardSent.add(1, {
+                from: this.region,
+                to: region,
+                class: 'bump',
+            });
+            const item: ForwardBump = {
+                kind: 'bump',
+                userId: bump.userId,
+                generation: bump.generation,
+                scope,
+                durable,
+            };
+            this.#queueFor().push(region, item);
+        }
+    }
+
+    /**
+     * Regions other than this one holding a socket for the pair, read through
+     * the generation-keyed cache and narrowed to regions this deployment can
+     * still address. An unaddressable name is skipped, not pruned: it may be a
+     * region this one's peer list does not know yet, and its item is only its
+     * own to retire. A decommissioned region's items age out on their `ttl`.
+     */
+    async regionsFor(
+        holderUserId: number,
+        appUid: string | null,
+    ): Promise<string[]> {
+        const app = presenceApp(appUid);
+        const cached = this.#cache.read(holderUserId, app);
+        if (cached) return this.#addressableRegions(cached);
+
+        const userUuid = await this.#uuidOf(holderUserId);
+        if (!userUuid) return [];
+
+        const epoch = this.#cache.generationOf(holderUserId);
+        let row: PresenceRow;
+        try {
+            row = await this.stores.presence.read(userUuid, app);
+        } catch (err) {
+            console.warn('[events] presence read failed', err);
+            return [];
+        }
+        this.#cache.write(holderUserId, app, epoch, row);
+        return this.#addressableRegions(row);
+    }
+
+    #addressableRegions(row: PresenceRow): string[] {
+        return remoteRegions(row, this.region).filter((region) =>
+            this.isPeer(region),
+        );
+    }
+
+    // -- Inbound -----------------------------------------------------
+
+    /**
+     * Apply one peer's batch. Deliveries go out over this region's own sockets;
+     * acks settle where the lease actually lives, which is here. A delivery for
+     * a pair this region holds nothing for means its own item is stale, and
+     * this region retires it.
+     *
+     * Deliveries keep the batch's order, so a subscription's events reach its
+     * socket as emitted; settles are each a row read, a queue write and a
+     * drain, so they run under a concurrency bound instead.
+     *
+     * `from` is the sender the signature actually proved, not the one the body
+     * names: peers that share a secret would otherwise be able to write each
+     * other's region into this region's remote-watch index.
+     */
+    async receive(batch: ForwardBatch, from: string): Promise<ForwardReply> {
+        const items = batch.items ?? [];
+        forwardReceived.add(items.length, {
+            from: from || 'unknown',
+            to: this.region,
+        });
+
+        for (const item of items) {
+            if (item.kind !== 'delivery') continue;
+            try {
+                await this.services.events.deliverForwarded(item);
+            } catch (err) {
+                console.warn('[events] forwarded delivery failed', err);
+            }
+        }
+
+        for (const item of items) {
+            if (item.kind !== 'watch') continue;
+            // Turned off here means the index is not kept here either: a peer
+            // still running the announce has nothing to forward against.
+            if (!this.forwardSessionActive) continue;
+            try {
+                await this.stores.eventSubscription.noteRemoteWatch(
+                    item.userId,
+                    item.token,
+                    from,
+                    item.op,
+                );
+            } catch (err) {
+                console.warn('[events] remote-watch note failed', err);
+            }
+        }
+
+        for (const item of items) {
+            if (item.kind !== 'bump') continue;
+            if (item.scope === 'presence') {
+                this.#cache.bump(item.userId);
+                continue;
+            }
+            this.services.events.invalidateUser(item.userId, {
+                rebuild: item.durable,
+            });
+        }
+
+        // Deliveries keep the batch's order (see the delivery loop above); a
+        // raw event replayed against session rows runs through the same
+        // region-local dispatch path a local write does, so it is walked the
+        // same way rather than under the ack's concurrency bound.
+        const noWatch: Array<{ userId: number; token: string }> = [];
+        for (const item of items) {
+            if (item.kind !== 'event') continue;
+            try {
+                const { matched, tokens } =
+                    await this.services.events.dispatchForwarded(item);
+                sessionForward.add(1, {
+                    from,
+                    result: matched ? 'matched' : 'no-rows',
+                });
+                if (!matched)
+                    for (const token of tokens)
+                        noWatch.push({ userId: item.ownerUserId, token });
+            } catch (err) {
+                console.warn('[events] forwarded session event failed', err);
+            }
+        }
+
+        const acks = items.filter(
+            (item): item is ForwardAck => item.kind === 'ack',
+        );
+        const settled = await runWithConcurrencyLimitSettled(
+            acks,
+            EventForwardService.RECEIVE_CONCURRENCY,
+            (ack) =>
+                this.services.events.settleRelayedAck(
+                    ack.userId,
+                    ack.subId,
+                    ack.entryId,
+                ),
+        );
+        for (const outcome of settled)
+            if (outcome.status === 'rejected')
+                console.warn('[events] relayed ack failed', outcome.reason);
+
+        // One check per (user, app) pair in the batch, not per item — a busy
+        // subscription can carry many deliveries for the same pair in one
+        // window.
+        const pairs = new Map<
+            string,
+            { userId: number; appUid: string | null }
+        >();
+        for (const item of items)
+            if (item.kind === 'delivery') {
+                const key = `${item.userId}|${presenceApp(item.appUid)}`;
+                if (!pairs.has(key))
+                    pairs.set(key, {
+                        userId: item.userId,
+                        appUid: item.appUid,
+                    });
+            }
+
+        const checks = await runWithConcurrencyLimitSettled(
+            [...pairs.values()],
+            EventForwardService.RECEIVE_CONCURRENCY,
+            (pair) => this.#retireIfIdle(pair),
+        );
+        for (const outcome of checks)
+            if (outcome.status === 'rejected')
+                console.warn(
+                    '[events] presence self-retire failed',
+                    outcome.reason,
+                );
+
+        const reply: ForwardReply = {};
+        if (noWatch.length > 0) reply.noWatch = noWatch;
+        return reply;
+    }
+
+    /**
+     * Retire this region's own item for a pair a peer forwarded to and nothing
+     * here holds. The region-wide connection count is the honest answer: the
+     * socket registry on one node says nothing about the others. The leave
+     * itself runs the same pin-ordered path a disconnect does, so a connect
+     * racing it is written back in.
+     */
+    async #retireIfIdle(pair: {
+        userId: number;
+        appUid: string | null;
+    }): Promise<void> {
+        if (this.services.socket.has(forwardTarget(pair.userId, pair.appUid)))
+            return;
+        const app = presenceApp(pair.appUid);
+        const key = `${pair.userId}|${app}`;
+        // A pair inside its disconnect window is one this region expects back;
+        // the leave already scheduled, on this node or another, decides.
+        if (this.#leaveTimers.has(key)) return;
+        if (await this.stores.presence.holdsConnection(pair.userId, app))
+            return;
+        if (await this.stores.presence.isLeaving(pair.userId, app)) return;
+        if (!(await this.stores.presence.claimRetire(pair.userId, app))) return;
+
+        try {
+            const userUuid = await this.#uuidOf(pair.userId);
+            if (!userUuid) return;
+            await this.#leaveIfStillGone(
+                { userId: pair.userId, userUuid, appUid: app, key },
+                'retire',
+            );
+        } catch (err) {
+            await this.stores.presence.releaseRetireClaim(pair.userId, app);
+            throw err;
+        }
+    }
+
+    // -- Transport ---------------------------------------------------
+
+    #send(region: string, delivery: ForwardableDelivery): void {
+        if (!this.isPeer(region)) return;
+        forwardSent.add(1, {
+            from: this.region,
+            to: region,
+            class: delivery.ackRequired ? 'single' : 'broadcast',
+        });
+        const item: ForwardDelivery = {
+            kind: 'delivery',
+            userId: delivery.holderUserId,
+            appUid: delivery.appUid,
+            subId: delivery.subId,
+            event: delivery.event,
+            ...(delivery.ackRequired
+                ? {
+                      ackRequired: true as const,
+                      ackId: delivery.ackId,
+                      origin: this.region,
+                  }
+                : {}),
+            ...(delivery.skipHandler ? { skipHandler: true as const } : {}),
+        };
+        this.#queueFor().push(region, item);
+    }
+
+    #queueFor(): PeerForwardQueue {
+        this.#queue ??= new PeerForwardQueue({
+            maxQueued: EventForwardService.MAX_QUEUED,
+            maxQueuedBytes: EventForwardService.MAX_QUEUED_BYTES,
+            send: (peerId, items) => this.#ship(peerId, items),
+            onOverflow: (peerId, dropped) => this.#overflowed(peerId, dropped),
+        });
+        return this.#queue;
+    }
+
+    async #ship(peerId: string, items: ForwardItem[]): Promise<void> {
+        // Shipped or lost, these are out of the queue either way, so the next
+        // shed for their subscriptions may queue a marker again.
+        this.#forgetMarkers(peerId, items);
+        const batch: ForwardBatch = { from: this.region, items };
+        const reply = (await this.services.broadcast.postToPeer(
+            peerId,
+            FORWARD_WEBHOOK_PATH,
+            batch,
+        )) as ForwardReply | null;
+
+        // A peer answering "I hold no session for this token" is
+        // authoritative — this region's own remote-watch entry for it is
+        // stale, so it stops sending there.
+        for (const stale of reply?.noWatch ?? [])
+            await this.stores.eventSubscription
+                .noteRemoteWatch(stale.userId, stale.token, peerId, 'drop')
+                .catch((err: unknown) => {
+                    console.warn('[events] remote-watch repair failed', err);
+                });
+    }
+
+    /**
+     * Deliveries the queue could not hold. Never a log line on its own: each
+     * subscription that lost events gets a marker in their place — handed back
+     * to the queue, which puts it where the shed just made room — and the
+     * region being this far behind is worth someone's attention.
+     *
+     * One marker per (peer, subscription) at a time. A subscription still
+     * losing events while its marker waits has already been told, and a second
+     * marker would take a slot from a delivery; a marker that is itself shed
+     * frees the slot for the next one.
+     */
+    #overflowed(peerId: string, dropped: ForwardItem[]): ForwardItem[] {
+        const pending = this.#pendingMarkersFor(peerId);
+        const markers: ForwardItem[] = [];
+        for (const item of dropped) {
+            if (item.kind !== 'delivery') continue;
+            if (item.event.op === 'gap') {
+                pending.delete(item.subId);
+                continue;
+            }
+            // A `single` loses nothing here: its lease is still running, and
+            // the next attempt is what the expiry is for.
+            if (item.ackRequired || pending.has(item.subId)) continue;
+            pending.add(item.subId);
+            // A gap always reaches the client's handler, like a local one.
+            const { skipHandler, ...unmarked } = item;
+            markers.push({ ...unmarked, event: overflowGap(item.event) });
+        }
+
+        this.clients.alarm.create(
+            'events_forward_overflow',
+            'Events queued for another region were dropped to stay inside the queue bound',
+            { peerId, dropped: dropped.length },
+            'warning',
+            { dedup: true },
+        );
+        return markers;
+    }
+
+    #pendingMarkersFor(peerId: string): Set<string> {
+        let pending = this.#pendingMarkers.get(peerId);
+        if (!pending) {
+            pending = new Set();
+            this.#pendingMarkers.set(peerId, pending);
+        }
+        return pending;
+    }
+
+    #forgetMarkers(peerId: string, items: ForwardItem[]): void {
+        const pending = this.#pendingMarkers.get(peerId);
+        if (!pending) return;
+        for (const item of items)
+            if (item.kind === 'delivery' && item.event.op === 'gap')
+                pending.delete(item.subId);
+    }
+
+    // -- Generation --------------------------------------------------
+
+    /**
+     * Say that presence moved. One `INCR` and one broadcast, the same shape the
+     * watched-token set and the permission cache use — which is what makes
+     * reads scale with transitions rather than with events.
+     */
+    async #bump(userId: number): Promise<void> {
+        try {
+            const generation =
+                await this.stores.presence.bumpGeneration(userId);
+            this.#cache.bump(userId, generation);
+            this.clients.event.emit(
+                'outer.pubsub.events.presenceBumped',
+                { userId, generation },
+                {},
+            );
+            // Addressed alongside the webhook emit above, which stays as the
+            // backstop for a peer that drops this or runs old code.
+            this.announceGeneration({ userId, generation }, false, 'presence');
+        } catch (err) {
+            this.#cache.bump(userId);
+            console.warn('[events] presence generation bump failed', err);
+        }
+    }
+
+    // -- Plumbing ----------------------------------------------------
+
+    #pairOf(actor: Actor): PresencePair | null {
+        const userId = actor.user?.id;
+        const userUuid = actor.user?.uuid;
+        if (typeof userId !== 'number' || !userUuid) return null;
+        const appUid = presenceApp(actor.effectiveApp?.uid ?? null);
+        this.#rememberUuid(userId, userUuid);
+        return { userId, userUuid, appUid, key: `${userId}|${appUid}` };
+    }
+
+    async #uuidOf(userId: number): Promise<string | null> {
+        const held = this.#uuids.get(userId);
+        if (held) return held;
+        try {
+            const user = await this.stores.user.getById(userId);
+            const uuid = user?.uuid;
+            if (!uuid) return null;
+            this.#rememberUuid(userId, uuid);
+            return uuid;
+        } catch {
+            return null;
+        }
+    }
+
+    #rememberUuid(userId: number, uuid: string): void {
+        this.#uuids.delete(userId);
+        this.#uuids.set(userId, uuid);
+        while (this.#uuids.size > UUID_CACHE_MAX) {
+            const oldest = this.#uuids.keys().next();
+            if (oldest.done) break;
+            this.#uuids.delete(oldest.value);
+        }
+    }
+}
+
+interface PresencePair {
+    userId: number;
+    userUuid: string;
+    appUid: string;
+    key: string;
+}

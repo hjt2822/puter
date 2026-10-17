@@ -1,0 +1,211 @@
+name: Backend Tests
+
+# Always triggers on PRs so it can be a required check; the `changes` job below
+# decides whether backend/extension paths actually changed (test-only changes
+# match the same globs, since tests are co-located with the code), and `test`
+# still reports success when they didn't. Pushes to main produce the coverage
+# PRs compare against. puter.js SDK changes are covered by puterjs-tests.yaml.
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  pull-requests: write
+  # Reads main's coverage artifact for the PR comparison.
+  actions: read
+
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      backend: ${{ steps.filter.outputs.backend }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dorny/paths-filter@v4
+        id: filter
+        with:
+          filters: |
+            backend:
+              - 'src/backend/**'
+              - 'extensions/**'
+              - 'tools/**'
+              - 'package.json'
+              - 'package-lock.json'
+              - 'tsconfig.json'
+              - 'tsconfig.build.json'
+              - '.github/workflows/backend-tests.yaml'
+
+  # `tsconfig.build.json` builds with `noCheck: true`, so nothing else in CI
+  # runs the type checker and a missing export compiles to `undefined`,
+  # surfacing only when the call is finally reached at runtime. This diffs
+  # against tools/typecheck-baseline.json and fails only on *new* errors.
+  #
+  # The consuming repo runs an equivalent gate, but only once someone bumps the
+  # submodule pointer — too late to keep the error off this repo's default
+  # branch. Hence a gate here, on this repo's own pull requests.
+  typecheck:
+    needs: changes
+    if: github.event_name == 'pull_request' && needs.changes.outputs.backend == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Type check (new errors only)
+        run: npm run typecheck
+
+  # The suite is CPU-bound, so it's split across runners. Each shard writes a
+  # blob report (results plus coverage) that the `coverage` job merges.
+  test-shard:
+    needs: changes
+    if: needs.changes.outputs.backend == 'true'
+    name: test shard ${{ matrix.shard }}/${{ strategy.job-total }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run backend tests with coverage
+        run: >-
+          npm run test:backend --
+          --coverage
+          --shard=${{ matrix.shard }}/${{ strategy.job-total }}
+          --reporter=default
+          --reporter=blob
+        env:
+          CI: 'true'
+
+      - name: Upload blob report
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: backend-blob-${{ matrix.shard }}
+          path: .vitest-reports/
+          include-hidden-files: true
+          retention-days: 1
+
+  # Required check, so its PR name is pinned. A skipped job would satisfy it,
+  # so this always runs and fails on any shard that didn't pass.
+  test:
+    needs: [changes, test-shard]
+    if: ${{ !cancelled() }}
+    name: test (${{ github.event_name == 'push' && 'main' || 'pr' }})
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check shard results
+        env:
+          CHANGES_RESULT: ${{ needs.changes.result }}
+          BACKEND_CHANGED: ${{ needs.changes.outputs.backend }}
+          SHARDS_RESULT: ${{ needs.test-shard.result }}
+        run: |
+          if [ "$CHANGES_RESULT" != "success" ]; then
+            echo "changes job: $CHANGES_RESULT"
+            exit 1
+          fi
+          if [ "$BACKEND_CHANGED" != "true" ]; then
+            echo "No backend changes."
+            exit 0
+          fi
+          if [ "$SHARDS_RESULT" != "success" ]; then
+            echo "test shards: $SHARDS_RESULT"
+            exit 1
+          fi
+
+  coverage:
+    needs: [changes, test-shard]
+    if: ${{ !cancelled() && needs.test-shard.result == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Download blob reports
+        uses: actions/download-artifact@v8
+        with:
+          pattern: backend-blob-*
+          path: .vitest-reports
+          merge-multiple: true
+
+      - name: Merge shard coverage
+        run: npx vitest run --config src/backend/vitest.config.ts --merge-reports --coverage
+        env:
+          CI: 'true'
+
+      - name: Upload coverage artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: backend-coverage-${{ github.event_name == 'push' && 'main' || 'pr' }}
+          path: src/backend/coverage/
+          retention-days: ${{ github.event_name == 'push' && 30 || 14 }}
+
+      # Latest main coverage from this repo's own runs; a fork can't publish
+      # under this repository id.
+      - name: Download main coverage
+        id: base
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          id=$(gh api "repos/$REPO/actions/artifacts?name=backend-coverage-main&per_page=20" --jq '
+            [.artifacts[]
+              | select(.expired | not)
+              | select(.workflow_run.head_branch == "main")
+              | select(.workflow_run.head_repository_id == .workflow_run.repository_id)
+            ][0].id // empty')
+          if [ -z "$id" ]; then
+            echo "No main coverage artifact; reporting without a comparison."
+            exit 0
+          fi
+          gh api "repos/$REPO/actions/artifacts/$id/zip" > coverage-base.zip
+          unzip -q coverage-base.zip -d coverage-base
+          echo "found=true" >> "$GITHUB_OUTPUT"
+
+      - name: Report coverage on PR
+        if: github.event_name == 'pull_request'
+        uses: davelosert/vitest-coverage-report-action@v2
+        with:
+          json-summary-path: src/backend/coverage/coverage-summary.json
+          json-final-path: src/backend/coverage/coverage-final.json
+          json-summary-compare-path: ${{ steps.base.outputs.found == 'true' && 'coverage-base/coverage-summary.json' || '' }}

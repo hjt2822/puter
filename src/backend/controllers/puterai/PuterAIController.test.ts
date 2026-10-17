@@ -1,0 +1,2824 @@
+/*
+ * Copyright (C) 2024-present Puter Technologies Inc.
+ *
+ * This file is part of Puter.
+ *
+ * Puter is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published
+ * by the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+/**
+ * Offline unit tests for PuterAIController.
+ *
+ * Boots a real PuterServer (in-memory sqlite + dynamo + s3 + mock
+ * redis) and drives the live wired controller from
+ * `server.controllers.puterAi`. The chat driver's `complete` method
+ * is spied per-test to inject canned results; that's the seam between
+ * controller (the unit under test) and provider/driver internals
+ * (which have their own tests). Tests cover route registration,
+ * actor gating, body validation, response shape (non-stream and SSE),
+ * model-listing endpoints, and the HMAC-gated video proxy guards.
+ */
+
+import { Readable } from 'node:stream';
+import type { Request, Response } from 'express';
+import {
+    afterAll,
+    afterEach,
+    beforeAll,
+    beforeEach,
+    describe,
+    expect,
+    it,
+    vi,
+} from 'vitest';
+
+import type { Actor } from '../../core/actor.js';
+import { Context } from '../../core/context.js';
+import type { RouteOptions } from '../../core/http/index.js';
+import {
+    COUNT_TOKENS,
+    type ChatCompletionDriver,
+} from '../../drivers/ai-chat/ChatCompletionDriver.js';
+import { AI_CONCURRENT, AI_RATE_LIMIT } from '../../drivers/util/aiLimits.js';
+import { PuterServer } from '../../server.js';
+import { inRequestScope, setupTestServer } from '../../testUtil.js';
+import { PuterAIController } from './PuterAIController.js';
+
+// ── Test harness ────────────────────────────────────────────────────
+
+let server: PuterServer;
+let controller: PuterAIController;
+
+beforeAll(async () => {
+    server = await setupTestServer();
+    controller = inRequestScope(
+        server.controllers.puterAi as unknown as PuterAIController,
+    );
+});
+
+afterAll(async () => {
+    await server?.shutdown();
+});
+
+afterEach(() => {
+    vi.restoreAllMocks();
+});
+
+// ── Test req/res helpers ────────────────────────────────────────────
+
+const makeUserActor = (): Actor => ({
+    user: { id: 7, uuid: 'u-7', username: 'alice' },
+});
+
+interface CapturedResponse {
+    statusCode: number;
+    body: unknown;
+    headers: Record<string, string>;
+    written: string[];
+    ended: boolean;
+}
+
+const makeReq = (init: {
+    body?: unknown;
+    query?: Record<string, unknown>;
+    params?: Record<string, string>;
+    headers?: Record<string, string>;
+    actor?: Actor;
+}): Request =>
+    ({
+        body: init.body ?? {},
+        query: init.query ?? {},
+        params: init.params ?? {},
+        headers: init.headers ?? {},
+        actor: init.actor,
+    }) as unknown as Request;
+
+const makeRes = () => {
+    const captured: CapturedResponse = {
+        statusCode: 200,
+        body: undefined,
+        headers: {},
+        written: [],
+        ended: false,
+    };
+    const res = {
+        json: vi.fn((value: unknown) => {
+            captured.body = value;
+            return res;
+        }),
+        status: vi.fn((code: number) => {
+            captured.statusCode = code;
+            return res;
+        }),
+        send: vi.fn((value: unknown) => {
+            captured.body = value;
+            return res;
+        }),
+        setHeader: vi.fn((k: string, v: string) => {
+            captured.headers[k] = v;
+            return res;
+        }),
+        write: vi.fn((chunk: string | Buffer) => {
+            captured.written.push(
+                typeof chunk === 'string' ? chunk : chunk.toString('utf8'),
+            );
+            return true;
+        }),
+        end: vi.fn(() => {
+            captured.ended = true;
+            return res;
+        }),
+        once: vi.fn(() => res),
+    };
+    return { res: res as unknown as Response, captured };
+};
+
+const ndjsonStreamFrom = (events: unknown[]): NodeJS.ReadableStream => {
+    const lines = events.map((e) => `${JSON.stringify(e)}\n`);
+    return Readable.from(lines);
+};
+
+const stubChatComplete = (result: unknown) => {
+    // Spy on the wired chat driver so the controller's `this.#driver()
+    // .complete(args)` returns our canned shape — keeps the test focused
+    // on the controller surface (validation, response shaping) without
+    // dragging in provider model resolution / credit checks.
+    return vi
+        .spyOn(
+            server.drivers.aiChat as unknown as ChatCompletionDriver,
+            'complete',
+        )
+        .mockResolvedValueOnce(result as never);
+};
+
+// ── Route registration ──────────────────────────────────────────────
+
+describe('PuterAIController.registerRoutes', () => {
+    it('registers all OpenAI-/Anthropic-/Responses-compatible routes plus model listing and video proxy', () => {
+        const calls: Array<{ method: string; path: string; opts: unknown }> =
+            [];
+        const router = {
+            post: vi.fn((path: string, opts: unknown) => {
+                calls.push({ method: 'post', path, opts });
+                return router;
+            }),
+            get: vi.fn((path: string, opts: unknown) => {
+                calls.push({ method: 'get', path, opts });
+                return router;
+            }),
+        };
+
+        controller.registerRoutes(router as never);
+
+        const paths = calls.map((c) => `${c.method} ${c.path}`);
+        // Compatibility surface — every path lives under /puterai for
+        // wire compatibility with puter-js and existing API tests.
+        expect(paths).toEqual(
+            expect.arrayContaining([
+                'post /puterai/openai/v1/chat/completions',
+                'post /puterai/openai/v1/completions',
+                'post /puterai/openai/v1/responses',
+                'post /puterai/anthropic/v1/messages',
+                'post /puterai/anthropic/v1/messages/count_tokens',
+                'get /puterai/anthropic/v1/models',
+                'get /puterai/anthropic/v1/models/:id',
+                'get /puterai/chat/models',
+                'get /puterai/chat/models/details',
+                'get /puterai/image/models',
+                'get /puterai/image/models/details',
+                'get /puterai/video/models',
+                'get /puterai/video/models/details',
+                'get /puterai/video/proxy',
+            ]),
+        );
+
+        // The four upstream-proxy routes accept exactly one credential
+        // shape — a full-access API token minted from the dashboard:
+        // `requireUserActor` keeps apps out, `allowFullAccessToken` admits
+        // the PAT, and `noUserSession` rejects the account session ("root")
+        // token. Each route also carries `requireVerified` (fresh accounts
+        // must confirm their email before using the AI wire surface),
+        // `requireSubscription` (the vendor-compatible surface is a paid
+        // feature; free accounts reach the same models via /drivers/call) and
+        // the shared per-tier AI rate-limit / concurrency policy — these
+        // routes bypass the `/drivers/call` dispatch (where the
+        // driver-declared limits are enforced), so without the route gates
+        // they'd be unthrottled.
+        const userOnlyPaths = [
+            '/puterai/openai/v1/chat/completions',
+            '/puterai/openai/v1/completions',
+            '/puterai/openai/v1/responses',
+            '/puterai/anthropic/v1/messages',
+        ];
+        for (const path of userOnlyPaths) {
+            const route = calls.find((c) => c.path === path);
+            expect(route?.opts).toEqual({
+                subdomain: 'api',
+                requireUserActor: true,
+                allowFullAccessToken: true,
+                noUserSession: true,
+                requireVerified: true,
+                requireSubscription: true,
+                rateLimit: {
+                    ...AI_RATE_LIMIT.default,
+                    scope: 'driver:puter-chat-completion:complete',
+                    key: expect.any(Function),
+                },
+                concurrent: {
+                    ...AI_CONCURRENT.default,
+                    scope: 'driver:puter-chat-completion:complete',
+                    key: expect.any(Function),
+                },
+                // Every error on these routes — including the gate
+                // failures above — is rendered in the vendor's own
+                // envelope, so a client built against the real SDK
+                // parses ours the same way.
+                errorRenderer: expect.any(Function),
+            });
+        }
+        // count_tokens: the shared user-credential gates, its own (more
+        // generous) rate limit, and no concurrency gate — there is no
+        // long-lived upstream call to bound a slot for.
+        const countTokensRoute = calls.find(
+            (c) => c.path === '/puterai/anthropic/v1/messages/count_tokens',
+        );
+        expect(countTokensRoute?.opts).toEqual({
+            subdomain: 'api',
+            requireUserActor: true,
+            allowFullAccessToken: true,
+            noUserSession: true,
+            requireVerified: true,
+            requireSubscription: true,
+            rateLimit: {
+                scope: 'puterai-count-tokens',
+                limit: 120,
+                window: 60_000,
+                key: expect.any(Function),
+            },
+            errorRenderer: expect.any(Function),
+        });
+        expect(countTokensRoute?.opts).not.toHaveProperty('concurrent');
+
+        // The Anthropic model listings are unauthenticated like the other
+        // catalogues, but rendered in the Anthropic envelope so an unknown
+        // id 404s the way the real API does.
+        for (const path of [
+            '/puterai/anthropic/v1/models',
+            '/puterai/anthropic/v1/models/:id',
+        ]) {
+            const route = calls.find((c) => c.path === path);
+            expect(route?.opts).toEqual({
+                subdomain: 'api',
+                requireAuth: false,
+                rateLimit: {
+                    scope: 'puterai-models',
+                    limit: 3_000,
+                    window: 60_000,
+                    key: 'ip',
+                },
+                errorRenderer: expect.any(Function),
+            });
+        }
+
+        const modelsRoute = calls.find(
+            (c) => c.path === '/puterai/chat/models',
+        );
+        // Unauthenticated, so the limit keys on IP rather than an actor —
+        // which makes the bucket an aggregate over every client behind that
+        // address, hence a ceiling sized for a network rather than a browser.
+        expect(modelsRoute?.opts).toEqual({
+            subdomain: 'api',
+            requireAuth: false,
+            rateLimit: {
+                scope: 'puterai-models',
+                limit: 3_000,
+                window: 60_000,
+                key: 'ip',
+            },
+        });
+    });
+
+    it('leaves the catalogue and the video proxy outside the plan gate', () => {
+        const calls: Array<{ path: string; opts: RouteOptions }> = [];
+        const router = {
+            post: vi.fn(() => router),
+            get: vi.fn((path: string, opts: RouteOptions) => {
+                calls.push({ path, opts });
+                return router;
+            }),
+        };
+
+        controller.registerRoutes(router as never);
+
+        // The catalogue is fetched before a client has any reason to
+        // authenticate, and the proxy streams a video the account already
+        // paid to generate to whoever holds the signed link — neither has a
+        // plan to read, let alone one to charge for.
+        const openPaths = [
+            '/puterai/chat/models',
+            '/puterai/chat/models/details',
+            '/puterai/image/models',
+            '/puterai/image/models/details',
+            '/puterai/video/models',
+            '/puterai/video/models/details',
+            '/puterai/video/proxy',
+            '/puterai/anthropic/v1/models',
+            '/puterai/anthropic/v1/models/:id',
+        ];
+        for (const path of openPaths) {
+            const route = calls.find((c) => c.path === path);
+            expect(route, path).toBeDefined();
+            expect(route?.opts.requireSubscription, path).toBeUndefined();
+        }
+    });
+
+    it('keys the proxy-route AI limits by user uuid so they share the /drivers/call buckets', () => {
+        const calls: Array<{ path: string; opts: RouteOptions }> = [];
+        const router = {
+            post: vi.fn((path: string, opts: RouteOptions) => {
+                calls.push({ path, opts });
+                return router;
+            }),
+            get: vi.fn(() => router),
+        };
+
+        controller.registerRoutes(router as never);
+
+        const route = calls.find(
+            (c) => c.path === '/puterai/openai/v1/chat/completions',
+        );
+        const rateLimit = route?.opts.rateLimit as {
+            key: (req: Request) => string;
+            scope: string;
+        };
+        const concurrent = route?.opts.concurrent as {
+            key: (req: Request) => string;
+            scope: string;
+        };
+
+        // The dispatch buckets requests as `driver:<iface>:<method>:<uid>`
+        // where uid is the actor's user uuid; scope + key must compose to the
+        // identical string or wire traffic mints a second per-user budget.
+        const req = makeReq({ actor: makeUserActor() });
+        expect(rateLimit.key(req)).toBe('u-7');
+        expect(concurrent.key(req)).toBe('u-7');
+        expect(rateLimit.scope).toBe('driver:puter-chat-completion:complete');
+        expect(concurrent.scope).toBe('driver:puter-chat-completion:complete');
+
+        // No-actor fallback still yields a usable (fingerprint) key rather
+        // than throwing or bucketing everyone together under undefined.
+        const anonKey = rateLimit.key(makeReq({}));
+        expect(typeof anonKey).toBe('string');
+        expect(anonKey.length).toBeGreaterThan(0);
+    });
+});
+
+// ── /openai/v1/chat/completions ─────────────────────────────────────
+
+describe('PuterAIController.openaiChatCompletions', () => {
+    // Note: app-actor rejection (403) is enforced by the `requireUserActor`
+    // route gate and is asserted in the registerRoutes test above. The
+    // handler itself no longer does that check, so unit-testing it here
+    // would require invoking the gate stack.
+
+    it('rejects bodies missing a messages array with HttpError 400', async () => {
+        const { res } = makeRes();
+        await expect(
+            controller.openaiChatCompletions(
+                makeReq({
+                    body: { model: 'gpt-test' },
+                    actor: makeUserActor(),
+                }),
+                res,
+            ),
+        ).rejects.toMatchObject({ statusCode: 400 });
+    });
+
+    it('leaves strictUpstreamErrors unset, unlike the Anthropic route', async () => {
+        let seen: unknown;
+        vi.spyOn(
+            server.drivers.aiChat as unknown as ChatCompletionDriver,
+            'complete',
+        ).mockImplementationOnce(() => {
+            seen = Context.get('strictUpstreamErrors');
+            return Promise.resolve({
+                message: { role: 'assistant', content: 'hi' },
+                finish_reason: 'stop',
+            } as never);
+        });
+
+        await controller.openaiChatCompletions(
+            makeReq({
+                body: {
+                    model: 'gpt-test',
+                    messages: [{ role: 'user', content: 'hi' }],
+                },
+                actor: makeUserActor(),
+            }),
+            makeRes().res,
+        );
+
+        expect(seen).toBeUndefined();
+    });
+
+    it('shapes a non-stream completion as an OpenAI chat.completion response', async () => {
+        const completeSpy = stubChatComplete({
+            message: { role: 'assistant', content: 'hi there' },
+            finish_reason: 'stop',
+            usage: { prompt_tokens: 4, completion_tokens: 2 },
+            usageDetails: { inputTokens: 4, outputTokens: 2 },
+        });
+
+        const { res, captured } = makeRes();
+        await controller.openaiChatCompletions(
+            makeReq({
+                body: {
+                    model: 'gpt-test',
+                    messages: [{ role: 'user', content: 'hi' }],
+                },
+                actor: makeUserActor(),
+            }),
+            res,
+        );
+
+        // Driver was given the user's messages and no provider pin, so it is
+        // free to pick the preferred healthy route for the model.
+        expect(completeSpy).toHaveBeenCalledTimes(1);
+        const completeArgs = completeSpy.mock.calls[0]![0];
+        expect(completeArgs.model).toBe('gpt-test');
+        expect(completeArgs.messages).toEqual([
+            { role: 'user', content: 'hi' },
+        ]);
+        expect(completeArgs.stream).toBe(false);
+        expect(completeArgs.provider).toBeUndefined();
+        // Wire routes translate shapes themselves; the driver is pinned
+        // provider-native so the release-date cutoff can't change them.
+        expect(completeArgs.normalize).toBe(false);
+
+        // Response shape matches OpenAI's /v1/chat/completions wire format.
+        const body = captured.body as Record<string, unknown>;
+        expect(body.object).toBe('chat.completion');
+        expect(body.model).toBe('gpt-test');
+        expect(
+            (body.choices as Array<Record<string, unknown>>)[0],
+        ).toMatchObject({
+            index: 0,
+            message: { role: 'assistant', content: 'hi there' },
+            finish_reason: 'stop',
+        });
+        // total_tokens is computed from prompt + completion.
+        expect(body.usage).toEqual({
+            prompt_tokens: 4,
+            completion_tokens: 2,
+            total_tokens: 6,
+            prompt_tokens_details: { cached_tokens: 0 },
+        });
+        // id is generated as `chatcmpl-<hex>`; just sanity-check the prefix.
+        expect(typeof body.id).toBe('string');
+        expect((body.id as string).startsWith('chatcmpl-')).toBe(true);
+    });
+
+    it('forwards an explicit provider as a pin instead of choosing one itself', async () => {
+        const completeSpy = stubChatComplete({
+            message: { role: 'assistant', content: 'hi there' },
+            finish_reason: 'stop',
+            usage: { prompt_tokens: 4, completion_tokens: 2 },
+        });
+
+        const { res } = makeRes();
+        await controller.openaiChatCompletions(
+            makeReq({
+                body: {
+                    model: 'gpt-test',
+                    provider: 'openai-completion',
+                    messages: [{ role: 'user', content: 'hi' }],
+                },
+                actor: makeUserActor(),
+            }),
+            res,
+        );
+
+        const completeArgs = completeSpy.mock.calls[0]![0];
+        expect(completeArgs.provider).toBe('openai-completion');
+    });
+
+    it('still pins OpenAI when the caller names no model, so the default model does not move', async () => {
+        const completeSpy = stubChatComplete({
+            message: { role: 'assistant', content: 'hi there' },
+            finish_reason: 'stop',
+            usage: { prompt_tokens: 4, completion_tokens: 2 },
+        });
+
+        const { res } = makeRes();
+        await controller.openaiChatCompletions(
+            makeReq({
+                body: { messages: [{ role: 'user', content: 'hi' }] },
+                actor: makeUserActor(),
+            }),
+            res,
+        );
+
+        // With no model there is no route to prefer — unpinned, this would
+        // take its default model from whichever provider the driver picks.
+        expect(completeSpy.mock.calls[0]![0].provider).toBe(
+            'openai-completion',
+        );
+    });
+
+    it('streams chat completion deltas as SSE chunks ending with [DONE]', async () => {
+        stubChatComplete({
+            // The controller's expectStream() checks the DriverStreamResult
+            // discriminant via isDriverStreamResult.
+            dataType: 'stream',
+            content_type: 'application/x-ndjson',
+            stream: ndjsonStreamFrom([
+                { type: 'text', text: 'he' },
+                { type: 'text', text: 'llo' },
+                {
+                    type: 'usage',
+                    usage: { prompt_tokens: 2, completion_tokens: 2 },
+                },
+            ]),
+        });
+
+        const { res, captured } = makeRes();
+        await controller.openaiChatCompletions(
+            makeReq({
+                body: {
+                    model: 'gpt-test',
+                    messages: [{ role: 'user', content: 'hi' }],
+                    stream: true,
+                },
+                actor: makeUserActor(),
+            }),
+            res,
+        );
+
+        // Wait a tick for the stream's `end` event to flush.
+        await new Promise<void>((resolve) => setImmediate(resolve));
+
+        // SSE headers were set.
+        expect(captured.headers['Content-Type']).toBe(
+            'text/event-stream; charset=utf-8',
+        );
+        // Wire output: every chunk is `data: {...}\n\n`, last is `data: [DONE]`.
+        const out = captured.written.join('');
+        expect(out).toContain('"content":"he"');
+        expect(out).toContain('"content":"llo"');
+        expect(out).toContain('"finish_reason":"stop"');
+        expect(out.endsWith('data: [DONE]\n\n')).toBe(true);
+        expect(captured.ended).toBe(true);
+    });
+
+    it('maps role:developer to role:system and max_completion_tokens to max_tokens', async () => {
+        const completeSpy = stubChatComplete({
+            message: { role: 'assistant', content: 'ok' },
+            finish_reason: 'stop',
+        });
+        const { res } = makeRes();
+        await controller.openaiChatCompletions(
+            makeReq({
+                body: {
+                    model: 'gpt-test',
+                    messages: [
+                        { role: 'developer', content: 'be terse' },
+                        { role: 'user', content: 'hi' },
+                    ],
+                    max_completion_tokens: 128,
+                },
+                actor: makeUserActor(),
+            }),
+            res,
+        );
+
+        const completeArgs = completeSpy.mock.calls[0]![0];
+        expect(completeArgs.messages[0]).toEqual({
+            role: 'system',
+            content: 'be terse',
+        });
+        expect(completeArgs.max_tokens).toBe(128);
+    });
+
+    it('maps tool_choice/stop/response_format/reasoning_effort to the normalized shape', async () => {
+        const completeSpy = stubChatComplete({
+            message: { role: 'assistant', content: 'ok' },
+            finish_reason: 'stop',
+        });
+        const { res } = makeRes();
+        await controller.openaiChatCompletions(
+            makeReq({
+                body: {
+                    model: 'gpt-test',
+                    messages: [{ role: 'user', content: 'hi' }],
+                    tool_choice: { type: 'function', function: { name: 'lookup' } },
+                    stop: ['STOP'],
+                    response_format: {
+                        type: 'json_schema',
+                        json_schema: {
+                            name: 'answer',
+                            schema: { type: 'object' },
+                        },
+                    },
+                    reasoning_effort: 'high',
+                },
+                actor: makeUserActor(),
+            }),
+            res,
+        );
+
+        const completeArgs = completeSpy.mock.calls[0]![0];
+        expect(completeArgs.tool_choice).toEqual({ type: 'tool', name: 'lookup' });
+        expect(completeArgs.stopSequences).toEqual(['STOP']);
+        expect(completeArgs.outputFormat).toEqual({
+            type: 'json_schema',
+            name: 'answer',
+            schema: { type: 'object' },
+        });
+        expect(completeArgs.reasoning_effort).toBe('high');
+    });
+
+    it('defaults parallel_tool_calls to true when the caller omits it', async () => {
+        const completeSpy = stubChatComplete({
+            message: { role: 'assistant', content: 'ok' },
+            finish_reason: 'stop',
+        });
+        const { res } = makeRes();
+        await controller.openaiChatCompletions(
+            makeReq({
+                body: {
+                    model: 'gpt-test',
+                    messages: [{ role: 'user', content: 'hi' }],
+                },
+                actor: makeUserActor(),
+            }),
+            res,
+        );
+        expect(completeSpy.mock.calls[0]![0].parallel_tool_calls).toBe(true);
+    });
+
+    it('streams incremental tool_call deltas via tool_use_start/tool_input_delta', async () => {
+        stubChatComplete({
+            dataType: 'stream',
+            content_type: 'application/x-ndjson',
+            stream: ndjsonStreamFrom([
+                { type: 'tool_use_start', id: 'call_1', name: 'lookup' },
+                { type: 'tool_input_delta', id: 'call_1', partialJson: '{"q":' },
+                { type: 'tool_input_delta', id: 'call_1', partialJson: '"hi"}' },
+                {
+                    type: 'tool_use',
+                    id: 'call_1',
+                    name: 'lookup',
+                    input: { q: 'hi' },
+                },
+                {
+                    type: 'usage',
+                    usage: { prompt_tokens: 1, completion_tokens: 1 },
+                    finish_reason: 'tool_calls',
+                },
+            ]),
+        });
+
+        const { res, captured } = makeRes();
+        await controller.openaiChatCompletions(
+            makeReq({
+                body: {
+                    model: 'gpt-test',
+                    messages: [{ role: 'user', content: 'hi' }],
+                    stream: true,
+                },
+                actor: makeUserActor(),
+            }),
+            res,
+        );
+        await new Promise<void>((resolve) => setImmediate(resolve));
+
+        const frames = captured.written
+            .join('')
+            .split('\n\n')
+            .filter((f) => f.startsWith('data: ') && !f.includes('[DONE]'))
+            .map((f) => JSON.parse(f.slice(6)));
+        const toolCallFrames = frames.filter(
+            (f) => f.choices[0].delta.tool_calls !== undefined,
+        );
+        // start: id+name, no arguments yet; two deltas; the final `tool_use`
+        // chunk emits nothing more since it was already streamed.
+        expect(toolCallFrames).toHaveLength(3);
+        expect(toolCallFrames[0].choices[0].delta.tool_calls[0]).toEqual({
+            index: 0,
+            id: 'call_1',
+            type: 'function',
+            function: { name: 'lookup', arguments: '' },
+        });
+        expect(toolCallFrames[1].choices[0].delta.tool_calls[0]).toEqual({
+            index: 0,
+            function: { arguments: '{"q":' },
+        });
+        expect(toolCallFrames[2].choices[0].delta.tool_calls[0]).toEqual({
+            index: 0,
+            function: { arguments: '"hi"}' },
+        });
+        expect(frames[frames.length - 1].choices[0].finish_reason).toBe(
+            'tool_calls',
+        );
+    });
+
+    it('emits an OpenAI error event (no finish chunk) on a mid-stream error chunk', async () => {
+        stubChatComplete({
+            dataType: 'stream',
+            content_type: 'application/x-ndjson',
+            stream: ndjsonStreamFrom([
+                { type: 'text', text: 'partial' },
+                {
+                    type: 'error',
+                    message: 'upstream overloaded',
+                    code: 'upstream_overloaded',
+                    status: 529,
+                },
+            ]),
+        });
+
+        const { res, captured } = makeRes();
+        await controller.openaiChatCompletions(
+            makeReq({
+                body: {
+                    model: 'gpt-test',
+                    messages: [{ role: 'user', content: 'hi' }],
+                    stream: true,
+                },
+                actor: makeUserActor(),
+            }),
+            res,
+        );
+        await new Promise<void>((resolve) => setImmediate(resolve));
+
+        const out = captured.written.join('');
+        expect(out).toContain('"message":"upstream overloaded"');
+        expect(out).toContain('"type":"upstream_error"');
+        // No finish chunk was ever sent for this run — the stream ended on
+        // the error, not a `stop`/`tool_calls` completion.
+        expect(out).not.toContain('"finish_reason":"stop"');
+        expect(out).not.toContain('"finish_reason":"tool_calls"');
+        expect(out.endsWith('data: [DONE]\n\n')).toBe(true);
+        expect(captured.ended).toBe(true);
+    });
+
+    it('returns tool_calls in the OpenAI shape on the assistant message', async () => {
+        stubChatComplete({
+            message: {
+                role: 'assistant',
+                content: null,
+                tool_calls: [
+                    {
+                        id: 'call_1',
+                        type: 'function',
+                        function: {
+                            name: 'lookup',
+                            arguments: '{"q":"puter"}',
+                        },
+                    },
+                ],
+            },
+            finish_reason: 'tool_calls',
+        });
+
+        const { res, captured } = makeRes();
+        await controller.openaiChatCompletions(
+            makeReq({
+                body: {
+                    model: 'gpt-test',
+                    messages: [{ role: 'user', content: 'do a tool call' }],
+                    tools: [
+                        {
+                            type: 'function',
+                            function: { name: 'lookup', parameters: {} },
+                        },
+                    ],
+                },
+                actor: makeUserActor(),
+            }),
+            res,
+        );
+
+        const body = captured.body as Record<string, unknown>;
+        const choice = (body.choices as Array<Record<string, unknown>>)[0];
+        expect(choice.finish_reason).toBe('tool_calls');
+        const message = choice.message as Record<string, unknown>;
+        expect(message.tool_calls).toEqual([
+            {
+                id: 'call_1',
+                type: 'function',
+                function: {
+                    name: 'lookup',
+                    arguments: '{"q":"puter"}',
+                },
+            },
+        ]);
+    });
+});
+
+// ── /openai/v1/completions ──────────────────────────────────────────
+
+describe('PuterAIController.openaiCompletions', () => {
+    // App-actor rejection lives in the `requireUserActor` gate now;
+    // see the registerRoutes assertion.
+
+    it('rejects a non-string prompt with HttpError 400', async () => {
+        const { res } = makeRes();
+        await expect(
+            controller.openaiCompletions(
+                makeReq({
+                    body: { prompt: { foo: 'bar' }, model: 'gpt-test' },
+                    actor: makeUserActor(),
+                }),
+                res,
+            ),
+        ).rejects.toMatchObject({ statusCode: 400 });
+    });
+
+    it('synthesises a single user message from the prompt and returns a text_completion shape', async () => {
+        const completeSpy = stubChatComplete({
+            message: { role: 'assistant', content: 'response' },
+            finish_reason: 'stop',
+            usage: { prompt_tokens: 1, completion_tokens: 1 },
+        });
+
+        const { res, captured } = makeRes();
+        await controller.openaiCompletions(
+            makeReq({
+                body: { model: 'gpt-test', prompt: 'hello there' },
+                actor: makeUserActor(),
+            }),
+            res,
+        );
+
+        const completeArgs = completeSpy.mock.calls[0]![0];
+        // The legacy /v1/completions endpoint is reshaped into a single
+        // user-role chat message before being dispatched.
+        expect(completeArgs.messages).toEqual([
+            { role: 'user', content: 'hello there' },
+        ]);
+        expect(completeArgs.normalize).toBe(false);
+
+        const body = captured.body as Record<string, unknown>;
+        expect(body.object).toBe('text_completion');
+        expect(
+            (body.choices as Array<Record<string, unknown>>)[0],
+        ).toMatchObject({
+            text: 'response',
+            index: 0,
+            finish_reason: 'stop',
+        });
+        expect((body.id as string).startsWith('cmpl-')).toBe(true);
+    });
+
+    it('leaves provider unset for a named model so the driver can route it', async () => {
+        const completeSpy = stubChatComplete({
+            message: { role: 'assistant', content: 'response' },
+            finish_reason: 'stop',
+        });
+        const { res } = makeRes();
+        await controller.openaiCompletions(
+            makeReq({
+                body: { model: 'gpt-test', prompt: 'hello' },
+                actor: makeUserActor(),
+            }),
+            res,
+        );
+        expect(completeSpy.mock.calls[0]![0].provider).toBeUndefined();
+    });
+
+    it('forwards an explicit provider as a pin', async () => {
+        const completeSpy = stubChatComplete({
+            message: { role: 'assistant', content: 'response' },
+            finish_reason: 'stop',
+        });
+        const { res } = makeRes();
+        await controller.openaiCompletions(
+            makeReq({
+                body: {
+                    model: 'gpt-test',
+                    provider: 'openai-completion',
+                    prompt: 'hello',
+                },
+                actor: makeUserActor(),
+            }),
+            res,
+        );
+        expect(completeSpy.mock.calls[0]![0].provider).toBe(
+            'openai-completion',
+        );
+    });
+
+    it('still pins OpenAI when the caller names no model', async () => {
+        const completeSpy = stubChatComplete({
+            message: { role: 'assistant', content: 'response' },
+            finish_reason: 'stop',
+        });
+        const { res } = makeRes();
+        await controller.openaiCompletions(
+            makeReq({ body: { prompt: 'hello' }, actor: makeUserActor() }),
+            res,
+        );
+        expect(completeSpy.mock.calls[0]![0].provider).toBe(
+            'openai-completion',
+        );
+    });
+});
+
+// ── /openai/v1/responses ────────────────────────────────────────────
+
+describe('PuterAIController.openaiResponses', () => {
+    // App-actor rejection lives in the `requireUserActor` gate now;
+    // see the registerRoutes assertion.
+
+    it('rejects providers other than openai-responses with HttpError 400', async () => {
+        const { res } = makeRes();
+        await expect(
+            controller.openaiResponses(
+                makeReq({
+                    body: {
+                        input: 'hi',
+                        model: 'gpt-test',
+                        provider: 'claude',
+                    },
+                    actor: makeUserActor(),
+                }),
+                res,
+            ),
+        ).rejects.toMatchObject({ statusCode: 400 });
+    });
+
+    // previous_response_id / conversation / prompt / background reference
+    // OpenAI's own server-side state, which this route can't hold or honor.
+    it.each([
+        ['previous_response_id', 'resp_abc'],
+        ['conversation', 'conv_1'],
+        ['prompt', { id: 'p_1' }],
+        ['background', true],
+    ] as const)('rejects `%s` with HttpError 400', async (key, value) => {
+        const { res } = makeRes();
+        await expect(
+            controller.openaiResponses(
+                makeReq({
+                    body: { model: 'gpt-test', input: 'hi', [key]: value },
+                    actor: makeUserActor(),
+                }),
+                res,
+            ),
+        ).rejects.toMatchObject({ statusCode: 400 });
+    });
+
+    it('forces store:false regardless of what the caller requested', async () => {
+        const completeSpy = stubChatComplete({
+            message: { role: 'assistant', content: 'ok' },
+            finish_reason: 'stop',
+        });
+        const { res } = makeRes();
+        await controller.openaiResponses(
+            makeReq({
+                body: { model: 'gpt-test', input: 'hi', store: true },
+                actor: makeUserActor(),
+            }),
+            res,
+        );
+        expect(completeSpy.mock.calls[0]![0].store).toBe(false);
+    });
+
+    it('shapes a non-stream completion as an OpenAI Responses object with output_text', async () => {
+        const completeSpy = stubChatComplete({
+            message: { role: 'assistant', content: 'final answer' },
+            finish_reason: 'stop',
+            usage: { prompt_tokens: 5, completion_tokens: 3 },
+            usageDetails: { inputTokens: 5, outputTokens: 3 },
+        });
+
+        const { res, captured } = makeRes();
+        await controller.openaiResponses(
+            makeReq({
+                body: {
+                    model: 'gpt-test',
+                    input: 'hi',
+                    instructions: 'be brief',
+                },
+                actor: makeUserActor(),
+            }),
+            res,
+        );
+
+        const completeArgs = completeSpy.mock.calls[0]![0];
+        // `instructions` becomes a leading system message.
+        expect(completeArgs.messages[0]).toEqual({
+            role: 'system',
+            content: 'be brief',
+        });
+        expect(completeArgs.normalize).toBe(false);
+        // `input` becomes a user message after the system one.
+        expect(completeArgs.messages[1]).toEqual({
+            role: 'user',
+            content: 'hi',
+        });
+        expect(completeArgs.provider).toBe('openai-responses');
+
+        const body = captured.body as Record<string, unknown>;
+        expect(body.object).toBe('response');
+        expect(body.status).toBe('completed');
+        // `output_text` is the joined assistant text content.
+        expect(body.output_text).toBe('final answer');
+        // Usage is in Responses-API shape: input_tokens / output_tokens.
+        expect(body.usage).toMatchObject({
+            input_tokens: 5,
+            output_tokens: 3,
+            total_tokens: 8,
+        });
+    });
+});
+
+// ── /anthropic/v1/messages ──────────────────────────────────────────
+
+describe('PuterAIController.anthropicMessages', () => {
+    // App-actor rejection lives in the `requireUserActor` gate now;
+    // see the registerRoutes assertion.
+
+    it('rejects bodies missing a messages array with HttpError 400', async () => {
+        const { res } = makeRes();
+        await expect(
+            controller.anthropicMessages(
+                makeReq({
+                    body: { model: 'claude-test' },
+                    actor: makeUserActor(),
+                }),
+                res,
+            ),
+        ).rejects.toMatchObject({ statusCode: 400 });
+    });
+
+    it('sets strictUpstreamErrors before calling the driver', async () => {
+        let seen: unknown;
+        vi.spyOn(
+            server.drivers.aiChat as unknown as ChatCompletionDriver,
+            'complete',
+        ).mockImplementationOnce(() => {
+            seen = Context.get('strictUpstreamErrors');
+            return Promise.resolve({
+                message: { role: 'assistant', content: 'hi' },
+                finish_reason: 'stop',
+            } as never);
+        });
+
+        await controller.anthropicMessages(
+            makeReq({
+                body: {
+                    model: 'claude-test',
+                    messages: [{ role: 'user', content: 'hi' }],
+                },
+                actor: makeUserActor(),
+            }),
+            makeRes().res,
+        );
+
+        expect(seen).toBe(true);
+    });
+
+    it('shapes a non-stream completion as an Anthropic message envelope', async () => {
+        const completeSpy = stubChatComplete({
+            message: { role: 'assistant', content: 'hi there' },
+            finish_reason: 'stop',
+            usageDetails: { inputTokens: 4, outputTokens: 2 },
+        });
+
+        const { res, captured } = makeRes();
+        await controller.anthropicMessages(
+            makeReq({
+                body: {
+                    model: 'claude-test',
+                    system: 'be helpful',
+                    messages: [{ role: 'user', content: 'hi' }],
+                },
+                actor: makeUserActor(),
+            }),
+            res,
+        );
+
+        const completeArgs = completeSpy.mock.calls[0]![0];
+        // A string `system` becomes a single text block, as its own
+        // leading system-role message — never a bare string.
+        expect(completeArgs.messages[0]).toEqual({
+            role: 'system',
+            content: [{ type: 'text', text: 'be helpful' }],
+        });
+        expect(completeArgs.provider).toBe('claude');
+        expect(completeArgs.normalize).toBe(false);
+
+        const body = captured.body as Record<string, unknown>;
+        expect(body.type).toBe('message');
+        expect(body.role).toBe('assistant');
+        expect(body.stop_reason).toBe('end_turn');
+        // Anthropic content is an array of typed blocks.
+        expect(body.content).toEqual([{ type: 'text', text: 'hi there' }]);
+        // Anthropic usage: input_tokens / output_tokens (not prompt/completion).
+        expect(body.usage).toMatchObject({
+            input_tokens: 4,
+            output_tokens: 2,
+        });
+        expect((body.id as string).startsWith('msg_')).toBe(true);
+        expect(captured.headers['request-id']).toMatch(/^req_/);
+    });
+
+    it('rejects a request carrying `thread` with the exact Unexpected-value(s) message', async () => {
+        const { res } = makeRes();
+        await expect(
+            controller.anthropicMessages(
+                makeReq({
+                    body: {
+                        model: 'claude-test',
+                        messages: [{ role: 'user', content: 'hi' }],
+                        thread: { type: 'create' },
+                    },
+                    actor: makeUserActor(),
+                }),
+                res,
+            ),
+        ).rejects.toMatchObject({
+            statusCode: 400,
+            message: expect.stringContaining(
+                'Unexpected value(s) `message-threads-2026-08-12` for the `anthropic-beta` header',
+            ),
+        });
+    });
+
+    it('rejects a message-threads anthropic-beta header, naming the header value', async () => {
+        const { res } = makeRes();
+        await expect(
+            controller.anthropicMessages(
+                makeReq({
+                    body: {
+                        model: 'claude-test',
+                        messages: [{ role: 'user', content: 'hi' }],
+                    },
+                    headers: { 'anthropic-beta': 'message-threads-2026-08-12' },
+                    actor: makeUserActor(),
+                }),
+                res,
+            ),
+        ).rejects.toMatchObject({
+            statusCode: 400,
+            message: expect.stringContaining(
+                'Unexpected value(s) `message-threads-2026-08-12`',
+            ),
+        });
+    });
+
+    it('accepts `mcp_servers` but never forwards it to the driver', async () => {
+        const completeSpy = stubChatComplete({
+            message: { role: 'assistant', content: 'ok' },
+            finish_reason: 'stop',
+        });
+        const { res } = makeRes();
+        await controller.anthropicMessages(
+            makeReq({
+                body: {
+                    model: 'claude-test',
+                    messages: [{ role: 'user', content: 'hi' }],
+                    mcp_servers: [{ type: 'url', url: 'https://evil.example' }],
+                },
+                actor: makeUserActor(),
+            }),
+            res,
+        );
+
+        const completeArgs = completeSpy.mock.calls[0]![0] as Record<
+            string,
+            unknown
+        >;
+        expect('mcp_servers' in completeArgs).toBe(false);
+    });
+
+    it('keeps a Claude-Code-style attribution header as its own, unmerged first system block', async () => {
+        const completeSpy = stubChatComplete({
+            message: { role: 'assistant', content: 'ok' },
+            finish_reason: 'stop',
+        });
+        const header =
+            'x-anthropic-billing-header: cc_version=2.1.289; cc_entrypoint=cli;';
+        await controller.anthropicMessages(
+            makeReq({
+                body: {
+                    model: 'claude-test',
+                    system: [
+                        { type: 'text', text: header },
+                        { type: 'text', text: 'You are a coding agent.' },
+                    ],
+                    messages: [{ role: 'user', content: 'hi' }],
+                },
+                actor: makeUserActor(),
+            }),
+            makeRes().res,
+        );
+        const msgs = completeSpy.mock.calls[0]![0].messages as Array<{
+            role: string;
+            content: unknown;
+        }>;
+        // Exactly the two blocks, in order, untouched — never merged into one
+        // string and never reordered.
+        expect(msgs[0]).toEqual({
+            role: 'system',
+            content: [
+                { type: 'text', text: header },
+                { type: 'text', text: 'You are a coding agent.' },
+            ],
+        });
+    });
+
+    it('translates assistant tool_calls into Anthropic tool_use blocks and stop_reason=tool_use', async () => {
+        stubChatComplete({
+            message: {
+                role: 'assistant',
+                content: null,
+                tool_calls: [
+                    {
+                        id: 'call_1',
+                        type: 'function',
+                        function: {
+                            name: 'lookup',
+                            arguments: '{"q":"puter"}',
+                        },
+                    },
+                ],
+            },
+            finish_reason: 'tool_calls',
+        });
+
+        const { res, captured } = makeRes();
+        await controller.anthropicMessages(
+            makeReq({
+                body: {
+                    model: 'claude-test',
+                    messages: [{ role: 'user', content: 'do a tool call' }],
+                },
+                actor: makeUserActor(),
+            }),
+            res,
+        );
+
+        const body = captured.body as Record<string, unknown>;
+        expect(body.stop_reason).toBe('tool_use');
+        expect(body.content).toEqual([
+            {
+                type: 'tool_use',
+                id: 'call_1',
+                name: 'lookup',
+                input: { q: 'puter' },
+            },
+        ]);
+    });
+});
+
+// ── Model listing ───────────────────────────────────────────────────
+
+describe('PuterAIController model listing', () => {
+    const captureGetHandler = (
+        path: string,
+    ): ((req: Request, res: Response) => Promise<void>) => {
+        let handler: ((req: Request, res: Response) => Promise<void>) | null =
+            null;
+        const router = {
+            post: vi.fn(),
+            get: vi.fn((p: string, _opts: unknown, h: never) => {
+                if (p === path) handler = h;
+            }),
+        };
+        controller.registerRoutes(router as never);
+        if (!handler) throw new Error(`did not capture ${path} handler`);
+        return handler;
+    };
+
+    it('exposes #listModels via /puterai/chat/models, filtering hidden ids', async () => {
+        const handler = captureGetHandler('/puterai/chat/models');
+        // Patch the wired aiChat.list to return a known mix.
+        vi.spyOn(server.drivers.aiChat, 'list').mockResolvedValueOnce([
+            'gpt-test',
+            'fake', // HIDDEN — should be filtered.
+            'abuse', // HIDDEN.
+            'gpt-other',
+        ] as never);
+
+        const { res, captured } = makeRes();
+        await handler(makeReq({}), res);
+        expect(captured.body).toEqual({
+            models: ['gpt-test', 'gpt-other'],
+        });
+    });
+
+    it('501s when the driver does not implement list()', async () => {
+        const handler = captureGetHandler('/puterai/chat/models');
+        // The wired driver's prototype defines `list`. Shadow it with an
+        // own undefined property so `if (!driver?.list)` in the handler
+        // takes the 501 branch, then restore.
+        const driver = server.drivers.aiChat as unknown as Record<
+            string,
+            unknown
+        >;
+        Object.defineProperty(driver, 'list', {
+            value: undefined,
+            configurable: true,
+            writable: true,
+        });
+        try {
+            const { res } = makeRes();
+            await expect(handler(makeReq({}), res)).rejects.toMatchObject({
+                statusCode: 501,
+            });
+        } finally {
+            // Drop the own property so the prototype impl shows through again.
+            Reflect.deleteProperty(driver, 'list');
+        }
+    });
+});
+
+// ── Video proxy (HMAC-gated) ────────────────────────────────────────
+
+describe('PuterAIController videoProxy', () => {
+    const captureProxyHandler = (): ((
+        req: Request,
+        res: Response,
+    ) => Promise<void>) => {
+        let handler: ((req: Request, res: Response) => Promise<void>) | null =
+            null;
+        const router = {
+            post: vi.fn(),
+            get: vi.fn((path: string, _opts: unknown, h: never) => {
+                if (path === '/puterai/video/proxy') {
+                    handler = h;
+                }
+            }),
+        };
+        controller.registerRoutes(router as never);
+        if (!handler)
+            throw new Error('did not capture /puterai/video/proxy handler');
+        return handler;
+    };
+
+    it('rejects requests with an invalid fileId character', async () => {
+        const handler = captureProxyHandler();
+        const { res, captured } = makeRes();
+        await handler(
+            makeReq({
+                query: {
+                    fileId: 'has spaces!',
+                    expires: '9999999999',
+                    signature: 'abc',
+                },
+            }),
+            res,
+        );
+        expect(captured.statusCode).toBe(400);
+    });
+
+    it('rejects requests missing expires/signature with 403', async () => {
+        const handler = captureProxyHandler();
+        const { res, captured } = makeRes();
+        await handler(makeReq({ query: { fileId: 'abc' } }), res);
+        expect(captured.statusCode).toBe(403);
+    });
+
+    it('rejects expired signatures with 403', async () => {
+        const handler = captureProxyHandler();
+        const { res, captured } = makeRes();
+        await handler(
+            makeReq({
+                query: {
+                    fileId: 'abc',
+                    expires: '1',
+                    signature: '00',
+                },
+            }),
+            res,
+        );
+        expect(captured.statusCode).toBe(403);
+    });
+
+    it('rejects an invalid signature with 403 once expiry/format checks pass', async () => {
+        const handler = captureProxyHandler();
+        // The default test config provides a signature secret, so a
+        // bogus signature with a future expiry should reach the
+        // timingSafeEqual gate and fail with 403. (The secret-missing
+        // 500 branch is unreachable when running against the default
+        // wired config.)
+        const { res, captured } = makeRes();
+        await handler(
+            makeReq({
+                query: {
+                    fileId: 'abc',
+                    expires: String(Math.floor(Date.now() / 1000) + 60),
+                    signature: 'deadbeef',
+                },
+            }),
+            res,
+        );
+        expect(captured.statusCode).toBe(403);
+    });
+
+    it('500s when url_signature_secret is not configured', async () => {
+        // Temporarily blank the secret so the controller hits the
+        // 500 branch instead of the constant-time-compare gate.
+        const cfg = (
+            controller as unknown as { config: Record<string, unknown> }
+        ).config;
+        const orig = cfg.url_signature_secret;
+        cfg.url_signature_secret = undefined;
+        try {
+            const handler = captureProxyHandler();
+            const { res, captured } = makeRes();
+            await handler(
+                makeReq({
+                    query: {
+                        fileId: 'abc',
+                        expires: String(Math.floor(Date.now() / 1000) + 60),
+                        signature: 'deadbeef',
+                    },
+                }),
+                res,
+            );
+            expect(captured.statusCode).toBe(500);
+        } finally {
+            cfg.url_signature_secret = orig;
+        }
+    });
+
+    it('rejects unsupported providers with 400 after passing the HMAC gate', async () => {
+        // Hit the post-signature `provider !== 'gemini'` branch by
+        // computing a valid signature for a known fileId/expires combo
+        // and then sending a different provider in the query.
+        const cfg = (
+            controller as unknown as { config: Record<string, unknown> }
+        ).config;
+        const secret = cfg.url_signature_secret as string;
+        const fileId = 'abc-123';
+        const expires = String(Math.floor(Date.now() / 1000) + 60);
+        const crypto = await import('node:crypto');
+        const signature = crypto
+            .createHash('sha256')
+            .update(`${fileId}/video-proxy/${secret}/${expires}`)
+            .digest('hex');
+
+        const handler = captureProxyHandler();
+        const { res, captured } = makeRes();
+        await handler(
+            makeReq({
+                query: {
+                    fileId,
+                    expires,
+                    signature,
+                    provider: 'not-gemini',
+                },
+            }),
+            res,
+        );
+        expect(captured.statusCode).toBe(400);
+    });
+
+    it('500s when provider=gemini but no Gemini API key is configured', async () => {
+        const cfg = (
+            controller as unknown as {
+                config: Record<string, unknown> & {
+                    providers?: Record<
+                        string,
+                        Record<string, unknown> | undefined
+                    >;
+                };
+            }
+        ).config;
+        const secret = cfg.url_signature_secret as string;
+        const fileId = 'gemini-no-key';
+        const expires = String(Math.floor(Date.now() / 1000) + 60);
+        const crypto = await import('node:crypto');
+        const signature = crypto
+            .createHash('sha256')
+            .update(`${fileId}/video-proxy/${secret}/${expires}`)
+            .digest('hex');
+
+        const origProviders = cfg.providers;
+        // Wipe out the gemini-video-generation key for the call.
+        cfg.providers = { ...(origProviders ?? {}) };
+        delete cfg.providers['gemini-video-generation'];
+
+        try {
+            const handler = captureProxyHandler();
+            const { res, captured } = makeRes();
+            await handler(
+                makeReq({
+                    query: {
+                        fileId,
+                        expires,
+                        signature,
+                        provider: 'gemini',
+                    },
+                }),
+                res,
+            );
+            expect(captured.statusCode).toBe(500);
+        } finally {
+            cfg.providers = origProviders;
+        }
+    });
+});
+
+// ── /openai/v1/completions streaming ────────────────────────────────
+
+describe('PuterAIController.openaiCompletions streaming + edges', () => {
+    it('streams text-completion deltas and a final [DONE] for stream=true', async () => {
+        // Mirror the chat-completions streaming test but on the legacy
+        // /v1/completions endpoint, which emits `text_completion` chunks.
+        stubChatComplete({
+            dataType: 'stream',
+            content_type: 'application/x-ndjson',
+            stream: ndjsonStreamFrom([
+                { type: 'text', text: 'foo' },
+                { type: 'text', text: 'bar' },
+                {
+                    type: 'usage',
+                    usage: { prompt_tokens: 1, completion_tokens: 2 },
+                },
+            ]),
+        });
+
+        const { res, captured } = makeRes();
+        await controller.openaiCompletions(
+            makeReq({
+                body: {
+                    model: 'gpt-test',
+                    prompt: 'hi',
+                    stream: true,
+                },
+                actor: makeUserActor(),
+            }),
+            res,
+        );
+        await new Promise<void>((resolve) => setImmediate(resolve));
+
+        const out = captured.written.join('');
+        expect(out).toContain('"text":"foo"');
+        expect(out).toContain('"text":"bar"');
+        expect(out).toContain('"finish_reason":"stop"');
+        expect(out.endsWith('data: [DONE]\n\n')).toBe(true);
+        expect(captured.ended).toBe(true);
+    });
+
+    it('emits a stream_error event then [DONE] when the upstream stream errors', async () => {
+        // pipeNdjsonStream forwards source errors to `onError`, which
+        // writes a JSON error block + [DONE]. Build a Readable that
+        // synchronously emits 'error' to exercise that branch.
+        const errStream = new Readable({
+            read() {
+                this.emit('error', new Error('upstream blew'));
+            },
+        });
+        stubChatComplete({
+            dataType: 'stream',
+            content_type: 'application/x-ndjson',
+            stream: errStream as unknown as NodeJS.ReadableStream,
+        });
+
+        const { res, captured } = makeRes();
+        await controller.openaiCompletions(
+            makeReq({
+                body: {
+                    model: 'gpt-test',
+                    prompt: 'hi',
+                    stream: true,
+                },
+                actor: makeUserActor(),
+            }),
+            res,
+        );
+        await new Promise<void>((resolve) => setImmediate(resolve));
+
+        const out = captured.written.join('');
+        expect(out).toContain('"stream_error"');
+        expect(out).toContain('upstream blew');
+        expect(out.endsWith('data: [DONE]\n\n')).toBe(true);
+    });
+
+    it('rejects a multi-item prompt array with 400 via getPromptText', async () => {
+        const { res } = makeRes();
+        await expect(
+            controller.openaiCompletions(
+                makeReq({
+                    body: {
+                        model: 'gpt-test',
+                        prompt: ['a', 'b'],
+                    },
+                    actor: makeUserActor(),
+                }),
+                res,
+            ),
+        ).rejects.toMatchObject({ statusCode: 400 });
+    });
+
+    it('accepts a single-item string prompt array', async () => {
+        // getPromptText special-cases a 1-element array → uses the item.
+        const completeSpy = stubChatComplete({
+            message: { role: 'assistant', content: 'ok' },
+            finish_reason: 'stop',
+        });
+        const { res } = makeRes();
+        await controller.openaiCompletions(
+            makeReq({
+                body: { model: 'gpt-test', prompt: ['just one'] },
+                actor: makeUserActor(),
+            }),
+            res,
+        );
+        expect(completeSpy.mock.calls[0]![0].messages[0]).toEqual({
+            role: 'user',
+            content: 'just one',
+        });
+    });
+});
+
+// ── /openai/v1/responses streaming ──────────────────────────────────
+
+describe('PuterAIController.openaiResponses streaming + edges', () => {
+    it('emits response.created → output_text deltas → response.completed for a text stream', async () => {
+        stubChatComplete({
+            dataType: 'stream',
+            content_type: 'application/x-ndjson',
+            stream: ndjsonStreamFrom([
+                { type: 'text', text: 'he' },
+                { type: 'text', text: 'llo' },
+                {
+                    type: 'usage',
+                    usage: { prompt_tokens: 2, completion_tokens: 3 },
+                },
+            ]),
+        });
+
+        const { res, captured } = makeRes();
+        await controller.openaiResponses(
+            makeReq({
+                body: { model: 'gpt-test', input: 'hi', stream: true },
+                actor: makeUserActor(),
+            }),
+            res,
+        );
+        await new Promise<void>((resolve) => setImmediate(resolve));
+
+        const out = captured.written.join('');
+        // Each SSE frame is `event: <type>\ndata: {...}\n\n`. Smoke-check
+        // that the key event types fired in the right order.
+        const firstCreated = out.indexOf('event: response.created');
+        const firstItemAdded = out.indexOf('event: response.output_item.added');
+        const firstDelta = out.indexOf('event: response.output_text.delta');
+        const completed = out.indexOf('event: response.completed');
+        expect(firstCreated).toBeGreaterThanOrEqual(0);
+        expect(firstItemAdded).toBeGreaterThan(firstCreated);
+        expect(firstDelta).toBeGreaterThan(firstItemAdded);
+        expect(completed).toBeGreaterThan(firstDelta);
+        expect(out).toContain('"delta":"he"');
+        expect(out).toContain('"delta":"llo"');
+        expect(out.endsWith('data: [DONE]\n\n')).toBe(true);
+    });
+
+    it('emits function_call events for tool_use in a stream', async () => {
+        stubChatComplete({
+            dataType: 'stream',
+            content_type: 'application/x-ndjson',
+            stream: ndjsonStreamFrom([
+                {
+                    type: 'tool_use',
+                    id: 'call_42',
+                    name: 'lookup',
+                    input: { q: 'puter' },
+                },
+            ]),
+        });
+
+        const { res, captured } = makeRes();
+        await controller.openaiResponses(
+            makeReq({
+                body: { model: 'gpt-test', input: 'tool me', stream: true },
+                actor: makeUserActor(),
+            }),
+            res,
+        );
+        await new Promise<void>((resolve) => setImmediate(resolve));
+
+        const out = captured.written.join('');
+        expect(out).toContain('"type":"function_call"');
+        expect(out).toContain('event: response.function_call_arguments.delta');
+        expect(out).toContain('event: response.function_call_arguments.done');
+        expect(out).toContain('"call_id":"call_42"');
+        expect(out).toContain('"name":"lookup"');
+    });
+
+    it('keeps the upstream function_call item id on an incrementally streamed call', async () => {
+        stubChatComplete({
+            dataType: 'stream',
+            content_type: 'application/x-ndjson',
+            stream: ndjsonStreamFrom([
+                {
+                    type: 'tool_use_start',
+                    id: 'call_7',
+                    name: 'lookup',
+                    canonical_id: 'fc_upstream',
+                },
+                { type: 'tool_input_delta', id: 'call_7', partialJson: '{}' },
+                {
+                    type: 'tool_use',
+                    id: 'call_7',
+                    name: 'lookup',
+                    canonical_id: 'fc_upstream',
+                    input: {},
+                },
+            ]),
+        });
+
+        const { res, captured } = makeRes();
+        await controller.openaiResponses(
+            makeReq({
+                body: { model: 'gpt-test', input: 'tool me', stream: true },
+                actor: makeUserActor(),
+            }),
+            res,
+        );
+        await new Promise<void>((resolve) => setImmediate(resolve));
+
+        const out = captured.written.join('');
+        expect(out).toContain('"item_id":"fc_upstream"');
+        expect(out).toContain('"id":"fc_upstream"');
+    });
+
+    it('emits a `response.error`-shaped SSE frame when the source stream errors', async () => {
+        const errStream = new Readable({
+            read() {
+                this.emit('error', new Error('responses upstream broke'));
+            },
+        });
+        stubChatComplete({
+            dataType: 'stream',
+            content_type: 'application/x-ndjson',
+            stream: errStream as unknown as NodeJS.ReadableStream,
+        });
+
+        const { res, captured } = makeRes();
+        await controller.openaiResponses(
+            makeReq({
+                body: { model: 'gpt-test', input: 'hi', stream: true },
+                actor: makeUserActor(),
+            }),
+            res,
+        );
+        await new Promise<void>((resolve) => setImmediate(resolve));
+
+        const out = captured.written.join('');
+        expect(out).toContain('event: error');
+        expect(out).toContain('responses upstream broke');
+        expect(out.endsWith('data: [DONE]\n\n')).toBe(true);
+    });
+
+    it('translates function_call_output items in `input` into role=tool messages', async () => {
+        // Exercises responseInputToMessages' function_call_output branch.
+        const completeSpy = stubChatComplete({
+            message: { role: 'assistant', content: 'ack' },
+            finish_reason: 'stop',
+        });
+        await controller.openaiResponses(
+            makeReq({
+                body: {
+                    model: 'gpt-test',
+                    input: [
+                        {
+                            type: 'function_call_output',
+                            call_id: 'call_x',
+                            output: 'result data',
+                        },
+                    ],
+                },
+                actor: makeUserActor(),
+            }),
+            makeRes().res,
+        );
+        expect(completeSpy.mock.calls[0]![0].messages).toContainEqual({
+            role: 'tool',
+            tool_call_id: 'call_x',
+            content: 'result data',
+        });
+    });
+
+    it('translates function_call items in `input` into assistant messages with tool_use parts', async () => {
+        const completeSpy = stubChatComplete({
+            message: { role: 'assistant', content: 'ack' },
+            finish_reason: 'stop',
+        });
+        await controller.openaiResponses(
+            makeReq({
+                body: {
+                    model: 'gpt-test',
+                    input: [
+                        {
+                            type: 'function_call',
+                            call_id: 'call_y',
+                            id: 'fc_y',
+                            name: 'tool_y',
+                            arguments: '{"a":1}',
+                        },
+                    ],
+                },
+                actor: makeUserActor(),
+            }),
+            makeRes().res,
+        );
+        const msgs = completeSpy.mock.calls[0]![0].messages as Array<{
+            role: string;
+            content: unknown;
+        }>;
+        const assistant = msgs.find((m) => m.role === 'assistant');
+        expect(assistant).toBeTruthy();
+        expect(assistant!.content).toEqual([
+            expect.objectContaining({
+                type: 'tool_use',
+                id: 'call_y',
+                canonical_id: 'fc_y',
+                name: 'tool_y',
+                input: { a: 1 },
+            }),
+        ]);
+    });
+
+    it("maps the 'developer' role in input messages to 'system'", async () => {
+        const completeSpy = stubChatComplete({
+            message: { role: 'assistant', content: 'k' },
+            finish_reason: 'stop',
+        });
+        await controller.openaiResponses(
+            makeReq({
+                body: {
+                    model: 'gpt-test',
+                    input: [{ role: 'developer', content: 'be helpful' }],
+                },
+                actor: makeUserActor(),
+            }),
+            makeRes().res,
+        );
+        const msgs = completeSpy.mock.calls[0]![0].messages as Array<{
+            role: string;
+        }>;
+        expect(msgs.some((m) => m.role === 'system')).toBe(true);
+        expect(msgs.some((m) => m.role === 'developer')).toBe(false);
+    });
+
+    it("rejects when `input` isn't a string or array (400)", async () => {
+        await expect(
+            controller.openaiResponses(
+                makeReq({
+                    body: { model: 'gpt-test', input: { not: 'valid' } },
+                    actor: makeUserActor(),
+                }),
+                makeRes().res,
+            ),
+        ).rejects.toMatchObject({ statusCode: 400 });
+    });
+});
+
+// ── /anthropic/v1/messages streaming ────────────────────────────────
+
+describe('PuterAIController.anthropicMessages streaming + helpers', () => {
+    it('emits message_start → content_block_delta → message_stop for a text stream', async () => {
+        stubChatComplete({
+            dataType: 'stream',
+            content_type: 'application/x-ndjson',
+            stream: ndjsonStreamFrom([
+                { type: 'text', text: 'one' },
+                { type: 'text', text: 'two' },
+                { type: 'usage', usage: {} },
+            ]),
+        });
+
+        const { res, captured } = makeRes();
+        await controller.anthropicMessages(
+            makeReq({
+                body: {
+                    model: 'claude-test',
+                    messages: [{ role: 'user', content: 'hi' }],
+                    stream: true,
+                },
+                actor: makeUserActor(),
+            }),
+            res,
+        );
+        await new Promise<void>((resolve) => setImmediate(resolve));
+
+        const out = captured.written.join('');
+        // Anthropic uses `event: <type>\ndata: ...\n\n` per SSE frame.
+        const start = out.indexOf('event: message_start');
+        const blockStart = out.indexOf('event: content_block_start');
+        const delta = out.indexOf('event: content_block_delta');
+        const stop = out.indexOf('event: message_stop');
+        expect(start).toBeGreaterThanOrEqual(0);
+        expect(blockStart).toBeGreaterThan(start);
+        expect(delta).toBeGreaterThan(blockStart);
+        expect(stop).toBeGreaterThan(delta);
+        expect(out).toContain('"text":"one"');
+        expect(out).toContain('"text":"two"');
+    });
+
+    it('translates a streamed tool_use into content_block_start/delta/stop with type=tool_use', async () => {
+        stubChatComplete({
+            dataType: 'stream',
+            content_type: 'application/x-ndjson',
+            stream: ndjsonStreamFrom([
+                {
+                    type: 'tool_use',
+                    id: 'tu_1',
+                    name: 'lookup',
+                    input: { q: 'x' },
+                },
+                { type: 'usage', usage: {} },
+            ]),
+        });
+
+        const { res, captured } = makeRes();
+        await controller.anthropicMessages(
+            makeReq({
+                body: {
+                    model: 'claude-test',
+                    messages: [{ role: 'user', content: 'tool me' }],
+                    stream: true,
+                },
+                actor: makeUserActor(),
+            }),
+            res,
+        );
+        await new Promise<void>((resolve) => setImmediate(resolve));
+
+        const out = captured.written.join('');
+        expect(out).toContain('"type":"tool_use"');
+        expect(out).toContain('"id":"tu_1"');
+        expect(out).toContain('"name":"lookup"');
+        // Stop reason becomes tool_use when sawToolCalls flips true.
+        expect(out).toContain('"stop_reason":"tool_use"');
+    });
+
+    it('drives the full event sequence: text → signed thinking → incremental tool_use → server_tool → message_delta with stop/usage/safeguard_results', async () => {
+        stubChatComplete({
+            dataType: 'stream',
+            content_type: 'application/x-ndjson',
+            stream: ndjsonStreamFrom([
+                { type: 'text', text: 'checking' },
+                { type: 'reasoning_start', format: 'anthropic' },
+                { type: 'reasoning', reasoning: 'thinking it over' },
+                {
+                    type: 'reasoning_detail',
+                    detail: {
+                        type: 'thinking',
+                        thinking: 'thinking it over',
+                        signature: 'sig123',
+                    },
+                },
+                { type: 'tool_use_start', id: 'tu_1', name: 'Bash' },
+                { type: 'tool_input_delta', id: 'tu_1', partialJson: '{"cmd":' },
+                { type: 'tool_input_delta', id: 'tu_1', partialJson: '"ls"}' },
+                { type: 'tool_use', id: 'tu_1', name: 'Bash', input: { cmd: 'ls' } },
+                {
+                    type: 'server_tool',
+                    block: {
+                        type: 'server_tool_use',
+                        id: 'srvtoolu_1',
+                        name: 'web_search',
+                        input: { query: 'puter' },
+                    },
+                },
+                { type: 'safeguard_results', results: [{ type: 'dangerous_tool_use' }] },
+                {
+                    type: 'usage',
+                    stopReason: 'tool_use',
+                    usageDetails: { inputTokens: 10, outputTokens: 5 },
+                },
+            ]),
+        });
+
+        const { res, captured } = makeRes();
+        await controller.anthropicMessages(
+            makeReq({
+                body: {
+                    model: 'claude-test',
+                    messages: [{ role: 'user', content: 'run ls' }],
+                    stream: true,
+                },
+                actor: makeUserActor(),
+            }),
+            res,
+        );
+        await new Promise<void>((resolve) => setImmediate(resolve));
+
+        const frames = captured.written.join('').split('\n\n').filter(Boolean);
+        const eventTypes = frames.map((f) => f.split('\n')[0]!.replace('event: ', ''));
+        expect(eventTypes).toEqual([
+            'message_start',
+            'content_block_start', // text
+            'content_block_delta', // text_delta
+            'content_block_stop',
+            'content_block_start', // thinking
+            'content_block_delta', // thinking_delta
+            'content_block_delta', // signature_delta
+            'content_block_stop',
+            'content_block_start', // tool_use
+            'content_block_delta', // input_json_delta
+            'content_block_delta', // input_json_delta
+            'content_block_stop',
+            'content_block_start', // server_tool_use
+            'content_block_delta', // input_json_delta
+            'content_block_stop',
+            'message_delta',
+            'message_stop',
+        ]);
+
+        const out = captured.written.join('');
+        expect(out).toContain('"type":"thinking"');
+        expect(out).toContain('"signature":"sig123"');
+        expect(out).toContain('"type":"server_tool_use"');
+        const deltaFrame = frames.find((f) => f.startsWith('event: message_delta'))!;
+        const deltaData = JSON.parse(deltaFrame.split('\ndata: ')[1]!);
+        expect(deltaData.delta.stop_reason).toBe('tool_use');
+        expect(deltaData.delta.safeguard_results).toEqual([
+            { type: 'dangerous_tool_use' },
+        ]);
+        expect(deltaData.usage.input_tokens).toBe(10);
+        expect(deltaData.usage.output_tokens).toBe(5);
+    });
+
+    it('drops unsigned reasoning deltas (no preceding reasoning_start) — never opens a thinking block', async () => {
+        stubChatComplete({
+            dataType: 'stream',
+            content_type: 'application/x-ndjson',
+            stream: ndjsonStreamFrom([
+                { type: 'reasoning', reasoning: 'stray, from a fallback provider' },
+                { type: 'text', text: 'hi' },
+            ]),
+        });
+
+        const { res, captured } = makeRes();
+        await controller.anthropicMessages(
+            makeReq({
+                body: {
+                    model: 'claude-test',
+                    messages: [{ role: 'user', content: 'hi' }],
+                    stream: true,
+                },
+                actor: makeUserActor(),
+            }),
+            res,
+        );
+        await new Promise<void>((resolve) => setImmediate(resolve));
+
+        const out = captured.written.join('');
+        expect(out).not.toContain('"type":"thinking"');
+        expect(out).not.toContain('thinking_delta');
+    });
+
+    it('an in-band error chunk writes event: error with no message_delta/message_stop', async () => {
+        stubChatComplete({
+            dataType: 'stream',
+            content_type: 'application/x-ndjson',
+            stream: ndjsonStreamFrom([
+                { type: 'text', text: 'partial' },
+                { type: 'error', message: 'upstream overloaded', status: 529 },
+            ]),
+        });
+
+        const { res, captured } = makeRes();
+        await controller.anthropicMessages(
+            makeReq({
+                body: {
+                    model: 'claude-test',
+                    messages: [{ role: 'user', content: 'hi' }],
+                    stream: true,
+                },
+                actor: makeUserActor(),
+            }),
+            res,
+        );
+        await new Promise<void>((resolve) => setImmediate(resolve));
+
+        const out = captured.written.join('');
+        expect(out).not.toContain('event: message_delta');
+        expect(out).not.toContain('event: message_stop');
+        expect(out).toContain('event: error');
+        expect(out).toContain('"type":"overloaded_error"');
+        expect(captured.ended).toBe(true);
+    });
+
+    it('sends an Anthropic keepalive ping after 15s of stream idle', async () => {
+        vi.useFakeTimers();
+        try {
+            let push: ((line: string) => void) | undefined;
+            let endStream: (() => void) | undefined;
+            const slowStream = new Readable({
+                read() {},
+            });
+            push = (line: string) => slowStream.push(`${line}\n`);
+            endStream = () => slowStream.push(null);
+
+            stubChatComplete({
+                dataType: 'stream',
+                content_type: 'application/x-ndjson',
+                stream: slowStream as unknown as NodeJS.ReadableStream,
+            });
+
+            const { res, captured } = makeRes();
+            const done = controller.anthropicMessages(
+                makeReq({
+                    body: {
+                        model: 'claude-test',
+                        messages: [{ role: 'user', content: 'hi' }],
+                        stream: true,
+                    },
+                    actor: makeUserActor(),
+                }),
+                res,
+            );
+            await done;
+            await vi.advanceTimersByTimeAsync(0);
+
+            expect(
+                captured.written.some((w) => w.includes('event: ping')),
+            ).toBe(false);
+            await vi.advanceTimersByTimeAsync(16_000);
+            expect(
+                captured.written.some((w) => w.includes('event: ping')),
+            ).toBe(true);
+
+            push(JSON.stringify({ type: 'text', text: 'hi' }));
+            push(
+                JSON.stringify({ type: 'usage', usageDetails: { inputTokens: 1, outputTokens: 1 } }),
+            );
+            endStream();
+            await vi.advanceTimersByTimeAsync(0);
+        } finally {
+            vi.useRealTimers();
+        }
+    });
+
+    it('emits an Anthropic-shaped error event when the upstream stream errors', async () => {
+        const errStream = new Readable({
+            read() {
+                this.emit('error', new Error('claude died'));
+            },
+        });
+        stubChatComplete({
+            dataType: 'stream',
+            content_type: 'application/x-ndjson',
+            stream: errStream as unknown as NodeJS.ReadableStream,
+        });
+
+        const { res, captured } = makeRes();
+        await controller.anthropicMessages(
+            makeReq({
+                body: {
+                    model: 'claude-test',
+                    messages: [{ role: 'user', content: 'hi' }],
+                    stream: true,
+                },
+                actor: makeUserActor(),
+            }),
+            res,
+        );
+        await new Promise<void>((resolve) => setImmediate(resolve));
+
+        const out = captured.written.join('');
+        expect(out).toContain('event: error');
+        expect(out).toContain('"type":"api_error"');
+        expect(out).toContain('claude died');
+        expect(captured.ended).toBe(true);
+    });
+
+    it('keeps an array `system` as an ordered block array on one leading system message', async () => {
+        const completeSpy = stubChatComplete({
+            message: { role: 'assistant', content: 'ok' },
+            finish_reason: 'stop',
+        });
+        await controller.anthropicMessages(
+            makeReq({
+                body: {
+                    model: 'claude-test',
+                    system: [
+                        { type: 'text', text: 'first' },
+                        { type: 'text', text: 'second' },
+                    ],
+                    messages: [{ role: 'user', content: 'hi' }],
+                },
+                actor: makeUserActor(),
+            }),
+            makeRes().res,
+        );
+        const msgs = completeSpy.mock.calls[0]![0].messages as Array<{
+            role: string;
+            content: unknown;
+        }>;
+        // Never merged into one string — each block stays separate, in order.
+        expect(msgs[0]).toEqual({
+            role: 'system',
+            content: [
+                { type: 'text', text: 'first' },
+                { type: 'text', text: 'second' },
+            ],
+        });
+    });
+
+    it('passes a tool_result content part through unchanged — no hoisting to role=tool', async () => {
+        const completeSpy = stubChatComplete({
+            message: { role: 'assistant', content: 'thanks' },
+            finish_reason: 'stop',
+        });
+        const userMessage = {
+            role: 'user',
+            content: [
+                {
+                    type: 'tool_result',
+                    tool_use_id: 'tu_42',
+                    content: [{ type: 'text', text: 'result-text' }],
+                },
+            ],
+        };
+        await controller.anthropicMessages(
+            makeReq({
+                body: {
+                    model: 'claude-test',
+                    messages: [userMessage],
+                },
+                actor: makeUserActor(),
+            }),
+            makeRes().res,
+        );
+        const msgs = completeSpy.mock.calls[0]![0].messages as unknown[];
+        expect(msgs).toEqual([userMessage]);
+        expect(msgs.some((m) => (m as { role?: string }).role === 'tool')).toBe(
+            false,
+        );
+    });
+
+    it('forwards a shorthand Anthropic tool (name + input_schema) unchanged — shape only', async () => {
+        const completeSpy = stubChatComplete({
+            message: { role: 'assistant', content: 'ok' },
+            finish_reason: 'stop',
+        });
+        const tool = {
+            name: 'lookup',
+            description: 'find things',
+            input_schema: {
+                type: 'object',
+                properties: { q: { type: 'string' } },
+            },
+        };
+        await controller.anthropicMessages(
+            makeReq({
+                body: {
+                    model: 'claude-test',
+                    messages: [{ role: 'user', content: 'hi' }],
+                    tools: [tool],
+                },
+                actor: makeUserActor(),
+            }),
+            makeRes().res,
+        );
+        // Shape-only at the controller: policy (wrapping into the function
+        // shape) is ClaudeProvider's job via `normalize_tools_object`.
+        expect(completeSpy.mock.calls[0]![0].tools).toEqual([tool]);
+    });
+
+    it('returns an empty content array when the assistant produced no content', async () => {
+        // A replayed `{type:'text', text:''}` 400s on Anthropic's own API, so
+        // empty content must be `[]`, never a single empty text block.
+        stubChatComplete({
+            message: { role: 'assistant', content: null },
+            finish_reason: 'stop',
+        });
+        const { res, captured } = makeRes();
+        await controller.anthropicMessages(
+            makeReq({
+                body: {
+                    model: 'claude-test',
+                    messages: [{ role: 'user', content: 'hi' }],
+                },
+                actor: makeUserActor(),
+            }),
+            res,
+        );
+        const body = captured.body as { content: unknown[] };
+        expect(body.content).toEqual([]);
+    });
+
+    it('keeps native block-array content as separate blocks, in order (no joining)', async () => {
+        stubChatComplete({
+            message: {
+                role: 'assistant',
+                content: [
+                    { type: 'text', text: 'hello ' },
+                    { type: 'text', text: 'world' },
+                ],
+            },
+            finish_reason: 'stop',
+        });
+        const { res, captured } = makeRes();
+        await controller.anthropicMessages(
+            makeReq({
+                body: {
+                    model: 'claude-test',
+                    messages: [{ role: 'user', content: 'hi' }],
+                },
+                actor: makeUserActor(),
+            }),
+            res,
+        );
+        const body = captured.body as { content: Array<{ text: string }> };
+        expect(body.content).toEqual([
+            { type: 'text', text: 'hello ' },
+            { type: 'text', text: 'world' },
+        ]);
+    });
+
+    it('reads tool_use blocks from message.content (not just message.tool_calls)', async () => {
+        // extractToolUseBlocks reads BOTH `tool_calls` and content-array
+        // tool_use parts; this exercises the latter path.
+        stubChatComplete({
+            message: {
+                role: 'assistant',
+                content: [
+                    {
+                        type: 'tool_use',
+                        id: 'tu_99',
+                        name: 'lookup',
+                        input: '{"q":"x"}',
+                    },
+                ],
+            },
+            finish_reason: 'tool_calls',
+        });
+        const { res, captured } = makeRes();
+        await controller.anthropicMessages(
+            makeReq({
+                body: {
+                    model: 'claude-test',
+                    messages: [{ role: 'user', content: 'hi' }],
+                },
+                actor: makeUserActor(),
+            }),
+            res,
+        );
+        const body = captured.body as {
+            content: Array<Record<string, unknown>>;
+            stop_reason: string;
+        };
+        expect(body.stop_reason).toBe('tool_use');
+        expect(body.content).toContainEqual({
+            type: 'tool_use',
+            id: 'tu_99',
+            name: 'lookup',
+            input: { q: 'x' },
+        });
+    });
+});
+
+// -- /anthropic/v1/messages/count_tokens ------------------------------
+
+describe('PuterAIController.anthropicCountTokens', () => {
+    const stubCountTokens = (result: { input_tokens: number }) =>
+        vi
+            .spyOn(
+                server.drivers.aiChat as unknown as ChatCompletionDriver,
+                COUNT_TOKENS,
+            )
+            .mockResolvedValueOnce(result as never);
+
+    it('parses the request and returns {input_tokens} with a request-id header', async () => {
+        const spy = stubCountTokens({ input_tokens: 17 });
+        const { res, captured } = makeRes();
+        await controller.anthropicCountTokens(
+            makeReq({
+                body: {
+                    model: 'claude-test',
+                    messages: [{ role: 'user', content: 'hi' }],
+                },
+            }),
+            res,
+        );
+        expect(spy.mock.calls[0]![0]).toMatchObject({
+            model: 'claude-test',
+            stream: false,
+        });
+        expect(captured.body).toEqual({ input_tokens: 17 });
+        expect(captured.headers['request-id']).toMatch(/^req_/);
+    });
+
+    it('never streams, even if the body asks for it', async () => {
+        const spy = stubCountTokens({ input_tokens: 1 });
+        await controller.anthropicCountTokens(
+            makeReq({
+                body: {
+                    model: 'claude-test',
+                    messages: [{ role: 'user', content: 'hi' }],
+                    stream: true,
+                },
+            }),
+            makeRes().res,
+        );
+        expect(spy.mock.calls[0]![0].stream).toBe(false);
+    });
+
+    it('still rejects malformed bodies (same parser as /messages)', async () => {
+        const { res } = makeRes();
+        await expect(
+            controller.anthropicCountTokens(
+                makeReq({ body: { model: 'claude-test' } }),
+                res,
+            ),
+        ).rejects.toMatchObject({ statusCode: 400 });
+    });
+});
+
+// -- /anthropic/v1/models[/:id] ---------------------------------------
+
+describe('PuterAIController anthropic model listing', () => {
+    const captureGetHandler = (
+        path: string,
+    ): ((req: Request, res: Response) => Promise<void>) => {
+        let handler: ((req: Request, res: Response) => Promise<void>) | null =
+            null;
+        const router = {
+            post: vi.fn(),
+            get: vi.fn((p: string, _opts: unknown, h: never) => {
+                if (p === path) handler = h;
+            }),
+        };
+        controller.registerRoutes(router as never);
+        if (!handler) throw new Error(`did not capture ${path} handler`);
+        return handler;
+    };
+
+    it('lists only claude-provider models in the Anthropic wire shape', async () => {
+        const handler = captureGetHandler('/puterai/anthropic/v1/models');
+        vi.spyOn(server.drivers.aiChat, 'models').mockResolvedValueOnce([
+            {
+                id: 'claude-haiku-4-5',
+                provider: 'claude',
+                name: 'Claude Haiku 4.5',
+                release_date: '2025-10-01',
+            },
+            { id: 'gpt-test', provider: 'openai-completion' },
+        ] as never);
+
+        const { res, captured } = makeRes();
+        await handler(makeReq({}), res);
+        const body = captured.body as {
+            data: unknown[];
+            has_more: boolean;
+            first_id: string;
+            last_id: string;
+        };
+        expect(body.data).toEqual([
+            {
+                type: 'model',
+                id: 'claude-haiku-4-5',
+                display_name: 'Claude Haiku 4.5',
+                created_at: '2025-10-01T00:00:00Z',
+            },
+        ]);
+        expect(body.has_more).toBe(false);
+        expect(body.first_id).toBe('claude-haiku-4-5');
+        expect(body.last_id).toBe('claude-haiku-4-5');
+        expect(captured.headers['request-id']).toMatch(/^req_/);
+    });
+
+    it('honors a `limit` query param', async () => {
+        const handler = captureGetHandler('/puterai/anthropic/v1/models');
+        vi.spyOn(server.drivers.aiChat, 'models').mockResolvedValueOnce([
+            { id: 'claude-a', provider: 'claude' },
+            { id: 'claude-b', provider: 'claude' },
+        ] as never);
+
+        const { res, captured } = makeRes();
+        await handler(makeReq({ query: { limit: '1' } }), res);
+        const body = captured.body as { data: unknown[]; has_more: boolean };
+        expect(body.data).toHaveLength(1);
+        expect(body.has_more).toBe(true);
+    });
+
+    it('404s an unknown model id in the Anthropic envelope shape', async () => {
+        const handler = captureGetHandler('/puterai/anthropic/v1/models/:id');
+        vi.spyOn(server.drivers.aiChat, 'models').mockResolvedValueOnce([
+            { id: 'claude-haiku-4-5', provider: 'claude' },
+        ] as never);
+
+        const { res } = makeRes();
+        await expect(
+            handler(makeReq({ params: { id: 'nope' } }), res),
+        ).rejects.toMatchObject({ statusCode: 404 });
+    });
+
+    it('resolves a model by alias', async () => {
+        const handler = captureGetHandler('/puterai/anthropic/v1/models/:id');
+        vi.spyOn(server.drivers.aiChat, 'models').mockResolvedValueOnce([
+            {
+                id: 'claude-haiku-4-5',
+                provider: 'claude',
+                aliases: ['claude-haiku-latest'],
+                name: 'Claude Haiku 4.5',
+            },
+        ] as never);
+
+        const { res, captured } = makeRes();
+        await handler(makeReq({ params: { id: 'claude-haiku-latest' } }), res);
+        expect(captured.body).toEqual({
+            type: 'model',
+            id: 'claude-haiku-4-5',
+            display_name: 'Claude Haiku 4.5',
+            created_at: null,
+        });
+    });
+});
+
+// ── Inline compaction ───────────────────────────────────────────────
+
+describe('PuterAIController inline compaction', () => {
+    // Extract the single `event: compaction\ndata: {...}` SSE frame.
+    const compactionFrame = (out: string): string | null => {
+        const m = out.match(/event: compaction\ndata: [^\n]*\n\n/);
+        return m ? m[0] : null;
+    };
+
+    it('forwards the compaction opt-in to the driver (/responses)', async () => {
+        const spy = stubChatComplete({
+            message: { role: 'assistant', content: 'ok' },
+            finish_reason: 'stop',
+        });
+        await controller.openaiResponses(
+            makeReq({
+                body: { model: 'gpt-test', input: 'hi', compaction: true },
+                actor: makeUserActor(),
+            }),
+            makeRes().res,
+        );
+        expect(spy.mock.calls[0]![0].compaction).toBe(true);
+    });
+
+    it('round-trips a compaction `input` item into a messages compaction item', async () => {
+        const spy = stubChatComplete({
+            message: { role: 'assistant', content: 'ack' },
+            finish_reason: 'stop',
+        });
+        await controller.openaiResponses(
+            makeReq({
+                body: {
+                    model: 'gpt-test',
+                    input: [
+                        {
+                            type: 'compaction',
+                            id: 'cmpct_1',
+                            encrypted_content: 'ENC',
+                        },
+                    ],
+                },
+                actor: makeUserActor(),
+            }),
+            makeRes().res,
+        );
+        expect(spy.mock.calls[0]![0].messages).toContainEqual({
+            type: 'compaction',
+            id: 'cmpct_1',
+            encrypted_content: 'ENC',
+        });
+    });
+
+    it('emits a canonical compaction SSE event and output item (/responses stream)', async () => {
+        stubChatComplete({
+            dataType: 'stream',
+            content_type: 'application/x-ndjson',
+            stream: ndjsonStreamFrom([
+                { type: 'text', text: 'hi' },
+                { type: 'compaction', id: 'cmpct_9', encrypted_content: 'ENC9' },
+                { type: 'usage', usage: { prompt_tokens: 1, completion_tokens: 1 } },
+            ]),
+        });
+        const { res, captured } = makeRes();
+        await controller.openaiResponses(
+            makeReq({
+                body: {
+                    model: 'gpt-test',
+                    input: 'hi',
+                    stream: true,
+                    compaction: true,
+                },
+                actor: makeUserActor(),
+            }),
+            res,
+        );
+        await new Promise<void>((resolve) => setImmediate(resolve));
+
+        const out = captured.written.join('');
+        expect(compactionFrame(out)).toBe(
+            'event: compaction\ndata: {"type":"compaction","id":"cmpct_9","encrypted_content":"ENC9"}\n\n',
+        );
+        // Native shape also lands in the final response.completed output[].
+        const completed = out
+            .split('event: response.completed\n')[1]
+            ?.split('\n\n')[0];
+        expect(completed).toContain('"type":"compaction"');
+        expect(completed).toContain('"encrypted_content":"ENC9"');
+    });
+
+    it('emits the compaction item in non-streaming /responses output', async () => {
+        stubChatComplete({
+            message: { role: 'assistant', content: 'done' },
+            finish_reason: 'stop',
+            compaction: { id: 'cmpct_n', encrypted_content: 'ENCN' },
+        });
+        const { res, captured } = makeRes();
+        await controller.openaiResponses(
+            makeReq({
+                body: { model: 'gpt-test', input: 'hi', compaction: true },
+                actor: makeUserActor(),
+            }),
+            res,
+        );
+        const body = captured.body as { output: Array<Record<string, unknown>> };
+        expect(body.output).toContainEqual(
+            expect.objectContaining({
+                type: 'compaction',
+                encrypted_content: 'ENCN',
+            }),
+        );
+    });
+
+    it('emits an identical canonical compaction SSE event on the Anthropic surface', async () => {
+        // /responses frame
+        stubChatComplete({
+            dataType: 'stream',
+            content_type: 'application/x-ndjson',
+            stream: ndjsonStreamFrom([
+                { type: 'compaction', id: 'cmpct_x', encrypted_content: 'ENCX' },
+            ]),
+        });
+        const r1 = makeRes();
+        await controller.openaiResponses(
+            makeReq({
+                body: { model: 'gpt-test', input: 'hi', stream: true },
+                actor: makeUserActor(),
+            }),
+            r1.res,
+        );
+        await new Promise<void>((resolve) => setImmediate(resolve));
+
+        // /anthropic/v1/messages frame
+        stubChatComplete({
+            dataType: 'stream',
+            content_type: 'application/x-ndjson',
+            stream: ndjsonStreamFrom([
+                { type: 'compaction', id: 'cmpct_x', encrypted_content: 'ENCX' },
+            ]),
+        });
+        const r2 = makeRes();
+        await controller.anthropicMessages(
+            makeReq({
+                body: {
+                    model: 'claude-test',
+                    messages: [{ role: 'user', content: 'hi' }],
+                    stream: true,
+                },
+                actor: makeUserActor(),
+            }),
+            r2.res,
+        );
+        await new Promise<void>((resolve) => setImmediate(resolve));
+
+        const a = compactionFrame(r1.captured.written.join(''));
+        const b = compactionFrame(r2.captured.written.join(''));
+        expect(a).not.toBeNull();
+        expect(a).toBe(b); // byte-identical streaming shape across providers
+    });
+
+    it('renders a native compaction content block in non-streaming /messages', async () => {
+        stubChatComplete({
+            message: { role: 'assistant', content: 'done' },
+            finish_reason: 'stop',
+            compaction: { id: 'cmpct_m', encrypted_content: 'ENCM' },
+        });
+        const { res, captured } = makeRes();
+        await controller.anthropicMessages(
+            makeReq({
+                body: {
+                    model: 'claude-test',
+                    messages: [{ role: 'user', content: 'hi' }],
+                },
+                actor: makeUserActor(),
+            }),
+            res,
+        );
+        const body = captured.body as { content: Array<Record<string, unknown>> };
+        expect(body.content).toContainEqual({
+            type: 'compaction',
+            id: 'cmpct_m',
+            encrypted_content: 'ENCM',
+        });
+    });
+
+    it('does not emit compaction frames for a normal stream (regression)', async () => {
+        stubChatComplete({
+            dataType: 'stream',
+            content_type: 'application/x-ndjson',
+            stream: ndjsonStreamFrom([
+                { type: 'text', text: 'hello' },
+                { type: 'usage', usage: { prompt_tokens: 1, completion_tokens: 1 } },
+            ]),
+        });
+        const { res, captured } = makeRes();
+        await controller.openaiResponses(
+            makeReq({
+                body: { model: 'gpt-test', input: 'hi', stream: true },
+                actor: makeUserActor(),
+            }),
+            res,
+        );
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        expect(captured.written.join('')).not.toContain('event: compaction');
+    });
+});
+
+// ── Model details listing ───────────────────────────────────────────
+
+describe('PuterAIController model details', () => {
+    const captureGetHandler = (
+        path: string,
+    ): ((req: Request, res: Response) => Promise<void>) => {
+        let handler: ((req: Request, res: Response) => Promise<void>) | null =
+            null;
+        const router = {
+            post: vi.fn(),
+            get: vi.fn((p: string, _opts: unknown, h: never) => {
+                if (p === path) handler = h;
+            }),
+        };
+        controller.registerRoutes(router as never);
+        if (!handler) throw new Error(`did not capture ${path} handler`);
+        return handler;
+    };
+
+    it('filters hidden ids out of /chat/models/details', async () => {
+        const handler = captureGetHandler('/puterai/chat/models/details');
+        vi.spyOn(server.drivers.aiChat, 'models').mockResolvedValueOnce([
+            { id: 'gpt-test' },
+            { id: 'fake' }, // hidden
+            { id: 'abuse' }, // hidden
+            { id: 'gpt-other' },
+        ] as never);
+
+        const { res, captured } = makeRes();
+        await handler(makeReq({}), res);
+        const body = captured.body as { models: Array<{ id: string }> };
+        expect(body.models.map((m) => m.id)).toEqual(['gpt-test', 'gpt-other']);
+    });
+
+    it('filters model details by provider when requested', async () => {
+        const handler = captureGetHandler('/puterai/chat/models/details');
+        vi.spyOn(server.drivers.aiChat, 'models').mockResolvedValueOnce([
+            { id: 'gpt-test', provider: 'openai' },
+            { id: 'fake', provider: 'openai' },
+            { id: 'claude-test', provider: 'claude' },
+        ] as never);
+        const { res, captured } = makeRes();
+        const req = makeReq({ query: { provider: 'openai' } });
+        await handler(req, res);
+        expect(captured.body).toEqual({ models: [{ id: 'gpt-test', provider: 'openai' }] });
+    });
+
+    it('501s when the driver lacks .models()', async () => {
+        const handler = captureGetHandler('/puterai/chat/models/details');
+        const driver = server.drivers.aiChat as unknown as Record<
+            string,
+            unknown
+        >;
+        Object.defineProperty(driver, 'models', {
+            value: undefined,
+            configurable: true,
+            writable: true,
+        });
+        try {
+            const { res } = makeRes();
+            await expect(handler(makeReq({}), res)).rejects.toMatchObject({
+                statusCode: 501,
+            });
+        } finally {
+            Reflect.deleteProperty(driver, 'models');
+        }
+    });
+});

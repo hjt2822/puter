@@ -1,0 +1,1899 @@
+/*
+ * Copyright (C) 2024-present Puter Technologies Inc.
+ *
+ * This file is part of Puter.
+ *
+ * Puter is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published
+ * by the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+import type { Actor } from '../../core/actor';
+import {
+    actorUid,
+    isAppActor,
+    isPlainUserActor,
+    isSystemActor,
+    userRelatedActor,
+} from '../../core/actor';
+import { Context, runInDerivedContext } from '../../core/context';
+import { HttpError, isHttpError } from '../../core/http/HttpError.js';
+import { isOwnHomePath, parseFsPathPermission } from './fsPathPermission.js';
+import { isMissingParentViolation } from '../../util/dbError.js';
+import { Span } from '../../util/span.js';
+import { PuterService } from '../types';
+import {
+    FLAT_PERM_WARM_TTL_SECONDS,
+    MANAGE_PERM_PREFIX,
+    PERMISSION_MAX_LEN,
+    PERMISSION_SCAN_CACHE_TTL_SECONDS,
+} from './consts';
+import {
+    isBareFsPermission,
+    PermissionUtil,
+    readingHasTerminal,
+    type PermissionExploder,
+    type PermissionImplicator,
+    type PermissionRewriter,
+    type ReadingNode,
+} from './permissionUtil';
+
+// eslint-disable-next-line @typescript-eslint/ban-ts-comment
+// @ts-ignore — hardcoded-permissions.js is plain JS
+import {
+    default_implicit_user_app_permissions,
+    default_user_permissions,
+    implicit_user_app_permissions,
+} from '../../data/hardcoded-permissions.js';
+import { UserRow } from '../../stores/user/UserStore';
+
+// -- Types ------------------------------------------------------------
+
+export interface ScanOptions {
+    noCache?: boolean;
+}
+
+export interface ScanState {
+    antiCycleActors: Actor[];
+}
+
+/** One flat-view warm: the holder's own grant, never a leaf beneath it. */
+interface FlatWarmEntry {
+    permission: string;
+    extra: unknown;
+    issuerUserId: number;
+}
+
+interface LinkedUserPerms {
+    reading: ReadingNode[];
+    warm: FlatWarmEntry[];
+}
+
+export interface GrantMeta {
+    reason?: string;
+    /**
+     * The app that acted, when a grant is issued programmatically on its user's
+     * behalf. The issuer is still the user — this is what makes the audit trail
+     * able to say which app it was.
+     */
+    appUid?: string | null;
+}
+
+/**
+ * PermissionService owns the _semantics_ side of permissions:
+ *
+ * - The rule registries (rewriters, implicators, exploders)
+ * - The `scan()` algorithm that traverses all the ways an actor might hold a
+ *   permission
+ * - Grant/revoke orchestration (rewrite → canManage → store writes → cache
+ *   invalidation)
+ *
+ * All persistence is delegated to PermissionStore.
+ */
+export class PermissionService extends PuterService {
+    private readonly rewriters: PermissionRewriter[] = [];
+    private readonly implicators: PermissionImplicator[] = [];
+    private readonly exploders: PermissionExploder[] = [];
+
+    // -- Extension hooks ----------------------------------------------
+    //
+    // Other services contribute domain semantics via these. A controller or
+    // driver *could* register too, but typically the owning service for a
+    // permission namespace (fs, app, site, ...) is the right place.
+
+    registerRewriter(rewriter: PermissionRewriter): void {
+        this.rewriters.push(rewriter);
+    }
+
+    registerImplicator(implicator: PermissionImplicator): void {
+        this.implicators.push(implicator);
+    }
+
+    registerExploder(exploder: PermissionExploder): void {
+        this.exploders.push(exploder);
+    }
+
+    // -- Rewrite / explode (pure-ish helpers) ------------------------
+
+    /**
+     * As `rewritePermission`, minus the 404 that would confirm someone else's
+     * path exists.
+     */
+    async rewritePermissionForActor(
+        actor: Actor,
+        permission: string,
+    ): Promise<string> {
+        try {
+            return await this.rewritePermission(permission);
+        } catch (e) {
+            // Every way a foreign path is refused has to read the same.
+            const collapsible =
+                isHttpError(e) &&
+                (e.legacyCode === 'subject_does_not_exist' ||
+                    e.legacyCode === 'forbidden');
+            if (!collapsible || !actor.user?.username) {
+                throw e;
+            }
+            // Only an fs path can oracle; other subjects are the caller's own.
+            const parsed = parseFsPathPermission(permission);
+            if (!parsed || isOwnHomePath(parsed.path, actor.user.username)) {
+                throw e;
+            }
+            throw new HttpError(403, `permission_denied: ${permission}`, {
+                legacyCode: 'permission_denied',
+            });
+        }
+    }
+
+    /** A foreign path that resolved must answer like one that didn't. */
+    async #assertReachableFsPath(
+        actor: Actor,
+        asked: string,
+        rewritten: string,
+    ): Promise<void> {
+        const parsed = parseFsPathPermission(asked);
+        if (!parsed || !actor.user?.username) return;
+        if (isOwnHomePath(parsed.path, actor.user.username)) return;
+
+        const parts = PermissionUtil.split(rewritten);
+        const fsIndex = parts[0] === MANAGE_PERM_PREFIX ? 1 : 0;
+        const uid = parts[fsIndex + 1];
+        if (!uid || uid.startsWith('/')) return;
+
+        if (await this.check(actor, PermissionUtil.join('fs', uid, 'see'))) {
+            return;
+        }
+        throw new HttpError(403, `permission_denied: ${asked}`, {
+            legacyCode: 'permission_denied',
+        });
+    }
+
+    async rewritePermission(permission: string): Promise<string> {
+        for (const rewriter of this.rewriters) {
+            if (!rewriter.matches(permission)) continue;
+            permission = await rewriter.rewrite(permission);
+        }
+        return permission;
+    }
+
+    /**
+     * Return the given permission plus all parents and their exploder
+     * expansions.
+     */
+    async getHigherPermissions(permission: string): Promise<string[]> {
+        const higher = new Set<string>();
+        higher.add(permission);
+        for (const parent of this.getParentPermissions(permission)) {
+            higher.add(parent);
+            for (const exploder of this.exploders) {
+                if (!exploder.matches(parent)) continue;
+                const more = await exploder.explode({ permission: parent });
+                for (const p of more) higher.add(p);
+            }
+        }
+        // The parent walk reaches `fs:<uid>`, which no grant is allowed to
+        // hold; drop it so a stored one can't answer a check for any mode.
+        return [...higher].filter((p) => !isBareFsPermission(p));
+    }
+
+    getParentPermissions(permission: string): string[] {
+        // Keep components escaped — we match against stored permission strings verbatim.
+        const parts = permission.split(':');
+        const parents: string[] = [];
+        for (let i = 0; i < parts.length; i++) {
+            parents.push(parts.slice(0, i + 1).join(':'));
+        }
+        parents.reverse();
+        return parents;
+    }
+
+    /**
+     * Grants only: an `fs:` permission has to name a mode. Without one the row
+     * sits above every mode, and a request that simply omits it reads to the
+     * user as a narrower grant than it is. Revokes stay unguarded so an
+     * existing bare row can still be withdrawn.
+     */
+    assertGrantableFsPermission(permission: string): void {
+        if (isBareFsPermission(permission)) {
+            throw new HttpError(
+                400,
+                'Invalid `permission`: `fs` requires an access mode',
+                { legacyCode: 'bad_request' },
+            );
+        }
+    }
+
+    // -- Public check / scan API --------------------------------------
+
+    async check(
+        actor: Actor,
+        permissionOptions: string | string[],
+        scanOptions?: ScanOptions,
+    ): Promise<boolean> {
+        if (this.#heldByDefault(actor, permissionOptions)) return true;
+        const reading = await this.scan(
+            actor,
+            permissionOptions,
+            undefined,
+            scanOptions,
+        );
+        const options = PermissionUtil.readingToOptions(reading);
+        return options.length > 0;
+    }
+
+    /**
+     * `scan`'s answer, without scanning, for what fixed config grants: a user's
+     * default permissions, and an app's default implicit grants that its user
+     * holds by default. Only while no rule matches any option or parent, since
+     * a rule is the only thing that could change what `scan` reads here.
+     */
+    #heldByDefault(
+        actor: Actor,
+        permissionOptions: string | string[],
+    ): boolean {
+        if (!actor.user?.id) return false;
+        const plainUser = isPlainUserActor(actor);
+        if (!plainUser && !isAppActor(actor)) return false;
+
+        // `getHigherPermissions`, minus exploders, which can't match here.
+        const exploded: string[] = [];
+        const requested = Array.isArray(permissionOptions)
+            ? permissionOptions
+            : [permissionOptions];
+        for (const permission of requested) {
+            if (typeof permission !== 'string') return false;
+            for (const parent of this.getParentPermissions(permission)) {
+                if (
+                    this.rewriters.some((rule) => rule.matches(parent)) ||
+                    this.exploders.some((rule) => rule.matches(parent)) ||
+                    this.implicators.some((rule) => rule.matches(parent))
+                ) {
+                    return false;
+                }
+                if (!isBareFsPermission(parent)) exploded.push(parent);
+            }
+        }
+
+        const held = (grants: Record<string, unknown>, option: string) =>
+            Object.prototype.hasOwnProperty.call(grants, option);
+        if (!exploded.some((option) => held(default_user_permissions, option)))
+            return false;
+        if (plainUser) return true;
+        const implied = default_implicit_user_app_permissions as Record<
+            string,
+            unknown
+        >;
+        return exploded.some(
+            (option) => held(implied, option) && !!implied[option],
+        );
+    }
+
+    /**
+     * Batch sibling of `check`. Returns a `Map<permission, boolean>` answering
+     * "does `actor` hold each of these permissions?" with one Redis MGET for
+     * cached decisions and per-permission evaluation for misses.
+     *
+     * `scan(actor, string[])` is intentionally an OR-style API: callers ask
+     * "does any option match?". That makes it unsafe to infer independent
+     * booleans for every requested permission from one combined scan, since
+     * some scanners are allowed to stop once one option is proven. Misses use
+     * the single-permission `check()` path to preserve exact semantics.
+     */
+    @Span('permission.checkMany', (_actor: unknown, permissions: string[]) => ({
+        'permission.count': permissions?.length ?? 0,
+    }))
+    async checkMany(
+        actor: Actor,
+        permissions: string[],
+    ): Promise<Map<string, boolean>> {
+        const out = new Map<string, boolean>();
+        if (!permissions || permissions.length === 0) return out;
+
+        const dedup = Array.from(new Set(permissions.filter(Boolean)));
+        if (dedup.length === 0) return out;
+
+        // System actors are universal — keep parity with the
+        // `grant_if_system` short-circuit inside `scan`.
+        if (isSystemActor(actor)) {
+            for (const p of dedup) out.set(p, true);
+            return out;
+        }
+
+        // -- Cache pass: one pipelined MGET --
+        const aUid = actorUid(actor);
+        const generation = await this.#cacheGenerationTag(actor);
+        const cached = await this.stores.permission.getMultiCheckCache(
+            aUid,
+            dedup,
+            generation,
+        );
+        const missing: string[] = [];
+        for (const p of dedup) {
+            if (cached.has(p)) {
+                out.set(p, cached.get(p)!);
+            } else {
+                missing.push(p);
+            }
+        }
+        if (missing.length === 0) return out;
+
+        const checked = await Promise.all(
+            missing.map(async (permission) => {
+                try {
+                    return {
+                        permission,
+                        granted: await this.check(actor, permission, {
+                            noCache: true,
+                        }),
+                    };
+                } catch {
+                    return { permission, granted: false };
+                }
+            }),
+        );
+        const writeBack: Array<{ permission: string; granted: boolean }> = [];
+        for (const { permission, granted } of checked) {
+            out.set(permission, granted);
+            writeBack.push({ permission, granted });
+        }
+
+        // Backfill cache (best-effort, fire-and-forget would also be
+        // fine — keeping it awaited so callers see deterministic state
+        // in tests). Use the same generation read above so a concurrent
+        // bump doesn't get masked by this write.
+        await this.stores.permission.setMultiCheckCache(
+            aUid,
+            writeBack,
+            generation,
+        );
+
+        return out;
+    }
+
+    async canManagePermission(
+        actor: Actor,
+        permission: string,
+    ): Promise<boolean> {
+        const managePerm = PermissionUtil.join(
+            MANAGE_PERM_PREFIX,
+            ...PermissionUtil.split(permission),
+        );
+        return await this.check(actor, managePerm);
+    }
+
+    /**
+     * Scan all paths by which `actor` might hold any of the given permission
+     * options. Returns a tree-shaped "reading". Use
+     * `PermissionUtil.readingToOptions()` to flatten to a yes/no answer.
+     */
+    // `check()` is a thin wrapper over scan(), so the span lives here —
+    // one span per evaluation regardless of which entry point was used.
+    @Span(
+        'permission.scan',
+        (_actor: unknown, permissionOptions: string | string[]) => ({
+            'permission.options': Array.isArray(permissionOptions)
+                ? permissionOptions.join(',')
+                : permissionOptions,
+        }),
+    )
+    async scan(
+        actor: Actor,
+        permissionOptions: string | string[],
+        state?: ScanState,
+        scanOptions: ScanOptions = {},
+    ): Promise<ReadingNode[]> {
+        let options = Array.isArray(permissionOptions)
+            ? [...permissionOptions]
+            : [permissionOptions];
+        const reading: ReadingNode[] = [];
+        const workingState: ScanState = state ?? { antiCycleActors: [actor] };
+
+        // A sub-scan's reading answers only for its own path.
+        const pathScoped = workingState.antiCycleActors.length > 1;
+
+        // -- Redis scan cache --
+        // The per-actor cache generation is folded into the key so a
+        // grant/revoke bump orphans this actor's cached readings at once.
+        // For derived actors the tag combines every relevant counter, so a
+        // user-level bump also orphans that user's app/token actors.
+        const aUid = actorUid(actor);
+        const generation = await this.#cacheGenerationTag(actor);
+        const cacheKey = this.stores.permission.buildScanCacheKey(
+            aUid,
+            options,
+            generation,
+        );
+        if (!scanOptions.noCache && !pathScoped) {
+            const cached = await this.stores.permission.getScanCache(cacheKey);
+            if (cached) return cached as ReadingNode[];
+        }
+
+        const startTs = Date.now();
+
+        // -- grant_if_system short-circuit --
+        if (isSystemActor(actor)) {
+            reading.push({
+                $: 'option',
+                key: 'sys',
+                permission: options[0],
+                source: 'implied',
+                by: 'system',
+                data: {},
+            });
+            reading.push({ $: 'time', value: Date.now() - startTs });
+            if (!pathScoped) await this.#maybeCacheScan(cacheKey, reading);
+            return reading;
+        }
+
+        // -- rewrite --
+        for (let i = 0; i < options.length; i++) {
+            const old = options[i];
+            const rewritten = await this.rewritePermission(old);
+            if (rewritten === old) continue;
+            options[i] = rewritten;
+            reading.push({ $: 'rewrite', from: old, to: rewritten });
+        }
+
+        // -- explode (parents + exploders) --
+        const exploded: string[][] = [];
+        for (let i = 0; i < options.length; i++) {
+            const perm = options[i];
+            const higher = await this.getHigherPermissions(perm);
+            exploded[i] = higher;
+            if (higher.length > 1) {
+                reading.push({ $: 'explode', from: perm, to: higher });
+            }
+        }
+        // Options explode into overlapping sets; each is evaluated once, in
+        // the order it first appears.
+        options = [...new Set(exploded.flat())];
+
+        // -- default user permissions --
+        // A group-independent floor every user actor holds, resolved in
+        // memory (see `default_user_permissions`). Derived actors are
+        // excluded: an app-under-user is gated by its own implicit grant map
+        // and an access token by its issuer, both of which recurse into a
+        // scan of the user actor and so still see this floor.
+        if (isPlainUserActor(actor) && actor.user?.id) {
+            const granted = options.find((option) =>
+                Object.prototype.hasOwnProperty.call(
+                    default_user_permissions,
+                    option,
+                ),
+            );
+            if (granted !== undefined) {
+                reading.push({
+                    $: 'option',
+                    key: 'default-user-permission',
+                    permission: granted,
+                    source: 'implied',
+                    by: 'default-user-permission',
+                    data: (default_user_permissions as Record<string, unknown>)[
+                        granted
+                    ],
+                    holder_username: actor.user.username,
+                    issuer_username: 'system',
+                });
+                reading.push({ $: 'time', value: Date.now() - startTs });
+                await this.#maybeCacheScan(cacheKey, reading);
+                return reading;
+            }
+        }
+
+        // -- shortcut implicators --
+        let shortCircuit = false;
+        for (const permission of options) {
+            for (const implicator of this.implicators) {
+                if (!implicator.shortcut) continue;
+                if (!implicator.matches(permission)) continue;
+                const implied = await implicator.check({ actor, permission });
+                if (!implied) continue;
+                reading.push({
+                    $: 'option',
+                    permission,
+                    source: 'implied',
+                    by: implicator.id,
+                    data: implied,
+                    ...(actor.user?.username
+                        ? { holder_username: actor.user.username }
+                        : {}),
+                });
+                shortCircuit = true;
+                break;
+            }
+            if (shortCircuit) break;
+        }
+
+        if (!shortCircuit) {
+            // -- scanners (formerly PERMISSION_SCANNERS) --
+            // Run in parallel — matches v1's `Promise.all(ps)` in the
+            // scan-permission Sequence. Each scanner has a cheap actor-shape
+            // guard at the top (e.g. `if (!isAppActor(actor)) return` for app-only
+            // ones) so the ones that don't apply to this actor fall out
+            // immediately. Scanners only push into `reading`; they don't
+            // read each other's writes, so there are no ordering hazards.
+            await Promise.all([
+                this.#scanNonShortcutImplicators(actor, options, reading),
+                this.#scanAccessToken(actor, options, reading),
+                this.#scanUserUser(actor, options, reading, workingState),
+                this.#scanUserGroup(actor, options, reading, workingState),
+                this.#scanUserAppImplied(actor, options, reading),
+                this.#scanUserApp(actor, options, reading),
+                this.#scanDevApp(actor, options, reading),
+            ]);
+        }
+
+        reading.push({ $: 'time', value: Date.now() - startTs });
+        if (!pathScoped) await this.#maybeCacheScan(cacheKey, reading);
+        return reading;
+    }
+
+    async #maybeCacheScan(
+        cacheKey: string,
+        reading: ReadingNode[],
+    ): Promise<void> {
+        try {
+            await this.stores.permission.setScanCache(
+                cacheKey,
+                reading,
+                PERMISSION_SCAN_CACHE_TTL_SECONDS,
+            );
+        } catch {
+            // cache write failures should never block a permission decision
+        }
+    }
+
+    // -- Scanners (inlined, no Sequence) ------------------------------
+
+    async #scanNonShortcutImplicators(
+        actor: Actor,
+        options: string[],
+        reading: ReadingNode[],
+    ): Promise<void> {
+        for (const permission of options) {
+            for (const implicator of this.implicators) {
+                if (implicator.shortcut) continue;
+                if (!implicator.matches(permission)) continue;
+                const implied = await implicator.check({ actor, permission });
+                if (!implied) continue;
+                reading.push({
+                    $: 'option',
+                    permission,
+                    source: 'implied',
+                    by: implicator.id,
+                    data: implied,
+                    ...(actor.user?.username
+                        ? { holder_username: actor.user.username }
+                        : {}),
+                });
+            }
+        }
+    }
+
+    async #scanAccessToken(
+        actor: Actor,
+        options: string[],
+        reading: ReadingNode[],
+    ): Promise<void> {
+        if (!actor.accessToken) return;
+        const issuerActor = actor.accessToken.issuer;
+
+        // Full-API-access token: it may do anything its issuing user can do.
+        // Resolve every requested option directly against the issuer (the
+        // owner FS implicator, group/service grants, and user-to-user grants
+        // all apply to the user actor), with no per-permission grant row
+        // required. The marker is the signed `full_access` claim surfaced on
+        // the actor (single source of truth, set only for user-issued tokens).
+        // Account-management endpoints stay closed because they gate on actor
+        // type (requireUserActor / session cookie), not permissions.
+        if (actor.accessToken.fullAccess) {
+            for (const permission of options) {
+                const issuerReading = await this.scan(issuerActor, permission);
+                reading.push({
+                    $: 'path',
+                    via: 'access-token',
+                    has_terminal: readingHasTerminal(issuerReading),
+                    permission,
+                    reading: issuerReading,
+                });
+            }
+            return;
+        }
+
+        const held = new Set(
+            await this.stores.permission.listAccessTokenPerms(
+                actor.accessToken.uid,
+            ),
+        );
+        for (const permission of options) {
+            if (!held.has(permission)) continue;
+            const issuerReading = await this.scan(issuerActor, permission);
+            reading.push({
+                $: 'path',
+                via: 'access-token',
+                has_terminal: readingHasTerminal(issuerReading),
+                permission,
+                reading: issuerReading,
+            });
+        }
+    }
+
+    async #scanUserUser(
+        actor: Actor,
+        options: string[],
+        reading: ReadingNode[],
+        state: ScanState,
+    ): Promise<void> {
+        if (!isPlainUserActor(actor)) return;
+        const subReadings = await this.validateUserPerms({
+            actor,
+            permissions: options,
+            state,
+        });
+        reading.push(...subReadings);
+    }
+
+    async #scanUserGroup(
+        actor: Actor,
+        options: string[],
+        reading: ReadingNode[],
+        state: ScanState,
+    ): Promise<void> {
+        if (!isPlainUserActor(actor)) return;
+        if (!actor.user?.id) return;
+
+        const rows = await this.stores.permission.readUserGroupPerms(
+            actor.user.id,
+            options,
+        );
+        for (const row of rows) {
+            const issuerUser = await this.stores.user.getById(row.user_id);
+            if (!issuerUser) continue;
+            const issuerActor = this.#userToActor(issuerUser);
+
+            // A sharer in their own group reaches their own row.
+            if (
+                state.antiCycleActors.some(
+                    (seen) => seen.user?.id === issuerActor.user.id,
+                )
+            )
+                continue;
+
+            const issuerReading = await this.scan(issuerActor, row.permission, {
+                antiCycleActors: [...state.antiCycleActors, issuerActor],
+            });
+            reading.push({
+                $: 'path',
+                via: 'user-group',
+                has_terminal: readingHasTerminal(issuerReading),
+                permission: row.permission,
+                data: row.extra,
+                holder_username: actor.user?.username,
+                issuer_username: issuerUser.username,
+                reading: issuerReading,
+                group_id: row.group_id,
+            });
+        }
+    }
+
+    async #scanUserAppImplied(
+        actor: Actor,
+        options: string[],
+        reading: ReadingNode[],
+    ): Promise<void> {
+        // `app`, not `effectiveApp`: a token gets the issuer's grants through
+        // `#scanAccessToken`, bounded by its own rows. Reading the chain here
+        // would hand it the issuing app's grants unbounded.
+        if (!actor.app) return;
+        const issuerActor = userRelatedActor(actor);
+        const issuerReading = await this.scan(issuerActor, options);
+        const hasTerminal = readingHasTerminal(issuerReading);
+        const appUid = actor.app.uid;
+
+        for (const permission of options) {
+            const implied = (
+                default_implicit_user_app_permissions as Record<string, unknown>
+            )[permission];
+            if (implied) {
+                reading.push({
+                    $: 'path',
+                    permission,
+                    has_terminal: hasTerminal,
+                    source: 'user-app-implied',
+                    by: 'user-app-hc-1',
+                    data: implied,
+                    issuer_username: actor.user?.username,
+                    reading: issuerReading,
+                });
+            }
+
+            // per-app hardcoded overrides
+            const hits: Record<string, unknown> = {};
+            for (const bucket of implicit_user_app_permissions as Array<{
+                apps: string[];
+                permissions: Record<string, unknown>;
+            }>) {
+                if (bucket.apps.includes(appUid)) {
+                    hits[permission] = bucket.permissions[permission];
+                }
+            }
+            if (hits[permission]) {
+                reading.push({
+                    $: 'path',
+                    permission,
+                    has_terminal: hasTerminal,
+                    source: 'user-app-implied',
+                    by: 'user-app-hc-2',
+                    data: hits[permission],
+                    issuer_username: actor.user?.username,
+                    reading: issuerReading,
+                });
+            }
+        }
+    }
+
+    async #scanUserApp(
+        actor: Actor,
+        options: string[],
+        reading: ReadingNode[],
+    ): Promise<void> {
+        // Direct app only — see `#scanUserAppImplied`.
+        if (!actor.app?.id || !actor.user?.id) return;
+        const rows = await this.stores.permission.readUserAppPerms(
+            actor.user.id,
+            actor.app.id,
+            options,
+        );
+        const row = rows[0];
+        if (!row) return;
+
+        const issuerActor = userRelatedActor(actor);
+        const issuerReading = await this.scan(issuerActor, row.permission);
+        reading.push({
+            $: 'path',
+            via: 'user-app',
+            permission: row.permission,
+            has_terminal: readingHasTerminal(issuerReading),
+            data: row.extra,
+            issuer_username: actor.user?.username,
+            reading: issuerReading,
+        });
+    }
+
+    async #scanDevApp(
+        actor: Actor,
+        options: string[],
+        reading: ReadingNode[],
+    ): Promise<void> {
+        // Direct app only — see `#scanUserAppImplied`.
+        if (!actor.app?.id) return;
+        const rows = await this.stores.permission.readDevAppPerms(
+            actor.app.id,
+            options,
+        );
+        const row = rows[0];
+        if (!row) return;
+
+        const issuerUser = await this.stores.user.getById(row.user_id);
+        if (!issuerUser) return;
+        const issuerActor = this.#userToActor(issuerUser);
+        const issuerReading = await this.scan(issuerActor, row.permission);
+        reading.push({
+            $: 'path',
+            via: 'dev-app',
+            permission: row.permission,
+            has_terminal: readingHasTerminal(issuerReading),
+            data: row.extra,
+            issuer_username: actor.user?.username,
+            reading: issuerReading,
+        });
+    }
+
+    // -- validateUserPerms (flat + linked reads) ----------------------
+
+    /**
+     * Resolves user-to-user permissions for an actor across the given
+     * permission strings. Prefers the "flat" KV view when present; otherwise
+     * falls back to a SQL traversal of `user_to_user_permissions` and warms the
+     * flat KV cache as a side-effect.
+     */
+    async validateUserPerms({
+        actor,
+        permissions,
+        state,
+    }: {
+        actor: Actor;
+        permissions: string[];
+        state?: ScanState;
+    }): Promise<ReadingNode[]> {
+        if (!actor.user?.id) return [];
+
+        const flatReading = await this.#flatValidateUserPerms(
+            actor,
+            permissions,
+        );
+        if (flatReading.length > 0) {
+            return flatReading[0].deleted ? [] : flatReading;
+        }
+
+        // Only on a miss: started beside the flat read, nothing awaits its rejection.
+        const { reading: linkedReading, warm } =
+            await this.#linkedValidateUserPerms(
+                actor,
+                permissions,
+                state ?? { antiCycleActors: [actor] },
+            );
+
+        // Warm flat KV cache for future hits (fire-and-forget, don't block
+        // result). Warms expire: they are derived from the SQL traversal
+        // above, and a warm whose KV write lands after a concurrent
+        // revoke's flat delete would otherwise re-materialize the revoked
+        // grant permanently. The expiry bounds that to the warm TTL — the
+        // next scan re-derives from SQL, which the revoke deletes
+        // synchronously. (Grant-path flat writes are authoritative and
+        // carry no expiry.)
+        const warmExpireAt =
+            Math.floor(Date.now() / 1000) + FLAT_PERM_WARM_TTL_SECONDS;
+        for (const entry of warm) {
+            this.stores.permission
+                .setFlatUserPerm(
+                    actor.user.id,
+                    entry.permission,
+                    {
+                        ...(entry.extra && typeof entry.extra === 'object'
+                            ? (entry.extra as Record<string, unknown>)
+                            : {}),
+                        permission: entry.permission,
+                        issuer_user_id: entry.issuerUserId,
+                        deleted: false,
+                    },
+                    { expireAt: warmExpireAt },
+                )
+                .catch(() => {
+                    /* swallow — this is a cache warm */
+                });
+        }
+
+        // Return the traversal result itself — not the (empty) flat
+        // reading — so the fallback grants on the check that took it
+        // rather than only after the warm lands. Returning the empty flat
+        // reading here would cache a false "denied" for the TTL every
+        // time a warm expires.
+        return linkedReading;
+    }
+
+    async #flatValidateUserPerms(
+        actor: Actor,
+        permissions: string[],
+    ): Promise<ReadingNode[]> {
+        if (!actor.user?.id) return [];
+        const values = await this.stores.permission.getFlatUserPerms(
+            actor.user.id,
+            permissions,
+        );
+
+        let anyDeleted = false;
+        for (const v of values) {
+            if (v.deleted) {
+                anyDeleted = true;
+                continue;
+            }
+            const { permission, issuer_user_id, ...extra } = v;
+            if (!permission) continue;
+            const issuer = issuer_user_id
+                ? await this.stores.user.getById(issuer_user_id)
+                : null;
+            return [
+                {
+                    $: 'option',
+                    via: 'user',
+                    has_terminal: true,
+                    permission,
+                    data: extra,
+                    holder_username: actor.user.username,
+                    issuer_username: issuer?.username,
+                    issuer_user_id: issuer?.uuid,
+                    reading: [],
+                },
+            ];
+        }
+        return anyDeleted ? [{ $: 'option', deleted: true }] : [];
+    }
+
+    async #linkedValidateUserPerms(
+        actor: Actor,
+        permissions: string[],
+        state: ScanState,
+    ): Promise<LinkedUserPerms> {
+        if (!actor.user?.id) return { reading: [], warm: [] };
+        const rows = await this.stores.permission.readLinkedUserUserPerms(
+            actor.user.id,
+            permissions,
+        );
+
+        const out: ReadingNode[] = [];
+        const warm: FlatWarmEntry[] = [];
+        for (const row of rows) {
+            const issuerUser = await this.stores.user.getById(
+                row.issuer_user_id,
+            );
+            if (!issuerUser) continue;
+            const issuerActor = this.#userToActor(issuerUser);
+
+            // anti-cycle
+            let skip = false;
+            for (const seen of state.antiCycleActors) {
+                if (seen.user?.id === issuerActor.user.id) {
+                    skip = true;
+                    break;
+                }
+            }
+            if (skip) continue;
+
+            const issuerReading = await this.scan(issuerActor, row.permission, {
+                antiCycleActors: [...state.antiCycleActors, issuerActor],
+            });
+
+            const hasTerminal = readingHasTerminal(issuerReading);
+            out.push({
+                $: 'path',
+                via: 'user',
+                has_terminal: hasTerminal,
+                permission: row.permission,
+                data: row.extra,
+                holder_username: actor.user.username,
+                issuer_username: issuerUser.username,
+                issuer_user_id: issuerUser.uuid,
+                reading: issuerReading,
+            });
+            // The holder's own row; the leaves beneath it are the issuer's.
+            if (hasTerminal) {
+                warm.push({
+                    permission: row.permission,
+                    extra: row.extra,
+                    issuerUserId: issuerUser.id,
+                });
+            }
+        }
+        return { reading: out, warm };
+    }
+
+    // -- Grant / revoke orchestration ---------------------------------
+    //
+    // Each method keeps its own order of checks; these keep one wording per
+    // refusal.
+
+    /** The acting user's id: grants and revokes are issued as a user. */
+    #requireUserId(actor: Actor): number {
+        if (!actor.user?.id)
+            throw new HttpError(403, 'actor must be a user', {
+                legacyCode: 'forbidden',
+            });
+        return actor.user.id;
+    }
+
+    #refuseAppActor(actor: Actor): void {
+        if (actor.effectiveApp)
+            throw new HttpError(403, 'actor must be a user', {
+                legacyCode: 'forbidden',
+            });
+    }
+
+    async #assertCanManage(actor: Actor, permission: string): Promise<void> {
+        if (!(await this.canManagePermission(actor, permission)))
+            throw new HttpError(403, `permission_denied: ${permission}`, {
+                legacyCode: 'permission_denied',
+            });
+    }
+
+    async #requireUser(username: string): Promise<UserRow> {
+        const user = await this.stores.user.getByUsername(username);
+        if (!user)
+            throw new HttpError(404, `user_does_not_exist: ${username}`, {
+                legacyCode: 'subject_does_not_exist',
+            });
+        return user;
+    }
+
+    async #requireApp(appIdentifier: string) {
+        const app = await this.stores.app.resolveApp(appIdentifier);
+        if (!app) throw this.#appNotFound(appIdentifier);
+        return app;
+    }
+
+    #appNotFound(appIdentifier: string): HttpError {
+        return new HttpError(404, `entity_not_found: app:${appIdentifier}`, {
+            legacyCode: 'subject_does_not_exist',
+        });
+    }
+
+    /**
+     * Checked after the rewrite, which decides how wide the row is. Past the
+     * column, MySQL/Postgres fault on INSERT and SQLite stores an unmatchable
+     * row.
+     */
+    #assertFitsColumn(
+        permission: string,
+        message = 'Invalid `permission`',
+    ): void {
+        if (permission.length > PERMISSION_MAX_LEN)
+            throw new HttpError(400, message, { legacyCode: 'bad_request' });
+    }
+
+    /** Off the critical path; `what` names a failure worth logging. */
+    #audit(write: Promise<unknown>, what?: string): void {
+        void (async () => {
+            try {
+                await write;
+            } catch (err) {
+                if (what) {
+                    console.warn(
+                        `[PermissionService] failed to audit ${what}:`,
+                        err,
+                    );
+                }
+            }
+        })();
+    }
+
+    async grantUserUserPermission(
+        actor: Actor,
+        username: string,
+        permission: string,
+        extra: Record<string, unknown> = {},
+        meta: GrantMeta = {},
+    ): Promise<void> {
+        permission = await this.rewritePermissionForActor(actor, permission);
+        this.assertGrantableFsPermission(permission);
+        const user = await this.#requireUser(username);
+        if (user.id === actor.user?.id)
+            throw new HttpError(400, 'cannot grant permissions to yourself', {
+                legacyCode: 'bad_request',
+            });
+
+        await this.#assertCanManage(actor, permission);
+        const issuerId = this.#requireUserId(actor);
+
+        // Durable row before the flat view, both awaited. A `manage:`-only
+        // delegate's grant resolves via flat and not via the linked chain, so
+        // writing SQL first makes a partial failure fail closed.
+        await this.stores.permission.upsertUserUserPerm(
+            user.id,
+            issuerId,
+            permission,
+            extra,
+        );
+        await this.stores.permission.setFlatUserPerm(user.id, permission, {
+            ...extra,
+            issuer_user_id: issuerId,
+            permission,
+            deleted: false,
+        });
+
+        // Logged on failure: a silent drop makes the log untrustworthy.
+        this.#audit(
+            this.stores.permission.auditUserUserPerm({
+                holder_user_id: user.id,
+                issuer_user_id: issuerId,
+                permission,
+                action: 'grant',
+                reason: meta.reason ?? 'granted via PermissionService',
+                extra: meta.appUid
+                    ? { appUid: meta.appUid }
+                    : this.#auditActorContext(actor),
+            }),
+            'user-user grant',
+        );
+
+        // Bust any cached "denied" reading so the grant is live immediately.
+        if (user.uuid) await this.#bumpUserCacheGeneration(user.uuid);
+    }
+
+    // -- Group grants ---- the write half; `#scanUserGroup` reads them ----
+
+    /** Resolved once here so neither grant nor revoke holds SQL. */
+    async #requireGroupId(groupUid: string): Promise<number> {
+        const groupId = await this.stores.permission.resolveGroupId(groupUid);
+        if (groupId === null) {
+            throw new HttpError(404, `group_does_not_exist: ${groupUid}`, {
+                legacyCode: 'subject_does_not_exist',
+            });
+        }
+        return groupId;
+    }
+
+    /** Batched: one event for the whole group, not one per member. */
+    async #bumpGroupCacheGeneration(groupId: number): Promise<void> {
+        const uuids =
+            await this.stores.permission.listGroupMemberUuids(groupId);
+        if (uuids.length === 0) return;
+        await this.stores.permission.bumpCacheGenerations(
+            uuids.map((uuid) => `user:${uuid}`),
+        );
+    }
+
+    /** The group analogue of `queryIssuerHolderPermissionsByPrefix`. */
+    async queryIssuerGroupPermissionsByPrefix(
+        issuer: Actor,
+        groupUid: string,
+        prefix: string,
+    ): Promise<string[]> {
+        if (!issuer.user?.id) return [];
+        const groupId = await this.stores.permission.resolveGroupId(groupUid);
+        if (groupId === null) return [];
+        return this.stores.permission.queryIssuerGroupPermsByPrefix(
+            issuer.user.id,
+            groupId,
+            prefix,
+        );
+    }
+
+    async grantUserGroupPermission(
+        actor: Actor,
+        groupUid: string,
+        permission: string,
+        extra: Record<string, unknown> = {},
+        meta: GrantMeta = {},
+    ): Promise<void> {
+        // First: the rewrite decides the row's width and what a revoke matches.
+        permission = await this.rewritePermissionForActor(actor, permission);
+        this.assertGrantableFsPermission(permission);
+        this.#assertFitsColumn(permission, 'permission is too long');
+        const groupId = await this.#requireGroupId(groupUid);
+
+        await this.#assertCanManage(actor, permission);
+        const issuerId = this.#requireUserId(actor);
+
+        await this.stores.permission.upsertUserGroupPerm(
+            groupId,
+            issuerId,
+            permission,
+            extra,
+        );
+
+        // Logged on failure: a silent drop makes the log untrustworthy.
+        this.#audit(
+            this.stores.permission.auditUserGroupPerm({
+                group_id: groupId,
+                issuer_user_id: issuerId,
+                permission,
+                action: 'grant',
+                reason: meta.reason ?? 'granted via PermissionService',
+                extra: this.#auditActorContext(actor),
+            }),
+            'user-group grant',
+        );
+
+        await this.#bumpGroupCacheGeneration(groupId);
+    }
+
+    /** Scoped to this issuer's grant; returns whether one was removed. */
+    async revokeUserGroupPermission(
+        actor: Actor,
+        groupUid: string,
+        permission: string,
+        meta: GrantMeta = {},
+        opts: { issuerUserId?: number } = {},
+    ): Promise<boolean> {
+        // Same rewrite as the grant, or this matches nothing and says it did.
+        permission = await this.rewritePermissionForActor(actor, permission);
+        const groupId = await this.#requireGroupId(groupUid);
+
+        const actorUserId = this.#requireUserId(actor);
+        // Whose grant to clear; authority still comes from `actor`, so an owner
+        // can withdraw a delegate's grant without impersonating them.
+        const issuerId = opts.issuerUserId ?? actorUserId;
+
+        await this.#assertCanManage(actor, permission);
+
+        const revoked = await this.stores.permission.deleteUserGroupPerm(
+            groupId,
+            issuerId,
+            permission,
+        );
+
+        this.#audit(
+            this.stores.permission.auditUserGroupPerm({
+                group_id: groupId,
+                issuer_user_id: issuerId,
+                permission,
+                action: 'revoke',
+                reason: meta.reason ?? 'revoked via PermissionService',
+                extra: this.#auditActorContext(actor),
+            }),
+            'user-group revoke',
+        );
+
+        // Bumped even when nothing matched: a cached allow must not survive.
+        await this.#bumpGroupCacheGeneration(groupId);
+
+        // Nothing but the membership names the holders, so without this their
+        // watches outlive the revoke.
+        if (revoked) {
+            for (const memberId of await this.stores.permission.listGroupMemberIds(
+                groupId,
+            )) {
+                this.#announceRevoked(memberId, null, permission);
+            }
+        }
+        return revoked;
+    }
+
+    /**
+     * Remove the grant `actor` issued, or the one named by `opts.issuerUserId`
+     * when the caller has established authority over another issuer's grant (a
+     * resource owner clearing a delegate's re-grant).
+     *
+     * Returns whether a grant was actually removed. Matching nothing isn't an
+     * error (an owner has no grant row to delete), but callers must be able to
+     * tell rather than reporting a removal that didn't happen.
+     */
+    async revokeUserUserPermission(
+        actor: Actor,
+        username: string,
+        permission: string,
+        meta: GrantMeta = {},
+        opts: { issuerUserId?: number } = {},
+    ): Promise<boolean> {
+        permission = await this.rewritePermissionForActor(actor, permission);
+        const user = await this.#requireUser(username);
+        const issuerId = this.#requireUserId(actor);
+
+        // Giving up access you hold needs no authority over the permission —
+        // it can only ever narrow what you can reach.
+        if (user.id !== issuerId) {
+            await this.#assertCanManage(actor, permission);
+        }
+
+        // Awaited (unlike the grant-path upsert): the generation bump below
+        // guarantees the holder's very next check re-derives from SQL, so a
+        // fire-and-forget delete here could lose the race and let that scan
+        // resurrect the revoked grant into the flat view. If this fails the
+        // caller gets the error — the permission is then still effectively
+        // granted (flat falls back to the surviving SQL row), which is the
+        // consistent, retryable outcome.
+        const revoked = await this.stores.permission.deleteUserUserPermByHolder(
+            user.id,
+            permission,
+            opts.issuerUserId ?? issuerId,
+        );
+
+        // The flat key isn't issuer-scoped, so it may only go once no issuer
+        // grants this any more. Dropping it while another grant stands would
+        // cut access outright for a `manage:`-only issuer, whose grant the
+        // linked chain can't resolve.
+        //
+        // Must read the primary: the delete above just landed there, and a
+        // replica (or the row cache the plain read would re-warm from it) can
+        // still show the deleted row. Skipping the flat delete on that stale
+        // view leaves a no-TTL flat grant standing with no SQL rows behind
+        // it — permanent, invisible access.
+        const remaining =
+            await this.stores.permission.readLinkedUserUserPermsFromPrimary(
+                user.id,
+                [permission],
+            );
+        if (remaining.length === 0) {
+            await this.stores.permission.delFlatUserPerm(user.id, permission);
+        }
+
+        // Only record a revoke that happened.
+        if (revoked) {
+            this.#audit(
+                this.stores.permission.auditUserUserPerm({
+                    holder_user_id: user.id,
+                    issuer_user_id: issuerId,
+                    permission,
+                    action: 'revoke',
+                    reason: meta.reason ?? 'revoked via PermissionService',
+                    extra: this.#auditActorContext(actor),
+                }),
+                'user-user revoke',
+            );
+        }
+
+        // Unconditional: the flat delete above can't report what it removed, so
+        // skipping the bump on a no-op risks leaving a cached allow standing.
+        if (user.uuid) await this.#bumpUserCacheGeneration(user.uuid);
+        // A revoke of a grant that was not there settled nothing; announcing
+        // it would only cost every listener a read.
+        if (revoked) this.#announceRevoked(user.id, null, permission);
+        return revoked;
+    }
+
+    /**
+     * What an audit row records about who was acting: which app asked, which is
+     * the whole question for anything minted under a standing consent.
+     *
+     * A user-user grant belongs to the user, so callers deliberately hand this
+     * layer an app-less actor (`userRelatedActor`) — the app survives only on
+     * the request actor, and is taken from there when it is the same user
+     * acting. A different user in scope is a background pass on someone else's
+     * behalf, whose app says nothing about this grant.
+     */
+    #auditActorContext(actor: Actor): Record<string, unknown> | null {
+        const requestActor = Context.get('actor') as Actor | undefined;
+        const acting =
+            actor.effectiveApp ??
+            (requestActor?.user?.id === actor.user?.id
+                ? requestActor?.effectiveApp
+                : null);
+        return acting?.uid ? { appUid: acting.uid } : null;
+    }
+
+    /**
+     * Withdraw a grant and everything the holder was given beneath it.
+     *
+     * Prefix implication is what makes the subtree part necessary: a grant on a
+     * region answers every check inside it, so leaving a deeper grant standing
+     * would leave access to part of a region that has just been taken back.
+     * Scoped to this issuer's grants to this holder — a region two people were
+     * given is two grants, and one being withdrawn is not the other's
+     * business.
+     *
+     * Returns the permissions removed. Each is announced separately, because
+     * each is a distinct thing something may have been standing on.
+     */
+    async revokeUserUserPermissionSubtree(
+        actor: Actor,
+        username: string,
+        permission: string,
+        meta: GrantMeta = {},
+    ): Promise<string[]> {
+        permission = await this.rewritePermissionForActor(actor, permission);
+        const user = await this.#requireUser(username);
+        const issuerId = this.#requireUserId(actor);
+
+        if (user.id !== issuerId) {
+            await this.#assertCanManage(actor, permission);
+        }
+
+        const removed =
+            await this.stores.permission.deleteUserUserPermSubtreeForHolder(
+                user.id,
+                issuerId,
+                permission,
+            );
+
+        for (const removedPermission of removed) {
+            this.#audit(
+                this.stores.permission.auditUserUserPerm({
+                    holder_user_id: user.id,
+                    issuer_user_id: issuerId,
+                    permission: removedPermission,
+                    action: 'revoke',
+                    reason: meta.reason ?? 'revoked via PermissionService',
+                    extra: meta.appUid
+                        ? { appUid: meta.appUid }
+                        : this.#auditActorContext(actor),
+                }),
+                'user-user revoke',
+            );
+        }
+
+        // Before the announcement, so whatever settles on it re-derives from a
+        // counter that has already moved.
+        if (user.uuid) await this.#bumpUserCacheGeneration(user.uuid);
+        for (const removedPermission of removed)
+            this.#announceRevoked(user.id, null, removedPermission);
+        return removed;
+    }
+
+    /**
+     * Rewrite a permission on its way into (or out of) a user-app row.
+     *
+     * Flags the context so the app-root-dir rewriter knows it's safe to resolve
+     * the pseudo-permission to a real `fs:<uid>:<mode>`. During scans
+     * (ACL.check) that rewriter returns PERMISSION_FOR_NOTHING_IN_PARTICULAR so
+     * `scan(actor, 'app-root-dir:…')` never accidentally matches through the fs
+     * path.
+     *
+     * Revoke goes through here too, and must: it has to name the same string
+     * the grant stored. Rewriting without the flag resolved the sentinel
+     * instead, so the DELETE matched nothing and reported success while the fs
+     * permission stayed live — including when the permission dialog withdraws a
+     * grant whose outcome it couldn't confirm, so a user who answered "Don't
+     * Allow" kept it. (The flag's name predates that; it now covers both
+     * writes.)
+     */
+    async #rewriteForUserAppWrite(
+        actor: Actor,
+        permission: string,
+    ): Promise<string> {
+        // Its own scope: a request-wide flag is read by its neighbours.
+        return runInDerivedContext(() => {
+            Context.set('is_grant_user_app_permission', true);
+            return this.rewritePermissionForActor(actor, permission);
+        });
+    }
+
+    /** See `PermissionRewriter.recordSource`. */
+    #recordsSource(permission: string): boolean {
+        return this.rewriters.some(
+            (rewriter) => rewriter.recordSource && rewriter.matches(permission),
+        );
+    }
+
+    /**
+     * What `grantUserAppPermission` checks before it writes: the rewrite that
+     * decides what the row stores, and the width of the column it lands in.
+     *
+     * Exposed so a caller granting several at once can reject the whole set
+     * before committing any of it — a half-written set reads to the caller as a
+     * refusal while some access is live.
+     */
+    async assertUserAppPermissionWritable(
+        actor: Actor,
+        permission: string,
+    ): Promise<void> {
+        const rewritten = await this.#rewriteForUserAppWrite(actor, permission);
+        this.assertGrantableFsPermission(rewritten);
+        this.#assertFitsColumn(rewritten);
+    }
+
+    /** `resolvedApp` is `appIdentifier`'s row when the caller already read it. */
+    async grantUserAppPermission(
+        actor: Actor,
+        appIdentifier: string,
+        permission: string,
+        extra: Record<string, unknown> = {},
+        meta: GrantMeta = {},
+        resolvedApp?: { id: number; uid: string },
+    ): Promise<void> {
+        const grantedAs = this.#recordsSource(permission) ? permission : null;
+        const askedFor = permission;
+        permission = await this.#rewriteForUserAppWrite(actor, permission);
+        this.assertGrantableFsPermission(permission);
+        await this.#assertReachableFsPath(actor, askedFor, permission);
+        this.#assertFitsColumn(permission);
+        const app = resolvedApp ?? (await this.#requireApp(appIdentifier));
+        const userId = this.#requireUserId(actor);
+
+        // Only this layer writes `grantedAs`, so revoke can trust it.
+        const { grantedAs: _, ...rowExtra } = extra;
+        const [existing] = await this.stores.permission.readUserAppPerms(
+            userId,
+            app.id,
+            [permission],
+        );
+        // Skip redundant upserts (saves db roundtrip + cache invalidation),
+        // unless the row has yet to record what this grant was asked as.
+        if (existing && (!grantedAs || existing.extra?.grantedAs === grantedAs))
+            return;
+
+        try {
+            await this.stores.permission.upsertUserAppPerm(
+                userId,
+                app.id,
+                permission,
+                grantedAs
+                    ? { ...existing?.extra, ...rowExtra, grantedAs }
+                    : rowExtra,
+            );
+        } catch (error) {
+            if (!isMissingParentViolation(error)) throw error;
+            // The row keys both the app and the user; ask which parent went
+            // away, or a dead account gets a live app tombstoned instead.
+            if (await this.stores.app.existsOnPrimary(app.id)) {
+                await this.stores.user.markDeletedById(userId);
+                throw new HttpError(401, 'This account no longer exists.', {
+                    legacyCode: 'unauthorized',
+                });
+            }
+            await this.stores.app.markDeleted(app);
+            throw this.#appNotFound(appIdentifier);
+        }
+        this.#audit(
+            this.stores.permission.auditUserAppPerm({
+                user_id: userId,
+                app_id: app.id,
+                permission,
+                action: 'grant',
+                reason: meta.reason ?? 'granted via PermissionService',
+            }),
+        );
+
+        // Bump the app-under-user cache generation so the grant takes
+        // effect on the next check rather than after the cache TTL.
+        await this.#bumpAppUnderUserCacheGeneration(actor.user.uuid!, app.uid);
+    }
+
+    async revokeUserAppPermission(
+        actor: Actor,
+        appIdentifier: string,
+        permission: string,
+        meta: GrantMeta = {},
+    ): Promise<void> {
+        // Before the rewrite: the pseudo-permission resolvers it runs refuse an
+        // app actor themselves, and this says why in the caller's own terms.
+        this.#refuseAppActor(actor);
+        const recordsSource = this.#recordsSource(permission);
+        // The same rewrite the grant used, so this names the row it wrote.
+        // A recorded source is looked up as asked instead, since it may now
+        // resolve somewhere other than where the grant did.
+        let rewritten = recordsSource
+            ? null
+            : await this.#rewriteForUserAppWrite(actor, permission);
+        const app = await this.#requireApp(appIdentifier);
+        const userId = this.#requireUserId(actor);
+
+        let removed: string[] = [];
+        if (recordsSource) {
+            const rows =
+                await this.stores.permission.listUserAppPermsFromPrimary(
+                    userId,
+                    app.id,
+                );
+            removed = rows
+                .filter((row) => row.extra?.grantedAs === permission)
+                .map((row) => row.permission);
+        }
+        if (removed.length === 0) {
+            // Rows written before sources were recorded carry none, so they
+            // can only be found by what the permission resolves to now.
+            rewritten ??= await this.#rewriteForUserAppWrite(actor, permission);
+            removed = [rewritten];
+        }
+
+        for (const removedPermission of removed) {
+            await this.stores.permission.deleteUserAppPerm(
+                userId,
+                app.id,
+                removedPermission,
+            );
+            this.#audit(
+                this.stores.permission.auditUserAppPerm({
+                    user_id: userId,
+                    app_id: app.id,
+                    permission: removedPermission,
+                    action: 'revoke',
+                    reason: meta.reason ?? 'revoked via PermissionService',
+                }),
+            );
+        }
+
+        if (actor.user.uuid) {
+            await this.#bumpAppUnderUserCacheGeneration(
+                actor.user.uuid,
+                app.uid,
+            );
+        }
+        for (const removedPermission of removed)
+            this.#announceRevoked(userId, app.uid, removedPermission);
+    }
+
+    async revokeUserAppAll(
+        actor: Actor,
+        appIdentifier: string,
+        meta: GrantMeta = {},
+    ): Promise<void> {
+        this.#refuseAppActor(actor);
+        const app = await this.#requireApp(appIdentifier);
+        const userId = this.#requireUserId(actor);
+
+        await this.stores.permission.deleteUserAppAll(userId, app.id);
+        this.#audit(
+            this.stores.permission.auditUserAppPerm({
+                user_id: userId,
+                app_id: app.id,
+                permission: '*',
+                action: 'revoke',
+                reason: meta.reason ?? 'revoked all via PermissionService',
+            }),
+        );
+
+        if (actor.user.uuid) {
+            await this.#bumpAppUnderUserCacheGeneration(
+                actor.user.uuid,
+                app.uid,
+            );
+        }
+        this.#announceRevoked(userId, app.uid, null);
+    }
+
+    async grantDevAppPermission(
+        actor: Actor,
+        appIdentifier: string,
+        permission: string,
+        extra: Record<string, unknown> = {},
+        meta: GrantMeta = {},
+    ): Promise<void> {
+        permission = await this.rewritePermissionForActor(actor, permission);
+        this.assertGrantableFsPermission(permission);
+        this.#assertFitsColumn(permission);
+        const app = await this.#requireApp(appIdentifier);
+        await this.#assertCanManage(actor, permission);
+        const userId = this.#requireUserId(actor);
+
+        await this.stores.permission.upsertDevAppPerm(
+            userId,
+            app.id,
+            permission,
+            extra,
+        );
+        this.#audit(
+            this.stores.permission.auditDevAppPerm({
+                user_id: userId,
+                app_id: app.id,
+                permission,
+                action: 'grant',
+                reason: meta.reason ?? 'granted via PermissionService',
+            }),
+        );
+    }
+
+    async revokeDevAppPermission(
+        actor: Actor,
+        appIdentifier: string,
+        permission: string,
+        meta: GrantMeta = {},
+    ): Promise<void> {
+        permission = await this.rewritePermissionForActor(actor, permission);
+        this.#refuseAppActor(actor);
+        const app = await this.#requireApp(appIdentifier);
+        const userId = this.#requireUserId(actor);
+
+        await this.stores.permission.deleteDevAppPerm(
+            userId,
+            app.id,
+            permission,
+        );
+        this.#audit(
+            this.stores.permission.auditDevAppPerm({
+                user_id: userId,
+                app_id: app.id,
+                permission,
+                action: 'revoke',
+                reason: meta.reason ?? 'revoked via PermissionService',
+            }),
+        );
+    }
+
+    async revokeDevAppAll(
+        actor: Actor,
+        appIdentifier: string,
+        meta: GrantMeta = {},
+    ): Promise<void> {
+        this.#refuseAppActor(actor);
+        const app = await this.#requireApp(appIdentifier);
+        const userId = this.#requireUserId(actor);
+
+        await this.stores.permission.deleteDevAppAll(userId, app.id);
+        this.#audit(
+            this.stores.permission.auditDevAppPerm({
+                user_id: userId,
+                app_id: app.id,
+                permission: '*',
+                action: 'revoke',
+                reason: meta.reason ?? 'revoked all via PermissionService',
+            }),
+        );
+    }
+
+    // -- Issuer queries (share discovery et al) -----------------------
+
+    async queryIssuerPermissionsByPrefix(
+        issuer: { id: number },
+        prefix: string,
+    ): Promise<{
+        users: Array<{ user: UserRowSummary | null; permission: string }>;
+        apps: Array<{
+            app: { id: number; uid: string; name?: string } | null;
+            permission: string;
+        }>;
+    }> {
+        const [userRows, appRows] = await Promise.all([
+            this.stores.permission.queryIssuerUserPermsByPrefix(
+                issuer.id,
+                prefix,
+            ),
+            this.stores.permission.queryIssuerAppPermsByPrefix(
+                issuer.id,
+                prefix,
+            ),
+        ]);
+        const [usersById, appsById] = await Promise.all([
+            this.stores.user.getByIds(userRows.map((r) => r.holder_user_id)),
+            this.stores.app.getByIds(appRows.map((r) => r.app_id)),
+        ]);
+        const users = userRows.map((r) => {
+            const u = usersById.get(r.holder_user_id);
+            return {
+                user: u
+                    ? {
+                          id: u.id,
+                          uuid: u.uuid,
+                          username: u.username,
+                          email: u.email,
+                      }
+                    : null,
+                permission: r.permission,
+            };
+        });
+        const apps = appRows.map((r) => {
+            const a = appsById.get(r.app_id);
+            return {
+                app: a ? { id: a.id, uid: a.uid, name: a.name } : null,
+                permission: r.permission,
+            };
+        }) as Array<{
+            app: { id: number; uid: string; name?: string } | null;
+            permission: string;
+        }>;
+        return { users, apps };
+    }
+
+    async queryIssuerHolderPermissionsByPrefix(
+        issuer: Actor,
+        holder: Actor,
+        prefix: string,
+    ): Promise<string[]> {
+        if (!issuer.user?.id || !holder.user?.id) return [];
+        return this.stores.permission.queryIssuerHolderPermsByPrefix(
+            issuer.user.id,
+            holder.user.id,
+            prefix,
+        );
+    }
+
+    // -- Cache invalidation -------------------------------------------
+    //
+    // Grants and revokes bump the affected holder's per-actor cache
+    // generation (see PermissionStore), which orphans all of that actor's
+    // cached scan/check readings at once. This is cluster-safe (a single
+    // INCR, no pattern scan) and makes a grant/revoke take effect on the
+    // holder's very next check rather than after the cache TTL.
+    //
+    // Derived actors fold their user's counter into their cache keys (see
+    // #cacheGenerationKeys), so a `user:<uuid>` bump also takes immediate
+    // effect for that user's app-under-user and access-token actors.
+    // Readings that embed a *different* user's reading (group/dev-app/
+    // user-user issuer chains) are not generation-linked to that issuer;
+    // those remain bounded by the scan-cache TTL.
+
+    /**
+     * Generation keys whose counters this actor's cached readings depend on. A
+     * derived actor (app-under-user, access-token) acts through its user — its
+     * readings embed that user's reading via the recursive issuer scan — so the
+     * user's counter is folded into its cache keys. A plain user actor depends
+     * only on its own counter.
+     */
+    #cacheGenerationKeys(actor: Actor): string[] {
+        const keys = [actorUid(actor)];
+        if (actor.accessToken) {
+            keys.push(...this.#cacheGenerationKeys(actor.accessToken.issuer));
+            if (actor.accessToken.authorized) {
+                keys.push(
+                    ...this.#cacheGenerationKeys(actor.accessToken.authorized),
+                );
+            }
+        } else if (isAppActor(actor) && actor.user?.uuid) {
+            keys.push(`user:${actor.user.uuid}`);
+        }
+        return Array.from(new Set(keys));
+    }
+
+    /**
+     * Cache-generation tag for an actor: the single counter value for a plain
+     * user actor (key format unchanged: `g<n>`), or the dependent counters
+     * joined with '.' for derived actors (e.g. `g<own>.<user>`). Joined rather
+     * than summed so distinct counter states can never collide on the same
+     * tag.
+     */
+    async #cacheGenerationTag(actor: Actor): Promise<number | string> {
+        const keys = this.#cacheGenerationKeys(actor);
+        if (keys.length === 1) {
+            return this.stores.permission.getCacheGeneration(keys[0]);
+        }
+        const gens = await Promise.all(
+            keys.map((k) => this.stores.permission.getCacheGeneration(k)),
+        );
+        return gens.join('.');
+    }
+
+    /**
+     * Tell whatever was standing on a grant that it is gone. Fire-and-forget: a
+     * listener that fails must not fail the revoke, and every check the grant
+     * used to answer already denies on its own.
+     */
+    #announceRevoked(
+        holderUserId: number,
+        appUid: string | null,
+        permission: string | null,
+    ): void {
+        try {
+            this.clients.event.emit(
+                'permission.revoked',
+                { holderUserId, appUid, permission },
+                {},
+            );
+        } catch (err) {
+            console.warn('[PermissionService] revoke announce failed:', err);
+        }
+    }
+
+    /** Bump a plain user holder (`user:<uuid>`). */
+    async #bumpUserCacheGeneration(userUuid: string): Promise<void> {
+        await this.stores.permission.bumpCacheGeneration(`user:${userUuid}`);
+    }
+
+    /** Bump an app-under-user holder (`app-under-user:<uuid>:<appUid>`). */
+    async #bumpAppUnderUserCacheGeneration(
+        userUuid: string,
+        appUid: string,
+    ): Promise<void> {
+        await this.stores.permission.bumpCacheGeneration(
+            `app-under-user:${userUuid}:${appUid}`,
+        );
+    }
+
+    /**
+     * Public: bump the permission cache for a set of users by username. Used
+     * when a group's membership changes — membership changes a user's effective
+     * permissions, so their cached readings must be orphaned (a removed user
+     * must lose the group's grants on their next check, not after the TTL).
+     */
+    async bumpPermissionCacheForUsernames(usernames: string[]): Promise<void> {
+        const unique = Array.from(new Set(usernames.filter(Boolean)));
+        await Promise.all(
+            unique.map(async (username) => {
+                const user = await this.stores.user.getByUsername(username);
+                if (user?.uuid) await this.#bumpUserCacheGeneration(user.uuid);
+            }),
+        );
+    }
+
+    // -- Internals ----------------------------------------------------
+
+    #userToActor(user: {
+        id: number;
+        uuid: string;
+        username: string;
+        email?: string | null;
+    }): Actor {
+        const actorUser: Partial<UserRow> = {
+            uuid: user.uuid,
+            id: user.id,
+            username: user.username,
+            email: user.email ?? null,
+        };
+        return { user: actorUser, effectiveApp: null };
+    }
+}
+
+// Minimal structural summary of a user row used in public return types.
+interface UserRowSummary {
+    id: number;
+    uuid: string;
+    username: string;
+    email?: string | null;
+}

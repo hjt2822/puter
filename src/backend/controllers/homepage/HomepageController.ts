@@ -1,0 +1,224 @@
+/*
+ * Copyright (C) 2024-present Puter Technologies Inc.
+ *
+ * This file is part of Puter.
+ *
+ * Puter is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published
+ * by the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+import express from 'express';
+import path from 'node:path';
+import { PuterController } from '../types.js';
+import { toAppShellView } from '../../util/appShellView.js';
+import type { PuterRouter } from '../../core/http/PuterRouter';
+import type {
+    PuterHomepageService,
+    PageMeta,
+    LaunchOptions,
+} from '../../services/homepage/PuterHomepageService';
+
+/** Longest description/og:description/twitter:description on `/app/<name>`. */
+export const APP_META_DESCRIPTION_MAX = 150;
+
+/**
+ * Unauthenticated, rendered on every request, so the bucket is the network
+ * address rather than an account.
+ */
+const APP_LANDING_LIMIT = {
+    scope: 'app-landing',
+    limit: 600,
+    window: 60_000,
+    key: 'ip' as const,
+};
+
+/**
+ * App descriptions can run long; search snippets and social cards want a
+ * short blurb. Collapses whitespace, then cuts at a word boundary with an
+ * ellipsis so the result never exceeds `APP_META_DESCRIPTION_MAX`.
+ */
+export function appMetaDescription(text: string): string {
+    const clean = text.replace(/\s+/g, ' ').trim();
+    if (clean.length <= APP_META_DESCRIPTION_MAX) return clean;
+    const head = clean.slice(0, APP_META_DESCRIPTION_MAX - 1);
+    const wordEnd = head.lastIndexOf(' ');
+    const cut = wordEnd > 0 ? head.slice(0, wordEnd) : head;
+    return `${cut.replace(/[\s,;:.!?…—-]+$/, '')}…`;
+}
+
+/**
+ * Routes that render the Puter GUI shell, plus a catch-all static fallback
+ * under `<gui_assets_root>/src` for non-dist/src paths (images, fonts, lib
+ * files referenced from the shell).
+ *
+ * All root-subdomain-only. Registered last in the controller list so the static
+ * catch-all doesn't shadow specific API routes.
+ */
+export class HomepageController extends PuterController {
+    registerRoutes(router: PuterRouter) {
+        const homepage = this.services
+            .homepage as unknown as PuterHomepageService;
+        if (!homepage) return;
+
+        const defaultMeta = (req: express.Request): PageMeta => ({
+            title: String(this.config.gui_params?.title ?? 'Puter'),
+            description: String(
+                this.config.gui_params?.short_description ?? '',
+            ),
+            short_description: String(
+                this.config.gui_params?.short_description ?? '',
+            ),
+            company: 'Puter Technologies Inc.',
+            canonical_url: `${req.protocol}://${this.config.domain ?? req.hostname}${req.path}`,
+            social_media_image: String(
+                this.config.gui_params?.social_media_image ?? '',
+            ),
+        });
+
+        const sendShell = async (
+            req: express.Request,
+            res: express.Response,
+            metaOverrides: Partial<PageMeta> = {},
+            launch: LaunchOptions = {},
+        ) => {
+            const meta = { ...defaultMeta(req), ...metaOverrides };
+            const actor =
+                (
+                    req as express.Request & {
+                        actor?: Parameters<typeof homepage.send>[0]['actor'];
+                    }
+                ).actor ?? null;
+            await homepage.send({ req, res, actor }, meta, launch);
+        };
+
+        // -- Root + path-aliased shell routes ------------------------
+
+        router.get('/', {}, (req, res) => sendShell(req, res));
+
+        router.get('/settings', {}, (req, res) => sendShell(req, res));
+        router.get('/settings/*splat', {}, (req, res) => sendShell(req, res));
+
+        router.get('/dashboard', {}, (req, res) => sendShell(req, res));
+        router.get('/dashboard/', {}, (req, res) => sendShell(req, res));
+
+        router.get('/desktop', {}, (req, res) => sendShell(req, res));
+        router.get('/desktop/', {}, (req, res) => sendShell(req, res));
+
+        router.get('/action/*splat', {}, (req, res) => sendShell(req, res));
+
+        router.get('/@:username', {}, (req, res) => sendShell(req, res));
+
+        // -- /app/:name - app metadata baked into the shell ----------
+        // `/desktop/app/:name` is the same landing booted on the desktop
+        // instead of the dashboard; the GUI strips the prefix and treats the
+        // rest of the path identically, so both render the same shell.
+
+        const sendAppShell = async (
+            req: express.Request,
+            res: express.Response,
+        ) => {
+            const name = String(req.params.name ?? '');
+            const app = name ? await this.stores.app.getByName(name) : null;
+
+            if (app) {
+                const metadata =
+                    (typeof app.metadata === 'string'
+                        ? safeJsonParse(app.metadata)
+                        : (app.metadata as Record<string, unknown> | null)) ??
+                    {};
+                // Never bake the raw store row into the shell — it exposes
+                // `index_url`, `owner_user_id`, and moderation flags. The
+                // shell only needs a preview; the GUI re-reads the app
+                // through the apps driver before launching, and that read is
+                // where the entitlement gate and hosted-backing guard run.
+                const clientApp = toAppShellView(app);
+                // Feeds <meta name="description">, og:description and
+                // twitter:description; scrapers truncate long blurbs anyway.
+                const description = appMetaDescription(
+                    String(app.description ?? ''),
+                );
+                await sendShell(req, res, {
+                    title: String(app.title ?? name),
+                    description,
+                    short_description: description,
+                    icon: typeof app.icon === 'string' ? app.icon : undefined,
+                    social_media_image:
+                        typeof metadata.social_image === 'string'
+                            ? metadata.social_image
+                            : undefined,
+                    app: clientApp as Record<string, unknown>,
+                });
+                return;
+            }
+
+            // App not found — return 404 but still render the shell so the
+            // client-side router can decide what to display.
+            res.status(404);
+            await sendShell(req, res, {
+                title: name
+                    ? name.charAt(0).toUpperCase() + name.slice(1)
+                    : 'Puter',
+            });
+        };
+
+        router.get(
+            '/app/:name',
+            { rateLimit: APP_LANDING_LIMIT },
+            sendAppShell,
+        );
+        router.get(
+            '/desktop/app/:name',
+            { rateLimit: APP_LANDING_LIMIT },
+            sendAppShell,
+        );
+
+        // -- /show/* - launch explorer with the requested file path --
+
+        router.get('/show/*splat', {}, (req, res) => {
+            const filePath = req.path.slice('/show'.length);
+            const launch: LaunchOptions = {
+                on_initialized: [
+                    {
+                        $: 'window-call',
+                        fn_name: 'launch_app',
+                        args: [{ name: 'explorer', path: filePath }],
+                    },
+                ],
+            };
+            return sendShell(req, res, {}, launch);
+        });
+
+        // -- Fallback static mount -----------------------------------
+        // Serves lingering GUI assets (images, fonts, lib files, etc.)
+        // out of <gui_assets_root>/src. Falls through to the 404 handler
+        // when the file doesn't exist.
+        if (this.config.gui_assets_root) {
+            router.use(
+                '/',
+                { subdomain: '' },
+                express.static(path.join(this.config.gui_assets_root, 'src')),
+            );
+        }
+    }
+}
+
+const safeJsonParse = (s: string): Record<string, unknown> | null => {
+    try {
+        const parsed = JSON.parse(s);
+        return parsed && typeof parsed === 'object'
+            ? (parsed as Record<string, unknown>)
+            : null;
+    } catch {
+        return null;
+    }
+};

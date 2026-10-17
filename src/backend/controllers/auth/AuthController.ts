@@ -1,0 +1,4611 @@
+/*
+ * Copyright (C) 2024-present Puter Technologies Inc.
+ *
+ * This file is part of Puter.
+ *
+ * Puter is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published
+ * by the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+import bcrypt from 'bcrypt';
+import type { Request, Response } from 'express';
+import crypto from 'node:crypto';
+import { posix as pathPosix } from 'node:path';
+import { v4 as uuidv4, validate as validateUuid } from 'uuid';
+import { Controller, Get, Patch, Post } from '../../core/http/decorators.js';
+import type { HttpErrorOptions } from '../../core/http/HttpError.js';
+import { HttpError } from '../../core/http/HttpError.js';
+import { antiCsrf } from '../../core/http/middleware/antiCsrf.js';
+import { generateCaptcha } from '../../core/http/middleware/captcha.js';
+import {
+    DEFAULT_ADMIN_USERNAMES,
+    hasVerifiedCard,
+    hasVerifiedPhone,
+} from '../../core/http/middleware/gates.js';
+import type { Actor } from '../../core/actor.js';
+import { isPlainUserActor, makeActor } from '../../core/actor.js';
+import {
+    checkRateLimit,
+    consumeRouteRateLimit,
+    peekRateLimit,
+    peekRouteRateLimit,
+} from '../../core/http/middleware/rateLimit.js';
+import {
+    signStepUpToken,
+    STEP_UP_COOKIE_NAME,
+    stepUpCookieOptions,
+} from '../../core/http/middleware/stepUpSession.js';
+import { createWebSessionActorGate } from '../../core/http/middleware/userProtected.js';
+import {
+    createRecoveryCode,
+    hashRecoveryCode,
+    createSecret as otpCreateSecret,
+    verify as verifyOtp,
+} from '../../services/auth/OTPUtil.js';
+import type { UserRow } from '../../stores/user/UserStore.js';
+import { isOwnedEmailConflict } from '../../stores/user/UserStore.js';
+import type { CardFallbackDeps } from '../../util/cardFallback.js';
+import {
+    CARD_FALLBACK_OPEN_TTL_SECONDS,
+    SEND_PHONE_RATE_LIMIT,
+    SEND_PHONE_RATE_WINDOW_MS,
+    cardFallbackAfterAttempts,
+    cardFallbackDepsFrom,
+    cardFallbackFlagKey,
+    isCardFallbackEligible,
+    isCardFallbackEnabled,
+    phoneAttemptsKey,
+} from '../../util/cardFallback.js';
+import { sessionCookieFlags } from '../../util/cookieFlags.js';
+import { cleanEmail, isStorableEmail } from '../../util/email.js';
+import { isGodmodeApp } from '../../util/godmodeApps.js';
+import { parsePhone } from '../../util/phone.js';
+import {
+    bonusCodeInvalidError,
+    checkSignupBonus,
+    isAbsentBonusCode,
+    normalizeBonusCode,
+} from '../../util/signupBonus.js';
+import { isTemporaryPasswordExpired } from '../../util/temporaryPassword.js';
+import { buildUserDetails, scrubSensitive } from '../../util/userDetails.js';
+import {
+    assertValidUsername,
+    generateUsername,
+    isUsernameTaken,
+    usernameConflict,
+    usernameRejection,
+} from '../../util/username.js';
+import { promoteToVerifiedGroup } from '../../util/userProvisioning.js';
+import {
+    assertBoundedManageGrant,
+    isKvSharePermission,
+} from '../../services/events/kvShares.js';
+import {
+    APP_DATA_PERMISSION_PREFIX,
+    appDataSharingAllowed,
+    parseAppDataPermission,
+} from '../../services/permission/appDataScopes.js';
+import {
+    assertCreatablePath,
+    isOwnHomePath,
+    fsCreateKindFor,
+    MAX_CREATED_ENTRIES_PER_GRANT,
+    parseCreateFlag,
+    parseFsPathPermission,
+    parseFsUidPermission,
+    type FsCreateKind,
+} from '../../services/permission/fsPathPermission.js';
+import type { AclMode } from '../../services/acl/ACLService';
+import type { ReauthReason } from '../../services/auth/AuthService';
+import { normalizeAbsolutePath } from '../../services/fs/resolveNode.js';
+import type { FSEntry } from '../../stores/fs/FSEntry.js';
+import { PuterController } from '../types.js';
+import { startWebSession } from './webSession.js';
+
+const FINGERPRINT_MAX_LENGTH = 128;
+// One consent prompt covers a handful of scopes at most. The cap keeps a
+// crafted request from turning a single grant call into a bulk write.
+const MAX_PERMISSIONS_PER_REQUEST = 16;
+/** The `fs:` scopes ACL answers; anything else keeps the scan. */
+const ACL_ANSWERABLE_MODES = new Set(['see', 'list', 'read', 'write']);
+/** Both spellings, so the same file cannot answer two ways. */
+const aclAnswerableFsPermission = (
+    permission: string,
+): { uid?: string; path?: string; mode: string } | null => {
+    const byUid = parseFsUidPermission(permission);
+    if (byUid) {
+        return ACL_ANSWERABLE_MODES.has(byUid.mode) ? byUid : null;
+    }
+    const byPath = parseFsPathPermission(permission);
+    if (!byPath || byPath.hasManage || byPath.rest.length !== 1) return null;
+    const mode = byPath.rest[0]!;
+    return ACL_ANSWERABLE_MODES.has(mode) ? { path: byPath.path, mode } : null;
+};
+
+// Rides every row a request writes, and the per-(user, app) cache after that.
+const GRANT_EXTRA_MAX_BYTES = 4096;
+const DISPATCH_ID_MAX_LENGTH = 128;
+// One name for the flag, so the write and the read cannot drift apart.
+const APP_AUTHENTICATED_FLAG = 'flag:app-is-authenticated';
+
+// -- Post-login route limits -----------------------------------------
+//
+// The credential legs above (login, signup, recovery, confirmation) each
+// carry their own limit. Everything a session can reach *after* signing
+// in shares the four shapes below, keyed on the actor rather than the
+// network — a per-account ceiling is the meaningful one once we know who
+// is calling.
+
+/**
+ * Mints or reconfigures a credential. Deliberately an hour-scale window: these
+ * are human actions taken a handful of times, and an unbounded rate turns one
+ * compromised session into a durable foothold.
+ */
+const CREDENTIAL_MINT_LIMIT = {
+    scope: 'auth-credential-mint',
+    limit: 20,
+    window: 60 * 60_000,
+    key: 'user',
+} as const;
+
+/** Revoking is cheap and undoing a mistake shouldn't fight the mint budget. */
+const ACCESS_TOKEN_REVOKE_LIMIT = {
+    scope: 'auth-access-token-revoke',
+    limit: 60,
+    window: 60_000,
+    key: 'user',
+} as const;
+
+/**
+ * Second-factor configuration, including the verify leg. Shorter window than
+ * the mint limit because enabling 2FA legitimately involves a few attempts in a
+ * row, but unbounded verification is a TOTP brute force.
+ */
+const TWO_FACTOR_LIMIT = {
+    scope: 'auth-2fa-configure',
+    limit: 30,
+    window: 15 * 60_000,
+    key: 'user',
+} as const;
+
+/** Permission writes. Never called in a loop by a client. */
+const GRANT_LIMIT = {
+    scope: 'auth-grant',
+    limit: 60,
+    window: 60_000,
+    key: 'user',
+} as const;
+
+/**
+ * Read-only checks the GUI makes on nearly every interaction. The ceiling is
+ * high enough that only a runaway loop reaches it.
+ */
+const AUTH_CHECK_LIMIT = {
+    scope: 'auth-check',
+    limit: 300,
+    window: 60_000,
+    key: 'user',
+} as const;
+
+/**
+ * Anti-CSRF token issuance. Clients mint a fresh token per protected mutation
+ * and cache nothing, so this ceiling has to clear the SUM of the budgets that
+ * spend tokens — matching any single one of them guarantees the gate fires
+ * before the mutation it guards does.
+ *
+ * What spends them: the session-authenticated download path, one token per
+ * file, at the read budget of 600/min — a multi-selection download burns tokens
+ * exactly the way a bulk delete burns its own budget, so this tracks the bulk
+ * figure used for filesystem mutations; logout at 60/min; and the
+ * session-management writes (revoke, rename), which a person triggers a handful
+ * of times. Call it ~700/min of real demand, and leave enough on top that a
+ * bulk operation runs out of files before it runs out of tokens.
+ */
+const ANTI_CSRF_MINT_LIMIT = {
+    scope: 'anticsrf',
+    limit: 1200,
+    window: 60_000,
+    key: 'user',
+} as const;
+
+/** Settings-page reads — enumerating sessions and permissions. */
+const AUTH_LIST_LIMIT = {
+    scope: 'auth-list',
+    limit: 120,
+    window: 60_000,
+    key: 'user',
+} as const;
+
+/** Session plumbing: logout, GUI token, cookie sync. */
+const SESSION_LIMIT = {
+    scope: 'auth-session',
+    limit: 60,
+    window: 60_000,
+    key: 'user',
+} as const;
+
+/**
+ * Completed renames. Charged by the handler after the rename lands, so a wrong
+ * password or a taken name doesn't spend it.
+ */
+const CHANGE_USERNAME_LIMIT = {
+    scope: 'change-username-done',
+    limit: 2,
+    window: 30 * 24 * 60 * 60_000,
+    key: 'user',
+} as const;
+
+/** Rename attempts, success or not. Bounds password guessing through the gate. */
+const CHANGE_USERNAME_ATTEMPT_LIMIT = {
+    scope: 'change-username-attempt',
+    limit: 10,
+    window: 60 * 60_000,
+    key: 'user',
+} as const;
+
+/**
+ * Wrong second-factor codes per account, shared by `/login/otp` and
+ * `/login/recovery-code`. Charged only on a wrong code.
+ */
+const SECOND_FACTOR_FAILURE_LIMIT = {
+    scope: 'login-2fa-failure',
+    limit: 10,
+    window: 30 * 60_000,
+} as const;
+
+/** Recovery mails per account per hour, across every requester. */
+const PASS_RECOVERY_EMAIL_TARGET_LIMIT = {
+    scope: 'send-pass-recovery-email-target',
+    limit: 5,
+    window: 60 * 60_000,
+} as const;
+
+/** Session-management writes accept web-session actors only. */
+const WEB_SESSION_GATE = createWebSessionActorGate();
+
+const BUILT_IN_ADMIN_USERNAMES: ReadonlySet<string> = new Set(
+    DEFAULT_ADMIN_USERNAMES,
+);
+
+/** Built-in admin accounts have no email password recovery. */
+const isBuiltInAdmin = (username: unknown): boolean =>
+    typeof username === 'string' &&
+    BUILT_IN_ADMIN_USERNAMES.has(username.toLowerCase());
+
+/** Lifetime of the `otp-login` JWT `/login` hands back. */
+const OTP_LOGIN_TOKEN_TTL = '5m';
+// Covers the token's lifetime plus verify's clock tolerance.
+const OTP_LOGIN_TOKEN_USED_WINDOW_MS = 10 * 60_000;
+
+// How long a failed-SMS-send record stays readable by its error_id — long
+// enough to cover the typical support round-trip.
+const SMS_SEND_ERROR_TTL_SECONDS = 7 * 24 * 60 * 60;
+
+/**
+ * Auth controller — login/logout, permission grants/revokes, session
+ * management, OTP, and permission checks.
+ */
+@Controller('')
+export class AuthController extends PuterController {
+    @Post('/login/wait', {
+        subdomain: ['api'],
+        rateLimit: [
+            // A client will make a request to this every 10 seconds while waiting for the login to complete, so we allow a higher limit than the main /login endpoint.
+            { scope: 'login-wait', limit: 100, window: 15 * 60_000, key: 'ip' },
+        ],
+    })
+    async loginWait(req: Request, res: Response) {
+        // Destructuring an absent body is a TypeError, not the 400 a request
+        // with no session id deserves.
+        const session = (req.body as { session?: unknown } | undefined)
+            ?.session;
+        // validate uuid to prevent ultra long key or listening on pubsub.login.*
+        if (typeof session !== 'string' || !validateUuid(session)) {
+            throw new HttpError(400, 'session is required.', {
+                legacyCode: 'bad_request',
+            });
+        }
+
+        // Browser-only gate. The session id is client-chosen and travels in a
+        // link, so it is not a secret — the `Origin` header is what actually
+        // says who is asking, and only a browser is prevented from lying about
+        // it. A caller with no `Origin` (curl, a server-side fetch) could
+        // otherwise collect a token minted for someone else's app just by
+        // knowing the id.
+        //
+        // `"null"` is rejected too: sandboxed iframes and `file://` documents
+        // serialise their opaque origin that way, and two *unrelated* opaque
+        // origins would compare equal to each other.
+        const reqOrigin = req.headers.origin;
+        if (!reqOrigin || reqOrigin === 'null') {
+            throw new HttpError(403, 'Origin not allowed', {
+                legacyCode: 'forbidden',
+            });
+        }
+
+        // The app identity this caller is allowed to collect a token for,
+        // derived from the browser-attested header rather than anything in
+        // the request body — so no client, honest or not, can influence the
+        // comparison made after the token arrives.
+        const expectedAppUid =
+            await this.services.auth.appUidFromOrigin(reqOrigin);
+
+        const { resolve, promise } = Promise.withResolvers<void>();
+
+        let token: string | null = null;
+        const listener = (_key: string, value: { authtoken: string }) => {
+            token = value.authtoken;
+            resolve();
+        };
+        this.clients.event.on(`pubsub.login.${session}`, listener);
+
+        const timeout = new Promise<void>((resolve) =>
+            setTimeout(resolve, 10000),
+        );
+        await Promise.race([promise, timeout]);
+        this.clients.event.off(`pubsub.login.${session}`, listener);
+        if (!token) {
+            throw new HttpError(408, 'Request timeout.', {
+                legacyCode: 'request_timeout',
+            });
+        }
+
+        // Audience check. The postMessage hand-off this relay stands in for
+        // is origin-bound for free — it posts with `targetOrigin`, so a page
+        // can only ever receive a token minted for *itself*. Delivering
+        // server-side dropped that binding; this restores it. Without it a
+        // popup talked into minting for app X (see `trustsOpenerOriginParam`
+        // in the GUI) hands X's token to whoever holds the session id.
+        if (!this.#tokenIsForApp(token, expectedAppUid)) {
+            // Deliberately the same 408 the no-token path returns: a caller
+            // learns only that nothing arrived for them, not that a token
+            // for a different app went past.
+            throw new HttpError(408, 'Request timeout.', {
+                legacyCode: 'request_timeout',
+            });
+        }
+
+        res.json({
+            auth_token: token,
+        });
+    }
+
+    /**
+     * Whether a relayed token is an app-under-user token minted for
+     * `expectedAppUid`. Verifies the signature — an unverified decode would let
+     * a caller relay a token whose claims it wrote itself.
+     */
+    #tokenIsForApp(token: string, expectedAppUid: string): boolean {
+        try {
+            const payload = this.services.token.verify<{
+                type?: string;
+                app_uid?: string;
+            }>('auth', token);
+            return (
+                payload.type === 'app-under-user' &&
+                !!payload.app_uid &&
+                payload.app_uid === expectedAppUid
+            );
+        } catch {
+            // Malformed, expired, or signed with a key we don't hold.
+            return false;
+        }
+    }
+    @Post('/login/set', {
+        subdomain: ['api'],
+        // Unauthenticated fan-out to every `/login/wait` listener on the
+        // session id. A legitimate popup posts here exactly once per sign-in,
+        // so a generous per-IP cap costs honest traffic nothing while denying
+        // an attacker unbounded attempts to land a token on a guessed id.
+        rateLimit: [
+            { scope: 'login-set', limit: 60, window: 15 * 60_000, key: 'ip' },
+        ],
+    })
+    async loginSet(req: Request, res: Response) {
+        const { session, auth_token } = req.body ?? {};
+        if (!session || !auth_token || !validateUuid(session)) {
+            throw new HttpError(400, 'session and auth_token are required.', {
+                legacyCode: 'bad_request',
+            });
+        }
+
+        this.clients.event.emit(
+            `pubsub.login.${session}`,
+            {
+                authtoken: auth_token,
+            },
+            {},
+        );
+
+        res.json({ success: true });
+    }
+
+    // -- Login -------------------------------------------------------
+
+    @Post('/login', {
+        // Returns a full session token in the response body. Reflected CORS
+        // would otherwise let any page trade a password for that token and
+        // read it — third-party sign-in goes through `puter.auth.signIn()`,
+        // whose popup runs on this origin and yields an app-scoped token.
+        guiOriginOnly: true,
+        captcha: true,
+        // Two limits: per-fingerprint keeps users behind a shared IP
+        // (offices, campuses) from throttling each other, while the
+        // coarser per-IP backstop stops an attacker from minting fresh
+        // fingerprint buckets by rotating client-controlled headers
+        // (User-Agent etc.). Same pattern on the other unauthenticated
+        // credential endpoints below.
+        rateLimit: [
+            { scope: 'login', limit: 10, window: 15 * 60_000 },
+            { scope: 'login-ip', limit: 50, window: 15 * 60_000, key: 'ip' },
+        ],
+    })
+    async handleLogin(req: Request, res: Response): Promise<void> {
+        const { username, email, password } = req.body ?? {};
+
+        if (!username && !email) {
+            throw new HttpError(400, 'Username or email is required.', {
+                legacyCode: 'bad_request',
+            });
+        }
+        if (!password || typeof password !== 'string') {
+            throw new HttpError(400, 'Password is required.', {
+                legacyCode: 'password_required',
+            });
+        }
+        if (password.length < (this.config.min_pass_length || 6)) {
+            throw new HttpError(400, 'Invalid password.', {
+                legacyCode: 'bad_request',
+            });
+        }
+
+        // Look up user
+        let user;
+        if (username) {
+            if (typeof username !== 'string')
+                throw new HttpError(400, 'username must be a string.', {
+                    legacyCode: 'bad_request',
+                });
+            user = await this.stores.user.getByUsername(username);
+        } else {
+            user = await this.stores.user.getByEmail(email);
+        }
+
+        if (!user) {
+            throw new HttpError(
+                404,
+                username ? 'Username not found.' : 'Email not found.',
+                { legacyCode: 'not_found' },
+            );
+        }
+        if (
+            user.username === 'system' &&
+            !(this.config as { allow_system_login?: boolean })
+                .allow_system_login
+        ) {
+            throw new HttpError(
+                404,
+                username ? 'Username not found.' : 'Email not found.',
+                { legacyCode: 'not_found' },
+            );
+        }
+        if (user.suspended) {
+            throw new HttpError(401, 'This account is suspended.', {
+                legacyCode: 'account_suspended',
+            });
+        }
+        if (user.password === null) {
+            throw new HttpError(401, 'Incorrect password.', {
+                legacyCode: 'unauthorized',
+            });
+        }
+
+        // Verify password
+        const passwordMatch = await bcrypt.compare(
+            password,
+            user.password as string,
+        );
+        if (!passwordMatch) {
+            throw new HttpError(401, 'Incorrect password.', {
+                legacyCode: 'password_mismatch',
+            });
+        }
+        // An administrator-issued temporary password that was never used dies
+        // rather than becoming a standing credential the team holds.
+        if (isTemporaryPasswordExpired(user)) {
+            throw new HttpError(
+                401,
+                'This temporary password has expired. Ask your team administrator for a new one.',
+                { legacyCode: 'temporary_password_expired' },
+            );
+        }
+
+        const reauthAuthId =
+            this.#verifySuppliedReauthToken(req.body.reauth_token)?.authId ??
+            null;
+        await this.#enforceAuthIdMatch(req, user, reauthAuthId);
+
+        // OTP branching — if 2FA enabled, return a short-lived OTP JWT.
+        // Re-bind the verified `auth_id` into the JWT so the follow-up
+        // OTP/recovery call can re-enforce the match without re-trusting
+        // a free-form claim from the client.
+        if (user.otp_enabled) {
+            const otpClaims: Record<string, unknown> = {
+                user_uid: user.uuid,
+                purpose: 'otp-login',
+                // Keeps each token distinct for the single-use check.
+                jti: uuidv4(),
+            };
+            if (reauthAuthId) otpClaims.auth_id = reauthAuthId;
+            const otp_jwt_token = this.services.token.sign('otp', otpClaims, {
+                expiresIn: OTP_LOGIN_TOKEN_TTL,
+            });
+
+            res.status(202).json({
+                proceed: true,
+                next_step: 'otp',
+                otp_jwt_token,
+            });
+            return;
+        }
+
+        await this.#completeLogin(req, res, user);
+    }
+
+    // -- Login: OTP verification -------------------------------------
+
+    @Post('/login/otp', {
+        // Second leg of `/login` — also completes into `#completeLogin`.
+        guiOriginOnly: true,
+        captcha: true,
+        rateLimit: [
+            { scope: 'login-otp', limit: 15, window: 30 * 60_000 },
+            {
+                scope: 'login-otp-ip',
+                limit: 60,
+                window: 30 * 60_000,
+                key: 'ip',
+            },
+        ],
+    })
+    async handleLoginOtp(req: Request, res: Response): Promise<void> {
+        const { token, code } = req.body ?? {};
+        if (!token)
+            throw new HttpError(400, 'token is required.', {
+                legacyCode: 'bad_request',
+            });
+        if (!code)
+            throw new HttpError(400, 'code is required.', {
+                legacyCode: 'bad_request',
+            });
+
+        let decoded;
+        try {
+            decoded = this.services.token.verify<{
+                user_uid: string;
+                purpose: string;
+                auth_id?: string;
+            }>('otp', token);
+        } catch {
+            throw new HttpError(400, 'Invalid token.', {
+                legacyCode: 'bad_request',
+            });
+        }
+        if (!decoded.user_uid || decoded.purpose !== 'otp-login') {
+            throw new HttpError(400, 'Invalid token.', {
+                legacyCode: 'bad_request',
+            });
+        }
+
+        const user = await this.stores.user.getByUuid(decoded.user_uid);
+        if (!user)
+            throw new HttpError(404, 'User not found.', {
+                legacyCode: 'not_found',
+            });
+        if (user.suspended) {
+            throw new HttpError(401, 'This account is suspended.', {
+                legacyCode: 'account_suspended',
+            });
+        }
+
+        await this.#assertSecondFactorAttemptsRemain(user.uuid);
+        if (!verifyOtp(user.username, user.otp_secret, code)) {
+            await this.#recordSecondFactorFailure(user.uuid);
+            res.json({ proceed: false });
+            return;
+        }
+        await this.#consumeOtpLoginToken(token);
+
+        await this.#enforceAuthIdMatch(req, user, decoded.auth_id ?? null);
+
+        await this.#completeLogin(req, res, user);
+    }
+
+    // -- Login: recovery code ----------------------------------------
+
+    @Post('/login/recovery-code', {
+        // Second leg of `/login` — also completes into `#completeLogin`.
+        guiOriginOnly: true,
+        captcha: true,
+        rateLimit: [
+            { scope: 'login-recovery', limit: 10, window: 60 * 60_000 },
+            {
+                scope: 'login-recovery-ip',
+                limit: 40,
+                window: 60 * 60_000,
+                key: 'ip',
+            },
+        ],
+    })
+    async handleLoginRecoveryCode(req: Request, res: Response): Promise<void> {
+        const { token, code } = req.body ?? {};
+        if (!token)
+            throw new HttpError(400, 'token is required.', {
+                legacyCode: 'bad_request',
+            });
+        if (!code)
+            throw new HttpError(400, 'code is required.', {
+                legacyCode: 'bad_request',
+            });
+
+        let decoded;
+        try {
+            decoded = this.services.token.verify<{
+                user_uid: string;
+                purpose: string;
+                auth_id?: string;
+            }>('otp', token);
+        } catch {
+            throw new HttpError(400, 'Invalid token.', {
+                legacyCode: 'bad_request',
+            });
+        }
+        if (!decoded.user_uid || decoded.purpose !== 'otp-login') {
+            throw new HttpError(400, 'Invalid token.', {
+                legacyCode: 'bad_request',
+            });
+        }
+
+        const user = await this.stores.user.getByUuid(decoded.user_uid);
+        if (!user)
+            throw new HttpError(404, 'User not found.', {
+                legacyCode: 'not_found',
+            });
+        if (user.suspended) {
+            throw new HttpError(401, 'This account is suspended.', {
+                legacyCode: 'account_suspended',
+            });
+        }
+
+        await this.#assertSecondFactorAttemptsRemain(user.uuid);
+        const hashed = hashRecoveryCode(code);
+        const codes = ((user.otp_recovery_codes as string) || '')
+            .split(',')
+            .filter(Boolean);
+        const idx = codes.indexOf(hashed);
+        if (idx === -1) {
+            await this.#recordSecondFactorFailure(user.uuid);
+            res.json({ proceed: false });
+            return;
+        }
+        await this.#consumeOtpLoginToken(token);
+
+        // Consume the recovery code
+        codes.splice(idx, 1);
+        await this.stores.user.update(user.id, {
+            otp_recovery_codes: codes.join(','),
+        });
+
+        await this.#enforceAuthIdMatch(req, user, decoded.auth_id ?? null);
+
+        await this.#completeLogin(req, res, user);
+    }
+
+    // -- Signup ------------------------------------------------------
+
+    @Post('/signup', {
+        // Completes into `#completeLogin`, so it hands back a session token
+        // exactly like `/login`. Same reasoning.
+        guiOriginOnly: true,
+        captcha: true,
+        rateLimit: [
+            { scope: 'signup', limit: 10, window: 15 * 60_000 },
+            { scope: 'signup-ip', limit: 50, window: 15 * 60_000, key: 'ip' },
+        ],
+    })
+    async handleSignup(req: Request, res: Response): Promise<void> {
+        const body = req.body ?? {};
+        const is_temp = Boolean(body.is_temp);
+
+        // Bot honeypot — only applies to non-temp signups
+        if (
+            !is_temp &&
+            body.p102xyzname !== '' &&
+            body.p102xyzname !== undefined
+        ) {
+            res.json({});
+            return;
+        }
+
+        // Optional device signal (browser fingerprint hash). Core only enforces
+        // shape and forwards the value verbatim — signup-abuse policy built on it
+        // lives in extensions. Checked before the reauth short-circuit so a
+        // malformed value is rejected on every /signup path.
+        if (body.fingerprint !== undefined && body.fingerprint !== null) {
+            if (typeof body.fingerprint !== 'string')
+                throw new HttpError(400, 'fingerprint must be a string.', {
+                    legacyCode: 'bad_request',
+                });
+            if (body.fingerprint.length > FINGERPRINT_MAX_LENGTH)
+                throw new HttpError(
+                    400,
+                    `fingerprint cannot be longer than ${FINGERPRINT_MAX_LENGTH} characters.`,
+                    { legacyCode: 'bad_request' },
+                );
+        }
+        // Empty strings are treated as absent — a signal that wasn't
+        // collected, not a malformed request.
+        const fingerprint: string | null = body.fingerprint || null;
+
+        // Temp-user reauth short-circuit: when an existing temp user is
+        // forced through the reauth flow, the GUI re-submits /signup with
+        // is_temp=true plus the server-signed reauth_token from the 401.
+        // Verifying the token (not a raw auth_id) means a leaked uuid alone
+        // can't re-attach a session to someone else's temp account. Only a
+        // session that expired can be re-attached; a revoked one stays ended.
+        // Permanent users must go through /login (they have credentials),
+        // so we reject that path here.
+        if (
+            is_temp &&
+            body.reauth_token !== undefined &&
+            body.reauth_token !== null
+        ) {
+            const claims = this.#verifySuppliedReauthToken(body.reauth_token);
+            if (!claims) {
+                throw new HttpError(400, 'Invalid `reauth_token`.', {
+                    legacyCode: 'bad_request',
+                });
+            }
+            const { authId: reauthAuthId, reason } = claims;
+            if (reason !== 'session_expired') {
+                throw new HttpError(
+                    401,
+                    'This session was signed out and cannot be restored.',
+                    { legacyCode: 'session_revoked' },
+                );
+            }
+            await this.#checkAuthIdRateLimit(req);
+            const existing = await this.stores.user.getByUuid(reauthAuthId);
+            if (!existing) {
+                throw new HttpError(404, 'auth_id not found.', {
+                    legacyCode: 'not_found',
+                });
+            }
+            if (existing.password !== null || existing.email !== null) {
+                throw new HttpError(
+                    400,
+                    'auth_id resolves to a non-temp account; use /login instead.',
+                    { legacyCode: 'bad_request' },
+                );
+            }
+            if (existing.suspended) {
+                throw new HttpError(401, 'This account is suspended.', {
+                    legacyCode: 'account_suspended',
+                });
+            }
+            await this.#completeLogin(req, res, existing);
+            return;
+        }
+
+        // Fill in temp user defaults
+        if (is_temp) {
+            body.username ??= await this.#generateTempUsername();
+            body.email ??= `${body.username}@gmail.com`;
+            body.password ??= uuidv4();
+        }
+
+        // Validation
+        if (!body.username)
+            throw new HttpError(400, 'Username is required', {
+                legacyCode: 'bad_request',
+            });
+        if (typeof body.username !== 'string')
+            throw new HttpError(400, 'username must be a string.', {
+                legacyCode: 'bad_request',
+            });
+        assertValidUsername(body.username);
+        if (!is_temp) {
+            if (!body.email)
+                throw new HttpError(400, 'Email is required', {
+                    legacyCode: 'bad_request',
+                });
+            if (typeof body.email !== 'string')
+                throw new HttpError(400, 'email must be a string.', {
+                    legacyCode: 'bad_request',
+                });
+            if (!isStorableEmail(body.email))
+                throw new HttpError(
+                    400,
+                    'Please enter a valid email address.',
+                    { legacyCode: 'bad_request' },
+                );
+            await this.services.signup.validateEmail(body.email);
+            if (!body.password)
+                throw new HttpError(400, 'Password is required', {
+                    legacyCode: 'bad_request',
+                });
+            if (typeof body.password !== 'string')
+                throw new HttpError(400, 'password must be a string.', {
+                    legacyCode: 'bad_request',
+                });
+            const minLen = this.config.min_pass_length || 6;
+            if (body.password.length < minLen) {
+                throw new HttpError(
+                    400,
+                    `Password must be at least ${minLen} characters long.`,
+                    { legacyCode: 'bad_request' },
+                );
+            }
+        }
+
+        // Only the shape is judged here; whether the code is honored is up to
+        // `puter.signup-bonus.validate`, after the abuse checks below.
+        let bonusCode: string | null = null;
+        if (!is_temp && !isAbsentBonusCode(body.bonusCode)) {
+            if (typeof body.bonusCode !== 'string')
+                throw new HttpError(400, 'bonusCode must be a string.', {
+                    legacyCode: 'bad_request',
+                });
+            bonusCode = normalizeBonusCode(body.bonusCode);
+            if (!bonusCode) throw bonusCodeInvalidError();
+        }
+
+        const user = await this.services.signup.signup({
+            req,
+            body,
+            isTemp: is_temp,
+            fingerprint,
+            bonusCode,
+        });
+        await this.#completeLogin(req, res, user);
+    }
+
+    /**
+     * Preview a signup bonus code before the account exists, so the signup form
+     * can say what it grants. Answers only valid/invalid: an extension owns the
+     * codes, and with none installed every code is invalid.
+     */
+    @Post('/signup/bonus-code/check', {
+        rateLimit: [
+            { scope: 'signup-bonus-check', limit: 20, window: 15 * 60_000 },
+            {
+                scope: 'signup-bonus-check-ip',
+                limit: 60,
+                window: 15 * 60_000,
+                key: 'ip',
+            },
+        ],
+    })
+    async handleSignupBonusCheck(req: Request, res: Response): Promise<void> {
+        const raw = req.body?.bonusCode;
+        if (typeof raw !== 'string')
+            throw new HttpError(400, 'bonusCode must be a string.', {
+                legacyCode: 'bad_request',
+            });
+        const code = normalizeBonusCode(raw);
+        if (!code) {
+            res.json({ valid: false });
+            return;
+        }
+
+        const fingerprint =
+            typeof req.body?.fingerprint === 'string' &&
+            req.body.fingerprint.length <= FINGERPRINT_MAX_LENGTH
+                ? req.body.fingerprint
+                : null;
+        const checkEvent = await checkSignupBonus(this.clients.event, code, {
+            ip: (req.ip || req.socket?.remoteAddress || null) as string | null,
+            fingerprint,
+        });
+
+        if (checkEvent.valid !== true || !checkEvent.display) {
+            res.json({
+                valid: false,
+                ...(checkEvent.reason ? { reason: checkEvent.reason } : {}),
+            });
+            return;
+        }
+        res.json({
+            valid: true,
+            display: {
+                title: String(checkEvent.display.title),
+                description: String(checkEvent.display.description),
+            },
+            requirements: {
+                phone: checkEvent.requirements?.phone === true,
+                card: checkEvent.requirements?.card === true,
+            },
+        });
+    }
+
+    // -- Logout ------------------------------------------------------
+
+    @Post('/logout', {
+        requireUserActor: true,
+        allowUnconfirmed: true,
+        antiCsrf: true,
+        rateLimit: SESSION_LIMIT,
+    })
+    async handleLogout(req: Request, res: Response): Promise<void> {
+        // Clear the session cookie + `puter_token_v2`. Nothing issues the
+        // latter any more (it came from the retired token migration), but
+        // authProbe still reads it as a fallback, so a value left in a
+        // browser would re-authenticate the next request.
+        res.clearCookie(this.config.cookie_name ?? 'puter_token');
+        res.clearCookie('puter_token_v2');
+        // Drop any step-up elevation too, so it can't reactivate on a shared
+        // machine.
+        res.clearCookie(STEP_UP_COOKIE_NAME, {
+            ...(this.config.domain ? { domain: this.config.domain } : {}),
+        });
+
+        // Remove the session (fire-and-forget)
+        if (req.token) {
+            this.services.auth.removeSessionByToken(req.token).catch(() => {});
+        }
+
+        // Delete temp users (no password + no email). Full cascade —
+        // same path as /user-protected/delete-own-user — so we don't
+        // orphan fsentries/sessions/permissions.
+        if (req.actor?.user && !req.actor.user.email) {
+            const user = await this.stores.user.getByUuid(
+                req.actor.user.uuid as string,
+            );
+            if (user && user.password === null && user.email === null) {
+                this.#cascadeDeleteUser(user.id).catch((e) => {
+                    console.warn('[logout] temp-user cleanup failed:', e);
+                });
+            }
+        }
+
+        res.send('logged out');
+    }
+
+    // -- Email confirmation ------------------------------------------
+
+    @Post('/send-confirm-email', {
+        subdomain: ['api', ''],
+        requireUserActor: true,
+        allowUnconfirmed: true,
+        rateLimit: {
+            scope: 'send-confirm-email',
+            limit: 10,
+            window: 60 * 60_000,
+            key: 'user',
+        },
+    })
+    async handleSendConfirmEmail(req: Request, res: Response): Promise<void> {
+        const user = await this.stores.user.getById(req.actor!.user.id!, {
+            force: true,
+        });
+        if (!user)
+            throw new HttpError(404, 'User not found.', {
+                legacyCode: 'user_not_found' as never,
+            });
+        if (user.suspended)
+            throw new HttpError(403, 'Account suspended.', {
+                legacyCode: 'account_suspended',
+            });
+        if (!user.email)
+            throw new HttpError(400, 'No email on file.', {
+                legacyCode: 'bad_request',
+            });
+
+        const code = String(crypto.randomInt(100000, 1000000));
+        await this.stores.user.update(user.id, {
+            email_confirm_code: code,
+        });
+
+        await this.services.signup.sendConfirmationEmail(user, 'resend', {
+            code,
+        });
+        res.json({});
+    }
+
+    @Post('/confirm-email', {
+        subdomain: ['api', ''],
+        requireUserActor: true,
+        allowUnconfirmed: true,
+        rateLimit: {
+            scope: 'confirm-email',
+            limit: 10,
+            window: 10 * 60_000,
+            key: 'user',
+        },
+    })
+    async handleConfirmEmail(req: Request, res: Response): Promise<void> {
+        const { code, original_client_socket_id } = req.body ?? {};
+        if (!code)
+            throw new HttpError(400, 'Missing `code`.', {
+                legacyCode: 'bad_request',
+            });
+
+        const user = await this.stores.user.getById(req.actor!.user.id!, {
+            force: true,
+        });
+        if (!user)
+            throw new HttpError(404, 'User not found.', {
+                legacyCode: 'not_found',
+            });
+        if (user.email_confirmed) {
+            res.json({
+                email_confirmed: true,
+                original_client_socket_id,
+            });
+            return;
+        }
+        // Reject before comparing when no code is stored: `String(null)` would
+        // otherwise equal a submitted `"null"` and confirm the email without
+        // the real code.
+        if (
+            !user.email_confirm_code ||
+            String(user.email_confirm_code) !== String(code)
+        ) {
+            res.json({
+                email_confirmed: false,
+                original_client_socket_id,
+            });
+            return;
+        }
+
+        await this.services.signup.confirmEmail(user, {
+            originalClientSocketId: original_client_socket_id,
+        });
+
+        res.json({ email_confirmed: true, original_client_socket_id });
+    }
+
+    // -- Phone verification (SMS via Prelude) ------------------------
+
+    /**
+     * Build the error thrown when a verification SMS can't be sent (a delivery
+     * failure, or a refused/blocked send). Mints a short `error_id`, writes a
+     * single greppable line tying that id to the real reason (so support can
+     * look it up in CloudWatch with the id the user quotes), stores the same
+     * record in KV under `sms-send-error:<error_id>` for a week (the admin
+     * abuse page looks it up there without needing log access), and returns the
+     * `HttpError` with the id attached as `error_id` for the GUI to surface.
+     * The phone number is deliberately omitted from the log line and the KV
+     * record (PII); the user + country are enough to correlate.
+     */
+    private async smsSendError(
+        statusCode: number,
+        clientMessage: string,
+        reason: string,
+        ctx: {
+            userId?: number;
+            userUid?: string;
+            country?: string;
+            detail?: unknown;
+        },
+        options: HttpErrorOptions = {},
+    ): Promise<HttpError> {
+        const errorId = uuidv4();
+        const detail =
+            ctx.detail instanceof Error ? ctx.detail.message : ctx.detail;
+        console.warn(
+            `[send-confirm-phone] send_failed error_id=${errorId} ` +
+                `reason=${reason} status=${statusCode} ` +
+                `user_id=${ctx.userId ?? ''} user_uid=${ctx.userUid ?? ''} ` +
+                `country=${ctx.country ?? ''}` +
+                (detail ? ` detail=${JSON.stringify(String(detail))}` : ''),
+        );
+        // Best-effort: the record backs a support lookup, so a KV failure
+        // must never mask the error actually being reported.
+        try {
+            const now = Math.floor(Date.now() / 1000);
+            await this.stores.kv.set({
+                key: `sms-send-error:${errorId}`,
+                value: {
+                    reason,
+                    status: statusCode,
+                    user_id: ctx.userId ?? null,
+                    user_uid: ctx.userUid ?? null,
+                    country: ctx.country ?? null,
+                    detail: detail != null ? String(detail) : null,
+                    t: now,
+                },
+                expireAt: now + SMS_SEND_ERROR_TTL_SECONDS,
+            });
+        } catch (e) {
+            console.warn('[send-confirm-phone] error-record store failed:', e);
+        }
+        return new HttpError(statusCode, clientMessage, {
+            ...options,
+            fields: { ...options.fields, error_id: errorId },
+        });
+    }
+
+    // -- SMS-to-card fallback -----------------------------------------
+    //
+    // Once a user has used up their SMS send attempts for the window without
+    // getting through, they can verify a card instead to clear the phone gate.
+    // On wherever both gates work unless config opts out. The rule itself lives
+    // in ../../util/cardFallback.ts, because /whoami answers the same question.
+    //
+    // Two KV keys: a short-lived counter tied to the send rate-limit window
+    // triggers the fallback, and a longer-lived "open" flag holds eligibility
+    // once the threshold is crossed. The card endpoints check only the flag —
+    // deriving eligibility from the raw counter would let it expire while the
+    // user is mid-way through the card flow. Every KV failure fails closed
+    // (fallback unavailable), never open.
+
+    // TTL ties the counter to the send rate-limit window, so it resets with it.
+    private async bumpPhoneAttempts(userId: number): Promise<number> {
+        try {
+            const { res } = await this.stores.kv.incr({
+                key: phoneAttemptsKey(userId),
+                pathAndAmountMap: { attempts: 1 },
+                expireAt:
+                    Math.floor(Date.now() / 1000) +
+                    SEND_PHONE_RATE_WINDOW_MS / 1000,
+            });
+            const count = (res as { attempts?: number } | null)?.attempts;
+            return typeof count === 'number' ? count : 0;
+        } catch (e) {
+            console.warn('[send-confirm-phone] attempt-count bump failed:', e);
+            return 0;
+        }
+    }
+
+    /**
+     * Count a send attempt and, once the threshold is crossed, stamp the
+     * eligibility flag the card endpoints check. Returns whether the fallback
+     * is open so send responses (success or 429) can advertise it.
+     */
+    private async recordPhoneAttemptForFallback(user: {
+        id: number;
+        requires_phone_verification?: boolean | number | null;
+    }): Promise<boolean> {
+        const attempts = await this.bumpPhoneAttempts(user.id);
+        if (attempts < cardFallbackAfterAttempts(this.config)) return false;
+        return this.openCardFallback(user);
+    }
+
+    /**
+     * Stamp the eligibility flag the card endpoints check, when the user is
+     * phone-gated and the fallback is on. Returns whether it is now open.
+     */
+    private async openCardFallback(user: {
+        id: number;
+        requires_phone_verification?: boolean | number | null;
+    }): Promise<boolean> {
+        if (!user.requires_phone_verification) return false;
+        const deps = this.cardFallbackDeps();
+        if (!(await isCardFallbackEnabled(this.config, deps))) return false;
+        try {
+            // Plain set, so each eligible attempt refreshes the window.
+            await this.stores.kv.set({
+                key: cardFallbackFlagKey(user.id),
+                value: true,
+                expireAt:
+                    Math.floor(Date.now() / 1000) +
+                    CARD_FALLBACK_OPEN_TTL_SECONDS,
+            });
+            return true;
+        } catch (e) {
+            console.warn('[send-confirm-phone] fallback flag stamp failed:', e);
+            return false;
+        }
+    }
+
+    private async isCardFallbackEligible(user: {
+        id: number;
+        requires_phone_verification?: boolean | number | null;
+    }): Promise<boolean> {
+        return isCardFallbackEligible(
+            this.config,
+            user,
+            async (key) => (await this.stores.kv.get({ key })).res,
+            this.cardFallbackDeps(),
+        );
+    }
+
+    /**
+     * The two facts the fallback's default rests on: SMS can only work with a
+     * provider configured, and the card gate belongs to an extension, so the
+     * only honest way to ask whether it is on is to ask that extension. Nothing
+     * is listening on a stock build, which reads as "no card gate".
+     */
+    private cardFallbackDeps(): CardFallbackDeps {
+        return cardFallbackDepsFrom(this.clients);
+    }
+
+    @Post('/send-confirm-phone', {
+        subdomain: ['api', ''],
+        requireUserActor: true,
+        allowUnconfirmed: true,
+        rateLimit: {
+            scope: 'send-confirm-phone',
+            limit: SEND_PHONE_RATE_LIMIT,
+            window: SEND_PHONE_RATE_WINDOW_MS,
+            key: 'user',
+        },
+    })
+    async handleSendConfirmPhone(req: Request, res: Response): Promise<void> {
+        const user = await this.stores.user.getById(req.actor!.user.id!, {
+            force: true,
+        });
+        if (!user)
+            throw new HttpError(404, 'User not found.', {
+                legacyCode: 'user_not_found' as never,
+            });
+        if (user.suspended)
+            throw new HttpError(403, 'Account suspended.', {
+                legacyCode: 'account_suspended',
+            });
+        if (!this.clients.prelude?.isConfigured())
+            throw await this.smsSendError(
+                503,
+                'Phone verification is unavailable.',
+                'prelude_not_configured',
+                { userId: user.id, userUid: user.uuid },
+                { legacyCode: 'service_unavailable' as never },
+            );
+
+        // Parse to E.164 (Prelude's required form + the stored form) and the
+        // country, so we can apply the per-country cost cap.
+        const parsed = parsePhone(
+            req.body?.phone,
+            this.clients.prelude.defaultCountry,
+        );
+        if (!parsed)
+            throw new HttpError(400, 'Invalid phone number.', {
+                legacyCode: 'bad_request',
+            });
+
+        // Optional Prelude dispatch id (browser signals gathered by the JS
+        // Signals SDK on the number-entry page). Shape-checked and forwarded
+        // verbatim to Prelude; an empty / oversized / non-string value is just
+        // dropped so a bad client signal never blocks a real verification.
+        const rawDispatchId = req.body?.dispatch_id;
+        const dispatchId =
+            typeof rawDispatchId === 'string' &&
+            rawDispatchId.length > 0 &&
+            rawDispatchId.length <= DISPATCH_ID_MAX_LENGTH
+                ? rawDispatchId
+                : undefined;
+
+        // Cost cap: skip countries with no SMS channel or rates above the cap
+        // (see PreludeClient / countries.ts). Avoids paying exorbitant per-SMS
+        // rates in low-revenue, high-fraud geographies.
+        if (!this.clients.prelude.isCountrySupported(parsed.country))
+            throw await this.smsSendError(
+                400,
+                'Phone verification is not available for this country.',
+                'country_not_supported',
+                {
+                    userId: user.id,
+                    userUid: user.uuid,
+                    country: parsed.country,
+                },
+                { legacyCode: 'phone_country_not_supported' as never },
+            );
+
+        // Counted before the abuse / Prelude checks so a blocked attempt still
+        // counts toward the fallback threshold.
+        const fallbackAvailable =
+            await this.recordPhoneAttemptForFallback(user);
+        const fallbackFields = fallbackAvailable
+            ? { card_fallback_available: true }
+            : {};
+
+        // Abuse caps live ENTIRELY in a listening abuse extension, consulted
+        // via `puter.phone-verification.check`. The backend ships no thresholds
+        // or detection of its own (so none of it is readable in the open-source
+        // repo): it forwards the user / number / ip, and the extension decides
+        // `allowed` plus an opaque `reason` (per-account + per-number send
+        // velocity, cross-account reuse, …). With no extension listening
+        // `allowed` stays true. Fail-open on a hook error — this is abuse/cost
+        // control, not a security boundary (the route rate limit and the country
+        // cost cap remain), so a flaky hook must not lock signups out.
+        const abuseCheck = {
+            user_id: user.id,
+            user_uid: user.uuid,
+            phone: parsed.e164,
+            device_fingerprint: req.deviceFingerprint ?? null,
+            allowed: true,
+            reason: null as string | null,
+            card_fallback_instead: false,
+        };
+        try {
+            await this.clients.event?.emitAndWait(
+                'puter.phone-verification.check',
+                abuseCheck,
+                {},
+            );
+        } catch (e) {
+            console.warn('[send-confirm-phone] abuse-check hook failed:', e);
+        }
+        // A veto that routes to the card fallback needs the fallback to exist;
+        // without it there is nothing to offer, so the send goes ahead.
+        let vetoFallbackFields = fallbackFields;
+        if (abuseCheck.allowed === false && abuseCheck.card_fallback_instead) {
+            if (await this.openCardFallback(user))
+                vetoFallbackFields = { card_fallback_available: true };
+            else abuseCheck.allowed = true;
+        }
+        // Forward the verdict verbatim: a generic 429 plus the opaque reason for
+        // the client to message on. The backend never interprets the reason —
+        // its meaning lives in the extension (which sets it) and the GUI (which
+        // displays it), so no abuse semantics leak into the OSS repo.
+        if (abuseCheck.allowed === false)
+            throw await this.smsSendError(
+                429,
+                'Phone verification is unavailable for this number right now.',
+                `not_allowed:${abuseCheck.reason ?? 'unspecified'}`,
+                {
+                    userId: user.id,
+                    userUid: user.uuid,
+                    country: parsed.country,
+                },
+                {
+                    legacyCode: 'phone_verification_unavailable' as never,
+                    fields: {
+                        ...vetoFallbackFields,
+                        ...(abuseCheck.reason
+                            ? { reason: abuseCheck.reason }
+                            : {}),
+                    },
+                },
+            );
+
+        // Stage the parsed number as pending in KV (NOT on the user row) so a
+        // never-confirmed number is never written to the indexed `phone`
+        // column. /confirm-phone reads it back and persists it to the row only
+        // once Prelude confirms the code. ~1h TTL covers the code's lifetime.
+        // Stored before the send so we never dispatch an SMS we couldn't later
+        // confirm against.
+        const pendingPhoneKey = `phone-verify-pending:${user.id}`;
+        try {
+            await this.stores.kv.set({
+                key: pendingPhoneKey,
+                value: parsed.e164,
+                expireAt: Math.floor(Date.now() / 1000) + 60 * 60,
+            });
+        } catch (e) {
+            throw await this.smsSendError(
+                503,
+                'Could not start phone verification.',
+                'pending_store_failed',
+                {
+                    userId: user.id,
+                    userUid: user.uuid,
+                    country: parsed.country,
+                    detail: e,
+                },
+                { legacyCode: 'service_unavailable' as never },
+            );
+        }
+
+        const ip = req.ip || req.socket?.remoteAddress || undefined;
+        const userAgent =
+            typeof req.headers['user-agent'] === 'string'
+                ? req.headers['user-agent']
+                : undefined;
+        // First entry of Prelude's delivery sequence — where the code actually
+        // went. Returned to the client so it can point the user at the right
+        // app (e.g. "check WhatsApp" instead of "check your texts").
+        let deliveryChannel: string | undefined;
+        try {
+            const result = await this.clients.prelude.createVerification(
+                parsed.e164,
+                {
+                    ip,
+                    device_id: req.deviceFingerprint ?? undefined,
+                    user_agent: userAgent,
+                    dispatch_id: dispatchId,
+                },
+            );
+            deliveryChannel = result.channels?.[0];
+            // Prelude rejected the attempt as abusive — surface as rate-limit.
+            if (
+                result.status === 'blocked' ||
+                result.status === 'shadow_blocked'
+            ) {
+                throw await this.smsSendError(
+                    429,
+                    'Phone verification is temporarily unavailable for this number.',
+                    `prelude_${result.status}`,
+                    {
+                        userId: user.id,
+                        userUid: user.uuid,
+                        country: parsed.country,
+                    },
+                    {
+                        legacyCode: 'too_many_requests' as never,
+                        fields: fallbackFields,
+                    },
+                );
+            }
+        } catch (e) {
+            if (e instanceof HttpError) throw e;
+            throw await this.smsSendError(
+                502,
+                'Could not send verification code.',
+                'prelude_request_failed',
+                {
+                    userId: user.id,
+                    userUid: user.uuid,
+                    country: parsed.country,
+                    detail: e,
+                },
+                { legacyCode: 'upstream_error' as never },
+            );
+        }
+
+        // Tell the abuse extension a code was actually sent, so it can bump its
+        // send-velocity counters (per number + per account). Fire-and-forget;
+        // the backend keeps no send counts of its own. Only reached after a
+        // successful send, so an upstream error never burns quota.
+        try {
+            this.clients.event?.emit(
+                'puter.phone-verification.sent' as never,
+                {
+                    user_id: user.id,
+                    user_uid: user.uuid,
+                    phone: parsed.e164,
+                    device_fingerprint: req.deviceFingerprint ?? null,
+                    dispatch_id: dispatchId ?? null,
+                } as never,
+                {},
+            );
+        } catch {
+            // ignore — best-effort velocity signal
+        }
+        res.json({
+            ...fallbackFields,
+            ...(deliveryChannel ? { channel: deliveryChannel } : {}),
+        });
+    }
+
+    @Post('/confirm-phone', {
+        subdomain: ['api', ''],
+        requireUserActor: true,
+        allowUnconfirmed: true,
+        rateLimit: {
+            scope: 'confirm-phone',
+            limit: 10,
+            window: 10 * 60_000,
+            key: 'user',
+        },
+    })
+    async handleConfirmPhone(req: Request, res: Response): Promise<void> {
+        const { code, original_client_socket_id } = req.body ?? {};
+        if (!code)
+            throw new HttpError(400, 'Missing `code`.', {
+                legacyCode: 'bad_request',
+            });
+
+        const user = await this.stores.user.getById(req.actor!.user.id!, {
+            force: true,
+        });
+        if (!user)
+            throw new HttpError(404, 'User not found.', {
+                legacyCode: 'not_found',
+            });
+        // Both halves, as for the card: the flag being clear only says nobody
+        // asked. A route requiring a verified phone sends never-flagged users
+        // here with no number on file, and answering "already verified" on
+        // the flag alone would bounce them between a dialog that reports
+        // success and a route that keeps refusing.
+        if (hasVerifiedPhone(user)) {
+            res.json({ phone_verified: true, original_client_socket_id });
+            return;
+        }
+        // The number being verified is the one staged at send time (KV
+        // pending), not the user row — we don't persist an unverified number.
+        // Fall back to a row value for accounts that already have one on file
+        // (legacy / a number persisted by a prior verified flow).
+        const pendingPhoneKey = `phone-verify-pending:${user.id}`;
+        let pendingPhone: string | null = null;
+        try {
+            const { res: staged } = await this.stores.kv.get({
+                key: pendingPhoneKey,
+            });
+            if (typeof staged === 'string' && staged) pendingPhone = staged;
+        } catch (e) {
+            console.warn('[confirm-phone] pending read failed:', e);
+        }
+        if (!pendingPhone) pendingPhone = user.phone ?? null;
+        if (!pendingPhone)
+            throw new HttpError(
+                400,
+                'No phone number on file. Request a code first.',
+                { legacyCode: 'bad_request' },
+            );
+        if (!this.clients.prelude?.isConfigured())
+            throw new HttpError(503, 'Phone verification is unavailable.', {
+                legacyCode: 'service_unavailable' as never,
+            });
+
+        let status;
+        try {
+            ({ status } = await this.clients.prelude.checkVerification(
+                pendingPhone,
+                String(code),
+            ));
+        } catch (e) {
+            console.warn('[confirm-phone] checkVerification failed:', e);
+            throw new HttpError(502, 'Could not verify code.', {
+                legacyCode: 'upstream_error' as never,
+            });
+        }
+
+        if (status !== 'success') {
+            res.json({ phone_verified: false, original_client_socket_id });
+            return;
+        }
+
+        // Verified — persist the number now (and only now) and clear the gate.
+        await this.stores.user.update(user.id, {
+            requires_phone_verification: 0,
+            phone: pendingPhone,
+        });
+
+        // Run the verified-event listeners synchronously (emitAndWait, not
+        // fire-and-forget emit) so a carrier-based card-verification waiver in
+        // the abuse extension lands BEFORE we broadcast "refresh" and respond —
+        // otherwise the client re-fetches and still sees the card gate. Load-
+        // bearing now; emitAndWait swallows listener errors, so this stays
+        // best-effort and never blocks confirm on a listener.
+        try {
+            await this.clients.event?.emitAndWait(
+                'user.phone-verified' as never,
+                {
+                    user_id: user.id,
+                    user_uid: user.uuid,
+                    phone: pendingPhone,
+                } as never,
+                {},
+            );
+        } catch {
+            // ignore — listeners are best-effort
+        }
+        // Notify other tabs/devices for this user so they refresh + drop the gate.
+        try {
+            await this.services.socket?.send(
+                { room: user.id },
+                'user.phone_verified',
+                { original_client_socket_id },
+            );
+        } catch {
+            // ignore — best-effort
+        }
+
+        res.json({ phone_verified: true, original_client_socket_id });
+    }
+
+    // -- Card verification ($0 auth via a payments extension) --------
+
+    /**
+     * Start card verification for the calling user. Pure mechanism: the
+     * endpoint emits `puter.card-verification.setup` and a payments extension
+     * fills in the client credentials — the OSS backend holds no provider
+     * knowledge or config. Phone verification (when required) must be completed
+     * first; the ordering is enforced here so a client can't skip the cheaper
+     * gate.
+     */
+    @Post('/card-verification/setup', {
+        subdomain: ['api', ''],
+        requireUserActor: true,
+        allowUnconfirmed: true,
+        rateLimit: {
+            scope: 'card-verification-setup',
+            limit: 5,
+            window: 60 * 60_000,
+            key: 'user',
+        },
+    })
+    async handleCardVerificationSetup(
+        req: Request,
+        res: Response,
+    ): Promise<void> {
+        const user = await this.stores.user.getById(req.actor!.user.id!, {
+            force: true,
+        });
+        if (!user)
+            throw new HttpError(404, 'User not found.', {
+                legacyCode: 'user_not_found' as never,
+            });
+        if (user.suspended)
+            throw new HttpError(403, 'Account suspended.', {
+                legacyCode: 'account_suspended',
+            });
+        // Phone normally comes first, but the fallback lets a phone-gated user
+        // in once they've exhausted SMS attempts.
+        const fallbackEligible = await this.isCardFallbackEligible(user);
+        // A free trial may ask for a card of its own even when one is already
+        // verified, so it doesn't stop here.
+        const purpose = req.body?.purpose === 'trial' ? 'trial' : null;
+        if (hasVerifiedCard(user) && !fallbackEligible && purpose !== 'trial') {
+            res.json({ card_verified: true });
+            return;
+        }
+        if (user.requires_phone_verification && !fallbackEligible)
+            throw new HttpError(
+                409,
+                'Phone verification must be completed first.',
+                { legacyCode: 'conflict' },
+            );
+
+        // `enabled` stays null when no extension is listening; an installed
+        // extension always sets it (true/false) before doing any work.
+        const setupEvent = {
+            user_id: user.id,
+            email: user.email!,
+            user_uid: user.uuid,
+            ip: (req.ip || req.socket?.remoteAddress || null) as string | null,
+            device_fingerprint: req.deviceFingerprint ?? null,
+            purpose,
+            enabled: null as boolean | null,
+            allowed: true,
+            reason: null as string | null,
+            client_secret: null as string | null,
+            publishable_key: null as string | null,
+        };
+        try {
+            await this.clients.event?.emitAndWait(
+                'puter.card-verification.setup',
+                setupEvent,
+                {},
+            );
+        } catch (e) {
+            console.warn('[card-verification/setup] setup hook failed:', e);
+        }
+
+        // Abuse veto (e.g. per-device setup-velocity cap): the extension refused
+        // before any Stripe work. Forward the opaque reason verbatim as a 429,
+        // same as the phone gate — the backend never interprets it.
+        if (setupEvent.allowed === false)
+            throw new HttpError(
+                429,
+                'Card verification is unavailable right now.',
+                {
+                    legacyCode: 'too_many_requests' as never,
+                    fields: setupEvent.reason
+                        ? { reason: setupEvent.reason }
+                        : {},
+                },
+            );
+
+        // Kill switch: the extension reports the feature disabled — unstick
+        // any user still carrying the flag instead of dead-ending them.
+        if (setupEvent.enabled === false) {
+            // A fallback user is here BECAUSE SMS isn't working for them, and
+            // now the card path is off too — they stay phone-gated with no
+            // way through. Surface it; don't clear a gate with nothing
+            // verified.
+            if (fallbackEligible)
+                console.warn(
+                    '[card-verification/setup] card verification disabled;' +
+                        ` fallback-eligible user ${user.uuid} remains` +
+                        ' phone-gated with no working verification path',
+                );
+            await this.stores.user.update(user.id, {
+                requires_card_verification: 0,
+            });
+            res.json({ card_verified: true, disabled: true });
+            return;
+        }
+        if (!setupEvent.client_secret || !setupEvent.publishable_key)
+            throw new HttpError(503, 'Card verification is not available.', {
+                legacyCode: 'service_unavailable' as never,
+            });
+
+        res.json({
+            client_secret: setupEvent.client_secret,
+            publishable_key: setupEvent.publishable_key,
+        });
+    }
+
+    /**
+     * Complete card verification. The client confirms the setup intent with the
+     * payment provider directly, then posts the resulting id here; the payments
+     * extension checks it (and applies its own abuse limits) via
+     * `puter.card-verification.confirm`. On success the gate clears exactly
+     * like `/confirm-phone` clears the phone gate.
+     */
+    @Post('/card-verification/confirm', {
+        subdomain: ['api', ''],
+        requireUserActor: true,
+        allowUnconfirmed: true,
+        rateLimit: {
+            scope: 'card-verification-confirm',
+            limit: 10,
+            window: 10 * 60_000,
+            key: 'user',
+        },
+    })
+    async handleCardVerificationConfirm(
+        req: Request,
+        res: Response,
+    ): Promise<void> {
+        const { setup_intent_id, original_client_socket_id } = req.body ?? {};
+        if (
+            typeof setup_intent_id !== 'string' ||
+            setup_intent_id.length === 0 ||
+            setup_intent_id.length > 255
+        )
+            throw new HttpError(400, 'Invalid `setup_intent_id`.', {
+                legacyCode: 'bad_request',
+            });
+
+        const user = await this.stores.user.getById(req.actor!.user.id!, {
+            force: true,
+        });
+        if (!user)
+            throw new HttpError(404, 'User not found.', {
+                legacyCode: 'not_found',
+            });
+        // Same fallback exception as setup: card may come before phone.
+        const fallbackEligible = await this.isCardFallbackEligible(user);
+        if (hasVerifiedCard(user) && !fallbackEligible) {
+            res.json({ card_verified: true });
+            return;
+        }
+        if (user.requires_phone_verification && !fallbackEligible)
+            throw new HttpError(
+                409,
+                'Phone verification must be completed first.',
+                { legacyCode: 'conflict' },
+            );
+
+        const confirmEvent = {
+            user_id: user.id,
+            user_uid: user.uuid,
+            email: user.email!,
+            setup_intent_id,
+            enabled: null as boolean | null,
+            verified: false,
+            reason: null as string | null,
+            fingerprint: null as string | null,
+            funding: null as string | null,
+            country: null as string | null,
+            customer_id: null as string | null,
+        };
+        try {
+            await this.clients.event?.emitAndWait(
+                'puter.card-verification.confirm',
+                confirmEvent,
+                {},
+            );
+        } catch (e) {
+            console.warn('[card-verification/confirm] confirm hook failed:', e);
+        }
+
+        // Kill switch — same semantics as /card-verification/setup.
+        if (confirmEvent.enabled === false) {
+            if (fallbackEligible)
+                console.warn(
+                    '[card-verification/confirm] card verification disabled;' +
+                        ` fallback-eligible user ${user.uuid} remains` +
+                        ' phone-gated with no working verification path',
+                );
+            await this.stores.user.update(user.id, {
+                requires_card_verification: 0,
+            });
+            res.json({ card_verified: true, disabled: true });
+            return;
+        }
+        // No extension listening — nothing could have verified anything.
+        if (confirmEvent.enabled === null)
+            throw new HttpError(503, 'Card verification is not available.', {
+                legacyCode: 'service_unavailable' as never,
+            });
+
+        if (confirmEvent.verified !== true) {
+            res.json({ card_verified: false, reason: confirmEvent.reason });
+            return;
+        }
+
+        // A fallback card clears the phone gate too — the point of the
+        // fallback. `fallbackEligible &&` makes the invariant local instead
+        // of leaning on the 409 guard above: only a fallback user's card can
+        // ever clear a phone gate.
+        const clearedPhoneGate =
+            fallbackEligible && Boolean(user.requires_phone_verification);
+        await this.stores.user.update(user.id, {
+            requires_card_verification: 0,
+            ...(clearedPhoneGate ? { requires_phone_verification: 0 } : {}),
+        });
+
+        // Awaited like `user.phone-verified`, so whatever a listener grants on
+        // verification is in place before the client refreshes. emitAndWait
+        // swallows listener errors, so confirm never fails on one.
+        try {
+            await this.clients.event?.emitAndWait(
+                'user.card-verified' as never,
+                {
+                    user_id: user.id,
+                    user_uid: user.uuid,
+                    fingerprint: confirmEvent.fingerprint,
+                    funding: confirmEvent.funding,
+                    country: confirmEvent.country,
+                    customer_id: confirmEvent.customer_id,
+                } as never,
+                {},
+            );
+        } catch {
+            // ignore — listeners are best-effort
+        }
+        // Notify other tabs/devices for this user so they refresh + drop the gate.
+        try {
+            await this.services.socket?.send(
+                { room: user.id },
+                'user.card_verified',
+                { original_client_socket_id },
+            );
+            // The fallback cleared the phone gate too — tell phone-gate UIs.
+            if (clearedPhoneGate)
+                await this.services.socket?.send(
+                    { room: user.id },
+                    'user.phone_verified',
+                    { original_client_socket_id },
+                );
+        } catch {
+            // ignore — best-effort
+        }
+
+        res.json({
+            card_verified: true,
+            ...(clearedPhoneGate ? { phone_verified: true } : {}),
+        });
+    }
+
+    // -- Password recovery -------------------------------------------
+
+    @Post('/send-pass-recovery-email', {
+        subdomain: ['api', ''],
+        captcha: true,
+        rateLimit: [
+            {
+                scope: 'send-pass-recovery-email',
+                limit: 10,
+                window: 60 * 60_000,
+            },
+            {
+                scope: 'send-pass-recovery-email-ip',
+                limit: 30,
+                window: 60 * 60_000,
+                key: 'ip',
+            },
+        ],
+    })
+    async handleSendPassRecoveryEmail(
+        req: Request,
+        res: Response,
+    ): Promise<void> {
+        const { username, email } = req.body ?? {};
+        if (!username && !email) {
+            throw new HttpError(400, 'username or email is required.', {
+                legacyCode: 'bad_request',
+            });
+        }
+
+        const genericMessage =
+            'If that account exists, a password recovery email was sent.';
+
+        let user;
+        if (username) {
+            user = await this.stores.user.getByUsername(username);
+        } else {
+            if (!isStorableEmail(email))
+                throw new HttpError(400, 'Invalid email.', {
+                    legacyCode: 'bad_request',
+                });
+            user = await this.stores.user.getByEmail(email);
+        }
+
+        // Same answer as any account, nothing sent, and the attempt alarms.
+        if (user && isBuiltInAdmin(user.username)) {
+            this.#adminRecoveryAttempted(req, user.username as string);
+            res.json({ message: genericMessage });
+            return;
+        }
+
+        if (!user || user.suspended || !user.email) {
+            res.json({ message: genericMessage });
+            return;
+        }
+
+        // A seat's address is admin-supplied and never verified, so whoever
+        // holds that inbox could take the seat over. Its recovery channel is
+        // the team admin's password reset, not this one.
+        if (await this.stores.team.getOrgSeat(user.id)) {
+            res.json({ message: genericMessage });
+            return;
+        }
+
+        // Per account, whoever asks. Over it, answer the same way and send
+        // nothing, so the limit doesn't reveal which accounts exist.
+        const { scope, limit, window } = PASS_RECOVERY_EMAIL_TARGET_LIMIT;
+        if (!(await checkRateLimit(`${scope}:${user.id}`, limit, window))) {
+            res.json({ message: genericMessage });
+            return;
+        }
+
+        // Reuse an outstanding token so a new send doesn't void a link already
+        // in the inbox. Each link still expires on its own.
+        let pass_recovery_token =
+            typeof user.pass_recovery_token === 'string'
+                ? user.pass_recovery_token
+                : null;
+        if (!pass_recovery_token) {
+            pass_recovery_token = uuidv4();
+            await this.stores.user.update(user.id, { pass_recovery_token });
+        }
+
+        const jwt = this.services.token.sign(
+            'otp',
+            {
+                token: pass_recovery_token,
+                user_uid: user.uuid,
+                email: user.email,
+                purpose: 'pass-recovery',
+            },
+            { expiresIn: '1h' },
+        );
+
+        const origin = this.config.origin ?? '';
+        const link = `${origin}/action/set-new-password?token=${encodeURIComponent(jwt)}`;
+
+        if (this.clients.email) {
+            try {
+                await this.clients.email.send(
+                    user.email,
+                    'email_password_recovery',
+                    { link },
+                );
+            } catch (e) {
+                console.warn('[send-pass-recovery-email] send failed:', e);
+            }
+        }
+
+        res.json({ message: genericMessage });
+    }
+
+    /**
+     * Pages on a recovery request for a built-in admin account. `dedup` per IP,
+     * so one source retrying is one incident.
+     */
+    #adminRecoveryAttempted(req: Request, target: string): void {
+        const ip = req.ip || req.socket?.remoteAddress || null;
+        try {
+            this.clients.alarm?.create(
+                `auth:admin-pass-recovery-attempt:${ip ?? 'unknown'}`,
+                'Password recovery requested for a built-in admin account',
+                {
+                    target,
+                    ip,
+                    user_agent: req.headers?.['user-agent'] ?? null,
+                    requester_uid: req.actor?.user?.uuid ?? null,
+                    requester_username: req.actor?.user?.username ?? null,
+                },
+                'critical',
+                { dedup: true },
+            );
+        } catch (e) {
+            console.warn('[send-pass-recovery-email] admin alarm failed:', e);
+        }
+    }
+
+    @Post('/verify-pass-recovery-token', {
+        subdomain: ['api', ''],
+        rateLimit: {
+            scope: 'verify-pass-recovery-token',
+            limit: 10,
+            window: 15 * 60_000,
+        },
+    })
+    async handleVerifyPassRecoveryToken(
+        req: Request,
+        res: Response,
+    ): Promise<void> {
+        const { token } = req.body ?? {};
+        if (!token)
+            throw new HttpError(400, 'Missing `token`.', {
+                legacyCode: 'token_missing' as never,
+            });
+
+        let decoded;
+        try {
+            decoded = this.services.token.verify<{
+                user_uid: string;
+                email: string;
+                exp: number;
+                purpose: string;
+            }>('otp', token);
+        } catch {
+            throw new HttpError(400, 'Invalid or expired token.', {
+                legacyCode: 'token_expired' as never,
+            });
+        }
+        if (decoded.purpose !== 'pass-recovery') {
+            throw new HttpError(400, 'Invalid or expired token.', {
+                legacyCode: 'token_expired' as never,
+            });
+        }
+
+        const user = await this.stores.user.getByUuid(decoded?.user_uid);
+        if (
+            !user ||
+            user.email !== decoded.email ||
+            isBuiltInAdmin(user.username)
+        ) {
+            throw new HttpError(400, 'Token is no longer valid.', {
+                legacyCode: 'bad_request',
+            });
+        }
+        if (user.suspended) {
+            throw new HttpError(401, 'This account is suspended.', {
+                legacyCode: 'account_suspended',
+            });
+        }
+
+        const exp = decoded.exp as number;
+        const time_remaining = exp
+            ? Math.max(0, exp - Math.floor(Date.now() / 1000))
+            : 0;
+        res.json({ time_remaining });
+    }
+
+    @Post('/set-pass-using-token', {
+        subdomain: ['api', ''],
+        rateLimit: {
+            scope: 'set-pass-using-token',
+            limit: 10,
+            window: 60 * 60_000,
+        },
+    })
+    async handleSetPassUsingToken(req: Request, res: Response): Promise<void> {
+        const { token, password } = req.body ?? {};
+        if (!token || !password) {
+            throw new HttpError(400, 'Missing `token` or `password`.', {
+                legacyCode: 'token_missing' as never,
+            });
+        }
+        const minLen = this.config.min_pass_length || 6;
+        if (password.length < minLen) {
+            throw new HttpError(
+                400,
+                `Password must be at least ${minLen} characters long.`,
+                { legacyCode: 'bad_request' },
+            );
+        }
+
+        let decoded;
+        try {
+            decoded = this.services.token.verify<{
+                user_uid: string;
+                email: string;
+                token: string;
+                purpose: string;
+            }>('otp', token);
+        } catch {
+            throw new HttpError(400, 'Invalid or expired token.', {
+                legacyCode: 'token_expired' as never,
+            });
+        }
+        if (decoded.purpose !== 'pass-recovery') {
+            throw new HttpError(400, 'Invalid or expired token.', {
+                legacyCode: 'token_expired' as never,
+            });
+        }
+
+        const user = await this.stores.user.getByUuid(decoded.user_uid);
+        if (
+            !user ||
+            user.email !== decoded.email ||
+            isBuiltInAdmin(user.username)
+        ) {
+            throw new HttpError(400, 'Token is no longer valid.', {
+                legacyCode: 'bad_request',
+            });
+        }
+        if (user.suspended) {
+            throw new HttpError(401, 'This account is suspended.', {
+                legacyCode: 'account_suspended',
+            });
+        }
+
+        // Atomic check: only update if the recovery token still matches
+        const password_hash = await bcrypt.hash(password, 8);
+        let result;
+        try {
+            result = await this.clients.db.write(
+                'UPDATE `user` SET `password` = ?, `pass_recovery_token` = NULL, `change_email_confirm_token` = NULL, ' +
+                    '`requires_password_change` = 0, `temp_password_expires_at` = NULL WHERE `id` = ? AND `pass_recovery_token` = ?',
+                [password_hash, user.id, decoded.token],
+            );
+        } catch (e) {
+            if (!isOwnedEmailConflict(e)) throw e;
+            // Recovery can be requested by username, so this row may be an
+            // unconfirmed placeholder that shares its address with a real
+            // account. Giving it a password would make it a second account able
+            // to drive recovery for that inbox, which is the thing the address
+            // constraint exists to stop. The inbox owner has an account
+            // already — they should be recovering that one.
+            throw new HttpError(
+                400,
+                'This email is already in use. Recover the account that uses it instead.',
+                { legacyCode: 'email_already_in_use' as never },
+            );
+        }
+        const affected =
+            (result as { affectedRows?: number; changes?: number })
+                ?.affectedRows ??
+            (result as { affectedRows?: number; changes?: number })?.changes ??
+            0;
+        if (affected === 0) {
+            throw new HttpError(400, 'Token has already been used.', {
+                legacyCode: 'bad_request',
+            });
+        }
+        await this.stores.user.invalidateById(user.id);
+        // Best effort: the password is already committed, and an audit write
+        // must not skip the eviction below.
+        await this.services.team
+            .recordPasswordSelfChange(user.id as number)
+            .catch((err: unknown) => {
+                console.warn('[team] password self-change audit failed:', err);
+            });
+
+        // A password reset is the "I think someone else has access" flow —
+        // evict every interactive session so a hijacked one doesn't survive.
+        await this.services.auth.revokeInteractiveSessionsForUserId(
+            user.id as number,
+        );
+
+        res.send('Password successfully updated.');
+    }
+
+    // -- User-protected mutations ------------------------------------
+
+    @Post('/user-protected/change-password', {
+        userProtected: true,
+        // The forced-change gate refuses everything else, so this is the one
+        // route an account owing a password change may reach.
+        allowUnconfirmed: true,
+        rateLimit: {
+            scope: 'passwd',
+            limit: 10,
+            window: 60 * 60_000,
+            key: 'user',
+        },
+    })
+    async handleChangePassword(req: Request, res: Response): Promise<void> {
+        const { new_pass } = req.body ?? {};
+        if (!new_pass)
+            throw new HttpError(400, 'Missing `new_pass`.', {
+                legacyCode: 'bad_request',
+            });
+        const minLen = this.config.min_pass_length || 6;
+        if (new_pass.length < minLen) {
+            throw new HttpError(
+                400,
+                `Password must be at least ${minLen} characters long.`,
+                { legacyCode: 'bad_request' },
+            );
+        }
+
+        const user = req.userProtected!.user;
+
+        const password_hash = await bcrypt.hash(new_pass, 8);
+        // Clearing the forced-change gate is what lets a team seat back
+        // in; nothing else writes these two columns to their cleared state.
+        await this.stores.user.update(user.id, {
+            password: password_hash,
+            pass_recovery_token: null,
+            change_email_confirm_token: null,
+            requires_password_change: 0,
+            temp_password_expires_at: null,
+        });
+        await this.services.team
+            .recordPasswordSelfChange(user.id)
+            .catch((err: unknown) => {
+                console.warn('[team] password self-change audit failed:', err);
+            });
+
+        // Sign out every other web session (cascading to their derived
+        // rows); only the session that changed the password survives.
+        await this.services.auth.revokeAllSessions(req.actor!);
+
+        if (this.clients.email && user.email) {
+            try {
+                await this.clients.email.send(
+                    user.email,
+                    'password_change_notification',
+                    {
+                        username: user.username,
+                    },
+                );
+            } catch (e) {
+                console.warn('[change-password] notification send failed:', e);
+            }
+        }
+
+        res.send('Password successfully updated.');
+    }
+
+    @Post('/user-protected/change-username', {
+        userProtected: true,
+        requireVerified: true,
+        rateLimit: CHANGE_USERNAME_ATTEMPT_LIMIT,
+    })
+    async handleChangeUsername(req: Request, res: Response): Promise<void> {
+        // A provisioned account's name belongs to the team that made it: the
+        // console lists its members by username and the audit log records them
+        // by username, so a self-service rename would desync both.
+        if (await this.stores.team.getOrgSeat(req.actor!.user.id!)) {
+            throw new HttpError(
+                403,
+                'Your team set this username. Ask a team admin to change it.',
+                { legacyCode: 'forbidden' },
+            );
+        }
+
+        const { new_username } = req.body ?? {};
+        if (!new_username || typeof new_username !== 'string') {
+            throw new HttpError(400, '`new_username` is required', {
+                legacyCode: 'bad_request',
+            });
+        }
+        assertValidUsername(new_username);
+        if (await this.stores.user.getByUsername(new_username)) {
+            throw new HttpError(400, 'This username is already taken.', {
+                legacyCode: 'username_already_in_use',
+            });
+        }
+        // Before the username is written, not after: the rename below is what
+        // keeps the account's files reachable, and it can't run onto a taken
+        // path.
+        if (
+            await this.stores.fsEntry.findHomePathConflict(
+                new_username,
+                req.actor!.user.id!,
+                { includeDescendants: true },
+            )
+        ) {
+            throw new HttpError(400, 'This username is not available.', {
+                legacyCode: 'username_already_in_use',
+            });
+        }
+
+        if (!(await peekRouteRateLimit(req, CHANGE_USERNAME_LIMIT))) {
+            throw new HttpError(
+                429,
+                'You can only change your username twice every 30 days.',
+                { legacyCode: 'too_many_requests' },
+            );
+        }
+
+        try {
+            await this.stores.user.update(req.actor!.user.id!, {
+                username: new_username,
+            });
+        } catch (e) {
+            if (
+                await isUsernameTaken(
+                    this.stores.user,
+                    e,
+                    new_username,
+                    req.actor!.user.id!,
+                )
+            ) {
+                throw new HttpError(400, 'This username is already taken.', {
+                    legacyCode: 'username_already_in_use',
+                });
+            }
+            throw e;
+        }
+        await consumeRouteRateLimit(req, CHANGE_USERNAME_LIMIT);
+
+        // Rename the user's FS home from `/<old>` to `/<new>` and
+        // cascade the prefix to all descendants. Without this, any
+        // path-based lookup (stat/readdir/write) would 404 after
+        // rename because the fsentries still reference `/<old>`.
+        try {
+            await this.stores.fsEntry.renameUserHome(
+                req.actor!.user.id!,
+                new_username,
+            );
+        } catch (e) {
+            console.warn('[change-username] fs home rename failed:', e);
+        }
+
+        try {
+            this.clients.event?.emit(
+                'user.username-changed' as never,
+                {
+                    user_id: req.actor!.user.id,
+                    old_username: req.actor!.user.username,
+                    new_username,
+                } as never,
+                {},
+            );
+        } catch {
+            // event emission best-effort
+        }
+
+        res.json({ username: new_username });
+    }
+
+    @Post('/user-protected/change-email', {
+        userProtected: true,
+        rateLimit: {
+            scope: 'change-email-start',
+            limit: 10,
+            window: 60 * 60_000,
+            key: 'user',
+        },
+    })
+    async handleChangeEmail(req: Request, res: Response): Promise<void> {
+        // The address is where admin-issued credentials and team notices go;
+        // same reasoning as the username and deletion guards above.
+        if (await this.stores.team.getOrgSeat(req.actor!.user.id!)) {
+            throw new HttpError(
+                403,
+                'Your team set this address. Ask a team admin to change it.',
+                { legacyCode: 'forbidden' },
+            );
+        }
+
+        const { new_email } = req.body ?? {};
+        if (!new_email || typeof new_email !== 'string') {
+            throw new HttpError(400, '`new_email` is required', {
+                legacyCode: 'bad_request',
+            });
+        }
+        if (!isStorableEmail(new_email)) {
+            throw new HttpError(400, 'Please enter a valid email address.', {
+                legacyCode: 'bad_request',
+            });
+        }
+        await this.services.signup.validateEmail(new_email);
+
+        // Block if any OTHER confirmed account (password or OIDC) already
+        // owns that email. Match raw + canonical to collapse gmail
+        // aliases — which is also why the caller has to be excluded: an
+        // alias of your own current address resolves back to you, and
+        // "already in use" about yourself is nonsense.
+        const existing = await this.stores.user.findEmailOwner(new_email);
+        if (
+            existing &&
+            existing.id !== req.actor!.user.id &&
+            (existing.email_confirmed || existing.password !== null)
+        ) {
+            throw new HttpError(400, 'This email is already in use.', {
+                legacyCode: 'email_already_in_use' as never,
+            });
+        }
+
+        const confirm_token = uuidv4();
+        await this.stores.user.update(req.actor!.user.id!, {
+            unconfirmed_change_email: new_email,
+            change_email_confirm_token: confirm_token,
+        });
+
+        const linkJwt = this.services.token.sign(
+            'otp',
+            {
+                token: confirm_token,
+                user_id: req.actor!.user.id,
+                purpose: 'change-email',
+            },
+            { expiresIn: '1h' },
+        );
+
+        if (this.clients.email) {
+            const origin = this.config.origin ?? '';
+            const link = `${origin}/change_email/confirm?token=${encodeURIComponent(linkJwt)}`;
+            try {
+                await this.clients.email.send(
+                    new_email,
+                    'email_verification_link',
+                    { link },
+                );
+            } catch (e) {
+                console.warn('[change-email] new-address email failed:', e);
+            }
+            // Notify the old address too
+            const user = await this.stores.user.getById(req.actor!.user.id!, {
+                force: true,
+            });
+            if (user?.email) {
+                try {
+                    await (
+                        this.clients.email as unknown as {
+                            sendRaw: (opts: {
+                                to: string;
+                                subject: string;
+                                text: string;
+                            }) => Promise<unknown>;
+                        }
+                    ).sendRaw({
+                        to: user.email,
+                        subject: 'Your Puter email change was requested',
+                        text: `A change to ${new_email} was requested on your account. If this wasn't you, please contact support.`,
+                    });
+                } catch (e) {
+                    console.warn(
+                        '[change-email] old-address notice failed:',
+                        e,
+                    );
+                }
+            }
+        }
+
+        res.json({});
+    }
+
+    @Get('/change_email/confirm', {
+        subdomain: ['api', ''],
+        rateLimit: {
+            scope: 'change-email-confirm',
+            limit: 10,
+            window: 60 * 60_000,
+        },
+    })
+    async handleChangeEmailConfirm(req: Request, res: Response): Promise<void> {
+        const jwtToken = req.query?.token;
+        if (!jwtToken || typeof jwtToken !== 'string') {
+            throw new HttpError(400, 'Missing `token`', {
+                legacyCode: 'token_missing' as never,
+            });
+        }
+
+        let decoded;
+        try {
+            decoded = this.services.token.verify('otp', jwtToken);
+        } catch {
+            throw new HttpError(400, 'Invalid or expired token.', {
+                legacyCode: 'token_expired' as never,
+            });
+        }
+        if (decoded.purpose !== 'change-email' || !decoded.token) {
+            throw new HttpError(400, 'Invalid or expired token.', {
+                legacyCode: 'token_expired' as never,
+            });
+        }
+
+        const rows = (await this.clients.db.read(
+            'SELECT * FROM `user` WHERE `change_email_confirm_token` = ? ORDER BY `id` ASC LIMIT 1',
+            [decoded.token],
+        )) as Array<Record<string, unknown>>;
+        const user = rows[0] as
+            | {
+                  id: number;
+                  email_confirmed?: number | boolean;
+                  password?: string | null;
+                  unconfirmed_change_email?: string;
+              }
+            | undefined;
+        if (!user || !user.unconfirmed_change_email) {
+            throw new HttpError(400, 'Invalid or expired token.', {
+                legacyCode: 'token_expired' as never,
+            });
+        }
+
+        const newEmail = user.unconfirmed_change_email;
+        // Staged by an earlier request, so gated by whatever ran back then.
+        if (!isStorableEmail(newEmail)) {
+            throw new HttpError(400, 'Please enter a valid email address.', {
+                legacyCode: 'bad_request',
+            });
+        }
+
+        // Re-check nobody claimed the new email meanwhile. Match raw +
+        // canonical; block if any real account (confirmed OR
+        // password-holding) already owns it. Read the primary — the request
+        // that took the address may have landed moments ago.
+        const canonical = cleanEmail(newEmail);
+        const owner = await this.stores.user.findEmailOwner(newEmail, {
+            force: true,
+        });
+        if (
+            owner &&
+            owner.id !== user.id &&
+            (owner.email_confirmed || owner.password !== null)
+        ) {
+            throw new HttpError(400, 'This email is already in use.', {
+                legacyCode: 'email_already_in_use' as never,
+            });
+        }
+
+        // Strip the address off any unconfirmed placeholder still holding it
+        // before taking it, so this row is the only owner.
+        await this.stores.user.unconfirmOthersByEmail(
+            user.id,
+            newEmail,
+            canonical,
+        );
+
+        try {
+            await this.stores.user.update(user.id, {
+                email: newEmail,
+                clean_email: canonical,
+                unconfirmed_change_email: null,
+                change_email_confirm_token: null,
+                pass_recovery_token: null,
+                email_confirmed: 1,
+                requires_email_confirmation: 0,
+            });
+        } catch (e) {
+            if (!isOwnedEmailConflict(e)) throw e;
+            throw new HttpError(400, 'This email is already in use.', {
+                legacyCode: 'email_already_in_use' as never,
+            });
+        }
+
+        await this.stores.oidc.unlinkAllByUserId(user.id);
+
+        try {
+            this.clients.event?.emit(
+                'user.email-changed' as never,
+                {
+                    user_id: user.id,
+                    new_email: newEmail,
+                } as never,
+                {},
+            );
+        } catch {
+            // best-effort
+        }
+
+        res.send('Email changed successfully. You may close this window.');
+    }
+
+    // -- Save account (convert temp user to permanent) ---------------
+
+    @Post('/save_account', {
+        subdomain: ['api', ''],
+        requireUserActor: true,
+        allowUnconfirmed: true,
+        captcha: true,
+        rateLimit: {
+            scope: 'save-account',
+            limit: 10,
+            window: 60 * 60_000,
+            key: 'user',
+        },
+    })
+    async handleSaveAccount(req: Request, res: Response): Promise<void> {
+        const { username, email, password } = req.body ?? {};
+
+        const user = await this.stores.user.getById(req.actor!.user.id!, {
+            force: true,
+        });
+        if (!user)
+            throw new HttpError(404, 'User not found', {
+                legacyCode: 'not_found',
+            });
+        if (user.password !== null || user.email !== null) {
+            throw new HttpError(400, 'This is not a temporary account.', {
+                legacyCode: 'temporary_accounts_not_allowed' as never,
+            });
+        }
+
+        // Validation
+        if (
+            !username ||
+            typeof username !== 'string' ||
+            usernameRejection(username) === 'format'
+        ) {
+            throw new HttpError(400, 'Invalid username.', {
+                legacyCode: 'bad_request',
+            });
+        }
+        assertValidUsername(username);
+        if (!email || !isStorableEmail(email)) {
+            throw new HttpError(400, 'Please enter a valid email address.', {
+                legacyCode: 'bad_request',
+            });
+        }
+        await this.services.signup.validateEmail(email);
+        if (!password || typeof password !== 'string') {
+            throw new HttpError(400, 'Password is required.', {
+                legacyCode: 'password_required',
+            });
+        }
+        const minLen = this.config.min_pass_length || 6;
+        if (password.length < minLen) {
+            throw new HttpError(
+                400,
+                `Password must be at least ${minLen} characters long.`,
+                { legacyCode: 'bad_request' },
+            );
+        }
+
+        // Duplicate checks
+        const conflict = await usernameConflict(this.stores, username, user.id);
+        if (conflict === 'account') {
+            throw new HttpError(400, 'This username is already taken.', {
+                legacyCode: 'username_already_in_use',
+            });
+        }
+        if (conflict === 'home') {
+            throw new HttpError(400, 'This username is not available.', {
+                legacyCode: 'username_already_in_use',
+            });
+        }
+        // Match raw + canonical to catch gmail-alias collisions, and
+        // reject on ANY confirmed account (OIDC accounts have
+        // password=null but are real) — not just password-holders.
+        const canonical = cleanEmail(email);
+        const existingEmail =
+            await this.services.signup.signupEmailHolder(email);
+        if (
+            existingEmail &&
+            existingEmail.id !== user.id &&
+            (existingEmail.email_confirmed || existingEmail.password !== null)
+        ) {
+            throw new HttpError(400, 'This email is already in use.', {
+                legacyCode: 'email_already_in_use' as never,
+            });
+        }
+
+        // Promote: set username/email/password on the existing row
+        const password_hash = await bcrypt.hash(password, 8);
+        const email_confirm_code = String(crypto.randomInt(100000, 1000000));
+        const email_confirm_token = uuidv4();
+
+        // bcrypt above is slow enough for someone else to take the address in
+        // the meantime, so re-check against the primary before the write.
+        const raced = await this.services.signup.signupEmailHolder(email, {
+            force: true,
+            releaseSeat: true,
+        });
+        if (
+            raced &&
+            raced.id !== user.id &&
+            (raced.email_confirmed || raced.password !== null)
+        ) {
+            throw new HttpError(400, 'This email is already in use.', {
+                legacyCode: 'email_already_in_use' as never,
+            });
+        }
+
+        try {
+            await this.stores.user.update(user.id, {
+                username,
+                email,
+                clean_email: canonical,
+                password: password_hash,
+                email_confirm_code,
+                email_confirm_token,
+                email_confirmed: 0,
+                requires_email_confirmation: 1,
+            });
+        } catch (e) {
+            if (isOwnedEmailConflict(e)) {
+                throw new HttpError(400, 'This email is already in use.', {
+                    legacyCode: 'email_already_in_use' as never,
+                });
+            }
+            if (await isUsernameTaken(this.stores.user, e, username, user.id)) {
+                throw new HttpError(400, 'This username is already taken.', {
+                    legacyCode: 'username_already_in_use',
+                });
+            }
+            throw e;
+        }
+
+        // Rename the user's FS home so `/<temp>/Desktop` etc.
+        // become `/<new>/Desktop`. Without this cascade, any
+        // subsequent path-based FS lookup against the new
+        // username would 404.
+        if (username !== user.username) {
+            try {
+                await this.stores.fsEntry.renameUserHome(user.id, username);
+            } catch (e) {
+                console.warn('[save-account] fs home rename failed:', e);
+            }
+        }
+
+        await promoteToVerifiedGroup(this.stores.group, this.config, {
+            ...user,
+            username,
+        });
+
+        // Send confirmation email
+        if (this.clients.email) {
+            try {
+                await this.clients.email.send(
+                    email,
+                    'email_verification_code',
+                    { code: email_confirm_code },
+                );
+            } catch (e) {
+                console.warn('[save-account] confirmation email failed:', e);
+            }
+        }
+
+        try {
+            this.clients.event?.emit(
+                'user.save_account' as never,
+                {
+                    user_id: user.id,
+                    old_username: user.username,
+                    new_username: username,
+                    email,
+                } as never,
+                {},
+            );
+        } catch {
+            // best-effort
+        }
+
+        const updatedUser = await this.stores.user.getById(user.id, {
+            force: true,
+        });
+        res.json({
+            user: {
+                username: updatedUser!.username,
+                uuid: updatedUser!.uuid,
+                email: updatedUser!.email,
+                email_confirmed: updatedUser!.email_confirmed,
+                requires_email_confirmation:
+                    updatedUser!.requires_email_confirmation,
+                is_temp: false,
+            },
+        });
+    }
+
+    // -- Captcha generation -------------------------------------------
+
+    @Get('/api/captcha/generate', {
+        subdomain: '*',
+        // Unauthenticated, renders an image per call, and is the gate
+        // protecting /login and /signup — so bulk pre-generation is
+        // directly useful to an attacker. Per-fingerprint for fairness on
+        // shared IPs, plus a per-IP backstop against header rotation.
+        //
+        // The fingerprint bucket is the one sized for a person: a handful of
+        // refreshes while getting a captcha right. The IP bucket is not — one
+        // address is a whole office, campus or carrier gateway, and everyone
+        // behind it is signing in through the same counter, so sizing it for
+        // a browser would deny the captcha to a network rather than to an
+        // attacker. It stays wide enough for that population and narrow
+        // enough that header rotation still runs out.
+        rateLimit: [
+            { scope: 'captcha', limit: 30, window: 60_000 },
+            { scope: 'captcha-ip', limit: 3_000, window: 60_000, key: 'ip' },
+        ],
+    })
+    async handleCaptchaGenerate(_req: Request, res: Response): Promise<void> {
+        const difficulty =
+            (this.config as { captcha?: { difficulty?: string } }).captcha
+                ?.difficulty || 'medium';
+        const { token, image } = await generateCaptcha(difficulty);
+        res.json({ token, image });
+    }
+
+    // -- Anti-CSRF token generation ----------------------------------
+
+    @Get('/get-anticsrf-token', {
+        rateLimit: ANTI_CSRF_MINT_LIMIT,
+        // Anti-CSRF tokens are only consumed by `requireUserActor` routes,
+        // so issuance is scoped to the same actor kind for consistency.
+        requireUserActor: true,
+        allowUnconfirmed: true,
+    })
+    async handleGetAntiCsrfToken(req: Request, res: Response): Promise<void> {
+        const sessionId = req.actor?.user?.uuid;
+        if (!sessionId)
+            throw new HttpError(401, 'Authentication required.', {
+                legacyCode: 'unauthorized',
+            });
+        const token = await antiCsrf.createToken(sessionId);
+        res.json({ token });
+    }
+
+    // -- Permission grants -------------------------------------------
+
+    /**
+     * Shared input validation for the user-app grant/revoke handlers, which
+     * accept a caller-supplied `origin` as an alternative to `app_uid`. All
+     * parameters are optional-but-typed: presence is enforced by the handlers'
+     * own `app_uid`/`permission` checks after origin resolution.
+     *
+     * These are bounded only against absurd input. The width of the column a
+     * permission lands in is enforced by the permission service instead, on the
+     * _rewritten_ string: `fs:/path:mode` is rewritten to `fs:<uuid>:mode`
+     * before it is stored, so a deep path is a ~45-character row and must not
+     * be rejected for the length of the path the caller typed.
+     */
+    #validateAppPermissionParams(params: {
+        app_uid?: unknown;
+        origin?: unknown;
+        permission?: unknown;
+        extra?: unknown;
+        meta?: unknown;
+    }): void {
+        const MAX_LEN = 4096;
+        for (const key of ['app_uid', 'origin', 'permission'] as const) {
+            const value = params[key];
+            if (value === undefined || value === null) continue;
+            if (typeof value !== 'string' || value.length > MAX_LEN) {
+                throw new HttpError(400, `Invalid \`${key}\``, {
+                    legacyCode: 'bad_request',
+                });
+            }
+        }
+        // `extra` and `meta` are forwarded into the audit row and read as
+        // objects downstream. A non-object would fault *after* the grant is
+        // committed, so reject it up front. `null` is treated as absent, the
+        // same as the string parameters above.
+        for (const key of ['extra', 'meta'] as const) {
+            const value = params[key];
+            if (value === undefined || value === null) continue;
+            if (typeof value !== 'object' || Array.isArray(value)) {
+                throw new HttpError(400, `Invalid \`${key}\``, {
+                    legacyCode: 'bad_request',
+                });
+            }
+            if (
+                Buffer.byteLength(JSON.stringify(value), 'utf8') >
+                GRANT_EXTRA_MAX_BYTES
+            ) {
+                throw new HttpError(
+                    400,
+                    `\`${key}\` may not exceed ${GRANT_EXTRA_MAX_BYTES} bytes`,
+                    { legacyCode: 'bad_request' },
+                );
+            }
+        }
+    }
+
+    /**
+     * Resolves a caller-supplied `origin` to the uid of a _registered_ app.
+     *
+     * `appUidFromOrigin` synthesises a deterministic `app-<uuidv5>` uid for an
+     * origin that has no app row yet, and the permission services resolve their
+     * identifier as uid-_or-name_. Passing a synthetic uid straight through
+     * would therefore let whoever registered an app under that literal name
+     * collect a grant the user made to the origin — the uid is derived from a
+     * published namespace constant, so it can be computed and squatted offline.
+     * Only a uid that names an existing app row is accepted.
+     *
+     * An `origin` supplied alongside an `app_uid` takes precedence over it (see
+     * the grant/revoke handlers). The origin is what a consent prompt shows the
+     * user, so it — not a uid travelling beside it — has to decide who receives
+     * the grant; otherwise a caller could name one app on screen and grant to
+     * another. No caller sends both with different intent.
+     */
+    async #registeredAppUidFromOrigin(origin: string): Promise<string> {
+        const uid = await this.services.auth.appUidFromOrigin(origin);
+        const app = await this.stores.app.getByUid(uid);
+        if (!app) {
+            throw new HttpError(404, `entity_not_found: app:${uid}`, {
+                legacyCode: 'subject_does_not_exist',
+            });
+        }
+        return app.uid;
+    }
+
+    /**
+     * Resolve the `permission` / `permissions` pair into the list to act on.
+     *
+     * One consent prompt can cover several scopes (read a store, write
+     * another), and a client looping the single form would have to invent its
+     * own partial-failure and rollback handling. Accepting the array keeps that
+     * in one request.
+     */
+    #appPermissionList(body: {
+        permission?: unknown;
+        permissions?: unknown;
+    }): string[] {
+        const { permission, permissions } = body;
+        if (permissions !== undefined && permissions !== null) {
+            if (permission !== undefined && permission !== null) {
+                throw new HttpError(
+                    400,
+                    'Pass `permission` or `permissions`, not both',
+                    { legacyCode: 'bad_request' },
+                );
+            }
+            if (!Array.isArray(permissions) || permissions.length === 0) {
+                throw new HttpError(400, 'Invalid `permissions`', {
+                    legacyCode: 'bad_request',
+                });
+            }
+            if (permissions.length > MAX_PERMISSIONS_PER_REQUEST) {
+                throw new HttpError(400, 'Too many `permissions`', {
+                    legacyCode: 'bad_request',
+                });
+            }
+            for (const entry of permissions) {
+                this.#validateAppPermissionParams({ permission: entry });
+                // `*` means "revoke everything" in the scalar form only —
+                // inside a list it would silently widen a targeted request.
+                if (!entry || entry === '*') {
+                    throw new HttpError(400, 'Invalid `permissions`', {
+                        legacyCode: 'bad_request',
+                    });
+                }
+            }
+            return [...new Set(permissions as string[])];
+        }
+        return typeof permission === 'string' && permission ? [permission] : [];
+    }
+
+    /**
+     * Gate a cross-app data grant: the target must exist, must not have opted
+     * out of sharing, and must be named. Also creates the target's AppData
+     * directory for an `fs` scope, since it is only created lazily when the app
+     * first runs — without this a valid grant would 404 until then.
+     */
+    async #prepareAppDataGrant(
+        actor: Actor,
+        permission: string,
+    ): Promise<void> {
+        const parsed = parseAppDataPermission(permission);
+        if (!parsed) {
+            // A bare `app-data` (or one with an empty target) would cover every
+            // app the user has by prefix implication, which no prompt can
+            // describe. Reject rather than treat it as an unrelated permission.
+            if (
+                permission === APP_DATA_PERMISSION_PREFIX ||
+                permission.startsWith(`${APP_DATA_PERMISSION_PREFIX}:`)
+            ) {
+                throw new HttpError(
+                    400,
+                    'Invalid `app-data` permission: missing target app',
+                    { legacyCode: 'bad_request' },
+                );
+            }
+            return;
+        }
+
+        const target = await this.stores.app.getByUid(parsed.targetAppUid);
+        if (!target) {
+            throw new HttpError(
+                404,
+                `entity_not_found: app:${parsed.targetAppUid}`,
+                { legacyCode: 'subject_does_not_exist' },
+            );
+        }
+        if (!appDataSharingAllowed(target)) {
+            throw new HttpError(
+                403,
+                'This app does not share its data with other apps',
+                { legacyCode: 'forbidden' },
+            );
+        }
+
+        const username = actor.user?.username;
+        const userId = actor.user?.id;
+        if ((parsed.store === 'fs' || !parsed.store) && username && userId) {
+            await this.services.fs.mkdir(userId, {
+                path: `/${username}/AppData/${parsed.targetAppUid}`,
+                createMissingParents: true,
+            } as never);
+        }
+    }
+
+    /**
+     * Whether a granted `fs:` path permission needs its target created before
+     * the grant can resolve, and if so where and what kind. Null when there is
+     * nothing to create: `create` is `false`, the entry does not name an `fs:`
+     * path, it is a `manage:` grant, or the path already exists.
+     *
+     * Side-effect-free, like `#prepareAppDataGrant` above — a pre-grant hook
+     * run in the same validation loop, so a bad entry elsewhere in the list
+     * still leaves nothing created.
+     */
+    async #planFsPathCreate(
+        actor: Actor,
+        permission: string,
+        create: boolean | FsCreateKind,
+    ): Promise<{ path: string; kind: FsCreateKind } | null> {
+        if (!create) return null;
+        const parsed = parseFsPathPermission(permission);
+        if (!parsed) return null;
+        // A `manage:` grant delegates re-sharing, not access itself — creating
+        // a path in order to delegate management of it is not a coherent
+        // request.
+        if (parsed.hasManage) return null;
+
+        const path = normalizeAbsolutePath(parsed.path);
+        const existing = await this.stores.fsEntry.getEntryByPath(path);
+        if (existing) {
+            if (
+                (create === 'dir' && !existing.isDir) ||
+                (create === 'file' && existing.isDir)
+            ) {
+                throw new HttpError(409, `An entry already exists at ${path}`, {
+                    legacyCode: 'conflict',
+                });
+            }
+            // Already there: the grant resolves the existing entry, nothing to
+            // create. A `true` heuristic guess never conflicts with reality.
+            return null;
+        }
+
+        // Word for word what an existing foreign path answers.
+        if (!isOwnHomePath(path, actor.user!.username!)) {
+            throw new HttpError(403, `permission_denied: ${permission}`, {
+                legacyCode: 'permission_denied',
+            });
+        }
+        assertCreatablePath(path, actor.user!.username!);
+
+        const kind =
+            create === true
+                ? fsCreateKindFor(pathPosix.basename(path))
+                : create;
+        return { path, kind };
+    }
+
+    /** Creates the target `#planFsPathCreate` planned, as the user actor. */
+    async #createGrantTarget(
+        actor: Actor,
+        plan: { path: string; kind: FsCreateKind },
+    ): Promise<FSEntry> {
+        const userId = actor.user!.id;
+        // Missing intermediate directories are created along with the leaf.
+        // They are deliberately not rolled back if a later phase fails, so a
+        // failed grant can leave empty directories inside the user's home.
+        return plan.kind === 'dir'
+            ? await this.services.fs.mkdir(userId!, {
+                  path: plan.path,
+                  createMissingParents: true,
+              })
+            : await this.services.fs.touch(userId!, {
+                  path: plan.path,
+                  createMissingParents: true,
+              });
+    }
+
+    /**
+     * Undoes what `#createGrantTarget` made for this request, newest first,
+     * when a later phase fails. Auto-created intermediate directories are not
+     * rolled back — they are left as empty directories inside the user's own
+     * home.
+     */
+    async #rollbackCreatedGrantTargets(
+        actor: Actor,
+        created: FSEntry[],
+    ): Promise<void> {
+        const userId = actor.user!.id;
+        for (const entry of [...created].reverse()) {
+            try {
+                await this.services.fs.remove(userId!, {
+                    entry,
+                    recursive: false,
+                });
+            } catch {
+                // Best-effort: the error that triggered the rollback is what
+                // the caller sees, not a failure to undo it.
+            }
+        }
+    }
+
+    @Post('/auth/grant-user-app', {
+        subdomain: 'api',
+        requireUserActor: true,
+        rateLimit: GRANT_LIMIT,
+    })
+    async handleGrantUserApp(req: Request, res: Response): Promise<void> {
+        let { app_uid } = req.body ?? {};
+        const { origin, permission, permissions, extra, meta } = req.body ?? {};
+        this.#validateAppPermissionParams({
+            app_uid,
+            origin,
+            permission,
+            extra,
+            meta,
+        });
+        const list = this.#appPermissionList({ permission, permissions });
+        if (origin) {
+            app_uid = await this.#registeredAppUidFromOrigin(origin);
+        }
+        if (!app_uid || list.length === 0) {
+            throw new HttpError(400, 'Missing `app_uid` or `permission`', {
+                legacyCode: 'bad_request',
+            });
+        }
+        // 400 on a bad value, before anything else runs. Absent means create.
+        const create = parseCreateFlag(req.body?.create);
+
+        // Validate every entry before writing or creating anything, so a bad
+        // one in the list cannot leave a partially-granted set behind: the
+        // dialog reads a 4xx as "nothing was written" and skips its
+        // withdrawal, so a partial commit leaves live access the user was
+        // told they refused.
+        const plans: Array<{
+            entry: string;
+            path: string;
+            kind: FsCreateKind;
+        }> = [];
+        for (const entry of list) {
+            // A delegation over a whole key-value namespace has no bounded
+            // description, so it is refused where it is asked for rather than
+            // prompted for and then refused at use.
+            assertBoundedManageGrant(entry);
+            await this.#prepareAppDataGrant(req.actor!, entry);
+            const plan = await this.#planFsPathCreate(
+                req.actor!,
+                entry,
+                create,
+            );
+            if (plan) {
+                // Checked on every planned entry, not just successful
+                // creations, so the cap bounds attempts in this request.
+                if (plans.length >= MAX_CREATED_ENTRIES_PER_GRANT) {
+                    throw new HttpError(400, 'Too many paths to create', {
+                        legacyCode: 'bad_request',
+                    });
+                }
+                plans.push({ entry, ...plan });
+            } else {
+                // Nothing to create for this entry: the same pre-flight the
+                // rewrite always ran, measuring the width of the row it
+                // resolves to. Once a path is created, `grantUserAppPermission`
+                // re-runs the identical rewrite and check itself.
+                await this.services.permission.assertUserAppPermissionWritable(
+                    req.actor!,
+                    entry,
+                );
+            }
+        }
+
+        // Two entries in the same batch can name the same path (different
+        // modes on one `fs:` target); create it once, not once per entry.
+        const uniquePlans = [
+            ...new Map(plans.map((p) => [p.path, p])).values(),
+        ];
+
+        const created: FSEntry[] = [];
+        try {
+            for (const plan of uniquePlans) {
+                created.push(await this.#createGrantTarget(req.actor!, plan));
+            }
+            for (const entry of list) {
+                await this.services.permission.grantUserAppPermission(
+                    req.actor!,
+                    app_uid,
+                    entry,
+                    extra ?? undefined,
+                    meta ?? undefined,
+                );
+            }
+        } catch (err) {
+            await this.#rollbackCreatedGrantTargets(req.actor!, created);
+            throw err;
+        }
+        res.json({});
+    }
+
+    // -- Permission revokes ------------------------------------------
+
+    /**
+     * @deprecated Use `puter.fs.unshare()`. Kept for direct HTTP callers:
+     *   access left behind by an older client has to stay withdrawable.
+     */
+    @Post('/auth/revoke-user-user', {
+        subdomain: 'api',
+        requireUserActor: true,
+        rateLimit: GRANT_LIMIT,
+    })
+    async handleRevokeUserUser(req: Request, res: Response): Promise<void> {
+        const { target_username, permission, meta } = req.body ?? {};
+        if (!target_username || !permission) {
+            throw new HttpError(
+                400,
+                'Missing `target_username` or `permission`',
+                { legacyCode: 'bad_request' },
+            );
+        }
+        await this.services.permission.revokeUserUserPermission(
+            req.actor!,
+            target_username,
+            permission,
+            meta,
+        );
+        // The share index is what listings read, so it has to go with the
+        // grant — otherwise the item keeps reporting itself as shared.
+        await this.services.share.onGrantRevoked(
+            req.actor!,
+            target_username,
+            permission,
+        );
+        res.json({});
+    }
+
+    @Post('/auth/revoke-user-app', {
+        subdomain: 'api',
+        requireUserActor: true,
+        rateLimit: GRANT_LIMIT,
+    })
+    async handleRevokeUserApp(req: Request, res: Response): Promise<void> {
+        let { app_uid } = req.body ?? {};
+        const { origin, permission, permissions, meta } = req.body ?? {};
+        this.#validateAppPermissionParams({
+            app_uid,
+            origin,
+            permission,
+            meta,
+        });
+        const list = this.#appPermissionList({ permission, permissions });
+        if (origin) {
+            app_uid = await this.#registeredAppUidFromOrigin(origin);
+        }
+        if (!app_uid || list.length === 0) {
+            throw new HttpError(400, 'Missing `app_uid` or `permission`', {
+                legacyCode: 'bad_request',
+            });
+        }
+        // Deliberately not gated by the target's sharing flag: a user must
+        // always be able to withdraw a grant, whatever the target now says.
+        if (permission === '*') {
+            await this.services.permission.revokeUserAppAll(
+                req.actor!,
+                app_uid,
+                meta ?? undefined,
+            );
+            // Withdrawing everything also retires the workers the app deployed
+            // under this user; their tokens would otherwise act as the app.
+            await this.services.auth.deleteWorkerSessionsForApp(
+                req.actor!.user!.id as number,
+                app_uid,
+            );
+        } else {
+            for (const entry of list) {
+                await this.services.permission.revokeUserAppPermission(
+                    req.actor!,
+                    app_uid,
+                    entry,
+                    meta ?? undefined,
+                );
+            }
+        }
+        res.json({});
+    }
+
+    // -- Permission checks -------------------------------------------
+
+    /**
+     * The caller's account acting as `appIdentifier`, resolved uid-or-name like
+     * the grant handlers.
+     */
+    async #appUnderUserActor(
+        actor: Actor,
+        appIdentifier: unknown,
+    ): Promise<Actor> {
+        this.#validateAppPermissionParams({ app_uid: appIdentifier });
+        // Sessions only: for an app, this would be a window onto its neighbours' grants.
+        if (!isPlainUserActor(actor)) {
+            throw new HttpError(403, 'actor must be a user', {
+                legacyCode: 'forbidden',
+            });
+        }
+        const app = await this.stores.app.resolveApp(appIdentifier as string);
+        if (!app) {
+            throw new HttpError(404, `App ${appIdentifier} does not exist`, {
+                legacyCode: 'not_found',
+            });
+        }
+        return makeActor({
+            user: actor.user,
+            app: { id: app.id, uid: app.uid },
+        });
+    }
+
+    @Post('/auth/check-permissions', {
+        subdomain: 'api',
+        requireAuth: true,
+        rateLimit: AUTH_CHECK_LIMIT,
+    })
+    async handleCheckPermissions(req: Request, res: Response): Promise<void> {
+        const { permissions, app_uid } = req.body ?? {};
+        if (!Array.isArray(permissions)) {
+            throw new HttpError(400, 'Missing or invalid `permissions` array', {
+                legacyCode: 'bad_request',
+            });
+        }
+        // As grant and revoke; `puter.perms.check` splits a longer list.
+        if (permissions.length > MAX_PERMISSIONS_PER_REQUEST) {
+            throw new HttpError(400, 'Too many `permissions`', {
+                legacyCode: 'bad_request',
+            });
+        }
+
+        // Present but empty must not fall through to checking the user: on their own file every `fs:` scope answers `true`.
+        if (
+            app_uid !== undefined &&
+            (typeof app_uid !== 'string' || !app_uid)
+        ) {
+            throw new HttpError(400, 'Invalid `app_uid`', {
+                legacyCode: 'bad_request',
+            });
+        }
+
+        // `app_uid` asks what an app of mine holds, not what I hold.
+        const actor = app_uid
+            ? await this.#appUnderUserActor(req.actor!, app_uid)
+            : req.actor!;
+
+        const unique = [...new Set(permissions)] as string[];
+        const result: Record<string, boolean> = {};
+
+        // `fs:` reaches down a tree, and only ACL walks that.
+        const viaAcl = new Set(
+            app_uid ? unique.filter((p) => aclAnswerableFsPermission(p)) : [],
+        );
+        const viaScan = unique.filter((p) => !viaAcl.has(p));
+
+        let granted: Map<string, boolean>;
+        try {
+            granted = await this.services.permission.checkMany(actor, viaScan);
+        } catch {
+            granted = new Map<string, boolean>();
+        }
+        for (const perm of viaScan) {
+            result[perm] = granted.get(perm) ?? false;
+        }
+        // Together: the GUI gives up on this after five seconds and prompts.
+        const reached = await Promise.all(
+            [...viaAcl].map((perm) => this.#appReachesFsEntry(actor, perm)),
+        );
+        [...viaAcl].forEach((perm, i) => {
+            result[perm] = reached[i]!;
+        });
+        res.json({ permissions: result });
+    }
+
+    /** Asked of ACL, so this cannot answer kinder than the operation will. */
+    async #appReachesFsEntry(actor: Actor, permission: string) {
+        const target = aclAnswerableFsPermission(permission);
+        if (!target) return false;
+        try {
+            const entry = target.uid
+                ? await this.stores.fsEntry.getEntryByUuid(target.uid)
+                : await this.stores.fsEntry.getEntryByPath(target.path!);
+            if (!entry) return false;
+            return await this.services.acl.check(
+                actor,
+                this.services.acl.fsDescriptor(entry.path),
+                target.mode as AclMode,
+            );
+        } catch {
+            // Unreadable means unknown, and an extra prompt is the safe miss.
+            return false;
+        }
+    }
+
+    // -- Session management ------------------------------------------
+
+    @Get('/auth/list-sessions', {
+        subdomain: 'api',
+        requireUserActor: true,
+        rateLimit: AUTH_LIST_LIMIT,
+    })
+    async handleListSessions(req: Request, res: Response): Promise<void> {
+        const sessions = await this.services.auth.listSessions(req.actor!);
+        res.json(sessions);
+    }
+
+    // Web sessions only: an access token must not be able to revoke its own
+    // issuing web session.
+    @Post('/auth/revoke-session', {
+        subdomain: 'api',
+        requireUserActor: true,
+        allowUnconfirmed: true,
+        antiCsrf: true,
+        middleware: [WEB_SESSION_GATE],
+    })
+    async handleRevokeSession(req: Request, res: Response): Promise<void> {
+        const { uuid } = req.body ?? {};
+        if (!uuid || typeof uuid !== 'string') {
+            throw new HttpError(400, 'Missing or invalid `uuid`', {
+                legacyCode: 'bad_request',
+            });
+        }
+        // The caller's own session row must go through /logout, not a
+        // self-revoke — otherwise the response can't write fresh auth
+        // state and the client ends up with an ambiguous post-revoke
+        // identity. /auth/revoke-all-sessions still supports a separate
+        // `include_current` opt-in for the nuclear case.
+        if (uuid === req.actor!.session?.uid) {
+            throw new HttpError(
+                400,
+                'Cannot revoke your current session — use /logout instead',
+                { legacyCode: 'bad_request' },
+            );
+        }
+        // `getByUuid` returns null when the row is missing, already
+        // soft-revoked, or past `expires_at` — surface as 404 so a stale
+        // manage-sessions UI doesn't 500 when it clicks revoke on a row
+        // that already went away.
+        const session = await this.stores.session.getByUuid(uuid);
+        if (!session) {
+            throw new HttpError(404, 'Session not found', {
+                legacyCode: 'not_found',
+            });
+        }
+        if (session.user_id !== req.actor!.user.id) {
+            throw new HttpError(403, 'Can only revoke your own sessions', {
+                legacyCode: 'unauthorized',
+            });
+        }
+        await this.services.auth.revokeSession(uuid);
+        const sessions = await this.services.auth.listSessions(req.actor!);
+        res.json({ sessions });
+    }
+
+    @Post('/auth/revoke-all-sessions', {
+        subdomain: 'api',
+        requireUserActor: true,
+        allowUnconfirmed: true,
+        antiCsrf: true,
+        rateLimit: {
+            scope: 'revoke-all-sessions',
+            limit: 10,
+            window: 60 * 60_000,
+            key: 'user',
+        },
+        middleware: [WEB_SESSION_GATE],
+    })
+    async handleRevokeAllSessions(req: Request, res: Response): Promise<void> {
+        const { include_current, include_apps } = req.body ?? {};
+        await this.services.auth.revokeAllSessions(req.actor!, {
+            includeCurrent: !!include_current,
+            includeApps: !!include_apps,
+        });
+        const sessions = await this.services.auth.listSessions(req.actor!);
+        res.json({ sessions });
+    }
+
+    @Patch('/auth/sessions/:uuid/label', {
+        subdomain: 'api',
+        requireUserActor: true,
+        allowUnconfirmed: true,
+        antiCsrf: true,
+        middleware: [WEB_SESSION_GATE],
+    })
+    async handleRenameSession(req: Request, res: Response): Promise<void> {
+        const uuid = req.params.uuid;
+        const { label } = (req.body ?? {}) as { label?: unknown };
+        if (!uuid || typeof uuid !== 'string') {
+            throw new HttpError(400, 'Missing or invalid `uuid`', {
+                legacyCode: 'bad_request',
+            });
+        }
+        if (label !== null && typeof label !== 'string') {
+            throw new HttpError(400, '`label` must be a string or null', {
+                legacyCode: 'bad_request',
+            });
+        }
+        await this.services.auth.setSessionLabel(
+            req.actor!,
+            uuid,
+            label ?? null,
+        );
+        res.json({});
+    }
+
+    // -- Dev app permissions -----------------------------------------
+
+    @Post('/auth/grant-dev-app', {
+        subdomain: 'api',
+        requireUserActor: true,
+        rateLimit: GRANT_LIMIT,
+    })
+    async handleGrantDevApp(req: Request, res: Response): Promise<void> {
+        let { app_uid } = req.body ?? {};
+        const { origin, permission, extra, meta } = req.body ?? {};
+        this.#validateAppPermissionParams({
+            app_uid,
+            origin,
+            permission,
+            extra,
+            meta,
+        });
+        if (origin && !app_uid) {
+            // Registered apps only, for the same reason the user-app handlers
+            // insist on it: a synthesised `app-<uuidv5(origin)>` is resolved
+            // downstream as uid-*or-name*, so it would land on whoever
+            // registered an app under that literal name. A dev-app grant is
+            // scanned with the issuer's authority for anyone running as that
+            // app, so that hands this user's permission to the squatter.
+            // Without a squatter the synthetic uid resolves to nothing and
+            // this 404s regardless, so nothing legitimate changes.
+            app_uid = await this.#registeredAppUidFromOrigin(origin);
+        }
+        if (!app_uid || !permission) {
+            throw new HttpError(400, 'Missing `app_uid` or `permission`', {
+                legacyCode: 'bad_request',
+            });
+        }
+        await this.services.permission.grantDevAppPermission(
+            req.actor!,
+            app_uid,
+            permission,
+            extra,
+            meta,
+        );
+        res.json({});
+    }
+
+    @Post('/auth/revoke-dev-app', {
+        subdomain: 'api',
+        requireUserActor: true,
+        rateLimit: GRANT_LIMIT,
+    })
+    async handleRevokeDevApp(req: Request, res: Response): Promise<void> {
+        let { app_uid } = req.body ?? {};
+        const { origin, permission, meta } = req.body ?? {};
+        if (origin && !app_uid) {
+            // Registered apps only — see handleGrantDevApp.
+            app_uid = await this.#registeredAppUidFromOrigin(origin);
+        }
+        if (!app_uid || !permission) {
+            throw new HttpError(400, 'Missing `app_uid` or `permission`', {
+                legacyCode: 'bad_request',
+            });
+        }
+        if (permission === '*') {
+            await this.services.permission.revokeDevAppAll(
+                req.actor!,
+                app_uid,
+                meta,
+            );
+        } else {
+            await this.services.permission.revokeDevAppPermission(
+                req.actor!,
+                app_uid,
+                permission,
+                meta,
+            );
+        }
+        res.json({});
+    }
+
+    // -- Permission listing ------------------------------------------
+
+    // A read of what was granted, not a grant; the mutations stay session-only.
+    @Get('/auth/list-permissions', {
+        subdomain: 'api',
+        requireUserActor: true,
+        allowFullAccessToken: true,
+        rateLimit: AUTH_LIST_LIMIT,
+    })
+    async handleListPermissions(req: Request, res: Response): Promise<void> {
+        const userId = req.actor!.user.id;
+        const db = this.clients.db;
+
+        const [appPerms, userPermsOut, userPermsIn] = await Promise.all([
+            db.read(
+                // The permissions table stores the numeric `app_id` FK; the
+                // public shape exposes the app's `uid`.
+                'SELECT a.`uid` AS app_uid, p.`permission`, p.`extra` ' +
+                    'FROM `user_to_app_permissions` p ' +
+                    'JOIN `apps` a ON a.`id` = p.`app_id` ' +
+                    'WHERE p.`user_id` = ?',
+                [userId],
+            ),
+            db.read(
+                'SELECT u.`username`, p.`permission`, p.`extra` FROM `user_to_user_permissions` p ' +
+                    'JOIN `user` u ON u.`id` = p.`holder_user_id` WHERE p.`issuer_user_id` = ?',
+                [userId],
+            ),
+            db.read(
+                'SELECT u.`username`, p.`permission`, p.`extra` FROM `user_to_user_permissions` p ' +
+                    'JOIN `user` u ON u.`id` = p.`issuer_user_id` WHERE p.`holder_user_id` = ?',
+                [userId],
+            ),
+        ]);
+
+        type Row = {
+            app_uid?: string;
+            username?: string;
+            permission: string;
+            extra?: string | Record<string, unknown> | null;
+        };
+
+        res.json({
+            myself_to_app: (appPerms as Row[]).map((r) => ({
+                app_uid: r.app_uid,
+                permission: r.permission,
+                extra:
+                    typeof r.extra === 'string'
+                        ? JSON.parse(r.extra)
+                        : (r.extra ?? {}),
+            })),
+            myself_to_user: (userPermsOut as Row[]).map((r) => ({
+                user: r.username,
+                permission: r.permission,
+                extra:
+                    typeof r.extra === 'string'
+                        ? JSON.parse(r.extra)
+                        : (r.extra ?? {}),
+            })),
+            // A key-value share grant names its owner's uuid and the exact
+            // key prefix it covers. The handle is the only name its holder is
+            // meant to have for that region, so the grant behind it is not
+            // part of what they are shown. The owner still sees their own side
+            // above, and in `GET /events/kv-handles`.
+            user_to_myself: (userPermsIn as Row[])
+                .filter((r) => !isKvSharePermission(r.permission))
+                .map((r) => ({
+                    user: r.username,
+                    permission: r.permission,
+                    extra:
+                        typeof r.extra === 'string'
+                            ? JSON.parse(r.extra)
+                            : (r.extra ?? {}),
+                })),
+        });
+    }
+
+    // -- App origin resolution ---------------------------------------
+
+    @Post('/auth/app-uid-from-origin', {
+        subdomain: 'api',
+        requireAuth: true,
+        rateLimit: AUTH_CHECK_LIMIT,
+    })
+    async handleAppUidFromOrigin(req: Request, res: Response): Promise<void> {
+        const origin = req.body?.origin || req.query?.origin;
+        if (!origin)
+            throw new HttpError(400, 'Missing `origin`', {
+                legacyCode: 'bad_request',
+            });
+        const uid = await this.services.auth.appUidFromOrigin(origin as string);
+        res.json({ uid });
+    }
+
+    // -- App token + check -------------------------------------------
+
+    @Post('/auth/get-user-app-token', {
+        subdomain: 'api',
+        requireUserActor: true,
+        // Called once per app launch, and the GUI can legitimately launch
+        // several in quick succession.
+        rateLimit: { ...AUTH_CHECK_LIMIT, scope: 'app-token', limit: 120 },
+    })
+    async handleGetUserAppToken(req: Request, res: Response): Promise<void> {
+        let { app_uid } = req.body ?? {};
+        const { origin } = req.body ?? {};
+        const resolvedFromOrigin = !app_uid && !!origin;
+        if (!app_uid && origin) {
+            app_uid = await this.services.auth.appUidFromOrigin(origin);
+        }
+        if (!app_uid) {
+            throw new HttpError(400, 'Missing `app_uid` or `origin`', {
+                legacyCode: 'bad_request',
+            });
+        }
+
+        let app = await this.stores.app.getByUid(app_uid);
+        if (!app && resolvedFromOrigin) {
+            // Hosted-subdomain origins get the site owner stamped as the
+            // app's creator at bootstrap; external origins stay unowned.
+            // Canonical origin only, so alternate hosts share one row.
+            const canonicalOrigin =
+                this.services.auth.canonicalizeOrigin(origin);
+            const ownerUserId =
+                await this.services.auth.subdomainOwnerIdFromOrigin(
+                    canonicalOrigin,
+                );
+            app = await this.stores.app.createFromOrigin(
+                app_uid,
+                canonicalOrigin,
+                { ownerUserId },
+            );
+            // An origin's uid is a deterministic uuidv5, so a deleted app
+            // reappears here under the identical uid. Withdraw any cross-app
+            // data grants left pointing at it before this new row can inherit
+            // consent the user gave its predecessor. Only *this* path can reuse
+            // a uid: `AppStore.create` mints a random uuid4, which no deleted
+            // app can ever hold again.
+            //
+            // Called directly rather than through `app.changed`: the token is
+            // issued below, so this has to be able to stop that, and
+            // `emitAndWait` swallows listener errors. Letting it throw is the
+            // point — a sweep that failed leaves the old grants live against an
+            // app whoever controls the origin now has just claimed.
+            await this.services.appPermission.withdrawAppDataGrants(
+                app_uid,
+                'uid reused by a new app',
+            );
+        }
+        if (!app) {
+            throw new HttpError(404, `App ${app_uid} does not exist`, {
+                legacyCode: 'not_found',
+            });
+        }
+
+        // A desktop launch of a godmode app gets a full-access token tied to
+        // this session. Origin lookups (sign-in popups for pages outside the
+        // desktop) keep getting an ordinary app token.
+        const godmode = !resolvedFromOrigin && isGodmodeApp(app);
+
+        const userPermGrantPromise =
+            this.services.permission.grantUserAppPermission(
+                req.actor!,
+                app_uid,
+                APP_AUTHENTICATED_FLAG,
+                {},
+                {},
+                app,
+            );
+
+        const tokenPromise: Promise<{ token: string; expiresAt?: number }> =
+            godmode
+                ? this.services.auth.getGodmodeAppToken(req.actor!, app)
+                : (async () => ({
+                      token: await this.services.auth.getUserAppToken(
+                          req.actor!,
+                          app_uid,
+                          app,
+                      ),
+                  }))();
+
+        const missingFSPathPromise = (async () => {
+            // Ensure the app's per-user AppData directory exists.
+            // v1 did this in LLMkdir with the app icon as thumbnail
+            // on first app open. mkdir is idempotent (returns
+            // existing dir without rewriting), and
+            // createMissingParents seeds `/<username>/AppData` if
+            // the user never had one. Path lookups in FSEntryStore
+            // have a recursive-CTE fallback (mirrors v1's
+            // `convert_path_to_fsentry` walk-down) so legacy rows
+            // with a NULL `path` column still resolve and get
+            // backfilled on first read.
+            const username = req.actor!.user?.username;
+            const userId = req.actor!.user?.id;
+            if (username && userId) {
+                await this.services.fs.mkdir(userId, {
+                    path: `/${username}/AppData/${app_uid}`,
+                    createMissingParents: true,
+                    thumbnail: (app as { icon?: string | null }).icon ?? null,
+                } as never);
+            }
+        })();
+
+        const [, { token, expiresAt }] = await Promise.all([
+            userPermGrantPromise,
+            tokenPromise,
+            missingFSPathPromise,
+        ]);
+
+        try {
+            const a = app as {
+                id?: number;
+                uid?: string;
+                index_url?: string | null;
+                owner_user_id?: number | null;
+                name?: string | null;
+            };
+            this.clients.event?.emit(
+                'puter.app.authenticated' as never,
+                {
+                    app_uid,
+                    app: {
+                        id: a.id,
+                        uid: a.uid,
+                        index_url: a.index_url ?? null,
+                        owner_user_id: a.owner_user_id ?? null,
+                        name: a.name ?? null,
+                        godmode: isGodmodeApp(app),
+                    },
+                    user_id: req.actor!.user?.id ?? null,
+                } as never,
+                {},
+            );
+        } catch {
+            // Fine if failed
+        }
+
+        res.json(
+            godmode
+                ? { token, app_uid, godmode: true, expires_at: expiresAt }
+                : { token, app_uid },
+        );
+    }
+
+    @Post('/auth/check-app', {
+        subdomain: 'api',
+        requireUserActor: true,
+        rateLimit: AUTH_CHECK_LIMIT,
+    })
+    async handleCheckApp(req: Request, res: Response): Promise<void> {
+        let { app_uid } = req.body ?? {};
+        const { origin } = req.body ?? {};
+        if (!app_uid && origin) {
+            app_uid = await this.services.auth.appUidFromOrigin(origin);
+        }
+        if (!app_uid)
+            throw new HttpError(400, 'Missing `app_uid` or `origin`', {
+                legacyCode: 'bad_request',
+            });
+
+        // The exact row, not a scan: a `service:`-shaped check falls open on the `service` root.
+        const app = await this.stores.app.resolveApp(app_uid);
+        const userId = req.actor!.user?.id;
+        const authenticated =
+            !!app?.id &&
+            !!userId &&
+            (await this.stores.permission
+                .hasUserAppPerm(userId, app.id, APP_AUTHENTICATED_FLAG)
+                .catch(() => false));
+
+        const result: {
+            app_uid: string;
+            authenticated: boolean;
+            token?: string;
+        } = { app_uid, authenticated };
+        if (authenticated) {
+            // The resolved uid: the token carries it as the app's identity.
+            result.token = await this.services.auth.getUserAppToken(
+                req.actor!,
+                app!.uid,
+                app!,
+            );
+        }
+        res.json(result);
+    }
+
+    // -- Access tokens -----------------------------------------------
+
+    @Post('/auth/create-access-token', {
+        subdomain: 'api',
+        requireAuth: true,
+        rateLimit: CREDENTIAL_MINT_LIMIT,
+    })
+    async handleCreateAccessToken(req: Request, res: Response): Promise<void> {
+        const { permissions, expiresIn, label } = req.body ?? {};
+        if (!Array.isArray(permissions) || permissions.length === 0) {
+            throw new HttpError(400, 'Missing or empty `permissions` array', {
+                legacyCode: 'bad_request',
+            });
+        }
+        if (permissions.length > MAX_PERMISSIONS_PER_REQUEST) {
+            throw new HttpError(400, 'Too many `permissions`', {
+                legacyCode: 'bad_request',
+            });
+        }
+
+        // Optional user-facing name for the manage-sessions UI. Trim and clamp
+        // to the same 64-char limit the rename endpoint enforces.
+        let normalizedLabel: string | null = null;
+        if (label !== undefined && label !== null) {
+            if (typeof label !== 'string') {
+                throw new HttpError(400, '`label` must be a string', {
+                    legacyCode: 'bad_request',
+                });
+            }
+            normalizedLabel = label.trim().slice(0, 64) || null;
+        }
+
+        // Whole seconds or a duration string ('30d'). A wrong type, a
+        // fraction, or an unparseable unit all reach the signer, which throws
+        // after the session row is already inserted.
+        if (expiresIn !== undefined && expiresIn !== null) {
+            const usable =
+                typeof expiresIn === 'number'
+                    ? Number.isInteger(expiresIn) && expiresIn > 0
+                    : typeof expiresIn === 'string' &&
+                      /^\d+\s*[smhdwy]?$/.test(expiresIn.trim());
+            if (!usable) {
+                throw new HttpError(
+                    400,
+                    '`expiresIn` must be a whole number of seconds or a duration string like `30d`',
+                    { legacyCode: 'bad_request' },
+                );
+            }
+        }
+
+        // Normalize specs: string → [string], [string] → [string, {}], [string, extra] → as-is
+        const normalized = permissions.map((spec) => {
+            const entry =
+                typeof spec === 'string'
+                    ? [spec]
+                    : Array.isArray(spec)
+                      ? spec
+                      : null;
+            if (!entry || typeof entry[0] !== 'string' || !entry[0]) {
+                throw new HttpError(
+                    400,
+                    'Each permission must be a string or [string, extra?]',
+                    { legacyCode: 'bad_request' },
+                );
+            }
+            // Same caps the grant routes apply, before a session or row exists.
+            this.#validateAppPermissionParams({
+                permission: entry[0],
+                extra: entry[1],
+            });
+            return entry;
+        });
+
+        const token = await this.services.auth.createAccessToken(
+            req.actor!,
+            normalized as never,
+            {
+                ...(expiresIn ? { expiresIn } : {}),
+                ...(normalizedLabel ? { label: normalizedLabel } : {}),
+            },
+        );
+        res.json({ token });
+    }
+
+    /**
+     * Revokes an access token given as its JWT. Unlike
+     * `/auth/revoke-access-token`, apps may call this; the service limits an
+     * app to tokens it issued and refuses personal API tokens.
+     */
+    @Post('/auth/revoke-own-access-token', {
+        subdomain: 'api',
+        requireAuth: true,
+        rateLimit: ACCESS_TOKEN_REVOKE_LIMIT,
+    })
+    async handleRevokeOwnAccessToken(
+        req: Request,
+        res: Response,
+    ): Promise<void> {
+        const { token } = req.body ?? {};
+        if (!token || typeof token !== 'string') {
+            throw new HttpError(400, 'Missing `token`', {
+                legacyCode: 'bad_request',
+            });
+        }
+        await this.services.auth.revokeOwnAccessToken(req.actor!, token);
+        res.json({ ok: true });
+    }
+
+    // Web sessions only: a leaked access token must not be able to revoke a
+    // personal API token, or revoke by raw uuid;
+    // `/auth/revoke-own-access-token` covers revoking scoped tokens by JWT and
+    // already refuses PATs itself.
+    @Post('/auth/revoke-access-token', {
+        subdomain: 'api',
+        requireUserActor: true,
+        antiCsrf: true,
+        middleware: [WEB_SESSION_GATE],
+    })
+    async handleRevokeAccessToken(req: Request, res: Response): Promise<void> {
+        let { tokenOrUuid } = req.body ?? {};
+        if (!tokenOrUuid || typeof tokenOrUuid !== 'string') {
+            throw new HttpError(400, 'Missing `tokenOrUuid`', {
+                legacyCode: 'bad_request',
+            });
+        }
+        // Extract JWT from /token-read URLs if needed
+        if (tokenOrUuid.includes('/token-read')) {
+            const match = tokenOrUuid.match(/\/token-read\/([^\s/?]+)/);
+            if (match) tokenOrUuid = match[1];
+        }
+        await this.services.auth.revokeAccessToken(req.actor!, tokenOrUuid);
+        res.json({ ok: true });
+    }
+
+    // -- 2FA: setup ---------------------------------------------------
+
+    @Post('/user-protected/setup-2fa', {
+        userProtected: true,
+        // A member owing their team's 2FA reaches nothing else until this.
+        allowUnconfirmed: true,
+        rateLimit: {
+            scope: 'setup-2fa',
+            limit: 10,
+            window: 60 * 60_000,
+            key: 'user',
+        },
+    })
+    async handleSetup2fa(req: Request, res: Response): Promise<void> {
+        const user = await this.stores.user.getById(req.actor!.user.id!, {
+            force: true,
+        });
+        if (!user)
+            throw new HttpError(404, 'User not found', {
+                legacyCode: 'not_found',
+            });
+        if (user.otp_enabled) {
+            throw new HttpError(409, '2FA is already enabled.', {
+                legacyCode: 'conflict',
+            });
+        }
+
+        const result = otpCreateSecret(user.username);
+
+        // Generate 10 recovery codes
+        const codes: string[] = [];
+        for (let i = 0; i < 10; i++) {
+            codes.push(createRecoveryCode());
+        }
+        const hashedCodes = codes.map((c) => hashRecoveryCode(c));
+
+        await this.stores.user.update(user.id, {
+            otp_secret: result.secret,
+            otp_recovery_codes: hashedCodes.join(','),
+        });
+
+        res.json({
+            url: result.url,
+            secret: result.secret,
+            codes,
+        });
+    }
+
+    // -- 2FA: configure ----------------------------------------------
+
+    @Post('/auth/configure-2fa/:action', {
+        subdomain: 'api',
+        requireUserActor: true,
+        // A member owing their team's 2FA reaches nothing else until this.
+        allowUnconfirmed: true,
+        rateLimit: TWO_FACTOR_LIMIT,
+    })
+    async handleConfigure2fa(req: Request, res: Response): Promise<void> {
+        const action = req.params.action;
+        const user = await this.stores.user.getById(req.actor!.user.id!, {
+            force: true,
+        });
+        if (!user)
+            throw new HttpError(404, 'User not found', {
+                legacyCode: 'not_found',
+            });
+
+        if (action === 'test') {
+            const { code } = req.body ?? {};
+            if (!code)
+                throw new HttpError(400, 'Missing `code`', {
+                    legacyCode: 'bad_request',
+                });
+            const ok = verifyOtp(user.username, user.otp_secret, code);
+            res.json({ ok });
+            return;
+        }
+
+        if (action === 'enable') {
+            // A seat has no email by design, so this would bar it forever.
+            const seat = await this.stores.team.getOrgSeat(user.id);
+            if (!user.email_confirmed && !seat) {
+                throw new HttpError(
+                    403,
+                    'Email must be confirmed before enabling 2FA.',
+                    { legacyCode: 'forbidden' },
+                );
+            }
+            if (user.otp_enabled) {
+                throw new HttpError(409, '2FA is already enabled.', {
+                    legacyCode: 'conflict',
+                });
+            }
+            if (!user.otp_secret) {
+                throw new HttpError(
+                    409,
+                    '2FA has not been configured. Call setup first.',
+                    { legacyCode: 'conflict' },
+                );
+            }
+            // Proves the caller holds the secret setup issued; a session alone
+            // can't turn 2FA on.
+            const { code } = req.body ?? {};
+            if (typeof code !== 'string' || !code)
+                throw new HttpError(400, 'Missing `code`', {
+                    legacyCode: 'bad_request',
+                });
+            if (!verifyOtp(user.username, user.otp_secret, code)) {
+                throw new HttpError(400, 'Incorrect code.', {
+                    legacyCode: 'code_mismatch',
+                });
+            }
+
+            await this.stores.user.update(user.id, { otp_enabled: true });
+
+            if (this.clients.email && user.email) {
+                try {
+                    await this.clients.email.send(user.email, 'enabled_2fa', {
+                        username: user.username,
+                    });
+                } catch (e) {
+                    console.warn('[configure-2fa] email send failed:', e);
+                }
+            }
+
+            res.json({});
+            return;
+        }
+
+        throw new HttpError(400, `Invalid action: ${action}`, {
+            legacyCode: 'bad_request',
+        });
+    }
+
+    // -- 2FA: disable -------------------------------------------------
+
+    @Post('/user-protected/disable-2fa', {
+        userProtected: true,
+        rateLimit: {
+            scope: 'disable-2fa',
+            limit: 10,
+            window: 60 * 60_000,
+            key: 'user',
+        },
+    })
+    async handleDisable2fa(req: Request, res: Response): Promise<void> {
+        const user = await this.stores.user.getById(req.actor!.user.id!, {
+            force: true,
+        });
+        if (!user)
+            throw new HttpError(404, 'User not found', {
+                legacyCode: 'not_found',
+            });
+
+        const seat = await this.stores.team.getOrgSeat(user.id);
+        if (seat && Number(seat.require_2fa) === 1) {
+            throw new HttpError(
+                409,
+                'Your team requires two-factor authentication, so it cannot be turned off.',
+                { legacyCode: 'conflict' },
+            );
+        }
+
+        await this.stores.user.update(user.id, {
+            otp_enabled: false,
+            otp_recovery_codes: null,
+            otp_secret: null,
+        });
+
+        if (this.clients.email && user.email) {
+            try {
+                await this.clients.email.send(user.email, 'disabled_2fa', {
+                    username: user.username,
+                });
+            } catch (e) {
+                console.warn('[disable-2fa] email send failed:', e);
+            }
+        }
+
+        res.json({ success: true });
+    }
+
+    // -- Developer profile -------------------------------------------
+
+    @Get('/get-dev-profile', {
+        subdomain: 'api',
+        requireUserActor: true,
+        allowFullAccessToken: true,
+        rateLimit: AUTH_LIST_LIMIT,
+    })
+    async handleGetDevProfile(req: Request, res: Response): Promise<void> {
+        const user = await this.stores.user.getById(req.actor!.user.id!, {
+            force: true,
+        });
+        if (!user)
+            throw new HttpError(404, 'User not found', {
+                legacyCode: 'not_found',
+            });
+
+        // The columns are `dev_`-prefixed; unprefixed is the fallback.
+        const u = user as unknown as {
+            dev_first_name?: string | null;
+            dev_last_name?: string | null;
+            dev_approved_for_incentive_program?: number | boolean;
+            dev_joined_incentive_program?: number | boolean;
+            dev_paypal?: string | null;
+            first_name?: string | null;
+            last_name?: string | null;
+            approved_for_incentive_program?: number | boolean;
+            joined_incentive_program?: number | boolean;
+            paypal?: string | null;
+        };
+        const paypal = u.dev_paypal ?? u.paypal ?? null;
+        res.json({
+            first_name: u.dev_first_name ?? u.first_name ?? null,
+            last_name: u.dev_last_name ?? u.last_name ?? null,
+            approved_for_incentive_program: Boolean(
+                u.dev_approved_for_incentive_program ??
+                u.approved_for_incentive_program,
+            ),
+            joined_incentive_program: Boolean(
+                u.dev_joined_incentive_program ?? u.joined_incentive_program,
+            ),
+            // The payout address stays behind a session.
+            paypal: isPlainUserActor(req.actor) ? paypal : null,
+        });
+    }
+
+    // -- Session helpers ---------------------------------------------
+
+    @Get('/get-gui-token', {
+        requireUserActor: true,
+        allowUnconfirmed: true,
+        rateLimit: SESSION_LIMIT,
+    })
+    async handleGetGuiToken(req: Request, res: Response): Promise<void> {
+        if (!req.actor?.session?.uid)
+            throw new HttpError(400, 'No session bound to this actor', {
+                legacyCode: 'session_required' as never,
+            });
+        // Token auth built this actor from the user's row in this request, and
+        // a deleted user fails it.
+        const guiToken = this.services.auth.createGuiToken(
+            req.actor.user as UserRow,
+            req.actor.session.uid,
+        );
+        res.json({ token: guiToken });
+    }
+
+    @Get('/session/sync-cookie', {
+        rateLimit: SESSION_LIMIT,
+        // Installs the session cookie. Only page script on our own origin
+        // should be able to ask for that (the `tokenSource` check below is the
+        // companion rule: the token has to come from an Authorization header,
+        // not a URL).
+        guiOriginOnly: true,
+        requireUserActor: true,
+        allowUnconfirmed: true,
+    })
+    async handleSessionSyncCookie(req: Request, res: Response): Promise<void> {
+        // This route installs a session cookie, so the token has to come from
+        // page script on our own origin rather than from the URL.
+        if (req.tokenSource !== 'header') {
+            throw new HttpError(
+                401,
+                'This endpoint requires an Authorization header.',
+                { legacyCode: 'token_auth_failed' },
+            );
+        }
+        if (!req.actor?.session?.uid) {
+            res.status(400).end();
+            return;
+        }
+        // As in `/get-gui-token`: the actor is the user's row as auth read it.
+        const sessionToken = this.services.auth.createSessionTokenForSession(
+            req.actor.user as UserRow,
+            req.actor.session.uid,
+        );
+        res.cookie(this.config.cookie_name ?? 'puter_token', sessionToken, {
+            ...sessionCookieFlags(this.config),
+            httpOnly: true,
+        });
+        res.status(204).end();
+    }
+
+    // -- Step-up ("elevation") ---------------------------------------
+    //
+    // Mints the second-factor cookie for a session that re-proves identity: a
+    // fresh TOTP code when 2FA is enabled, otherwise the account password.
+    // Privileged endpoints require it on top of the session, so a leaked session
+    // alone can't exercise them. Accounts with neither credential (no password
+    // and 2FA disabled) can't elevate.
+    //
+    // Served on the root origin (browser form posts) and on `api` (SDK/script
+    // clients with no cookie jar). Not cookie-gated: the password/TOTP in the
+    // body is the control, which also makes CSRF a non-issue.
+    // `requireUserActor` keeps app and access-token actors out, so an access
+    // token can never mint an elevation for its issuer.
+
+    @Post('/auth/elevate', {
+        subdomain: ['api', ''],
+        requireUserActor: true,
+        allowUnconfirmed: true,
+        rateLimit: [
+            { scope: 'elevate', limit: 10, window: 15 * 60_000, key: 'user' },
+            {
+                scope: 'elevate-ip',
+                limit: 40,
+                window: 15 * 60_000,
+                key: 'ip',
+            },
+        ],
+    })
+    async handleElevate(req: Request, res: Response): Promise<void> {
+        const user = await this.stores.user.getById(req.actor!.user.id!, {
+            force: true,
+        });
+        if (!user)
+            throw new HttpError(404, 'User not found.', {
+                legacyCode: 'not_found',
+            });
+        if (user.suspended)
+            throw new HttpError(403, 'Account suspended.', {
+                legacyCode: 'account_suspended',
+            });
+
+        if (user.otp_enabled) {
+            const code = req.body?.code;
+            if (!code)
+                throw new HttpError(400, 'code is required.', {
+                    legacyCode: 'bad_request',
+                    fields: { factor: 'otp' },
+                });
+            if (
+                !verifyOtp(
+                    user.username,
+                    user.otp_secret as string,
+                    String(code),
+                )
+            )
+                throw new HttpError(401, 'Incorrect code.', {
+                    legacyCode: 'code_mismatch' as never,
+                    fields: { factor: 'otp' },
+                });
+        } else if (user.password) {
+            const password = req.body?.password;
+            if (!password || typeof password !== 'string')
+                throw new HttpError(400, 'Password is required.', {
+                    legacyCode: 'password_required',
+                    fields: { factor: 'password' },
+                });
+            const match = await bcrypt.compare(
+                password,
+                user.password as string,
+            );
+            if (!match)
+                throw new HttpError(401, 'Incorrect password.', {
+                    legacyCode: 'password_mismatch',
+                    fields: { factor: 'password' },
+                });
+        } else {
+            // Neither credential on file (e.g. an account that only ever
+            // authenticated through an external identity provider).
+            throw new HttpError(
+                403,
+                'This account has no credential to re-authenticate with. Set a password or enable two-factor authentication first.',
+                { legacyCode: 'elevation_unavailable' as never },
+            );
+        }
+
+        const token = signStepUpToken(this.services.token, user as never);
+        res.cookie(
+            STEP_UP_COOKIE_NAME,
+            token,
+            stepUpCookieOptions(this.config),
+        );
+
+        // A browser reads its elevation back from the httpOnly cookie and never
+        // needs the raw value; handing it to page JS would put the second factor
+        // within reach of an XSS. API clients have no cookie jar, so they get the
+        // token to send back as `x-puter-elevation`. Both paths proved the same
+        // password/TOTP — this only avoids needless exposure, it isn't a gate.
+        const cookieName = this.config.cookie_name ?? 'puter_token';
+        const usedSessionCookie =
+            !!req.token && req.token === req.cookies?.[cookieName];
+        res.json(
+            usedSessionCookie ? { elevated: true } : { elevated: true, token },
+        );
+    }
+
+    // -- Delete own account ------------------------------------------
+    //
+    // Purge S3 objects + fsentries first, then the user row. FK
+    // cascades on most related tables are `ON DELETE SET NULL` (not
+    // CASCADE), so anything holding tightly to user_id (sessions) we
+    // clear explicitly to avoid orphan rows.
+
+    @Post('/user-protected/delete-own-user', {
+        userProtected: { allowTempUsers: true },
+        allowUnconfirmed: true,
+    })
+    async handleDeleteOwnUser(req: Request, res: Response): Promise<void> {
+        const userId = req.actor!.user.id!;
+        // The team owns the account and is billed for it; only they may close
+        // it, through the console that keeps the audit trail.
+        if (await this.stores.team.getOrgSeat(userId)) {
+            throw new HttpError(
+                403,
+                'Your team owns this account. Ask a team admin to remove it.',
+                { legacyCode: 'forbidden' },
+            );
+        }
+        // The other direction: deleting an owner sets `owner_user_id` NULL and
+        // cascades their membership, leaving a team no one can administer —
+        // not even an admin, since every team route resolves by membership.
+        if (await this.stores.team.countOwned(userId)) {
+            throw new HttpError(
+                403,
+                'Delete the teams you own before closing this account.',
+                { legacyCode: 'forbidden' },
+            );
+        }
+        // A deleted team's seats are suspended, not gone, and only its owner
+        // can retire them.
+        if (await this.stores.team.countOwnedTeamsWithAccounts(userId)) {
+            throw new HttpError(
+                403,
+                'Close the accounts your teams created before closing this one.',
+                { legacyCode: 'forbidden' },
+            );
+        }
+        res.clearCookie(this.config.cookie_name ?? 'puter_token');
+        res.clearCookie('puter_token_v2');
+        res.clearCookie('puter_revalidation');
+        res.clearCookie(STEP_UP_COOKIE_NAME, {
+            ...(this.config.domain ? { domain: this.config.domain } : {}),
+        });
+        await this.#cascadeDeleteUser(userId);
+        res.json({ success: true });
+    }
+
+    // -- Private helpers ----------------------------------------------
+
+    async #cascadeDeleteUser(userId: number): Promise<void> {
+        await this.services.userAccount.cascadeDelete(userId);
+    }
+
+    async #generateTempUsername(): Promise<string> {
+        const username = await generateUsername(this.stores);
+        if (!username) {
+            throw new HttpError(
+                409,
+                'Failed to generate unique username. Try again later.',
+                { legacyCode: 'conflict' },
+            );
+        }
+        return username;
+    }
+
+    /**
+     * Per-IP enumeration clamp on `auth_id`-bearing auth requests. Separate
+     * from the route-level rate limit so a tighter ceiling applies only to the
+     * path that takes a uuid hint from the body — the normal login path stays
+     * at its more generous limit.
+     */
+    async #checkAuthIdRateLimit(req: Request): Promise<void> {
+        const ip = req.ip || req.socket?.remoteAddress || 'unknown';
+        const ok = await checkRateLimit(
+            `login-with-auth-id:${ip}`,
+            5,
+            15 * 60_000,
+        );
+        if (!ok) {
+            throw new HttpError(429, 'Too many auth_id login attempts.', {
+                legacyCode: 'too_many_requests',
+                fields: { 'retry-after': 900 },
+            });
+        }
+    }
+
+    /**
+     * Refuse once an account's wrong-code budget is spent, before checking the
+     * code.
+     */
+    async #assertSecondFactorAttemptsRemain(userUid: string): Promise<void> {
+        const { scope, limit, window } = SECOND_FACTOR_FAILURE_LIMIT;
+        if (await peekRateLimit(`${scope}:${userUid}`, limit, window)) return;
+        throw new HttpError(429, 'Too many incorrect codes. Try again later.', {
+            legacyCode: 'too_many_requests',
+        });
+    }
+
+    async #recordSecondFactorFailure(userUid: string): Promise<void> {
+        const { scope, limit, window } = SECOND_FACTOR_FAILURE_LIMIT;
+        await checkRateLimit(`${scope}:${userUid}`, limit, window);
+    }
+
+    /** An `otp-login` JWT completes one sign-in; a second redemption is refused. */
+    async #consumeOtpLoginToken(token: string): Promise<void> {
+        const digest = crypto.createHash('sha256').update(token).digest('hex');
+        const firstUse = await checkRateLimit(
+            `login-otp-token-used:${digest}`,
+            1,
+            OTP_LOGIN_TOKEN_USED_WINDOW_MS,
+        );
+        if (!firstUse) {
+            throw new HttpError(400, 'Invalid token.', {
+                legacyCode: 'bad_request',
+            });
+        }
+    }
+
+    /**
+     * Verify a client-supplied reauth_token and return its claims. Returns null
+     * when no token was supplied. Throws on invalid/expired tokens. The
+     * reauth_token is a server-signed JWT minted by the authProbe at 401 time —
+     * accepting only the signed envelope (vs. a raw UUID) means a leaked
+     * auth_id alone can't attach a session to an existing account.
+     */
+    #verifySuppliedReauthToken(
+        suppliedToken: unknown,
+    ): { authId: string; reason: ReauthReason | undefined } | null {
+        if (suppliedToken === undefined || suppliedToken === null) return null;
+        if (typeof suppliedToken !== 'string' || !suppliedToken) {
+            throw new HttpError(400, 'Invalid `reauth_token`.', {
+                legacyCode: 'bad_request',
+            });
+        }
+        return this.services.auth.verifyReauthToken(suppliedToken);
+    }
+
+    /**
+     * Enforce a verified `auth_id` against the user the credential flow has
+     * resolved. Caller has already extracted `auth_id` from the server-signed
+     * reauth_token (or from an OTP-flow JWT). When the GUI is forced through
+     * reauth, the 401 response embeds the reauth_token; the client echoes it
+     * back so we can confirm the second login lands on the same user row —
+     * critical for temp users, where a fresh signup would otherwise mint a new
+     * account and strand their files.
+     *
+     * No `authId` supplied → no-op (normal login). Unknown `authId` → 404
+     * (mirrors username-not-found, avoids being an enumeration oracle).
+     * Mismatch against the resolved user → 409 (`auth_id_mismatch`).
+     */
+    async #enforceAuthIdMatch(
+        req: Request,
+        resolvedUser: { id: number; uuid: string },
+        authId: string | null,
+    ): Promise<void> {
+        if (!authId) return;
+
+        await this.#checkAuthIdRateLimit(req);
+
+        // Common path: auth_id maps to the same uuid the credential flow
+        // resolved. Skip the user-table read entirely. The DB lookup is
+        // only needed to disambiguate 404 (unknown auth_id) from 409
+        // (known but mismatched) on the error path.
+        if (authId === resolvedUser.uuid) return;
+
+        const authIdUser = await this.stores.user.getByUuid(authId);
+        if (!authIdUser) {
+            throw new HttpError(404, 'auth_id not found.', {
+                legacyCode: 'not_found',
+            });
+        }
+        if (authIdUser.id !== resolvedUser.id) {
+            throw new HttpError(409, 'auth_id does not match credentials.', {
+                legacyCode: 'bad_request',
+                fields: { code: 'auth_id_mismatch' },
+            });
+        }
+    }
+
+    async #completeLogin(
+        req: Request,
+        res: Response,
+        user: UserRow,
+    ): Promise<void> {
+        const gui_token = await startWebSession(req, res, user, {
+            config: this.config,
+            auth: this.services.auth,
+        });
+
+        // The whoami payload, so a no-reload login can store it as
+        // window.user verbatim and skip a round-trip on first paint.
+        const details = await buildUserDetails(
+            user,
+            {
+                config: this.config,
+                clients: this.clients,
+                stores: this.stores,
+                services: this.services,
+            },
+            { isUser: true },
+        );
+        scrubSensitive(details);
+
+        // Response body gets the GUI token (client never sees session token)
+        res.json({
+            proceed: true,
+            next_step: 'complete',
+            token: gui_token,
+            user: details,
+        });
+    }
+}

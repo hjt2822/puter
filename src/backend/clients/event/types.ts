@@ -1,0 +1,948 @@
+/**
+ * Shape of every payload emitted on the event bus, keyed by event name.
+ *
+ * Domain objects (User, Actor, FSEntry, Socket, ...) are typed as `unknown`
+ * here on purpose — pulling their real types in would couple this module to
+ * most of the backend and risk import cycles. Refine at the listener if you
+ * need narrowed access.
+ *
+ * Conventions:
+ *
+ * - `*.validate` events carry an `allow` flag listeners flip to reject; they tend
+ *   to grow listener-specific fields, so they accept extras via an index
+ *   signature.
+ * - `outer.gui.*` events ride the `{ user_id_list, response }` envelope the
+ *   SocketService fans out to user-scoped channels.
+ */
+
+import type {
+    Request as ExpressRequest,
+    Response as ExpressResponse,
+} from 'express';
+import { Actor } from '../../core';
+import type { UsageInput } from '../../services/metering/types';
+import { FSEntry } from '../../stores/fs/FSEntry';
+
+// GUI write events spread an entry plus per-event metadata into `response`.
+// The exact field set varies by emit site (FSController / LegacyFSController /
+// WebDAVController each project a slightly different shape) so the envelope
+// stays loose; listeners narrow on whichever fields they actually consume.
+type GuiEvent<R = Record<string, unknown>> = {
+    user_id_list: number[];
+    response: R;
+};
+
+// The entry arrives under several aliases, for handlers of any vintage.
+type FsCreateEvent = { node: FSEntry; entry: FSEntry; uid: string };
+
+/**
+ * Who pays, and for which team. Deliberately no payment identity: the payer's
+ * row is alive at emit time, so a consumer resolves it when it acts -- a
+ * snapshot taken here would be stale, and two events racing on it would each
+ * create their own customer.
+ */
+export type TeamBillingContext = {
+    team_uid: string;
+    owner_user_id: number;
+};
+
+/** A team event about one seat. */
+export type TeamBillingEvent = TeamBillingContext & {
+    user_id: number;
+    user_uuid: string;
+    username: string;
+};
+
+/**
+ * Extension-augmentable half of {@link EventMap}, declaration-merged like
+ * `IExtensionClientInstances`. No index signature: it would widen `keyof
+ * EventMap` to `string` and disable key checking on every `emit`.
+ */
+// eslint-disable-next-line @typescript-eslint/no-empty-object-type
+export interface IExtensionEventMap {}
+
+/**
+ * What a KV mutation did to a key. `expire` is a lifetime change rather than a
+ * value change, which is why it is not folded into `set`.
+ */
+export type KvOp = 'set' | 'del' | 'expire';
+
+/** A flush empties a whole namespace, so it is never reported per key. */
+export type KvMutation = KvOp | 'flush';
+
+export type EventMap = {
+    // ---- Server lifecycle ----
+    serverStart: Record<string, never>;
+    serverPrepareShutdown: Record<string, never>;
+    serverShutdown: Record<string, never>;
+
+    // ---- AI ----
+    'ai.prompt.validate': {
+        username: string;
+        intended_service: string;
+        parameters: unknown;
+        allow?: boolean;
+        abuse?: unknown;
+        custom?: unknown;
+        [key: string]: unknown;
+    };
+    'ai.prompt.complete': {
+        username: string;
+        completionId: string;
+        intended_service: string;
+        parameters: unknown;
+        result: unknown;
+        model_used: string;
+        service_used: string;
+    };
+    'ai.prompt.cost-calculated': {
+        completionId: string;
+        username: string;
+        usage: unknown;
+        input_tokens: number;
+        output_tokens: number;
+        input_ucents: number;
+        output_ucents: number;
+        total_ucents: number;
+        costs_currency: string;
+        model_used: string;
+        service_used: string;
+        intended_service: string;
+        model_details: {
+            id: string;
+            provider: string;
+            input_cost_key: string;
+            output_cost_key: string;
+            costs: unknown;
+            costs_currency: string;
+        };
+    };
+    'ai.log.image': {
+        actor: unknown;
+        completionId: string;
+        parameters: unknown;
+        intended_service: string;
+        model_used: string;
+        service_used: string;
+    };
+
+    // ---- Apps ----
+    /** Awaited before lookup; listeners may mutate or replace appNames. */
+    'app.recommended': { appNames: string[] };
+    'app.changed': {
+        app_uid: string;
+        action: string;
+        app?: unknown;
+        old_app?: unknown;
+    };
+    'app.new-icon': { app_uid: string; data_url: string };
+    'app.opened': { app_uid: string; user_id: number; ts: number };
+    'app.rename': {
+        app_uid: string;
+        old_name: string;
+        new_name: string;
+        app: unknown;
+    };
+    'app.from-origin': { origin: string };
+    'app.privateAccess.check': {
+        appUid: string;
+        userUid: string;
+        requestHost: string;
+        requestPath: string;
+        actor?: Actor;
+        result: {
+            allowed: boolean;
+            reason?: string;
+            redirectUrl?: string;
+            checkedBy?: string;
+        };
+    };
+    'app.privateAccess.resolveLaunch': {
+        app: unknown;
+        actor: unknown;
+        result: { allowed: boolean; reason?: string; error?: string };
+    };
+    // Emitted after an app token is granted (get-user-app-token). The app-side
+    // analogue of `site.htmlServed` — the external-app abuse scanner
+    // (extensions/subdomainAbuse/appScan.ts) listens to screenshot + classify
+    // external `index_url`s that Puter never serves itself.
+    'puter.app.authenticated': {
+        app_uid?: string;
+        user_id?: number | null;
+        app?: {
+            id?: number;
+            uid?: string;
+            index_url?: string | null;
+            owner_user_id?: number | null;
+            name?: string | null;
+            godmode?: boolean;
+        };
+    };
+
+    // ---- Auth / signup ----
+    'puter.signup.validate': {
+        allow: boolean;
+        email?: string;
+        /**
+         * The address in the same canonical form the `email.validate` hook was
+         * given (`cleanEmail`), so a handler can correlate the two hooks on one
+         * key. Aliases (`a+tag@outlook.com`, `a.b@icloud.com`) differ from
+         * `email` here.
+         */
+        clean_email?: string;
+        /**
+         * True for a temp (frictionless, no-password) signup. Those carry a
+         * synthetic `<username>@gmail.com` and never reach email validation, so
+         * a handler must not draw conclusions from `email`.
+         */
+        is_temp?: boolean;
+        ip?: string | null;
+        source?: 'oidc';
+        req?: unknown;
+        data?: unknown;
+        abuse?: unknown;
+        trail?: Array<string>;
+        /**
+         * Set by the abuse harness for flagged signups — the id under which the
+         * decision trail is persisted to KV (`abuse:trail:<id>`), shared back
+         * on the request for log / support correlation.
+         */
+        trail_id?: string;
+        /** Device signal forwarded verbatim from the signup request body. */
+        fingerprint?: string | null;
+        /**
+         * Set by the abuse harness — require SMS phone verification
+         * post-signup.
+         */
+        requires_phone_verification?: boolean;
+        /** Set by the abuse harness — require card verification post-signup. */
+        requires_card_verification?: boolean;
+        [key: string]: unknown;
+    };
+    'puter.signup.success': {
+        user_id: number;
+        user_uuid: string;
+        email: string;
+        username: string;
+        ip?: string | null;
+        fingerprint?: string | null;
+        /** True when the created account is a temp user (no email/password). */
+        is_temp?: boolean;
+        /** The bonus code `puter.signup-bonus.validate` accepted, if any. */
+        bonus_code?: string;
+        [key: string]: unknown;
+    };
+    // Signup bonus codes are pure mechanism here: an extension decides what a
+    // code is worth and fills these in (both emitted via `emitAndWait`).
+    'puter.signup-bonus.check': {
+        code: string;
+        ip: string | null;
+        fingerprint: string | null;
+        valid: boolean;
+        /** Opaque to core; forwarded to the client when `valid` is false. */
+        reason: string | null;
+        display: { title: string; description: string } | null;
+        /** Verification the code will require after signup. */
+        requirements: { phone: boolean; card: boolean } | null;
+    };
+    /**
+     * Emitted once a signup has passed `puter.signup.validate`, so listeners
+     * see the harness's verdict. A listener sets `accepted` to honor the code,
+     * and may raise (never lower) the verification requirements.
+     */
+    'puter.signup-bonus.validate': {
+        code: string;
+        email?: string;
+        clean_email?: string;
+        ip?: string | null;
+        fingerprint?: string | null;
+        reputation?: number | null;
+        source?: 'oidc';
+        requires_phone_verification: boolean;
+        requires_card_verification: boolean;
+        accepted: boolean;
+    };
+    'email.validate': {
+        email: string;
+        allow: boolean;
+        message: string | null;
+        [key: string]: unknown;
+    };
+    // Inbound mail to a feedback address (`abuse@`, `fbl@`, ...), emitted via
+    // `emitAndWait`. A listener that takes it sets `handled` and it reaches no
+    // mailbox; otherwise it is routed like any other message.
+    'email.ingress.feedback': {
+        /** The envelope recipient, as the relay presented it. */
+        to: string;
+        from: string | null;
+        /** The whole message, exactly as received. */
+        raw: Buffer;
+        handled: boolean;
+    };
+    'user.save_account': {
+        user_id: number;
+        old_username?: string;
+        new_username?: string;
+        email?: string;
+    };
+    'user.email-confirmed': {
+        user_id: number;
+        user_uid: string;
+        email: string;
+    };
+    // Phone-reuse cap is pure mechanism here — the abuse extension answers
+    // (emitted via `emitAndWait`) by counting how many OTHER accounts have
+    // already verified this number and flipping `allowed` to false when the
+    // cross-account limit is hit. No extension listening → `allowed` stays
+    // true and the send proceeds.
+    'puter.phone-verification.check': {
+        user_id: number;
+        user_uid: string;
+        phone: string;
+        // Client-supplied device fingerprint for this request, or null. Lets
+        // the abuse extension cap sends per device (across accounts) so a
+        // device farm can't dodge the per-account cap with fresh signups.
+        device_fingerprint: string | null;
+        allowed: boolean;
+        reason: string | null;
+        // With `allowed` false, offer the card fallback in place of SMS. Only
+        // honored while the fallback is on; otherwise the send proceeds.
+        card_fallback_instead?: boolean;
+        [key: string]: unknown;
+    };
+    // Fire-and-forget signal that a code was actually sent — the abuse
+    // extension bumps its per-number / per-account / per-device send-velocity
+    // counters off this. No-op with no extension listening.
+    'puter.phone-verification.sent': {
+        user_id: number;
+        user_uid: string;
+        phone: string;
+        device_fingerprint: string | null;
+        // Browser-signals dispatch id the client sent with this request, or
+        // null when it sent none.
+        dispatch_id: string | null;
+    };
+    'user.phone-verified': {
+        user_id: number;
+        user_uid: string;
+        phone: string;
+    };
+    // Card verification is pure mechanism here — a payments extension fills
+    // these in (emitted via `emitAndWait`). `enabled` stays null when no
+    // extension is installed; the extension always sets it (true/false) so
+    // the endpoints can distinguish "disabled" from "not installed".
+    'puter.card-verification.setup': {
+        user_id: number;
+        user_uid: string;
+        email?: string;
+        ip?: string | null;
+        // Client-supplied device fingerprint for this request, or null. Lets
+        // the abuse extension cap card-verification setups per device (across
+        // accounts) before any Stripe SetupIntent is created.
+        device_fingerprint: string | null;
+        // 'trial' when the card is being added for a free trial; null for the
+        // verification gates.
+        purpose?: string | null;
+        enabled: boolean | null;
+        // Set false by the extension to refuse this setup (e.g. the per-device
+        // setup-velocity cap); `reason` carries the opaque code. Stays true
+        // when allowed or with no extension listening.
+        allowed: boolean;
+        reason: string | null;
+        client_secret: string | null;
+        publishable_key: string | null;
+        [key: string]: unknown;
+    };
+    // Side-effect-free "is the card gate usable?" probe. The extension stamps
+    // `enabled` from its own config and does nothing else — no provider call,
+    // no user state, nothing billed. It exists so the SMS-to-card fallback can
+    // default on only where a card gate actually works, which means it gets
+    // asked often and must stay cheap.
+    'puter.card-verification.status': {
+        enabled: boolean | null;
+    };
+    'puter.card-verification.confirm': {
+        user_id: number;
+        user_uid: string;
+        email?: string;
+        setup_intent_id: string;
+        enabled: boolean | null;
+        verified: boolean;
+        reason: string | null;
+        fingerprint: string | null;
+        funding: string | null;
+        country: string | null;
+        customer_id: string | null;
+        [key: string]: unknown;
+    };
+    'user.card-verified': {
+        user_id: number;
+        user_uid: string;
+        fingerprint: string | null;
+        funding: string | null;
+        country: string | null;
+        customer_id: string | null;
+    };
+    'user.username-changed': {
+        user_id: number;
+        old_username: string;
+        new_username: string;
+    };
+    'user.email-changed': { user_id: number; new_email: string };
+    // Fired after an account is torn down (self-serve, admin, or temp-user
+    // logout cleanup). Listeners purge external state tied to the account —
+    // e.g. the marketplace extension cancels the user's Stripe subscriptions.
+    // The row is already gone by emit time, so identifiers ride the payload.
+    'user.delete': {
+        user_id: number;
+        user_uuid?: string;
+        stripe_customer_id?: string | null;
+    };
+
+    // ---- Team billing ---- the trigger, never the charge ----
+    'team.account.created': TeamBillingEvent;
+    /** `held_bytes` is what to bill storage on while the seat is off. */
+    'team.account.disabled': TeamBillingEvent & { held_bytes: number };
+    'team.account.enabled': TeamBillingEvent & { held_bytes: number };
+    /** Emitted pre-delete: the membership row cascades away with the user. */
+    'team.account.deleted': TeamBillingEvent;
+    /** Per-seat charges stop; byte charges do not, the accounts remain. */
+    'team.deleted': TeamBillingContext & { account_count: number };
+    /** A budget line was crossed. Emitted on transition only, never per request. */
+    'metering.credit-state': {
+        user_uuid: string;
+        state: 'near-limit' | 'exhausted';
+        allowance_used: number;
+        month_usage_allowance: number;
+    };
+
+    // ---- Filesystem ----
+    'fs.copy.node': {
+        source: unknown;
+        copy: unknown;
+        sourceObjectKey: string;
+        copyObjectKey: string;
+    };
+    /**
+     * `fromUserId` is the owner the node had before the move. A move into
+     * someone else's tree re-owns the row, and `node` already carries the new
+     * owner — listeners that care about the hand-over need the old one.
+     */
+    'fs.move.node': {
+        node: FSEntry;
+        fromPath: string;
+        toPath: string;
+        fromUserId?: number;
+    };
+    'fs.remove.node': { node: FSEntry; entry: FSEntry; target: FSEntry };
+    'fs.write.file': { node: FSEntry; entry: FSEntry; target: FSEntry };
+    /** A new entry, one key per flavor; `fs.write.file` is the overwrite. */
+    'fs.create.file': FsCreateEvent;
+    'fs.create.directory': FsCreateEvent;
+    'fs.create.shortcut': FsCreateEvent;
+    'fs.create.symlink': FsCreateEvent;
+    /** In-place name change. A move emits `fs.move.node` instead. */
+    'fs.rename': FsCreateEvent & {
+        old_name: string;
+        new_name: string;
+        old_path: string;
+        new_path: string;
+    };
+    'fs.storage.upload-progress': {
+        upload_tracker: unknown;
+        context: unknown;
+        meta: {
+            user_id: number;
+            userId: number;
+            item_uid: string;
+            item_path: string;
+            [key: string]: unknown;
+        };
+    };
+    /**
+     * Bytes to add to a user's storage allowance. Listeners run concurrently:
+     * add to `extra` after your own awaits, never `extra += await x`.
+     */
+    'storage.quota.bonus': { userId: number; userUuid?: string; extra: number };
+
+    // ---- Key-value ----
+    /**
+     * Keys of one namespace that changed together, announced after the write
+     * commits. `namespace` is `v1:<userUuid>:<appUid>` and `userId` is the same
+     * user by its row id — the only part a listener cannot derive from the
+     * namespace, and the one dispatch keys on.
+     *
+     * Distinct from `outer.kv.cacheInvalidated`, which carries encoded cache
+     * keys and is suppressed entirely when the read cache is off.
+     */
+    'kv.mutated': {
+        namespace: string;
+        userId: number;
+        keys: string[];
+        op: KvOp;
+        /**
+         * What each key holds after the change, aligned with `keys`: the
+         * written value on a `set`, `null` on a `del`. Absent when the write
+         * did not have it in hand, as an `expire` does not.
+         */
+        values?: unknown[];
+        /** Keys among `keys` private to the namespace's app. */
+        noShareKeys?: string[];
+        /** Events handler runs behind the write; see `Actor.handlerDepth`. */
+        handlerDepth?: number;
+    };
+    /**
+     * A whole namespace was emptied. Namespace-level on purpose: `flush`'s own
+     * key enumeration is truncated for a large namespace, so the keys it saw
+     * are not the keys it removed.
+     */
+    'kv.flushed': { namespace: string; userId: number };
+
+    // ---- Notifications ----
+    /**
+     * A notification row exists. Emitted after the insert commits — nothing
+     * pushes a uid before there is a row to name — and carries the scope tuple
+     * so a listener never has to read the row back.
+     */
+    'notif.created': {
+        userId: number;
+        userUuid: string;
+        uid: string;
+        type: string;
+        audience: string;
+        appUid: string | null;
+        value: Record<string, unknown>;
+        createdAt: number;
+        /** Events handler runs behind whatever created it. */
+        handlerDepth?: number;
+    };
+    /**
+     * One notification, addressed at whatever sockets each region holds for the
+     * recipient. `outer.*` reaches peer regions and never sibling nodes, so
+     * every region applies it exactly once — which is what keeps a socket from
+     * receiving the same notification twice.
+     */
+    'outer.notif.delivery': {
+        userId: number;
+        wire: 'notif.message' | 'notif.unreads' | 'notif.ack';
+        response: unknown;
+    };
+
+    // ---- Metering ----
+    // Recurring charges are pure mechanism here: the metering service knows
+    // when to ask (once per user per month, the first time that month's usage
+    // record is touched) and how to record the answer, and an extension
+    // decides what the account owes. Listeners push onto `charges`; the
+    // service applies them as ordinary usage once every listener has run.
+    // Nothing listening → no charges and no claim is ever taken.
+    //
+    // Emitted after the claim is settled, so a listener that calls back into
+    // metering can't re-trigger it.
+    'metering.monthly.charges': {
+        /**
+         * User-scoped, with no app on it: the account is what recurs, and the
+         * app that happened to trigger the month's first call has nothing to do
+         * with what is owed. Price against what the user owns.
+         */
+        actor: Actor;
+        /** The month being charged for, `YYYY-MM` in UTC. */
+        month: string;
+        /**
+         * Push what the user owes here. Every listener's charges are merged
+         * into one amount map and recorded as a single increment.
+         */
+        charges: UsageInput[];
+    };
+
+    // ---- Workers ----
+    // Only a genuinely new worker. Redeploying an existing name updates its
+    // row instead, and never reaches here — so a listener that prices this
+    // is pricing workers that came into existence, not deploys.
+    'worker.create': { actor: Actor; workerName: string };
+
+    // The same announcement for worker code that lives inside a hosted site
+    // and is deployed on demand rather than by an explicit call. Such a worker
+    // has no row of ours to key on, so what stands in for "genuinely new" is
+    // the absence of any prior record that it ran — which is why it is
+    // announced separately, and identified by where its source lives rather
+    // than by a worker name.
+    'worker.dynamic.create': {
+        actor: Actor;
+        subdomain: string;
+        worker: string;
+    };
+
+    // An app's events worker coming into being (its handler count going 0→1)
+    // and going away (1→0, whether by removing the last handler or by the
+    // destroy route). `actor.user` is the app's owner, not the caller — a
+    // developer session publishing for an app it owns is the common case, but
+    // billing follows ownership.
+    'events.worker.create': { actor: Actor; appUid: string };
+    'events.worker.destroy': { actor: Actor; appUid: string };
+
+    // ---- Outer / GUI broadcast ----
+    'outer.cacheUpdate': {
+        cacheKey: string[];
+        data?: unknown;
+        ttlSeconds?: number;
+    };
+    /**
+     * Permission cache generations were bumped, so peer regions must bump their
+     * own — the counter is per-cluster, so a local bump says nothing to them.
+     * Carries the actors, not the values: the numbers only have to change.
+     */
+    'outer.permission.generationBumped': { actorUids: string[] };
+    /**
+     * Flat permission entries were deleted. Grant-path flat entries carry no
+     * expiry, so without this a revoke never lands in a peer region whose KV
+     * table isn't replicated. Revoke-only: a grant that fails to replicate just
+     * denies there, which is the safe direction.
+     */
+    'outer.permission.flatInvalidated': {
+        entries: Array<{ holderUserId: number; permission: string }>;
+    };
+    /**
+     * A user's subscription set changed, so every process must drop its cached
+     * "does this user have any subscriptions" answer. Carries the counter the
+     * bump produced so a listener can order two bumps it sees out of order.
+     *
+     * The dispatch hot path never reads the counter — it is the broadcast that
+     * invalidates, which is what keeps an unsubscribed write at zero Redis
+     * commands. Hence `outer.pubsub.*`: the cache is a per-process map, the
+     * webhook reaches one node per peer region, and only the Redis fan reaches
+     * that node's siblings — a node the bump never reached has nothing that
+     * expires.
+     */
+    'outer.pubsub.events.generationBumped': {
+        userId: number;
+        generation: number;
+        /** Whether the table changed; only then does a peer need to re-read it. */
+        durable: boolean;
+        /**
+         * Session subscriptions this bump ended, so siblings stop queueing for
+         * them.
+         */
+        ended?: string[];
+    };
+    /**
+     * A user's sockets moved between regions, so every node must drop what it
+     * cached about where they are. Bumped on a first connect, a last
+     * disconnect, and every repair — never on a timer, which is what keeps
+     * presence reads proportional to session churn rather than to event volume.
+     * `outer.pubsub.*` for the same reason as the generation bump: a
+     * per-process cache that only the Redis fan reaches on a region's other
+     * nodes.
+     */
+    'outer.pubsub.events.presenceBumped': {
+        userId: number;
+        generation: number;
+    };
+    /**
+     * Someone's entry was just shared, so every process must drop its cached
+     * "this owner has nothing shared" answer. `outer.pubsub.*` for the same
+     * reason as the events generation bump: a per-process cache.
+     */
+    'outer.pubsub.share.ownerShared': { ownerUserId: number };
+    'outer.fs.write-hash': { hash: string; uuid: string };
+    /**
+     * Cache keys the KV read cache must stop serving, because the entries
+     * behind them were just written somewhere else.
+     *
+     * `outer.*` rather than `outer.pubsub.*` on purpose: the cache lives in the
+     * Redis a cluster shares, so one node applying the invalidation covers the
+     * whole cluster — fanning it out to siblings would just repeat the write.
+     */
+    'outer.kv.cacheInvalidated': { cacheKeys: string[] };
+    'outer.gui.item.added': GuiEvent;
+    'outer.gui.item.updated': GuiEvent;
+    'outer.gui.item.moved': GuiEvent;
+    'outer.gui.item.pending': GuiEvent;
+    'outer.gui.item.removed': GuiEvent;
+    'outer.gui.item.renamed': GuiEvent;
+    'outer.gui.notif.ack': GuiEvent<{ uid: string }>;
+    'outer.gui.notif.message': GuiEvent<{ uid: string; notification: unknown }>;
+    'outer.gui.notif.unreads': GuiEvent<{
+        unreads: { uid: string; notification: unknown }[];
+    }>;
+
+    // ---- Subdomains ----
+    // `uid` is the row uuid — for `delete` it is the only surviving handle a
+    // listener can use to find state keyed to the row after it is gone.
+    'subdomain.delete': { subdomain: string; uid?: string };
+    'subdomain.update': { subdomain: string; uid?: string };
+    'site.htmlServed': {
+        subdomain: string;
+        entry: unknown;
+        host: string;
+        requestPath: string;
+        requestUrl?: string;
+        requestHash?: string;
+        mime: string;
+    };
+    // Asked before a hosted file is streamed. A listener that owns the site
+    // sets `result.allowed = false` to withhold the entry; the visitor then
+    // sees the same 404 as for a missing file.
+    'site.access.check': {
+        subdomain: string;
+        host: string;
+        requestPath: string;
+        entry: { name: string; path: string };
+        result: { allowed: boolean };
+    };
+
+    // ---- Thumbnails ----
+    // The listener rewrites `thumbnail` in place (an s3:// key or legacy
+    // https:// URL becomes a signed URL) and falls back to `uuid`/`uid` to
+    // migrate inline data-URL thumbnails. Declared to match: the previous
+    // `uri` member was never emitted nor read.
+    'thumbnail.read': {
+        uuid?: string;
+        uid?: string;
+        thumbnail?: string | null;
+    };
+    /** `uuid` is the entry the thumbnail belongs to. */
+    'thumbnail.created': { url: string; uuid: string };
+    'thumbnail.upload.prepare': {
+        items: { index: number; item_uid: string }[];
+        uploadUrl?: string;
+        thumbnailUrl?: string;
+    };
+
+    // ---- Web sockets ----
+    'web.socket.connected': { socket: unknown; user: unknown };
+    'web.socket.user-connected': { socket: unknown; user: unknown };
+
+    /**
+     * Sessions were revoked for a user. Anything holding one of them open — a
+     * live socket, say — should drop it: `revoked_at` is otherwise only read on
+     * the next handshake.
+     *
+     * `outer.*` rather than `outer.pubsub.*` on purpose: the eviction runs
+     * through the socket.io Redis adapter a cluster shares, so one node
+     * disconnecting covers every node in it — fanning out to siblings would
+     * just have each of them repeat the same cluster-wide disconnect.
+     */
+    'outer.auth.sessions.revoked': {
+        user_id: number;
+        session_uids: string[];
+    };
+
+    /** One access token was revoked; only its own connections should drop. */
+    'auth.access-token.revoked': { token_uid: string };
+
+    /**
+     * A grant was withdrawn, so whatever was standing on it has to be settled
+     * rather than left to fail its next check.
+     *
+     * Local rather than `outer.*` on purpose: a listener settles shared state,
+     * and one region doing it covers every other. Emitted once per revoke call,
+     * not once per row it affects.
+     */
+    'permission.revoked': {
+        /** Whose access went. */
+        holderUserId: number;
+        /** The app the grant was to, or `null` for a user-to-user grant. */
+        appUid: string | null;
+        /** The grant string, or `null` when every grant to the app went. */
+        permission: string | null;
+    };
+
+    // ---- Extension hooks / misc ----
+    'puter.gui.addons': {
+        prependHeadContent?: string[];
+        prependBodyContent?: string[];
+    };
+    'whoami.details': {
+        user: unknown;
+        details: {
+            uuid?: string;
+            username?: string;
+            email?: string;
+            app_name?: string;
+        };
+        /** False for an app actor: add only `subscribed` / `paid_storage` then. */
+        isUser: boolean;
+    };
+    'wisp.get-policy': {
+        app: unknown;
+        actor: unknown;
+        allow: boolean;
+        policy?: unknown;
+    };
+    'ip.validate': { allow: boolean; ip: string };
+} & {
+    // SocketService re-emits each fanout-eligible event under
+    // `sent-to-user.<wireName>` so per-user channels can subscribe by wire name.
+    [K in `sent-to-user.${string}`]: { user_id: number; response: unknown };
+} & {
+    // Generic per-driver-method lifecycle, emitted by DriverController for
+    // EVERY driver call under a key scoped to the interface + method:
+    // `driver.<iface>.<method>.before|after|error|reject`. Wildcard
+    // subscribers can listen to `driver.*` for everything, `driver.<iface>.*`
+    // for one interface, or the exact key for one method. The `.before` phase
+    // is emitted via `emitAndWait`, so a listener may set `allow = false`
+    // (with an optional `rejectReason`) to veto the call before it runs — a
+    // vetoed call emits `.reject` instead of running.
+    [K in `driver.${string}`]: DriverMethodLifecycleEvent;
+} & {
+    // Generic per-route-endpoint lifecycle, emitted by the route materializer
+    // for EVERY non-middleware route under a key scoped to the HTTP method +
+    // normalized path: `route.<method>.<path>.before|after|error|reject`. Same
+    // wildcard + veto semantics as the driver lifecycle above.
+    [K in `route.${string}`]: RouteLifecycleEvent;
+} & {
+    // Cost factor for recorded AI usage, keyed by driver and model:
+    // `ai.cost.factor.<driverName>.<provider>:<model>`. Emitted once per model
+    // per batch; the last listener to set `factor` wins.
+    [K in `ai.cost.factor.${string}`]: AiCostFactorEvent;
+} & {
+    // A plan gate is about to refuse a caller. Keyed per surface the way the
+    // lifecycles above are: `subscription.gate.route.<method>.<path>`,
+    // `subscription.gate.driver.<iface>.<method>`. Emitted via `emitAndWait`;
+    // a listener that sets `allow` waives the plan requirement for that call.
+    [K in `subscription.gate.${string}`]: SubscriptionGateEvent;
+} & {
+    [K in `pubsub.login.${string}`]: { authtoken: string };
+} & {
+    /**
+     * A user's subscription now resolves to a different policy. Carried on the
+     * `outer.pubsub.*` channel so it reaches sibling nodes and peer clusters,
+     * not just the one that handled the change — every node caches the resolved
+     * policy, so a purchase is only live once they have all dropped theirs.
+     */
+    'outer.pubsub.metering.subscription-changed': { userUuid: string };
+    /**
+     * A user's purchased credit balance changed. Separate from a policy change
+     * because it moves the other half of the same budget, and carried on the
+     * `outer.pubsub.*` channel for the same reason: every node caches whether
+     * an account has budget left, so a top-up only lifts enforcement once they
+     * have all dropped that answer.
+     */
+    'outer.pubsub.metering.credits-changed': { userUuid: string };
+} & IExtensionEventMap;
+
+/** Payload for `subscription.gate.<surface>` events. */
+export type SubscriptionGateEvent = {
+    actor: Actor;
+    /** The key after `subscription.gate.`, e.g. `driver.puter-kvstore.get`. */
+    surface: string;
+    /** What the gate asked for: any paid plan (`true`) or these policy ids. */
+    requirement: boolean | readonly string[];
+    /** The request being gated, when there is one. */
+    req?: ExpressRequest;
+    allow: boolean;
+};
+
+/** Payload for `ai.cost.factor.<driver>.<model>` events. */
+export type AiCostFactorEvent = {
+    /** Driver doing the pricing, e.g. `ai-chat`. */
+    driver: string;
+    /** `<provider>:<model>` the usage is recorded under. */
+    model: string;
+    /** Who the usage is being charged to. */
+    actor: Actor;
+    /** Applied to the cost, starting at 1. Values <= 0 are ignored. */
+    factor: number;
+};
+
+/**
+ * Phase of a request/method lifecycle. `reject` is emitted when a `before`
+ * listener vetoes the call (sets `allow = false`); the call never runs and no
+ * `after`/`error` follows.
+ */
+export type LifecyclePhase = 'before' | 'after' | 'error' | 'reject';
+
+/**
+ * Payload for `driver.<iface>.<method>.<phase>` events.
+ *
+ * One shape across all phases; read `phase` (or the key suffix) to branch.
+ * `allow`/`rejectReason` are only meaningful on the `before` phase (emitted via
+ * `emitAndWait`).
+ */
+export type DriverMethodLifecycleEvent = {
+    phase: LifecyclePhase;
+    iface: string;
+    method: string;
+    /** Resolved concrete driver name. */
+    driver: string;
+    /** Full actor object, if the request is authenticated. */
+    actor?: Actor;
+    /** Stable actor id (see `actorUid`), if the request is authenticated. */
+    actorUid?: string;
+    /** Call arguments. Present on every phase. */
+    args?: unknown;
+    /** Return value. Present on `after`. */
+    result?: unknown;
+    /** Thrown error. Present on `error`. */
+    error?: unknown;
+    /** Wall-clock duration of the invocation. Present on `after`/`error`. */
+    durationMs?: number;
+    /** Veto channel for `before`: set `false` to block the call. */
+    allow?: boolean;
+    /** Optional human-readable reason surfaced to the caller when vetoed. */
+    rejectReason?: string;
+};
+
+/**
+ * Payload for `route.<method>.<path>.<phase>` events. Mirrors
+ * {@link DriverMethodLifecycleEvent} for HTTP endpoints.
+ */
+export type RouteLifecycleEvent = {
+    phase: LifecyclePhase;
+    /** HTTP method, lowercased (`get`, `post`, ...). */
+    method: string;
+    /** Full route path including the controller prefix. */
+    path: string;
+    /**
+     * The live express request/response for this call. Present on every phase.
+     * On `before` a listener can read the parsed body/headers or write its own
+     * response; on terminal phases they're useful for logging. These are real
+     * in-process objects — never serialize or forward them across nodes.
+     */
+    req: ExpressRequest;
+    res: ExpressResponse;
+    /** Full actor object, if the request is authenticated. */
+    actor?: Actor;
+    /** Stable actor id (see `actorUid`), if the request is authenticated. */
+    actorUid?: string;
+    /** Response status code. Present on `after`/`error`. */
+    statusCode?: number;
+    /** Wall-clock duration from `before` to terminal phase. */
+    durationMs?: number;
+    /** Set when the request did not complete normally (abort / >=500). */
+    error?: unknown;
+    /** Veto channel for `before`: set `false` to block the request. */
+    allow?: boolean;
+    /** Optional human-readable reason surfaced to the caller when vetoed. */
+    rejectReason?: string;
+};
+
+export type EventKey = keyof EventMap & string;
+
+// "a.b.c" -> "a.*" | "a.b.*"
+// Generates a wildcard for every non-final dot-separated prefix of K.
+export type WildcardPrefixes<K extends string> =
+    K extends `${infer Head}.${infer Tail}`
+        ?
+              | `${Head}.*`
+              | (Tail extends `${string}.${string}`
+                    ? `${Head}.${WildcardPrefixes<Tail>}`
+                    : never)
+        : never;
+
+export type ListenKey = EventKey | WildcardPrefixes<EventKey>;
+
+export type MatchingEvents<P extends ListenKey> = P extends `${infer Prefix}.*`
+    ? Extract<EventKey, `${Prefix}.${string}`>
+    : P & EventKey;
+
+export type EventMetadata = {
+    from_outside?: boolean;
+    /** Set by `emitAndWait` when a listener threw, so a verdict hook can refuse. */
+    listener_failed?: boolean;
+};
+export type EventListener<K extends EventKey = EventKey> = (
+    key: K,
+    data: EventMap[K],
+    meta: EventMetadata,
+) => Promise<void> | void;

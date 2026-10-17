@@ -1,0 +1,609 @@
+import type { Request, Response } from 'express';
+import { v4 as uuidv4 } from 'uuid';
+import {
+    afterAll,
+    beforeAll,
+    describe,
+    expect,
+    it,
+    vi,
+} from 'vitest';
+import { makeActor, type Actor } from '../src/backend/core/actor.ts';
+import { runWithContext } from '../src/backend/core/context.ts';
+import { configContainer } from '../src/backend/exports.ts';
+import { PuterServer } from '../src/backend/server.ts';
+import { setupTestServer } from '../src/backend/testUtil.ts';
+import { handleWhoami } from './whoami.ts';
+
+interface CapturedResponse {
+    statusCode: number;
+    body: unknown;
+}
+
+const makeReq = (query: Record<string, unknown> = {}): Request =>
+    ({ query }) as unknown as Request;
+
+const makeRes = () => {
+    const captured: CapturedResponse = { statusCode: 200, body: undefined };
+    const res = {
+        json: vi.fn((value: unknown) => {
+            captured.body = value;
+            return res;
+        }),
+        status: vi.fn((code: number) => {
+            captured.statusCode = code;
+            return res;
+        }),
+    };
+    return { res: res as unknown as Response, captured };
+};
+
+let server: PuterServer;
+
+beforeAll(async () => {
+    server = await setupTestServer({
+        // Feature flag allowlist is enforced in the handler. We seed
+        // both an allow-listed flag and an internal flag to verify the
+        // internal one never reaches the response.
+        feature_flags: {
+            create_shortcut: true,
+            payment_bypass: true,
+        },
+        teams_enabled: true,
+    } as never);
+});
+
+afterAll(async () => {
+    await server?.shutdown();
+});
+
+const seedUser = async () => {
+    const slug = Math.random().toString(36).slice(2, 8);
+    return server.stores.user.create({
+        username: `wuser_${slug}`,
+        uuid: uuidv4(),
+        password: 'hashedpw',
+        email: `${slug}@example.com`,
+    });
+};
+
+describe('whoami extension — handleWhoami', () => {
+    // The sidebar label needs this at boot, which is why it rides whoami
+    // rather than a call of its own.
+    describe('the team an account belongs to', () => {
+        // A seat is created, never adopted, so it must have no password.
+        const seedSeat = async () => {
+            const slug = Math.random().toString(36).slice(2, 8);
+            return server.stores.user.create({
+                username: `wseat_${slug}`,
+                uuid: uuidv4(),
+                password: null,
+                email: null,
+            });
+        };
+
+        const seatOf = async (teamName: string) => {
+            const owner = await seedUser();
+            const seat = await seedSeat();
+            const team = await server.stores.team.create({
+                ownerUserId: owner.id as number,
+                name: teamName,
+                handle: `wt-${Math.random().toString(36).slice(2, 9)}`,
+            });
+            await server.stores.team.addMember(team.uid, seat.id as number, {
+                orgOwned: true,
+            });
+            return { seat, team };
+        };
+
+        it('names the team for a seat', async () => {
+            const { seat, team } = await seatOf('Acme Corp');
+            const { res, captured } = makeRes();
+
+            await runWithContext(
+                { actor: { user: { uuid: seat.uuid, id: seat.id as number } } },
+                () => handleWhoami(makeReq(), res),
+            );
+
+            expect((captured.body as { team?: unknown }).team).toEqual({
+                uid: team.uid,
+                name: 'Acme Corp',
+            });
+        });
+
+        it('says nothing for an account that is not a seat', async () => {
+            const user = await seedUser();
+            const { res, captured } = makeRes();
+
+            await runWithContext(
+                { actor: { user: { uuid: user.uuid, id: user.id as number } } },
+                () => handleWhoami(makeReq(), res),
+            );
+
+            expect(captured.body).not.toHaveProperty('team');
+        });
+
+        it('withholds it from an app actor', async () => {
+            // Same class as the phone number: a seat's employer is not an
+            // app's business.
+            const { seat } = await seatOf('Acme Corp');
+            const { res, captured } = makeRes();
+
+            await runWithContext(
+                {
+                    actor: makeActor({
+                        user: { uuid: seat.uuid, id: seat.id as number },
+                        app: { uid: 'app-1' },
+                    }),
+                },
+                () => handleWhoami(makeReq(), res),
+            );
+
+            expect(captured.body).not.toHaveProperty('team');
+        });
+    });
+
+    it('returns 401 when no actor is on the context', async () => {
+        const { res, captured } = makeRes();
+
+        await runWithContext({ actor: undefined }, () =>
+            handleWhoami(makeReq(), res),
+        );
+
+        expect(captured.statusCode).toBe(401);
+        expect(captured.body).toEqual({ error: 'Authentication required' });
+    });
+
+    it('returns 404 when the actor’s user no longer exists', async () => {
+        const { res, captured } = makeRes();
+
+        await runWithContext(
+            {
+                actor: {
+                    user: { uuid: 'ghost-uuid', id: 99_999_999 },
+                },
+            },
+            () => handleWhoami(makeReq(), res),
+        );
+
+        expect(captured.statusCode).toBe(404);
+        expect(captured.body).toEqual({ error: 'User not found' });
+    });
+
+    describe("an app's view of the email", () => {
+        const appActorFor = async (user: { uuid: string; id: unknown }) => {
+            const app = await (
+                server.stores.app.create as unknown as (
+                    fields: Record<string, unknown>,
+                    opts: { ownerUserId: number },
+                ) => Promise<{ uid: string; id: number }>
+            )(
+                {
+                    name: `we-${uuidv4()}`,
+                    title: 'Email reader',
+                    index_url: `https://${uuidv4()}.example/`,
+                },
+                { ownerUserId: user.id as number },
+            );
+            return {
+                app,
+                actor: makeActor({
+                    user: { uuid: user.uuid, id: user.id as number },
+                    app: { uid: app.uid, id: app.id },
+                }),
+            };
+        };
+
+        const whoamiAs = async (actor: Actor) => {
+            const { res, captured } = makeRes();
+            await runWithContext({ actor }, () =>
+                handleWhoami(makeReq(), res),
+            );
+            return captured;
+        };
+
+        it('is withheld until the user grants it, then shown', async () => {
+            const user = await seedUser();
+            const { app, actor } = await appActorFor(user);
+
+            const before = (await whoamiAs(actor)).body as Record<
+                string,
+                unknown
+            >;
+            expect(before).not.toHaveProperty('email');
+            expect(before).not.toHaveProperty('unconfirmed_email');
+
+            await server.services.permission.grantUserAppPermission(
+                makeActor({ user: { uuid: user.uuid, id: user.id as number } }),
+                app.uid,
+                `user:${user.uuid}:email:read`,
+            );
+            const after = (await whoamiAs(actor)).body as Record<
+                string,
+                unknown
+            >;
+            expect(after.email).toBe(user.email);
+            expect(after.unconfirmed_email).toBe(user.email);
+        });
+
+        it('answers 404 for a missing account even when the check fails', async () => {
+            const check = vi
+                .spyOn(server.services.permission, 'check')
+                .mockRejectedValue(new Error('scan failed'));
+            try {
+                const captured = await whoamiAs(
+                    makeActor({
+                        user: { uuid: 'ghost-uuid', id: 99_999_998 },
+                        app: { uid: 'app-ghost', id: 1 },
+                    }),
+                );
+                expect(captured.statusCode).toBe(404);
+                expect(captured.body).toEqual({ error: 'User not found' });
+            } finally {
+                check.mockRestore();
+            }
+        });
+    });
+
+    it('returns full user details for a user actor', async () => {
+        const user = await seedUser();
+        const { res, captured } = makeRes();
+
+        await runWithContext(
+            { actor: { user: { uuid: user.uuid, id: user.id as number } } },
+            () => handleWhoami(makeReq(), res),
+        );
+
+        const body = captured.body as Record<string, unknown>;
+        expect(body.username).toBe(user.username);
+        expect(body.uuid).toBe(user.uuid);
+        expect(body.email).toBe(user.email);
+        expect(body.is_temp).toBe(false);
+        expect(body.oidc_only).toBe(false);
+        // is_user_token is present (true) for user actors.
+        expect(body.is_user_token).toBe(true);
+        // Account creation time, in unix seconds.
+        expect(typeof body.created_ts).toBe('number');
+        expect(body.created_ts).toBeGreaterThan(0);
+        // `directories` is only sent to user actors — confirm it’s present.
+        expect(body.directories).toBeDefined();
+        // taskbar_items is only sent to user actors.
+        expect(body).toHaveProperty('taskbar_items');
+    });
+
+    it('reports the SMS-to-card fallback only once a send has opened it', async () => {
+        const user = await server.stores.user.create({
+            username: `wuser_${Math.random().toString(36).slice(2, 8)}`,
+            uuid: uuidv4(),
+            password: 'hashedpw',
+            email: `${Math.random().toString(36).slice(2, 8)}@example.com`,
+            requires_phone_verification: true,
+        } as never);
+        const prev = configContainer.phone_verification_card_fallback;
+        configContainer.phone_verification_card_fallback = {
+            enabled: true,
+        } as never;
+        try {
+            const before = makeRes();
+            await runWithContext(
+                { actor: { user: { uuid: user.uuid, id: user.id as number } } },
+                () => handleWhoami(makeReq(), before.res),
+            );
+            // Phone-gated, but the user has attempts left — no offer yet.
+            expect(
+                before.captured.body as Record<string, unknown>,
+            ).toMatchObject({ card_fallback_available: false });
+
+            // Exhausting SMS attempts stamps this flag; whoami is then the only
+            // thing that can still tell a reloading GUI about the offer, since
+            // further sends are rejected by the route's own rate limit.
+            await server.stores.kv.set({
+                key: `card-fallback-open:${user.id}`,
+                value: true,
+            });
+
+            const after = makeRes();
+            await runWithContext(
+                { actor: { user: { uuid: user.uuid, id: user.id as number } } },
+                () => handleWhoami(makeReq(), after.res),
+            );
+            expect(
+                after.captured.body as Record<string, unknown>,
+            ).toMatchObject({ card_fallback_available: true });
+        } finally {
+            configContainer.phone_verification_card_fallback = prev;
+        }
+    });
+
+    it('only forwards allow-listed feature flags', async () => {
+        const user = await seedUser();
+        const { res, captured } = makeRes();
+
+        await runWithContext(
+            { actor: { user: { uuid: user.uuid, id: user.id as number } } },
+            () => handleWhoami(makeReq(), res),
+        );
+
+        const flags = (captured.body as Record<string, unknown>)
+            .feature_flags as Record<string, boolean>;
+        // Allowed flag is forwarded as a coerced boolean.
+        expect(flags.create_shortcut).toBe(true);
+        // Internal flag must never leak.
+        expect(flags.payment_bypass).toBeUndefined();
+    });
+
+    it('strips desktop_bg_*, created_ts and human_readable_age fields for app actors', async () => {
+        const user = await seedUser();
+        const { res, captured } = makeRes();
+
+        await runWithContext(
+            {
+                actor: makeActor({
+                    user: { uuid: user.uuid, id: user.id as number },
+                    app: { uid: 'app-test-actor' },
+                }),
+            },
+            () => handleWhoami(makeReq(), res),
+        );
+
+        const body = captured.body as Record<string, unknown>;
+        expect(body.app_name).toBe('app-test-actor');
+        // is_user_token is stripped for app actors.
+        expect(body.is_user_token).toBeUndefined();
+        expect(body.desktop_bg_url).toBeUndefined();
+        expect(body.desktop_bg_color).toBeUndefined();
+        expect(body.desktop_bg_fit).toBeUndefined();
+        expect(body.human_readable_age).toBeUndefined();
+        // Account age, in either form, is not exposed to apps.
+        expect(body.created_ts).toBeUndefined();
+        // Directories are user-only.
+        expect(body.directories).toBeUndefined();
+    });
+
+    describe('fields added by whoami.details listeners', () => {
+        const addAccountDetails = (
+            _key: unknown,
+            event: { details: Record<string, unknown> },
+        ) => {
+            Object.assign(event.details, {
+                subscribed: true,
+                paid_storage: 1024,
+                subscription: { tier: 'pro', status: 'trialing' },
+                accountEligible: true,
+            });
+        };
+
+        const whoamiWithListener = async (
+            actor: Actor,
+            listener: typeof addAccountDetails = addAccountDetails,
+        ) => {
+            const { res, captured } = makeRes();
+            server.clients.event.on('whoami.details', listener);
+            try {
+                await runWithContext({ actor }, () =>
+                    handleWhoami(makeReq(), res),
+                );
+            } finally {
+                server.clients.event.off('whoami.details', listener);
+            }
+            return captured.body as Record<string, unknown>;
+        };
+
+        it('reach an app actor only as the documented subscribed / paid_storage', async () => {
+            const user = await seedUser();
+            const body = await whoamiWithListener(
+                makeActor({
+                    user: { uuid: user.uuid, id: user.id as number },
+                    app: { uid: 'app-test-actor' },
+                }),
+            );
+
+            expect(body.subscribed).toBe(true);
+            expect(body.paid_storage).toBe(1024);
+            expect(body).not.toHaveProperty('subscription');
+            expect(body).not.toHaveProperty('accountEligible');
+            // Fields the handler built itself still ship.
+            expect(body.username).toBe(user.username);
+            expect(body.app_name).toBe('app-test-actor');
+        });
+
+        it('are withheld from an app reached through an access token it issued', async () => {
+            const user = await seedUser();
+            const owner = { uuid: user.uuid, id: user.id as number };
+            const body = await whoamiWithListener(
+                makeActor({
+                    user: owner,
+                    accessToken: {
+                        uid: 'tok-1',
+                        issuer: makeActor({
+                            user: owner,
+                            app: { uid: 'app-issuer' },
+                        }),
+                    },
+                }),
+            );
+
+            expect(body.subscribed).toBe(true);
+            expect(body).not.toHaveProperty('subscription');
+            expect(body).not.toHaveProperty('accountEligible');
+        });
+
+        it('all reach a user actor', async () => {
+            const user = await seedUser();
+            const body = await whoamiWithListener(
+                makeActor({ user: { uuid: user.uuid, id: user.id as number } }),
+            );
+
+            expect(body).toMatchObject({
+                subscribed: true,
+                paid_storage: 1024,
+                subscription: { tier: 'pro', status: 'trialing' },
+                accountEligible: true,
+            });
+        });
+
+        it('cannot add taskbar_items for an app actor, which core omits', async () => {
+            const user = await seedUser();
+            const body = await whoamiWithListener(
+                makeActor({
+                    user: { uuid: user.uuid, id: user.id as number },
+                    app: { uid: 'app-test-actor' },
+                }),
+                (_key, event) => {
+                    event.details.taskbar_items = [{ name: 'injected' }];
+                },
+            );
+
+            expect(body).not.toHaveProperty('taskbar_items');
+        });
+    });
+
+    it('redacts tmp_password from metadata for user actors', async () => {
+        const user = await seedUser();
+        await server.stores.user.updateMetadata(user.id as number, {
+            tmp_password: 'bootstrap-secret',
+            hasDevAccountAccess: true,
+        });
+
+        const { res, captured } = makeRes();
+        await runWithContext(
+            { actor: { user: { uuid: user.uuid, id: user.id as number } } },
+            () => handleWhoami(makeReq(), res),
+        );
+
+        const body = captured.body as Record<string, unknown>;
+        const metadata = body.metadata as Record<string, unknown>;
+        expect(metadata.tmp_password).toBeUndefined();
+        // Other metadata keys still reach the user's own client.
+        expect(metadata.hasDevAccountAccess).toBe(true);
+        expect(body.hasDevAccountAccess).toBe(true);
+    });
+
+    it('never sends user metadata to app actors', async () => {
+        const user = await seedUser();
+        await server.stores.user.updateMetadata(user.id as number, {
+            tmp_password: 'bootstrap-secret',
+        });
+
+        const { res, captured } = makeRes();
+        await runWithContext(
+            {
+                actor: makeActor({
+                    user: { uuid: user.uuid, id: user.id as number },
+                    app: { uid: 'app-test-actor' },
+                }),
+            },
+            () => handleWhoami(makeReq(), res),
+        );
+
+        const body = captured.body as Record<string, unknown>;
+        expect(body.metadata).toBeUndefined();
+        expect(JSON.stringify(body)).not.toContain('bootstrap-secret');
+    });
+
+    it('never exposes phone, card fingerprint or signup identity', async () => {
+        const user = await seedUser();
+        await server.stores.user.update(user.id as number, {
+            phone: '+15551234567',
+            card_fingerprint: 'fp_ABC123',
+            requires_phone_verification: false,
+            requires_card_verification: false,
+        });
+        // Guard against a vacuous assertion below: the columns really do hold
+        // the values we then expect never to see on the wire.
+        const stored = await server.stores.user.getById(user.id as number, {
+            cached: false,
+            force: true,
+        });
+        expect(stored?.phone).toBe('+15551234567');
+        expect(stored?.card_fingerprint).toBe('fp_ABC123');
+
+        for (const actor of [
+            makeActor({ user: { uuid: user.uuid, id: user.id as number } }),
+            makeActor({
+                user: { uuid: user.uuid, id: user.id as number },
+                app: { uid: 'app-test-actor' },
+            }),
+        ]) {
+            const { res, captured } = makeRes();
+            await runWithContext({ actor }, () =>
+                handleWhoami(makeReq(), res),
+            );
+
+            const body = captured.body as Record<string, unknown>;
+            expect(body.phone).toBeUndefined();
+            expect(body.card_fingerprint).toBeUndefined();
+            expect(body.password).toBeUndefined();
+            expect(body.otp_secret).toBeUndefined();
+            expect(body.signup_ip).toBeUndefined();
+            // Not just absent as a key — the values must not appear anywhere
+            // in the payload (nested under metadata, taskbar items, …).
+            const serialized = JSON.stringify(body);
+            expect(serialized).not.toContain('5551234567');
+            expect(serialized).not.toContain('fp_ABC123');
+            // The verification flags, which the GUI acts on, still ship.
+            expect(body).toHaveProperty('requires_phone_verification');
+            expect(body).toHaveProperty('requires_card_verification');
+        }
+    });
+
+    it('scrubs sensitive keys added to metadata, and leaves the cached row intact', async () => {
+        const user = await seedUser();
+        await server.stores.user.updateMetadata(user.id as number, {
+            tmp_password: 'bootstrap-secret',
+            billing: { card_fingerprint: 'fp_NESTED', tier: 'pro' },
+        });
+
+        const { res, captured } = makeRes();
+        await runWithContext(
+            { actor: { user: { uuid: user.uuid, id: user.id as number } } },
+            () => handleWhoami(makeReq(), res),
+        );
+
+        const body = captured.body as Record<string, unknown>;
+        const metadata = body.metadata as Record<string, unknown>;
+        expect(metadata.tmp_password).toBeUndefined();
+        // Nested sensitive keys are removed too; siblings survive.
+        expect(metadata.billing).toEqual({ tier: 'pro' });
+        expect(JSON.stringify(body)).not.toContain('fp_NESTED');
+
+        // The scrub works on a copy — server-side state is untouched.
+        const fresh = await server.stores.user.getById(user.id as number, {
+            cached: false,
+            force: true,
+        });
+        expect(fresh?.metadata?.tmp_password).toBe('bootstrap-secret');
+        expect(
+            (fresh?.metadata?.billing as Record<string, unknown>)
+                ?.card_fingerprint,
+        ).toBe('fp_NESTED');
+    });
+
+    it('marks the user as oidc_only when password is null', async () => {
+        const slug = Math.random().toString(36).slice(2, 8);
+        const oidcUser = await server.stores.user.create({
+            username: `oidc_${slug}`,
+            uuid: uuidv4(),
+            password: null,
+            email: `${slug}@oidc.test`,
+        });
+
+        const { res, captured } = makeRes();
+        await runWithContext(
+            {
+                actor: {
+                    user: {
+                        uuid: oidcUser.uuid,
+                        id: oidcUser.id as number,
+                    },
+                },
+            },
+            () => handleWhoami(makeReq(), res),
+        );
+
+        const body = captured.body as Record<string, unknown>;
+        expect(body.oidc_only).toBe(true);
+        // No email yet means temp account.
+        expect(body.is_temp).toBe(false);
+    });
+});

@@ -1,24 +1,48 @@
-import io from '../../lib/socket.io/socket.io.esm.min.js';
+import path from 'path-browserify';
+import { io } from 'socket.io-client';
+import { PuterModule } from '../../lib/PuterModule.js';
+import { socketAutoUnref } from '../../lib/socketOptions.js';
+import * as utils from '../../lib/utils.js';
+
+// Constants
+//
+// The last valid time of the local cache.
+const LAST_VALID_TS = 'last_valid_ts';
 
 // Operations
-import space from "./operations/space.js";
-import mkdir from "./operations/mkdir.js";
-import copy from "./operations/copy.js";
-import rename from "./operations/rename.js";
-import upload from "./operations/upload.js";
-import read from "./operations/read.js";
-import move from "./operations/move.js";
-import write from "./operations/write.js";
-import sign from "./operations/sign.js";
-// Why is this called deleteFSEntry instead of just delete? because delete is 
-// a reserved keyword in javascript
-import deleteFSEntry from "./operations/deleteFSEntry.js";
-import { ProxyFilesystem, TFilesystem } from '../../lib/filesystem/definitions.js';
-import { AdvancedBase } from '../../../../putility/index.js';
-import { CachedFilesystem } from '../../lib/filesystem/CacheFS.js';
-import { PuterAPIFilesystem } from '../../lib/filesystem/APIFS.js';
+import FSItem from '../FSItem.js';
+import copy from './operations/copy.js';
+import deleteFSEntry from './operations/deleteFSEntry.js';
+import getReadURL from './operations/getReadUrl.js';
+import getShareLink from './operations/getShareLink.js';
+import getShares from './operations/getShares.js';
+import listShared from './operations/listShared.js';
+import listSharedByMe from './operations/listSharedByMe.js';
+import mkdir from './operations/mkdir.js';
+import move from './operations/move.js';
+import read from './operations/read.js';
+import readdir from './operations/readdir.js';
+import readdirSubdomains from './operations/readdirSubdomains.js';
+import rename from './operations/rename.js';
+import revokeReadURL from './operations/revokeReadUrl.js';
+import share from './operations/share.js';
+import sign from './operations/sign.js';
+import space from './operations/space.js';
+import stat from './operations/stat.js';
+import unshare from './operations/unshare.js';
+import upload from './operations/upload/index.js';
+import write from './operations/write.js';
 
-export class PuterJSFileSystemModule extends AdvancedBase {
+/**
+ * The Cloud Storage API. Lets you store and manage files and directories in
+ * the cloud.
+ *
+ * Operation implementations live under `operations/` as `this`-context
+ * functions whose JSDoc (including the per-form `@overload` declarations) is
+ * the source of truth for the public signatures — `types/` is generated from
+ * it, never edited by hand.
+ */
+export class PuterJSFileSystemModule extends PuterModule {
 
     space = space;
     mkdir = mkdir;
@@ -32,55 +56,38 @@ export class PuterJSFileSystemModule extends AdvancedBase {
     move = move;
     write = write;
     sign = sign;
+    getReadURL = getReadURL;
+    revokeReadURL = revokeReadURL;
+    readdir = readdir;
+    readdirSubdomains = readdirSubdomains;
+    stat = stat;
 
-    static NARI_METHODS = {
-        stat: {
-            positional: ['path'],
-            firstarg_options: true,
-            async fn (parameters) {
-                const svc_fs = await this.context.services.aget('filesystem');
-                return svc_fs.filesystem.stat(parameters);
-            }
-        },
-        readdir: {
-            positional: ['path'],
-            firstarg_options: true,
-            async fn (parameters) {
-                const svc_fs = await this.context.services.aget('filesystem');
-                return svc_fs.filesystem.readdir(parameters);
-            }
-        },
-    }
+    // Sharing
+    share = share;
+    unshare = unshare;
+    listShared = listShared;
+    listSharedByMe = listSharedByMe;
+    getShares = getShares;
+    getShareLink = getShareLink;
+
+    FSItem = FSItem;
 
     /**
-     * Creates a new instance with the given authentication token, API origin, and app ID,
-     * and connects to the socket.
+     * Connects the socket used for cache invalidation and upload progress.
+     * Unlike the request-based modules, the socket carries the token from the
+     * moment it connects, so it has to be rebuilt whenever auth state changes.
      *
-     * @class
-     * @param {string} authToken - Token used to authenticate the user.
-     * @param {string} APIOrigin - Origin of the API server. Used to build the API endpoint URLs.
-     * @param {string} appID - ID of the app to use.
+     * @param {import('../../index.js').Puter} puter
      */
-    constructor (authToken, APIOrigin, appID, context) {
-        super();
-        this.authToken = authToken;
-        this.APIOrigin = APIOrigin;
-        this.appID = appID;
-        this.context = context;
-        // Connect socket.
-        this.initializeSocket();
-
-        // We need to use `Object.defineProperty` instead of passing
-        // `authToken` and `APIOrigin` because they will change.
-        const api_info = {};
-        Object.defineProperty(api_info, 'authToken', {
-            get: () => this.authToken,
-        });
-        Object.defineProperty(api_info, 'APIOrigin', {
-            get: () => this.APIOrigin,
-        });
+    constructor (puter) {
+        super(puter);
+        this.cacheUpdateTimer = null;
+        // Connect socket, unless this client opted out (see `puter.socketEnabled`).
+        if (puter.socketEnabled) {
+            this.initializeSocket();
+        }
+        puter.onAuthStateChanged(() => this.onAuthStateChanged());
     }
-
 
     /**
      * Initializes the socket connection to the server using the current API origin.
@@ -91,80 +98,234 @@ export class PuterJSFileSystemModule extends AdvancedBase {
      * @memberof FileSystem
      * @returns {void}
      */
-    initializeSocket() {
-        if (this.socket) {
+    initializeSocket () {
+        if ( this.socket ) {
             this.socket.disconnect();
         }
 
         this.socket = io(this.APIOrigin, {
             auth: {
                 auth_token: this.authToken,
-            }
+            },
+            // socket.io's autoUnref path expects ws._socket.unref() to exist.
+            // Enable it only for Node runtimes that expose a ws-like WebSocket.
+            autoUnref: this.shouldUseSocketAutoUnref(),
+            transports: ['websocket', 'polling'],
+            withCredentials: true,
         });
 
         this.bindSocketEvents();
     }
 
-    bindSocketEvents() {
+    shouldUseSocketAutoUnref () {
+        return socketAutoUnref(this.puter);
+    }
+
+    bindSocketEvents () {
+        this.socket.on('item.renamed', (item) => {
+            puter._cache.flushall();
+        });
+
+        this.socket.on('item.removed', (item) => {
+            // check original_client_socket_id and if it matches this.socket.id, don't invalidate cache
+            puter._cache.flushall();
+        });
+
+        this.socket.on('item.added', (item) => {
+            // remove readdir cache for parent
+            puter._cache.del(puter.fsCacheKey('readdir', path.dirname(item.path)));
+            // remove item cache for parent directory
+            puter._cache.del(puter.fsCacheKey('item', path.dirname(item.path)));
+        });
+
+        this.socket.on('item.updated', (item) => {
+            puter._cache.flushall();
+        });
+
+        this.socket.on('item.moved', (item) => {
+            puter._cache.flushall();
+        });
+
         this.socket.on('connect', () => {
-            if(puter.debugMode)
+            if ( puter.debugMode )
+            {
                 console.log('FileSystem Socket: Connected', this.socket.id);
+            }
         });
 
         this.socket.on('disconnect', () => {
-            if(puter.debugMode)
+            if ( puter.debugMode )
+            {
                 console.log('FileSystem Socket: Disconnected');
+            }
         });
 
         this.socket.on('reconnect', (attempt) => {
-            if(puter.debugMode)
+            if ( puter.debugMode )
+            {
                 console.log('FileSystem Socket: Reconnected', this.socket.id);
+            }
         });
 
         this.socket.on('reconnect_attempt', (attempt) => {
-            if(puter.debugMode)
+            if ( puter.debugMode )
+            {
                 console.log('FileSystem Socket: Reconnection Attemps', attempt);
+            }
         });
 
         this.socket.on('reconnect_error', (error) => {
-            if(puter.debugMode)
+            if ( puter.debugMode )
+            {
                 console.log('FileSystem Socket: Reconnection Error', error);
+            }
         });
 
         this.socket.on('reconnect_failed', () => {
-            if(puter.debugMode)
+            if ( puter.debugMode )
+            {
                 console.log('FileSystem Socket: Reconnection Failed');
+            }
         });
 
         this.socket.on('error', (error) => {
-            if(puter.debugMode)
+            if ( puter.debugMode )
+            {
                 console.error('FileSystem Socket Error:', error);
+            }
         });
     }
 
     /**
-     * Sets a new authentication token and resets the socket connection with the updated token.
+     * Reconnects the socket against the current token and API origin. Called
+     * by the SDK whenever either changes.
      *
-     * @param {string} authToken - The new authentication token.
      * @memberof [FileSystem]
      * @returns {void}
      */
-    setAuthToken (authToken) {
-        this.authToken = authToken;
-        // reset socket
-        this.initializeSocket();
+    onAuthStateChanged () {
+        // Check cache timestamp and purge if needed (only in GUI environment)
+        if ( this.puter.env === 'gui' ) {
+            this.checkCacheAndPurge();
+            // Start background task to update LAST_VALID_TS every 1 second
+            this.startCacheUpdateTimer();
+        }
+
+        if ( this.puter.socketEnabled ) {
+            this.initializeSocket();
+        }
     }
 
     /**
-     * Sets the API origin and resets the socket connection with the updated API origin.
-     * 
-     * @param {string} APIOrigin - The new API origin.
-     * @memberof [Apps]
+     * The cache-related actions after local and remote updates.
+     *
+     * @memberof PuterJSFileSystemModule
      * @returns {void}
      */
-    setAPIOrigin (APIOrigin) {
-        this.APIOrigin = APIOrigin;
-        // reset socket
-        this.initializeSocket();
+    invalidateCache () {
+        // Action: Update last valid time
+        // Set to 0, which means the cache is not up to date.
+        localStorage.setItem(LAST_VALID_TS, '0');
+        puter._cache.flushall();
+    }
+
+    /**
+     * Calls the cache API to get the last change timestamp from the server.
+     *
+     * @memberof PuterJSFileSystemModule
+     * @returns {Promise<number>} The timestamp from the server
+     */
+    async getCacheTimestamp () {
+        return new Promise((resolve, reject) => {
+            const xhr = utils.initXhr('/cache/last-change-timestamp', this.APIOrigin, this.authToken, 'get', 'application/json');
+
+            // set up event handlers for load and error events
+            utils.setupXhrEventHandlers(xhr, undefined, undefined, async (result) => {
+                try {
+                    const response = typeof result === 'string' ? JSON.parse(result) : result;
+                    resolve(response.timestamp || Date.now());
+                } catch (e) {
+                    reject(new Error('Failed to parse response'));
+                }
+            }, reject);
+
+            xhr.send();
+        });
+    }
+
+    /**
+     * Checks cache timestamp and purges cache if needed.
+     * Only runs in GUI environment.
+     *
+     * @memberof PuterJSFileSystemModule
+     * @returns {void}
+     */
+    async checkCacheAndPurge () {
+        try {
+            const serverTimestamp = await this.getCacheTimestamp();
+            const localValidTs = parseInt(localStorage.getItem(LAST_VALID_TS)) || 0;
+
+            if ( serverTimestamp - localValidTs > 2000 ) {
+                // Server has newer data, purge local cache
+                puter._cache.flushall();
+                localStorage.setItem(LAST_VALID_TS, '0');
+            }
+        } catch ( error ) {
+            // If we can't get the server timestamp, silently fail
+            // This ensures the socket initialization doesn't break
+            console.error('Error checking cache timestamp:', error);
+        }
+    }
+
+    /**
+     * Starts the background task to update LAST_VALID_TS every 1 second.
+     * Only runs in GUI environment.
+     *
+     * @memberof PuterJSFileSystemModule
+     * @returns {void}
+     */
+    startCacheUpdateTimer () {
+        if ( this.puter.env !== 'gui' ) {
+            return;
+        }
+
+        // The auth token is set more than once over a session, and each call
+        // lands here; without clearing first, every call would leave another
+        // interval running.
+        this.stopCacheUpdateTimer();
+
+        this.cacheUpdateTimer = setInterval(() => {
+            localStorage.setItem(LAST_VALID_TS, Date.now().toString());
+        }, 1000);
+    }
+
+    /**
+     * Stops the background cache update timer.
+     *
+     * @memberof PuterJSFileSystemModule
+     * @returns {void}
+     */
+    stopCacheUpdateTimer () {
+        if ( this.cacheUpdateTimer ) {
+            clearInterval(this.cacheUpdateTimer);
+            this.cacheUpdateTimer = null;
+        }
     }
 }
+
+/**
+ * The public face of the module: derived from the class, with the internal
+ * `puter` handle, the socket plumbing, and the legacy `authToken` accessor
+ * omitted.
+ *
+ * @typedef {import('../../lib/types.js').OmitMembers<
+ *     typeof PuterJSFileSystemModule,
+ *     'puter' | 'authToken'
+ *     | 'socket' | 'cacheUpdateTimer'
+ *     | 'initializeSocket' | 'shouldUseSocketAutoUnref' | 'bindSocketEvents'
+ *     | 'onAuthStateChanged' | 'invalidateCache'
+ *     | 'startCacheUpdateTimer' | 'stopCacheUpdateTimer'
+ * >} FSConstructor
+ */
+
+export const FS = /** @type {FSConstructor} */ (PuterJSFileSystemModule);

@@ -1,0 +1,559 @@
+// Shapes shared across the `puter.ai` operations. JSDoc-only; no runtime exports.
+//
+// Provider-specific response bodies stay loosely typed: the SDK does not yet
+// publish stable shapes for those payloads.
+
+/**
+ * @typedef {string
+ *     | { image_url?: { url: string } }
+ *     | { video_url?: { url: string } }
+ *     | Record<string, unknown>} AIMessageContent
+ */
+
+/**
+ * An image attached to a message.
+ *
+ * @typedef {Object} ImageContent
+ * @property {string} type
+ * @property {{ url: string }} image_url
+ */
+
+/**
+ * One tool call the model asked for.
+ *
+ * @typedef {Object} ToolCall
+ * @property {string} id
+ * @property {{ name: string, arguments: string }} function
+ */
+
+/**
+ * A function/tool definition the model may call.
+ *
+ * @typedef {Object} Tool
+ * @property {string} type
+ * @property {{ name: string, description: string, parameters: object, strict?: boolean }} function
+ */
+
+/**
+ * One message in a chat conversation.
+ *
+ * @typedef {Object} ChatMessage
+ * @property {string} [role]
+ * @property {AIMessageContent | AIMessageContent[]} content
+ * @property {ToolCall[]} [tool_calls]
+ * @property {string} [tool_call_id]
+ * @property {{ type: string }} [cache_control]
+ * @property {ImageContent[]} [images] Images attached to the message. Present on responses from
+ * image-capable models.
+ * @property {string} [reasoning] Reasoning/thinking text, when the model exposes it and the
+ * request asked for it. Present on responses only.
+ * @property {object[]} [reasoning_details] Opaque provider reasoning artifacts (Anthropic thinking
+ * signatures, OpenAI reasoning item ids/encrypted content). Resend them verbatim to continue an
+ * extended-thinking turn. Present on responses only.
+ * @property {string | null} [refusal] Refusal message when the model declined, otherwise `null`.
+ * Present on responses only.
+ */
+
+/**
+ * Options for a chat completion request.
+ *
+ * @typedef {Object} ChatOptions
+ * @property {AbortSignal} [signal] Cancel the request and stop generation when aborted.
+ * @property {string} [model] The model to use for the completion. Defaults to `gpt-5.4-nano` if not
+ * specified.
+ * @property {number} [temperature] Sampling temperature between 0 and 2. Lower values are more focused
+ * and deterministic, higher values more random. Defaults to the model's own default.
+ * @property {number} [max_tokens]
+ * @property {boolean} [vision]
+ * @property {string} [driver]
+ * @property {string} [provider] The provider to route the request through.
+ * @property {Tool[]} [tools] Function/tool definitions the model can call. See Function Calling.
+ * @property {boolean} [normalize] Response-format control for non-streaming results. `true` returns the
+ * OpenAI-style shape regardless of provider or release date (`message.content` as a string,
+ * `message.tool_calls`, a mapped `finish_reason`); `false` forces the provider's native shape. Left
+ * unset, the SDK-wide `puter.ai.normalize` applies — itself tri-state: `true` normalizes every call,
+ * `false` disables normalization for every call, and unset (the default) means the release-date
+ * policy: models released on or after September 1, 2026 are normalized, older models keep their native
+ * shape. Streaming responses are unaffected (chunks are already provider-uniform).
+ * @property {unknown} [response]
+ * @property {string} [reasoning_effort] Controls how much effort reasoning models spend thinking. Flat
+ * form. Accepted values: `none`, `minimal`, `low`, `medium`, `high`, `xhigh` (availability varies by
+ * model; default `medium` on newer GPT-5.x models). Reasoning models only.
+ * @property {{ effort: string }} [reasoning] Nested form of `reasoning_effort`. The `effort` value
+ * accepts the same values as `reasoning_effort`. Reasoning models only.
+ * @property {string} [verbosity] Controls how long or short responses are. Flat form. Accepted values:
+ * `low`, `medium`, `high`. Reasoning models only.
+ * @property {{ verbosity: string }} [text] Nested form of `verbosity` — it lives under `text`. The
+ * `verbosity` value accepts the same values as `verbosity`. Reasoning models only.
+ * @property {{ aspect_ratio: string, image_size: string }} [image_config] Controls image output for
+ * image-capable models. `aspect_ratio` is the aspect ratio of the generated image, e.g. `"16:9"`,
+ * `"1:1"`, `"9:16"`; `image_size` is the output quality/resolution and must be one of the model's
+ * supported quality levels.
+ * @property {boolean | { trigger_tokens?: number }} [compaction] Provider-neutral inline-compaction
+ * opt-in for long stateless conversations. `true` enables it with provider defaults; an object sets the
+ * token threshold at which earlier context is summarized. When the upstream compacts, you receive a
+ * `"compaction"` chunk (streaming) or a `compaction` field on the result (non-streaming) — resend it in
+ * `messages` on the next turn in place of the summarized history.
+ * @property {unknown} [context_management] Escape hatch: a provider-native `context_management`
+ * payload, passed through untouched. Prefer `compaction` for provider portability.
+ * @property {'auto' | 'none' | 'required' | { type: 'auto' | 'any' | 'none' } | { type: 'tool', name: string }} [toolChoice]
+ * Which tool, if any, the model must call. The plain strings `'auto'`/`'none'`/`'required'` map onto
+ * `{type:'auto'}`/`{type:'none'}`/`{type:'any'}`; pass the object form directly to also name a specific
+ * tool (`{type:'tool', name}`).
+ * @property {boolean} [parallelToolCalls] Whether the model may call more than one tool in a single
+ * turn. Left unset, tool calls run one at a time (the long-standing default).
+ * @property {string[]} [stopSequences] Up to the model's limit of strings; generation stops the moment
+ * one appears in the output.
+ * @property {{ type: 'json_schema', schema: object, name?: string, strict?: boolean }} [outputFormat]
+ * Constrains the response to a JSON schema. `strict` tightens enforcement on providers that support it.
+ * @property {{ type: 'adaptive' | 'enabled' | 'disabled' | 'between_tools', budgetTokens?: number, display?: 'summarized' | 'omitted' | 'updates' } | null} [thinking]
+ * Extended-thinking control. `null` sends no thinking configuration at all (the model's own default);
+ * leaving it unset falls back to the legacy derivation from `reasoning_effort`. `budgetTokens` only
+ * applies to `'enabled'`.
+ * @property {boolean} [streamToolInput] Streaming only: emit incremental `tool_use_start` /
+ * `tool_input_delta` chunks as a tool call's arguments are generated, instead of a single `tool_use`
+ * chunk once the call completes.
+ */
+
+/**
+ * `ChatOptions` with streaming turned on, which changes what `chat()` resolves
+ * to.
+ *
+ * @typedef {ChatOptions & { stream: boolean }} StreamingChatOptions
+ */
+
+/**
+ * Provider-neutral usage breakdown, present on both the non-streaming result and the final streaming
+ * `"usage"` chunk. `inputTokens` excludes cache reads/writes; `outputTokens` includes reasoning tokens.
+ *
+ * @typedef {Object} UsageDetails
+ * @property {number} inputTokens
+ * @property {number} outputTokens
+ * @property {number} [cacheReadTokens]
+ * @property {number} [cacheWrite5mTokens]
+ * @property {number} [cacheWrite1hTokens]
+ * @property {number} [reasoningTokens]
+ * @property {number} [webSearchRequests]
+ * @property {number} [webFetchRequests]
+ * @property {'fast' | 'standard'} [speed]
+ * @property {string} [serviceTier]
+ * @property {Array<{ type: string, model?: string, inputTokens: number, outputTokens: number, cacheReadTokens?: number, cacheWrite5mTokens?: number, cacheWrite1hTokens?: number }>} [iterations]
+ * Per-pass breakdown when the upstream ran several passes (compaction, an advisor sub-call).
+ */
+
+/**
+ * What a non-streaming `chat()` resolves to.
+ *
+ * @typedef {Object} ChatResponse
+ * @property {ChatMessage} [message]
+ * @property {string} [finish_reason] Why generation stopped: `stop`, `length`, `tool_calls`, or
+ * `content_filter` — or the vendor's own stop reason (e.g. Anthropic's `pause_turn`), passed
+ * through unchanged when it has no OpenAI equivalent. Treat it as an open set.
+ * @property {boolean} [normalized] Present and `true` when the response format was normalized
+ * server-side (see the `normalize` option on [ChatOptions]).
+ * @property {unknown} [choices]
+ * @property {{ type: 'compaction', id?: string, encrypted_content: string }} [compaction]
+ * Inline-compaction artifact, present when the upstream compacted earlier context during this
+ * (non-streaming) response. Carries `type:'compaction'` so you can push it straight into `messages` on
+ * the next turn in place of the summarized history (same shape as the streaming `compaction` chunk).
+ * @property {string} [stopReason] The native stop reason (Anthropic vocabulary: `end_turn`,
+ * `max_tokens`, `tool_use`, `pause_turn`, `refusal`, …). On a native (non-normalized) Claude result,
+ * `finish_reason` is always `"stop"` on the wire — read `stopReason` for the real value.
+ * @property {string | null} [stopSequence] The stop sequence that ended generation, when one did.
+ * @property {Record<string, unknown> | null} [stopDetails] Extra detail on why generation stopped
+ * (e.g. a refusal classification). Provider-specific.
+ * @property {Record<string, number>} [usage] Token counts under provider-specific keys, plus `cost`:
+ * what the request was charged, in microcents ($0.01 = 1,000,000).
+ * @property {UsageDetails} [usageDetails] Provider-neutral usage breakdown — prefer this over `usage`
+ * for anything beyond raw billing totals.
+ */
+
+/**
+ * A single chunk of a streaming chat response. Each chunk has a `type`
+ * discriminator; which other fields are present depends on that `type`.
+ *
+ * @typedef {Object} ChatResponseChunk
+ * @property {string} type The kind of chunk: `"text"`, `"reasoning"`, `"reasoning_start"`,
+ * `"reasoning_detail"`, `"image"`, `"tool_use"`, `"tool_use_start"`, `"tool_input_delta"`,
+ * `"server_tool"`, `"safeguard_results"`, `"compaction"`, `"extra_content"`, `"usage"`, or `"error"`.
+ * @property {string} [text] Text delta. Present on `"text"` chunks.
+ * @property {string} [reasoning] Reasoning/thinking delta. Present on `"reasoning"` chunks.
+ * @property {string} [format] Reasoning artifact format (currently only `"anthropic"`). Present on
+ * `"reasoning_start"` chunks — marks the reasoning that follows as replayable (see `detail`).
+ * @property {Record<string, unknown>} [detail] A verbatim, replayable reasoning artifact — a signed
+ * `thinking` block, a `redacted_thinking` block, or an OpenAI Responses `reasoning` item. Present on
+ * `"reasoning_detail"` chunks; push it into `message.reasoning_details` to replay the turn.
+ * @property {ImageContent} [image] A generated image. Present on `"image"` chunks from image-capable
+ * models.
+ * @property {string} [id] Tool call id (`"tool_use"`, `"tool_use_start"`, `"tool_input_delta"`) or
+ * compaction item id (`"compaction"`).
+ * @property {string} [name] Tool/function name. Present on `"tool_use"` and `"tool_use_start"` chunks.
+ * @property {unknown} [input] Parsed tool call arguments. Present on `"tool_use"` chunks.
+ * @property {string} [partialJson] An incremental slice of a tool call's JSON arguments, in the order
+ * generated. Present on `"tool_input_delta"` chunks — opt in with `streamToolInput`; concatenate and
+ * parse once the matching `"tool_use"` chunk arrives.
+ * @property {Record<string, unknown>} [block] A server-executed tool call or result block
+ * (`server_tool_use`, `web_search_tool_result`, …), in the upstream's native shape. Present on
+ * `"server_tool"` chunks.
+ * @property {unknown[]} [results] Dangerous-tool-use classifier verdicts, keyed by the `tool_use` id
+ * they judged. Present on `"safeguard_results"` chunks — Claude only, and only when the upstream
+ * actually sent them.
+ * @property {string} [encrypted_content] Opaque/encrypted compaction summary. Present on
+ * `"compaction"` chunks — the same shape regardless of which provider served the request. Resend it in
+ * `messages` on the next turn in place of the summarized history.
+ * @property {unknown} [extra_content] Provider-specific extra metadata.
+ * @property {Record<string, number>} [usage] Token usage totals, plus `cost`: what the request was
+ * charged, in microcents ($0.01 = 1,000,000). Present on the final `"usage"` chunk.
+ * @property {string} [finish_reason] OpenAI-vocabulary finish reason, derived from `stopReason`.
+ * Present on the final `"usage"` chunk.
+ * @property {string} [stopReason] The native stop reason. Present on the final `"usage"` chunk.
+ * @property {string | null} [stopSequence] The stop sequence that ended generation, when one did.
+ * Present on the final `"usage"` chunk.
+ * @property {Record<string, unknown> | null} [stopDetails] Extra detail on why generation stopped.
+ * Present on the final `"usage"` chunk.
+ * @property {UsageDetails} [usageDetails] Provider-neutral usage breakdown. Present on the final
+ * `"usage"` chunk.
+ * @property {string} [message] Error description. Present on `"error"` chunks, which end the stream.
+ * @property {string} [code] The upstream's own error type/code (e.g. `overloaded_error`), when known.
+ * Present on `"error"` chunks.
+ * @property {number} [status] The HTTP status the error maps to. Present on `"error"` chunks.
+ */
+
+/**
+ * A Mistral OCR annotation format: the JSON schema the annotation must follow.
+ * `jsonSchema` / `schemaDefinition` are accepted as aliases of `json_schema` / `schema`.
+ *
+ * @typedef {Object} OcrAnnotationFormat
+ * @property {'json_schema'} [type]
+ * @property {{ name?: string, description?: string, schema: Record<string, unknown>, strict?: boolean }} [json_schema]
+ * @property {{ name?: string, description?: string, schemaDefinition: Record<string, unknown>, strict?: boolean }} [jsonSchema]
+ */
+
+/**
+ * Options for `img2txt()` (OCR).
+ *
+ * @typedef {Object} Img2TxtOptions
+ * @property {string | File | Blob} [source] Image or document: URL, Puter path, data URI, `File` or `Blob`.
+ * @property {string} [model] OCR model: `'aws-textract'` (alias `'textract'`), `'mistral-ocr-latest'`
+ * (OCR 4.1; aliases `'mistral-ocr-4'`, `'mistral-ocr-4-1'`) or `'mistral-ocr-2512'`
+ * (OCR 3; aliases `'mistral-ocr-3'`, `'mistral-ocr-3-0'`). The model picks its provider.
+ * @property {string} [provider] `'aws-textract'` (default) or `'mistral'`; aliases `'aws'`, `'textract'`,
+ * `'mistral-ocr'`. Without a `model`, the provider's default model runs.
+ * @property {boolean} [testMode]
+ * @property {boolean} [test_mode] `snake_case` spelling of `testMode`, forwarded to the driver as-is.
+ * @property {number[]} [pages] Mistral: 0-based page indexes to process.
+ * @property {boolean} [includeImageBase64] Mistral: include extracted images in the provider response.
+ * @property {number} [imageLimit] Mistral: maximum number of images to extract.
+ * @property {number} [imageMinSize] Mistral: minimum height and width of an image to extract.
+ * @property {OcrAnnotationFormat} [bboxAnnotationFormat] Mistral: schema for per-image annotations.
+ * @property {OcrAnnotationFormat} [documentAnnotationFormat] Mistral: schema for a document-level
+ * annotation. When set, `img2txt()` resolves to the annotation (a JSON string) instead of the text.
+ * @property {string} [documentAnnotationPrompt] Mistral: instructions for the document annotation.
+ * @property {'markdown' | 'html'} [tableFormat] Mistral: extract tables in this format.
+ * @property {boolean} [extractHeader] Mistral: move page headers out of the text.
+ * @property {boolean} [extractFooter] Mistral: move page footers out of the text.
+ */
+
+/**
+ * Options for `txt2img()`.
+ *
+ * @typedef {Object} Txt2ImgOptions
+ * @property {string} [prompt] Non-empty text description of the image to generate. Missing, blank,
+ * or non-string values reject with `prompt_required`.
+ * @property {string} [model] Image model to use (provider-specific). Without one, the provider's
+ * default applies: `'gpt-image-2'` (OpenAI, preferred when no provider is given),
+ * `'gemini-3.1-flash-image'` (Gemini), `'@cf/black-forest-labs/flux-1-schnell'` (Cloudflare),
+ * `'grok-imagine-image'` (xAI), `'black-forest-labs/flux-schnell'` (Replicate), or
+ * `'seedream-5-0-lite-260128'` (BytePlus).
+ * @property {string} [quality] Image quality / output size tier. Interpretation is provider- and
+ * model-specific: OpenAI GPT models take `'high'` | `'medium'` | `'low'` (default `'low'`),
+ * `gpt-image-2` also accepts `'auto'`, and `gpt-image-2.5-sunburst` / `gpt-image-2.5-flare` also
+ * accept `'xhigh'` | `'max'` | `'auto'`; Gemini takes an output size tier `'512'` | `'1K'` | `'2K'` |
+ * `'4K'` (availability varies by model).
+ * @property {string} [resolution] xAI output resolution: `'1k'` (default) or `'2k'`; model-specific resolution tier on Replicate.
+ * On `grok-imagine-image-2.0`, `quality` independently accepts `'low'`, `'medium'`, or `'auto'`.
+ * The older xAI models also accept the resolution through `quality` for compatibility.
+ * @property {string} [input_image] One reference image: a public URL, data URI, or raw base64.
+ * @property {string[]} [input_images] Reference images as URLs, data URIs, or raw base64.
+ * Model support varies. xAI accepts up to 5; Together and Cloudflare accept one.
+ * @property {string} [input_image_mime_type] MIME type of the input image(s), e.g. `'image/png'`. Used
+ * as a fallback when the type cannot be auto-detected (Gemini).
+ * @property {string} [driver] Legacy driver ID, e.g. `'xai-image-generation'`.
+ * @property {string} [provider] Provider name: `'openai'`, `'gemini'`, `'together'`, `'cloudflare'`,
+ * `'xai'`, `'replicate'`, or `'byteplus'`. Full `*-image-generation` IDs also work.
+ * Prefers this provider when it offers the model; otherwise a known model selects its provider.
+ * Routes excluded by data policy reject with `bad_request`; Together image routes are currently excluded.
+ * @property {string} [service] Ignored; retained for compatibility. Use `provider` or `driver` to select a provider.
+ * @property {{ w: number, h: number }} [ratio] Aspect ratio as `{ w, h }` (e.g. `{ w: 16, h: 9 }`).
+ * Supported sizes and aspect ratios depend on the model.
+ * @property {number} [width] Width of the image to generate, in pixels; use with `height`.
+ * @property {number} [height] Height of the image to generate, in pixels; use with `width`.
+ * @property {string} [aspect_ratio] Alternative aspect ratio, e.g. `'16:9'`.
+ * @property {number} [steps] Number of generation/inference steps (Together default varies by model; Replicate
+ * models with sampling controls; Cloudflare limits vary by model).
+ * @property {number} [seed] Seed used for generation; reuse to reproduce results (Together, Replicate).
+ * @property {string} [negative_prompt] Prompt describing what NOT to guide the image generation toward
+ * (Together, supported Cloudflare and Replicate models).
+ * @property {number} [n] Reserved for compatibility. Image generation currently returns one image; this option is ignored.
+ * @property {string} [image_url] URL of an input image for models that support it (Together; no effect while Together routes are excluded).
+ * @property {string} [image_base64] Base64-encoded input image for image-to-image generation (Together; no effect while Together routes are excluded).
+ * @property {string} [mask_image_url] URL of a mask image for inpainting (Together; no effect while Together routes are excluded).
+ * @property {string} [mask_image_base64] Base64-encoded mask image for inpainting (Together; no effect while Together routes are excluded).
+ * @property {string} [maskImage] Mask image URL, data URI, or raw base64 for supported Cloudflare and
+ * Replicate inpainting models. Supply an input image as well.
+ * @property {Record<string, unknown>} [providerOptions] Native options for Replicate catalog models,
+ * validated against the selected model's API schema. Common options take precedence.
+ * @property {number} [strength] Transformation strength for supported Cloudflare and Replicate image editing models.
+ * @property {number} [prompt_strength] How strongly the prompt influences the output (Together; no effect while Together routes are excluded).
+ * @property {boolean} [disable_safety_checker] When `true`, disables the safety checker (Together,
+ * Replicate).
+ * @property {string} [response_format] Format of the image response. Together: `'base64'` | `'url'`.
+ * Replicate: output format, e.g. `'webp'` | `'jpg'` | `'png'`.
+ * @property {number} [guidance] Guidance scale (Cloudflare and supported Replicate models).
+ * @property {boolean} [go_fast] Use the model's optimized fast mode (Replicate `flux-2-dev`). Defaults
+ * to `true` for that model, and affects pricing.
+ * @property {number} [output_quality] Output quality, 0-100 (Replicate, flux family).
+ * @property {string} [output_megapixels] Output size in megapixels on Replicate `flux-2-pro`,
+ * `flux-2-klein-*`, and `flux-schnell`, from the model's own list (e.g. `'0.25'` | `'0.5'` | `'1'` |
+ * `'2'` | `'4'`); ignored by `flux-2-dev` and `flux-1.1-pro`.
+ * @property {number} [safety_tolerance] Safety tolerance level (Replicate `flux-2-pro`,
+ * `flux-1.1-pro`).
+ * @property {boolean} [prompt_upsampling] Enable prompt upsampling (Replicate `flux-1.1-pro`).
+ * @property {string} [generation_mode] Generation tier for Replicate Leonardo models, which affects
+ * pricing: `'standard'` | `'ultra'` (`lucid-origin`), `'fast'` | `'quality'` | `'ultra'`
+ * (`phoenix-1.0`).
+ * @property {string} [style] Stylistic preset (Replicate Leonardo models).
+ * @property {string} [contrast] Contrast preset (Replicate Leonardo models).
+ * @property {boolean} [prompt_enhance] Server-side prompt enhancement (Replicate Leonardo models).
+ * @property {boolean} [test_mode] When `true`, returns a sample image without using credits.
+ * @property {string} [puter_output_path] When set, the generated image is saved to this path on the
+ * Puter filesystem. Relative paths resolve against the app's data directory (`~/AppData/<appID>/`) when
+ * called from an app, or `~/` otherwise. The caller must have write permission to the destination.
+ */
+
+/**
+ * Options for `txt2vid()`.
+ *
+ * @typedef {Object} Txt2VidOptions
+ * @property {string} [prompt] Text description of the clip.
+ * @property {string} [provider] Pin the request to one provider: `'together-video-generation'`,
+ * `'byteplus-video-generation'` or `'gemini-video-generation'`. Defaults to the provider that owns
+ * `model`, or Together AI when neither is given.
+ * @property {string} [driver] Same effect as `provider`.
+ * @property {string} [model] Video model id (provider-specific). Defaults to
+ * `'togetherai:wan-ai/wan2.7-t2v'` (Wan 2.7 text-to-video). `'gemini-omni-1.1-flash'` selects
+ * Gemini Omni, which rejects `seconds`, `duration`, `fps`, `steps`, `guidance_scale`, `seed`,
+ * `negative_prompt`, `output_quality`, `generate_audio`, `frame_images`, `last_frame`,
+ * `reference_images` and `metadata`, and takes a prompt of at most 4,000 characters.
+ * @property {number} [seconds] Clip length in seconds. A value the model does not offer falls back
+ * to the model default. Gemini Omni has no length control and rejects it.
+ * @property {number} [duration] Alias of `seconds`.
+ * @property {boolean} [test_mode] When `true`, returns a sample clip without using credits.
+ * @property {string} [size] Output size as `'WIDTHxHEIGHT'` on every provider (tier-based models map
+ * it to the tier of the shorter side plus an aspect ratio), or a tier such as `'720p'` for Seedance,
+ * Wan 2.7 and Gemini Omni. Gemini Omni takes `'360p'`, `'720p'` (default), `'1080p'` or `'4k'`, or
+ * the exact 16:9 or 9:16 size of one of them (`'640x360'`, `'360x640'`, `'1280x720'`, …), and
+ * rejects any other value.
+ * @property {string} [resolution] Alias of `size`.
+ * @property {string} [input_reference] First-frame image for image-to-video: a URL, data URI or raw
+ * base64, on every provider. Gemini Omni also takes a Puter file path, and accepts one PNG, JPEG or
+ * WebP image up to 5 MiB.
+ * @property {string} [last_frame] Last-frame image, same formats as `input_reference`.
+ * @property {string[]} [reference_images] Subject/style reference images (URL, data URI or base64).
+ * Seedance 2.0: up to 9; Seedance 2.5: up to 30; Together: model-dependent.
+ * @property {string} [negative_prompt] What to keep out of the video (Together).
+ * @property {boolean} [generate_audio] Generate a soundtrack on models that support audio (Seedance 2.x
+ * and Together models with audio). Defaults to `true` on Seedance.
+ * @property {number} [seed] Random seed (Together, Seedance 1.x).
+ * @property {number} [width] Output width in pixels on Together models sized in pixels; with `height`,
+ * selects the aspect ratio on Seedance and Wan 2.7. Filled in from `size` when omitted. On Gemini
+ * Omni, `width` and `height` together must be one of its exact sizes and match `size` when both are
+ * given.
+ * @property {number} [height] Output height in pixels; see `width`.
+ * @property {number} [fps] TogetherAI.
+ * @property {number} [steps] TogetherAI.
+ * @property {number} [guidance_scale] TogetherAI.
+ * @property {string} [output_format] TogetherAI. Gemini Omni accepts only `'video/mp4'`.
+ * @property {number} [output_quality] TogetherAI.
+ * @property {Array<{ input_image: string, frame: number }>} [frame_images] TogetherAI: keyframe images
+ * for image-to-video.
+ * @property {Record<string, unknown>} [metadata] TogetherAI.
+ * @property {string} [puter_output_path] Save the generated video to this path on the Puter filesystem.
+ * Relative paths resolve against the app's data directory (`~/AppData/<appID>/`) when called from an
+ * app, or `~/` otherwise. The caller must have write permission to the destination.
+ */
+
+/**
+ * Options for `txt2speech()`.
+ *
+ * @typedef {Object} Txt2SpeechOptions
+ * @property {string} [text] Text to synthesize. At most 3000 characters.
+ * @property {string} [language] Language code. For AWS Polly defaults to `'en-US'`; for xAI a BCP-47
+ * code defaulting to `'en'` (supports `'auto'`).
+ * @property {string} [voice] Voice ID used for synthesis (provider-specific). Defaults to `'Joanna'`
+ * (aws-polly), `'alloy'` (openai), `'21m00Tcm4TlvDq8ikWAM'` (elevenlabs), `'Kore'` (gemini), `'eve'`
+ * (xai), `'geffen_32'` (speechify).
+ * @property {string} [engine] AWS Polly synthesis engine: `'standard'` (default), `'neural'`,
+ * `'long-form'`, or `'generative'`.
+ * @property {string} [provider] TTS provider: `'aws-polly'` (default), `'openai'`, `'elevenlabs'`,
+ * `'gemini'`, `'xai'`, or `'speechify'`. Common aliases (`'eleven'`, `'google'`, `'grok'`, `'polly'`,
+ * `'simba'`, …) resolve to these.
+ * @property {string} [model] Model identifier (provider-specific).
+ * @property {string} [response_format] OpenAI output format: `'mp3'` (default), `'wav'`, `'opus'`,
+ * `'aac'`, `'flac'`, or `'pcm'`.
+ * @property {string} [output_format] Output format for ElevenLabs (defaults to `'mp3_44100_128'`) and
+ * xAI (`'mp3'` default, `'wav'`, `'pcm'`, `'mulaw'`, `'alaw'`).
+ * @property {string} [instructions] Natural-language guidance for voice style such as tone, speed, and
+ * mood (OpenAI and Gemini). At most 3000 characters for Gemini.
+ * @property {Record<string, unknown>} [voice_settings] ElevenLabs voice tuning options (e.g. stability,
+ * similarity boost, speed).
+ * @property {boolean} [ssml] When `true`, AWS Polly treats `text` as SSML markup.
+ * @property {boolean} [test_mode] When `true`, returns a sample audio without using credits.
+ */
+
+/**
+ * Options for `txt2speech.listEngines()`.
+ *
+ * @typedef {Object} ListTTSEnginesOptions
+ * @property {string} [provider] TTS provider to query. Defaults to `'aws-polly'`; `'all'` returns every
+ * provider's engines.
+ */
+
+/**
+ * A TTS engine/model as returned by `txt2speech.listEngines()`.
+ *
+ * @typedef {Object} TTSEngine
+ * @property {string} id Engine/model identifier.
+ * @property {string} name Human-readable engine name.
+ * @property {string} provider Provider this engine belongs to.
+ * @property {number} [pricing_per_million_chars] Cost per million characters (may be absent).
+ */
+
+/**
+ * Options for `txt2speech.listVoices()`.
+ *
+ * @typedef {Object} ListTTSVoicesOptions
+ * @property {string} [provider] TTS provider to query. Defaults to `'aws-polly'`; `'all'` returns every
+ * provider's voices.
+ * @property {string} [engine] Engine/model filter (provider-specific, ignored by some providers).
+ */
+
+/**
+ * A TTS voice as returned by `txt2speech.listVoices()`.
+ *
+ * @typedef {Object} TTSVoice
+ * @property {string} id Voice identifier to pass to `txt2speech()`.
+ * @property {string} name Human-readable voice name.
+ * @property {string} provider Provider this voice belongs to.
+ * @property {{ name: string, code: string }} [language] Language info (may be absent).
+ * @property {string} [description] Short description of the voice (may be absent).
+ * @property {string} [category] Voice category, e.g. `'premade'` (may be absent).
+ * @property {Record<string, unknown>} [labels] Provider-specific labels (may be absent).
+ * @property {string[]} [supported_models] Model IDs this voice works with (may be absent).
+ * @property {string[]} [supported_engines] Engine types this voice supports (may be absent).
+ */
+
+/**
+ * One word of a `speech2txt()` transcript.
+ *
+ * @typedef {Object} Speech2TxtWord
+ * @property {string} text
+ * @property {number} start Seconds from the start of the audio.
+ * @property {number} end Seconds from the start of the audio.
+ * @property {string} [speaker] Detected speaker, present when `diarize: true` (xAI, and Gemini when it labels the word, e.g. `'spk:0'`).
+ */
+
+/**
+ * What `speech2txt()` resolves to, unless `response_format` is `"text"`.
+ *
+ * @typedef {Object} Speech2TxtResult
+ * @property {string} text
+ * @property {string} [model] Model that produced the transcript.
+ * @property {string} [language] Language of the transcript. OpenAI and xAI report it; Gemini echoes the `language` you passed and omits it otherwise.
+ * @property {Record<string, unknown>[]} [segments]
+ * @property {number} [duration] Duration of the audio in seconds (provider-dependent, e.g. xAI).
+ * @property {Speech2TxtWord[]} [words] Per-word timestamps (xAI; Gemini when `timestamp_granularities: ['word']` or `diarize: true`).
+ */
+
+/**
+ * The options every `speech2txt()` form shares.
+ *
+ * @typedef {Object} BaseSpeech2TxtOptions
+ * @property {string | File | Blob} [file]
+ * @property {string | File | Blob} [audio]
+ * @property {string} [provider] `'openai'` (default), `'xai'` or `'gemini'`, or an alias such as `'whisper'`, `'grok'` or `'google'`.
+ * @property {string} [model] e.g. `'gpt-transcribe'`, `'grok-voice-transcribe-2.0'` or `'gemini-3.5-transcribe'`.
+ * @property {string} [language]
+ * @property {string} [prompt] Not supported by Gemini, which rejects it.
+ * @property {boolean} [stream]
+ * @property {boolean} [translate] Not supported by OpenAI or Gemini, which reject it.
+ * @property {number} [temperature] Not supported by Gemini, which rejects it.
+ * @property {boolean} [logprobs] Not supported by Gemini, which rejects `true`.
+ * @property {string[]} [timestamp_granularities] `['word']` returns per-word timestamps on Gemini, which rejects entries other than `'word'`. Ignored by OpenAI and xAI.
+ * @property {string} [chunking_strategy] Ignored by OpenAI and xAI; rejected by Gemini.
+ * @property {string[]} [known_speaker_names] Ignored by OpenAI and xAI; rejected by Gemini.
+ * @property {Record<string, unknown>} [extra_body] OpenAI only; rejected by Gemini.
+ * @property {boolean} [format]
+ * @property {boolean} [diarize] Adds a `speaker` to each word (xAI and Gemini). On Gemini it also returns `words`.
+ * @property {boolean} [multichannel]
+ * @property {number} [channels]
+ * @property {string} [audio_format]
+ * @property {number} [sample_rate]
+ * @property {boolean} [test_mode]
+ */
+
+/**
+ * The `response_format: "text"` form, which resolves to a plain string.
+ *
+ * @typedef {BaseSpeech2TxtOptions & { response_format: 'text' }} TextFormatSpeech2TxtOptions
+ */
+
+/**
+ * Any other `speech2txt()` form, which resolves to a `Speech2TxtResult`.
+ *
+ * @typedef {BaseSpeech2TxtOptions & { response_format?: Exclude<string, 'text'> }} Speech2TxtOptions
+ */
+
+/**
+ * Options for `speech2speech()`. The camelCase aliases are mapped onto the
+ * snake_case names before the request goes out; the snake_case spelling wins
+ * when both are given.
+ *
+ * @typedef {Object} Speech2SpeechOptions
+ * @property {string | File | Blob} [audio]
+ * @property {string | File | Blob} [file]
+ * @property {string} [provider]
+ * @property {string} [model]
+ * @property {string} [model_id]
+ * @property {string} [voice]
+ * @property {string} [voice_id]
+ * @property {string} [output_format]
+ * @property {Record<string, unknown>} [voice_settings]
+ * @property {number} [seed]
+ * @property {string} [file_format]
+ * @property {boolean} [remove_background_noise]
+ * @property {number} [optimize_streaming_latency]
+ * @property {boolean} [enable_logging]
+ * @property {boolean} [test_mode]
+ * @property {string} [modelId] camelCase alias of `model_id`.
+ * @property {string} [voiceId] camelCase alias of `voice_id`.
+ * @property {string} [outputFormat] camelCase alias of `output_format`.
+ * @property {Record<string, unknown>} [voiceSettings] camelCase alias of `voice_settings`.
+ * @property {string} [fileFormat] camelCase alias of `file_format`.
+ * @property {boolean} [removeBackgroundNoise] camelCase alias of `remove_background_noise`.
+ * @property {number} [optimizeStreamingLatency] camelCase alias of `optimize_streaming_latency`.
+ * @property {boolean} [enableLogging] camelCase alias of `enable_logging`.
+ */
+
+export {};
+
+
+/**
+ * Parsed chat chunks, with a byte-stream adapter for `new ReadableStream(response)`.
+ * Stopping iteration or cancelling the byte stream cancels the HTTP request.
+ * Text chunks become UTF-8 text; other chunks become newline-terminated JSON.
+ * @typedef {AsyncGenerator<ChatResponseChunk, void, unknown> & {
+ *     start: (controller: ReadableStreamDefaultController<Uint8Array>) => Promise<void>;
+ *     cancel: () => Promise<IteratorResult<ChatResponseChunk, void>>;
+ * }} ChatResponseStream
+ */

@@ -1,0 +1,1833 @@
+/*
+ * Copyright (C) 2024-present Puter Technologies Inc.
+ *
+ * This file is part of Puter.
+ *
+ * Puter is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published
+ * by the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+import { v4 as uuidv4 } from 'uuid';
+import { PuterStore } from '../types';
+import { HttpError } from '../../core/http/HttpError.js';
+import { isUniqueViolation } from '../../util/dbError.js';
+import {
+    validateUrl,
+    WEB_AND_EXTENSION_PROTOCOLS,
+} from '../../util/validation.js';
+
+/**
+ * Persistence + cache for the `apps` table.
+ *
+ * CRUD over app rows with multi-key caching (uid, name, id). No validation or
+ * permission logic — those live in AppDriver. Callers that need enforcement
+ * should go through the driver; callers that just need data (internal services)
+ * can hit the store directly.
+ */
+
+const CACHE_KEY_PREFIX = 'apps';
+const CACHE_TTL_SECONDS = 24 * 60 * 60;
+const LIST_CACHE_KEY_PREFIX = `${CACHE_KEY_PREFIX}:list`;
+const LIST_CACHE_TTL_SECONDS = 15 * 60;
+// Outlives every page cached under it, so a lapsed generation can't bring
+// one back.
+const LIST_GENERATION_TTL_SECONDS = 2 * LIST_CACHE_TTL_SECONDS;
+const FILETYPE_CACHE_KEY_PREFIX = 'apps:by-filetype';
+const FILETYPE_CACHE_TTL_SECONDS = 60;
+// Filetype associations are matched against the bare lowercase extension
+// (see SuggestedAppsService), but clients historically stored whatever the
+// developer typed — `.docx` was common. Canonicalize on write and tolerate
+// the dotted legacy form on read.
+const normalizeFiletype = (type) =>
+    typeof type === 'string'
+        ? type.trim().toLowerCase().replace(/^\.+/, '')
+        : '';
+const APP_ID_PROPERTIES = ['id', 'uid', 'name'];
+// Old-name redirect window. Reads ignore expired entries; the app's next
+// rename prunes them.
+const OLD_APP_NAME_TTL_MONTHS = 3;
+// Cap on placeholders per `IN (?, ?, …)` query. SQLite's default parameter
+// limit is 999; staying well under that keeps `getByIds` portable across
+// backends without splitting the cap by driver.
+const BULK_QUERY_CHUNK_SIZE = 200;
+// Placeholders per index_url `IN (…)` chunk; under SQLite's old 999 default.
+const INDEX_URL_CHUNK_SIZE = 900;
+// Window an account's repeat opens of one app collapse into a single count.
+const APP_OPEN_COUNT_PERIOD_SECONDS = 60 * 60;
+
+// Top-level all-time open/user counts: hot path, slow to compute. Cached
+// lazily on read (pipelined MGET on every app list/read; misses query the
+// analytics source once and backfill) and left to autoexpire — these counts
+// tolerate being slightly stale, so there's no background refresh.
+const STATS_CACHE_TTL_SECONDS = 30 * 60;
+// `app-` + a UUID. ClickHouse's `app_opens.app_uid` is FixedString(40) and
+// fails the whole query on a longer value.
+const APP_UID_MAX_BYTES = 40;
+
+// Period helpers for detailed/grouped stats. Ported from v1
+// AppInformationService — queries go straight to ClickHouse/MySQL on demand
+// (no cache) since they're UI-driven and rarely repeated with identical args.
+const MYSQL_DATE_FORMATS = {
+    hour: '%Y-%m-%d %H:00:00',
+    day: '%Y-%m-%d',
+    week: '%Y-%U',
+    month: '%Y-%m',
+    year: '%Y',
+};
+const CLICKHOUSE_GROUP_BY_FORMATS = {
+    hour: 'toStartOfHour(fromUnixTimestamp(ts))',
+    day: 'toStartOfDay(fromUnixTimestamp(ts))',
+    week: 'toStartOfWeek(fromUnixTimestamp(ts))',
+    month: 'toStartOfMonth(fromUnixTimestamp(ts))',
+    year: 'toStartOfYear(fromUnixTimestamp(ts))',
+};
+
+// Columns that may not be set through `create` / `update` from user input
+// or from any patch map forwarded into the store. Defence-in-depth against
+// future callers (admin routes, extensions, new REST endpoints) that might
+// forward `req.body` straight to `update`: the driver's #validateInput is
+// an allow-list upstream, but the store is the last line before SQL.
+//
+// Categories:
+//   - identity: `id`, `uid`
+//   - system timestamps / admin review: `timestamp`, `last_review`
+//   - admin-only flags: `approved_for_*`, `godmode`
+//   - ownership: `owner_user_id`, `app_owner` — set via `create`'s second
+//     argument, never from a patch map. Re-assigning via update would
+//     hand an app to another user.
+//   - access gates: `protected`, `is_private` — flipping these silently
+//     bypasses #canReadApp / leaks a private app's index_url via
+//     #toClient. If an admin flow ever needs to toggle these it must
+//     call a purpose-built method, not a generic patch.
+//
+// `index_url` is intentionally NOT here — it's legitimately user-editable
+// (the whole point of updating an app). XSS-unsafe schemes are rejected
+// upstream by validateUrl's scheme allow-list.
+const READ_ONLY_COLUMNS = new Set([
+    'id',
+    'uid',
+    'timestamp',
+    'last_review',
+    'approved_for_listing',
+    'approved_for_opening_items',
+    'approved_for_incentive_program',
+    'godmode',
+    'owner_user_id',
+    'app_owner',
+    'protected',
+    'is_private',
+]);
+// Unique-key columns `#getManyByProperty` may build an IN-list against.
+const BATCH_LOOKUP_COLUMNS = new Set(['id', 'uid', 'name']);
+const APP_BOOLEAN_COLUMNS = new Set([
+    'godmode',
+    'maximize_on_start',
+    'approved_for_listing',
+    'approved_for_opening_items',
+    'approved_for_incentive_program',
+    'background',
+    'protected',
+    'is_private',
+    'feedback_enabled',
+]);
+// What a new row holds in each column its INSERT leaves to the schema. A new
+// `apps` column belongs here too; the create tests compare against the table.
+const APP_COLUMN_DEFAULTS = {
+    owner_user_id: null,
+    icon: null,
+    description: null,
+    godmode: false,
+    maximize_on_start: false,
+    approved_for_listing: false,
+    approved_for_opening_items: false,
+    approved_for_incentive_program: false,
+    last_review: null,
+    tags: null,
+    app_owner: null,
+    background: false,
+    metadata: null,
+    protected: false,
+    is_private: false,
+    feedback_enabled: false,
+};
+
+export class AppStore extends PuterStore {
+    /** @type {import('../types').RowCache<any>} */
+    #cache = this.rowCache({
+        prefix: CACHE_KEY_PREFIX,
+        props: APP_ID_PROPERTIES,
+        ttlSeconds: CACHE_TTL_SECONDS,
+        revive: (app) => this.#normalizeRow(app),
+    });
+
+    // -- Reads --------------------------------------------------------
+
+    async getByUid(uid) {
+        return this.#getByProperty('uid', uid);
+    }
+    async getById(id) {
+        return this.#getByProperty('id', id);
+    }
+    async getByName(name) {
+        return this.#getByProperty('name', name);
+    }
+
+    /**
+     * Batched `getByName`, keyed by the requested names: a name the collation
+     * matched case-insensitively and a recent old name both resolve.
+     */
+    async getByNames(names) {
+        const requested = [
+            ...new Set(
+                (Array.isArray(names) ? names : []).filter(
+                    (name) => typeof name === 'string' && name.length > 0,
+                ),
+            ),
+        ];
+        const live = new Map(
+            [...(await this.#getManyByProperty('name', requested))].map(
+                ([name, app]) => [String(name).toLowerCase(), app],
+            ),
+        );
+        const missing = requested.filter(
+            (name) => !live.has(name.toLowerCase()),
+        );
+        const renamed =
+            missing.length > 0
+                ? await this.#resolveByOldNames(missing)
+                : new Map();
+
+        const result = new Map();
+        for (const name of requested) {
+            const key = name.toLowerCase();
+            const app = live.get(key) ?? renamed.get(key);
+            if (app) result.set(name, app);
+        }
+        return result;
+    }
+
+    /** Batched `#resolveByOldName`, keyed by lowercased old name. */
+    async #resolveByOldNames(names) {
+        const result = new Map();
+        for (
+            let offset = 0;
+            offset < names.length;
+            offset += BULK_QUERY_CHUNK_SIZE
+        ) {
+            const chunk = names.slice(offset, offset + BULK_QUERY_CHUNK_SIZE);
+            const rows = await this.clients.db.read(
+                `SELECT a.*, ${this.#createdEpochColumn('a.')}, o.\`name\` AS \`old_name\`
+                 FROM \`apps\` AS a
+                 INNER JOIN \`old_app_names\` AS o ON o.\`app_uid\` = a.\`uid\`
+                 WHERE o.\`name\` IN (${chunk.map(() => '?').join(', ')})
+                   AND o.\`timestamp\` >= ${this.#oldNameCutoffClause()}
+                 ORDER BY o.\`timestamp\` DESC`,
+                chunk,
+            );
+            for (const { old_name: oldName, ...row } of rows) {
+                const key = String(oldName).toLowerCase();
+                // Newest redirect wins, as in `#resolveByOldName`.
+                if (!result.has(key)) result.set(key, this.#normalizeRow(row));
+            }
+        }
+        return result;
+    }
+
+    /** Cache-free existence check against the primary. */
+    async existsOnPrimary(appId) {
+        if (appId === undefined || appId === null) return false;
+        const rows = await this.clients.db.pread(
+            'SELECT `id` FROM `apps` WHERE `id` = ? LIMIT 1',
+            [appId],
+        );
+        return rows.length > 0;
+    }
+
+    /**
+     * Batched lookup by id. Use this in place of `Promise.all(ids.map(
+     * getById))` to avoid one connection per row on large id sets.
+     *
+     * Missing ids (no DB row) are simply absent from the returned map.
+     */
+    async getByIds(ids) {
+        return this.#getManyByProperty('id', ids);
+    }
+
+    /**
+     * Batched lookup by uid — the uid-keyed twin of `getByIds`, for callers
+     * that hold uids (recent-opens lists, launch metadata).
+     *
+     * Missing uids (no DB row) are simply absent from the returned map.
+     */
+    async getByUids(uids) {
+        return this.#getManyByProperty('uid', uids);
+    }
+
+    /**
+     * Shared engine behind `getByIds` / `getByUids`: a pipelined cache read,
+     * then one `SELECT … WHERE <prop> IN (…)` per chunk of misses. The returned
+     * map is keyed by `prop`'s value.
+     */
+    async #getManyByProperty(prop, values) {
+        // `prop` is interpolated into SQL, so it may only ever be one of the
+        // unique-key columns this store owns — never caller-supplied.
+        if (!BATCH_LOOKUP_COLUMNS.has(prop)) {
+            throw new Error(`AppStore: unsupported batch lookup key ${prop}`);
+        }
+        const present = (Array.isArray(values) ? values : []).filter(
+            (value) => value !== null && value !== undefined,
+        );
+        return this.#cache.getMany(prop, present, async (missing, primary) => {
+            const apps = [];
+            for (
+                let offset = 0;
+                offset < missing.length;
+                offset += BULK_QUERY_CHUNK_SIZE
+            ) {
+                const chunk = missing.slice(
+                    offset,
+                    offset + BULK_QUERY_CHUNK_SIZE,
+                );
+                const placeholders = chunk.map(() => '?').join(', ');
+                const sql = `SELECT *, ${this.#createdEpochColumn()} FROM \`apps\` WHERE \`${prop}\` IN (${placeholders})`;
+                const rows = primary
+                    ? await this.clients.db.pread(sql, chunk)
+                    : await this.clients.db.read(sql, chunk);
+                for (const row of rows) {
+                    const app = this.#normalizeRow(row);
+                    if (app) apps.push(app);
+                }
+            }
+            return apps;
+        });
+    }
+
+    async existsByName(name) {
+        const rows = await this.clients.db.read(
+            'SELECT `id` FROM `apps` WHERE `name` = ? LIMIT 1',
+            [name],
+        );
+        return rows.length > 0;
+    }
+
+    /**
+     * Find the oldest app whose `index_url` matches one of `candidates`. Used
+     * by the driver to detect duplicate puter-hosted index_url rows
+     * (origin-bootstrap apps + same-owner duplicates) so they can be merged on
+     * `create` / `update`. Returns the minimal row shape needed by the merge
+     * path; falsy when nothing matches.
+     */
+    async findByIndexUrlCandidates(candidates, { excludeAppId } = {}) {
+        if (!Array.isArray(candidates) || candidates.length === 0) return null;
+        const placeholders = candidates.map(() => '?').join(', ');
+        const params = [...candidates];
+        let sql = `SELECT \`id\`, \`uid\`, \`owner_user_id\`, \`index_url\` FROM \`apps\` WHERE \`index_url\` IN (${placeholders})`;
+        if (Number.isInteger(excludeAppId) && excludeAppId > 0) {
+            sql += ' AND `id` != ?';
+            params.push(excludeAppId);
+        }
+        sql += ' ORDER BY `timestamp` ASC, `id` ASC LIMIT 1';
+        const rows = await this.clients.db.read(sql, params);
+        return rows[0] ?? null;
+    }
+
+    /**
+     * Every app whose `index_url` matches one of `candidates`, with the owner
+     * and the app that built it. Used by the subdomain driver to decide who may
+     * re-create a hosted name that apps still point at, and to derive a
+     * subdomain row's associated app.
+     */
+    async listByIndexUrlCandidates(candidates) {
+        const uniqueCandidates = [
+            ...new Set(
+                (Array.isArray(candidates) ? candidates : []).filter(
+                    (c) => typeof c === 'string' && c.length > 0,
+                ),
+            ),
+        ];
+        if (uniqueCandidates.length === 0) return [];
+
+        const rowsById = new Map();
+        for (
+            let offset = 0;
+            offset < uniqueCandidates.length;
+            offset += INDEX_URL_CHUNK_SIZE
+        ) {
+            const chunk = uniqueCandidates.slice(
+                offset,
+                offset + INDEX_URL_CHUNK_SIZE,
+            );
+            const placeholders = chunk.map(() => '?').join(', ');
+            const rows = await this.clients.db.read(
+                `SELECT \`id\`, \`uid\`, \`owner_user_id\`, \`app_owner\`, \`index_url\` FROM \`apps\` WHERE \`index_url\` IN (${placeholders})`,
+                chunk,
+            );
+            for (const row of rows) rowsById.set(row.id, row);
+        }
+        return [...rowsById.values()];
+    }
+
+    /**
+     * Canonical app uid among rows matching `candidates`: private first, then
+     * oldest.
+     */
+    async findCanonicalUidByIndexUrlCandidates(candidates) {
+        const uniqueCandidates = [
+            ...new Set(
+                (Array.isArray(candidates) ? candidates : []).filter(
+                    (c) => typeof c === 'string' && c.length > 0,
+                ),
+            ),
+        ];
+        if (uniqueCandidates.length === 0) return null;
+
+        const placeholders = uniqueCandidates.map(() => '?').join(', ');
+        const rows = await this.clients.db.read(
+            `SELECT \`uid\` FROM \`apps\` WHERE \`index_url\` IN (${placeholders}) ` +
+                `ORDER BY CASE WHEN \`is_private\` = ${this.clients.db.booleanLiteral(true)} THEN 0 ELSE 1 END, \`id\` ASC LIMIT 1`,
+            uniqueCandidates,
+        );
+        const uid = rows[0]?.uid;
+        return typeof uid === 'string' && uid ? uid : null;
+    }
+
+    /**
+     * `ownerUserId`'s apps whose `index_url` is one of `candidates`, private
+     * first, then by id. At most two, so a caller can tell an ambiguous match;
+     * only the columns the hosted-site gate reads.
+     *
+     * @param {number} ownerUserId
+     * @param {string[]} candidates
+     * @param {{ requirePrivate?: boolean }} [opts]
+     * @returns {Promise<
+     *     {
+     *         id: number;
+     *         uid: string;
+     *         name: string;
+     *         title: string;
+     *         is_private: number | boolean | null;
+     *         owner_user_id: number;
+     *         index_url: string;
+     *     }[]
+     * >}
+     */
+    async listOwnedByIndexUrlCandidates(
+        ownerUserId,
+        candidates,
+        { requirePrivate = false } = {},
+    ) {
+        if (!Array.isArray(candidates) || candidates.length === 0) return [];
+        const isPrivate = `\`is_private\` = ${this.clients.db.booleanLiteral(true)}`;
+        const placeholders = candidates.map(() => '?').join(', ');
+        return this.clients.db.read(
+            'SELECT `id`, `uid`, `name`, `title`, `is_private`, `owner_user_id`, `index_url` ' +
+                'FROM `apps` WHERE `owner_user_id` = ? ' +
+                (requirePrivate ? `AND ${isPrivate} ` : '') +
+                `AND \`index_url\` IN (${placeholders}) ` +
+                `ORDER BY CASE WHEN ${isPrivate} THEN 0 ELSE 1 END, \`id\` LIMIT 2`,
+            [ownerUserId, ...candidates],
+        );
+    }
+
+    /**
+     * One row per distinct `index_url` in `candidates` with its lowest private
+     * id (`private_id`, null if none) and lowest id (`min_id`). An external
+     * index_url can be shared by thousands of apps, so batch callers pick
+     * canonical winners from these instead of every matching row.
+     */
+    async listIndexUrlWinners(candidates) {
+        const uniqueCandidates = [
+            ...new Set(
+                (Array.isArray(candidates) ? candidates : []).filter(
+                    (c) => typeof c === 'string' && c.length > 0,
+                ),
+            ),
+        ];
+        if (uniqueCandidates.length === 0) return [];
+
+        const winnersByIndexUrl = new Map();
+        for (
+            let offset = 0;
+            offset < uniqueCandidates.length;
+            offset += INDEX_URL_CHUNK_SIZE
+        ) {
+            const chunk = uniqueCandidates.slice(
+                offset,
+                offset + INDEX_URL_CHUNK_SIZE,
+            );
+            const placeholders = chunk.map(() => '?').join(', ');
+            const rows = await this.clients.db.read(
+                `SELECT \`index_url\`, ` +
+                    `MIN(CASE WHEN \`is_private\` = ${this.clients.db.booleanLiteral(true)} THEN \`id\` END) AS private_id, ` +
+                    `MIN(\`id\`) AS min_id ` +
+                    `FROM \`apps\` WHERE \`index_url\` IN (${placeholders}) GROUP BY \`index_url\``,
+                chunk,
+            );
+            // Deduped candidates land in one chunk each, so groups never span chunks.
+            for (const row of rows) {
+                if (typeof row.index_url === 'string') {
+                    winnersByIndexUrl.set(row.index_url, row);
+                }
+            }
+        }
+        return [...winnersByIndexUrl.values()];
+    }
+
+    /**
+     * Set `owner_user_id` on an app row only if it has no current owner. Used
+     * by the merge path to claim ownership of an origin-bootstrap app row
+     * (auto-created with no owner) before merging into it. Returns true iff the
+     * row was modified.
+     */
+    async claimOwnership(appId, userId) {
+        if (!Number.isInteger(appId) || appId <= 0) return false;
+        if (!Number.isInteger(userId) || userId <= 0) return false;
+        const result = await this.clients.db.write(
+            'UPDATE `apps` SET `owner_user_id` = ? WHERE `id` = ? AND `owner_user_id` IS NULL',
+            [userId, appId],
+        );
+        const affected = (result?.affectedRows ?? result?.changes ?? 0) > 0;
+        if (affected) {
+            // Invalidating needs the uid and name; only the id is known. Not
+            // `getById`: on a cache miss it would cache the replica's
+            // pre-claim row.
+            const fresh = await this.#readFromDb('id', appId, {
+                primary: true,
+            });
+            if (fresh) {
+                await this.invalidate(fresh);
+            }
+        }
+        return affected;
+    }
+
+    /**
+     * List apps with optional filters. Returns raw normalised rows — the driver
+     * is responsible for permission filtering + icon URL resolution when
+     * serving to clients.
+     *
+     * @param {object} filters
+     * @param {number} [filters.ownerUserId] — only apps owned by this user
+     * @param {number} [filters.appOwner] — only apps created by another app
+     * @param {string} [filters.name] — exact name match
+     * @param {number} [filters.limit=500] Default is `500`
+     */
+    async list(filters = {}) {
+        const where = [];
+        const params = [];
+
+        if (filters.ownerUserId !== undefined) {
+            where.push('`owner_user_id` = ?');
+            params.push(filters.ownerUserId);
+        }
+        if (filters.appOwner !== undefined) {
+            where.push('`app_owner` = ?');
+            params.push(filters.appOwner);
+        }
+        if (filters.name !== undefined) {
+            where.push('`name` = ?');
+            params.push(filters.name);
+        }
+        if (filters.afterId !== undefined && filters.afterId !== null) {
+            where.push('`id` > ?');
+            params.push(filters.afterId);
+        }
+
+        const whereClause = where.length ? `WHERE ${where.join(' AND ')}` : '';
+        const limit = filters.limit ?? 500;
+        const offset = filters.offset ?? 0;
+        const generation = await this.#listGeneration(filters.ownerUserId);
+        const cacheKey =
+            generation &&
+            `${LIST_CACHE_KEY_PREFIX}:${generation}:${JSON.stringify([
+                whereClause,
+                params,
+                limit,
+                offset,
+            ])}`;
+
+        try {
+            const cached = cacheKey && (await this.clients.redis.get(cacheKey));
+            if (cached) {
+                const parsed = JSON.parse(cached);
+                if (Array.isArray(parsed)) {
+                    return parsed.map((r) => this.#normalizeRow(r));
+                }
+            }
+        } catch {
+            // Fall through to DB on any cache failure.
+        }
+
+        let sql = `SELECT *, ${this.#createdEpochColumn()} FROM \`apps\` ${whereClause} ORDER BY \`id\` ASC LIMIT ?`;
+        const sqlParams = [...params, limit];
+        if (offset > 0) {
+            sql += ' OFFSET ?';
+            sqlParams.push(offset);
+        }
+        const rows = await this.clients.db.read(sql, sqlParams);
+        const apps = rows.map((r) => this.#normalizeRow(r));
+
+        if (cacheKey) void this.#writeListCache(cacheKey, apps);
+        return apps;
+    }
+
+    /**
+     * Count apps matching the same equality filters as `list`.
+     * `visibleToUserId` counts the public catalog for one caller —
+     * non-protected apps plus their own; apps visible only via explicit
+     * permission grants are not included.
+     */
+    async count(filters = {}) {
+        const where = [];
+        const params = [];
+
+        if (filters.ownerUserId !== undefined) {
+            where.push('`owner_user_id` = ?');
+            params.push(filters.ownerUserId);
+        }
+        if (filters.appOwner !== undefined) {
+            where.push('`app_owner` = ?');
+            params.push(filters.appOwner);
+        }
+        if (filters.visibleToUserId !== undefined) {
+            where.push(
+                '(`protected` IS NULL OR `protected` = false OR `owner_user_id` = ?)',
+            );
+            params.push(filters.visibleToUserId);
+        }
+
+        const whereClause = where.length ? `WHERE ${where.join(' AND ')}` : '';
+        const rows = await this.clients.db.read(
+            `SELECT COUNT(*) AS n FROM \`apps\` ${whereClause}`,
+            params,
+        );
+        return Number(rows[0]?.n ?? 0);
+    }
+
+    // -- Writes -------------------------------------------------------
+
+    /**
+     * Create a new app row.
+     *
+     * `fields` is the post-validation column map from the driver. `ownerUserId`
+     * and `appOwner` come in as a separate arg rather than living on `fields`
+     * so user-derived patches can never fake ownership — the store's
+     * READ_ONLY_COLUMNS filter would strip them from `fields` anyway; putting
+     * them here makes the privileged contract obvious at the call site.
+     *
+     * Returns the created app row.
+     */
+    async create(
+        fields,
+        /** @type {{ ownerUserId?: number; appOwner?: number }} */
+        { ownerUserId, appOwner = null } = {},
+    ) {
+        if (typeof ownerUserId !== 'number') {
+            throw new Error('AppStore.create requires a numeric ownerUserId');
+        }
+
+        const uid = `app-${uuidv4()}`;
+        const allowed = this.#filterEditable(fields);
+        allowed.owner_user_id = ownerUserId;
+        if (appOwner !== null && appOwner !== undefined) {
+            allowed.app_owner = appOwner;
+        }
+
+        const written = { uid, ...allowed };
+        const createdAt = Math.floor(Date.now() / 1000);
+        const { sql, values } = this.#insertStatement(written, createdAt);
+        const result = await this.clients.db.write(sql, values);
+        const insertId = result?.insertId;
+        if (!insertId)
+            throw new Error('Failed to create app — no insertId returned');
+
+        // A reused name retires its predecessor's tombstone.
+        await this.clearCacheTombstones(
+            this.#cacheKeysForApp({ id: insertId, uid, name: allowed.name }),
+        );
+        const fresh = await this.#createdApp(
+            Number(insertId),
+            written,
+            createdAt,
+        );
+        if (fresh?.name) {
+            await this.#clearOldAppNamesForName(fresh.name);
+        }
+        await this.#invalidateListCachesForApps([fresh]);
+        return fresh;
+    }
+
+    /**
+     * Create an origin-bootstrap app row for `origin` with the deterministic
+     * `uid` (UUIDv5 of origin). `ownerUserId` is a privileged arg (same
+     * contract as `create`) — callers pass the hosted-subdomain owner so the
+     * site owner is the app's creator from the first minted token. Without one
+     * the row stays unclaimed until a developer registers an app for the same
+     * origin and AppDriver's merge path takes ownership. Marker shape (`name
+     * === uid && title === uid` + description prefix) is what
+     * `#isOriginBootstrapApp` checks.
+     */
+    async createFromOrigin(
+        uid,
+        origin,
+        /** @type {{ ownerUserId?: number | null }} */
+        { ownerUserId = null } = {},
+    ) {
+        // Bootstrap apps persist `origin` straight into `index_url`, which is
+        // later loaded as `iframe.src`. Enforce the same scheme allow-list
+        // as the AppDriver create/update path so a caller-supplied
+        // `javascript:`/`data:`/`file:` origin can never become a stored,
+        // launchable code-execution vector.
+        validateUrl(origin, {
+            key: 'origin',
+            protocols: WEB_AND_EXTENSION_PROTOCOLS,
+        });
+
+        const fields = {
+            name: uid,
+            title: uid,
+            description: `App created from origin ${origin}`,
+            index_url: origin,
+            owner_user_id:
+                Number.isInteger(ownerUserId) && ownerUserId > 0
+                    ? ownerUserId
+                    : null,
+        };
+
+        const written = { uid, ...fields };
+        const createdAt = Math.floor(Date.now() / 1000);
+        const { sql, values } = this.#insertStatement(written, createdAt);
+
+        let result;
+        try {
+            result = await this.clients.db.write(sql, values);
+        } catch (error) {
+            if (!isUniqueViolation(error)) throw error;
+            // Lost a check-then-insert race: `uid` is deterministic
+            // (UUIDv5 of origin), so a concurrent request for the same
+            // origin already created the row. Read it from the primary —
+            // the replica may not have it yet, which is exactly the lag
+            // that let both callers past the existence check.
+            const rows = await this.clients.db.pread(
+                `SELECT *, ${this.#createdEpochColumn()} FROM \`apps\` WHERE \`uid\` = ? LIMIT 1`,
+                [uid],
+            );
+            if (rows.length === 0) throw error;
+            const app = this.#normalizeRow(rows[0]);
+            await this.#writeCache(app);
+            return app;
+        }
+        const insertId = result?.insertId;
+        if (!insertId)
+            throw new Error(
+                'Failed to create origin-bootstrap app — no insertId returned',
+            );
+
+        // Deterministic uid: this is the re-bootstrap of a deleted app.
+        await this.clearCacheTombstones(
+            this.#cacheKeysForApp({ id: insertId, uid, name: fields.name }),
+        );
+        const fresh = await this.#createdApp(
+            Number(insertId),
+            written,
+            createdAt,
+        );
+        await this.#invalidateListCachesForApps([fresh]);
+        return fresh;
+    }
+
+    /** Updates + refreshes cache (local + peers) with the post-update row. */
+    async update(appId, patch) {
+        const allowed = this.#filterEditable(patch);
+        const keys = Object.keys(allowed);
+        if (keys.length === 0) return this.getById(appId);
+
+        const before = await this.#readFromDb('id', appId);
+        const setClause = keys.map((k) => `\`${k}\` = ?`).join(', ');
+        const values = keys.map((k) => allowed[k]);
+
+        await this.clients.db.write(
+            `UPDATE \`apps\` SET ${setClause} WHERE \`id\` = ?`,
+            [...values, appId],
+        );
+
+        const renamed =
+            before &&
+            typeof allowed.name === 'string' &&
+            allowed.name !== before.name;
+        if (renamed) {
+            await this.#recordOldAppName(before.uid, before.name);
+            // The new name now belongs to `appId`, so any redirect that
+            // used to point to a different app for that name is no
+            // longer accurate — drop it. Also covers the reclaim case
+            // where this same app's earlier (uid, newName) row would
+            // otherwise linger as a self-redirect.
+            await this.#clearOldAppNamesForName(allowed.name);
+        }
+
+        // Not `{ ...before, ...allowed }`: `before` is the replica's, and a
+        // column it has stale would go into the cache.
+        const fresh = await this.#readFromDb('id', appId, { primary: true });
+        await this.#invalidateListCachesForApps([before, fresh]);
+        if (fresh) {
+            await this.#refreshCache({ ...fresh, ...allowed });
+        }
+        if (renamed) {
+            // Drop any stale `apps:name:<old>` cache so the next
+            // getByName(old) goes through the redirect path with fresh
+            // data instead of returning a copy of the app under its old
+            // name.
+            await this.publishCacheKeys({
+                keys: [this.#cache.key('name', before.name)],
+                broadcast: true,
+            });
+        }
+        return fresh;
+    }
+
+    /**
+     * Point an app's icon at `iconUrl` if it still holds an inline data URL; an
+     * icon set since is left alone.
+     */
+    async replaceDataUrlIcon(uid, iconUrl) {
+        await this.clients.db.write(
+            "UPDATE `apps` SET `icon` = ? WHERE `uid` = ? AND `icon` LIKE 'data:%'",
+            [iconUrl, uid],
+        );
+        await this.invalidateByUid(uid);
+    }
+
+    /**
+     * Record `oldName` as a redirect to the app identified by `appUid`. The
+     * (app_uid, name) tuple is unique in `old_app_names`, so the upsert
+     * refreshes the timestamp when the same app re-records the same previous
+     * name (which happens whenever a user renames back and forth) — that resets
+     * the TTL clock so the redirect stays live for another
+     * {@link OLD_APP_NAME_TTL_MONTHS} months.
+     */
+    async #recordOldAppName(appUid, oldName) {
+        if (!appUid || typeof oldName !== 'string' || oldName.length === 0) {
+            return;
+        }
+        const upsertClause = this.clients.db.case({
+            mysql: 'ON DUPLICATE KEY UPDATE `timestamp` = CURRENT_TIMESTAMP',
+            otherwise:
+                'ON CONFLICT(`app_uid`, `name`) DO UPDATE SET `timestamp` = CURRENT_TIMESTAMP',
+        });
+        await this.clients.db.write(
+            `INSERT INTO \`old_app_names\` (\`app_uid\`, \`name\`) VALUES (?, ?) ${upsertClause}`,
+            [appUid, oldName],
+        );
+        // Reads only filter expired redirects, so this is where they're pruned.
+        await this.clients.db.write(
+            `DELETE FROM \`old_app_names\` WHERE \`app_uid\` = ? AND \`timestamp\` < ${this.#oldNameCutoffClause()}`,
+            [appUid],
+        );
+    }
+
+    /**
+     * Drop every `old_app_names` row for `name`. Called whenever a name is
+     * freshly claimed in `apps` (create or rename-into) so the authoritative
+     * live row isn't shadowed by a stale redirect that pointed `name` at some
+     * prior owner.
+     */
+    async #clearOldAppNamesForName(name) {
+        if (typeof name !== 'string' || name.length === 0) return;
+        await this.clients.db.write(
+            'DELETE FROM `old_app_names` WHERE `name` = ?',
+            [name],
+        );
+    }
+
+    /**
+     * Delete an app row. Also deletes its filetype associations, records its
+     * uid and owner in `deleted_apps`, and invalidates cache, its own and that
+     * of the sites and workers that cascade away with it.
+     */
+    async delete(appId) {
+        const app = await this.getById(appId);
+        if (!app) return false;
+
+        const sites = await this.stores.subdomain.listAppCascade({ appId });
+
+        const owner = app.owner_user_id ?? null;
+        await this.clients.db.write(
+            `INSERT INTO \`deleted_apps\` (\`uid\`, \`owner_user_id\`) VALUES (?, ?) ${this.#deletedAppsUpsert()}`,
+            [app.uid, owner, owner],
+        );
+        await this.clients.db.write(
+            'DELETE FROM `app_filetype_association` WHERE `app_id` = ?',
+            [appId],
+        );
+        await this.clients.db.write('DELETE FROM `apps` WHERE `id` = ?', [
+            appId,
+        ]);
+        // Tombstone, so a lagging replica can't cache the row back for a day.
+        await this.markDeleted(app);
+        await this.stores.subdomain.forgetCascadeDeleted(sites);
+        return true;
+    }
+
+    /**
+     * Record every app `userId` owns in `deleted_apps`, as {@link delete} does.
+     * Call before deleting the user: the `apps` rows go with it by FK cascade.
+     */
+    async recordDeletedForOwner(userId) {
+        await this.clients.db.write(
+            `INSERT INTO \`deleted_apps\` (\`uid\`, \`owner_user_id\`) SELECT \`uid\`, \`owner_user_id\` FROM \`apps\` WHERE \`owner_user_id\` = ? ${this.#deletedAppsUpsert()}`,
+            [userId, userId],
+        );
+    }
+
+    /**
+     * Owner each of `uids` had when its app was deleted (null if it had none).
+     * Uids that never belonged to a deleted app are absent.
+     *
+     * @param {string[]} uids
+     * @returns {Promise<Map<string, number | null>>}
+     */
+    async getDeletedOwnersByUids(uids) {
+        const unique = [...new Set(uids)];
+        const out = new Map();
+        for (
+            let offset = 0;
+            offset < unique.length;
+            offset += BULK_QUERY_CHUNK_SIZE
+        ) {
+            const chunk = unique.slice(offset, offset + BULK_QUERY_CHUNK_SIZE);
+            const rows = await this.clients.db.read(
+                `SELECT \`uid\`, \`owner_user_id\` FROM \`deleted_apps\` WHERE \`uid\` IN (${chunk.map(() => '?').join(', ')})`,
+                chunk,
+            );
+            for (const row of rows) {
+                const owner = Number(row.owner_user_id);
+                out.set(
+                    String(row.uid),
+                    row.owner_user_id != null && owner > 0 ? owner : null,
+                );
+            }
+        }
+        return out;
+    }
+
+    #deletedAppsUpsert() {
+        return this.clients.db.upsertClause(['uid'], ['owner_user_id']);
+    }
+
+    // -- Filetype associations ----------------------------------------
+
+    async getFiletypeAssociations(appId) {
+        const rows = await this.clients.db.read(
+            'SELECT `type` FROM `app_filetype_association` WHERE `app_id` = ?',
+            [appId],
+        );
+        return rows.map((r) => r.type);
+    }
+
+    /**
+     * Batch sibling of {@link getFiletypeAssociations} — one query for many app
+     * ids, returns `Map<appId, string[]>` (every requested id is present, with
+     * `[]` for apps that have no associations).
+     */
+    async getFiletypeAssociationsByIds(appIds) {
+        const ids = Array.isArray(appIds)
+            ? Array.from(
+                  new Set(
+                      appIds.filter((id) => id !== null && id !== undefined),
+                  ),
+              )
+            : [];
+        const out = new Map();
+        for (const id of ids) out.set(id, []);
+        if (ids.length === 0) return out;
+
+        const placeholders = ids.map(() => '?').join(',');
+        const rows = await this.clients.db.read(
+            `SELECT \`app_id\`, \`type\` FROM \`app_filetype_association\`
+             WHERE \`app_id\` IN (${placeholders})`,
+            ids,
+        );
+        for (const row of rows) {
+            const list = out.get(row.app_id);
+            if (list) list.push(row.type);
+        }
+        return out;
+    }
+
+    async getAppsByFiletype(extension) {
+        // Cache-on-read: first request after a miss pays the join, subsequent
+        // reads inside the TTL window hit redis. `setFiletypeAssociations`
+        // invalidates the affected extension explicitly so changes show up
+        // immediately.
+        const ext = normalizeFiletype(extension);
+        if (!ext) return [];
+        const cacheKey = `${FILETYPE_CACHE_KEY_PREFIX}:${ext}`;
+        try {
+            const cached = await this.clients.redis.get(cacheKey);
+            if (cached) {
+                const parsed = JSON.parse(cached);
+                if (Array.isArray(parsed)) return parsed;
+            }
+        } catch {
+            // Fall through to DB on any cache failure.
+        }
+
+        // Rows written before writes were canonicalized may carry a leading
+        // dot (`.docx`); match both forms so they work without a migration.
+        const rows = await this.clients.db.read(
+            `SELECT a.*, ${this.#createdEpochColumn('a.')} FROM \`apps\` a
+             INNER JOIN \`app_filetype_association\` fa ON fa.\`app_id\` = a.\`id\`
+             WHERE fa.\`type\` IN (?, ?)`,
+            [ext, `.${ext}`],
+        );
+        // An app associated under both forms joins to two rows.
+        const seenIds = new Set();
+        const apps = [];
+        for (const row of rows) {
+            if (seenIds.has(row.id)) continue;
+            seenIds.add(row.id);
+            apps.push(this.#normalizeRow(row));
+        }
+
+        this.clients.redis
+            .set(
+                cacheKey,
+                JSON.stringify(apps),
+                'EX',
+                FILETYPE_CACHE_TTL_SECONDS,
+            )
+            .catch(() => {
+                // Best-effort cache write.
+            });
+
+        return apps;
+    }
+
+    async getRecentAppOpens(userId, { limit = 10 } = {}) {
+        const rows = await this.clients.db.read(
+            `SELECT DISTINCT \`app_uid\` FROM \`app_opens\`
+             WHERE \`user_id\` = ?
+             GROUP BY \`app_uid\`
+             ORDER BY MAX(\`_id\`) DESC
+             LIMIT ${limit}`,
+            [userId],
+        );
+        return rows.map((r) => r.app_uid);
+    }
+
+    async setFiletypeAssociations(appId, types) {
+        // Replace-all semantics. Capture the previous extension set so we
+        // can drop their cached app lists in addition to the new ones.
+        const previous = await this.getFiletypeAssociations(appId);
+        // Canonicalize before storing — readers match on the bare lowercase
+        // extension. Dedupe after normalizing: '.docx' and 'docx' in the
+        // same call are one association, not two rows.
+        const newTypes = [
+            ...new Set(
+                (Array.isArray(types) ? types : [])
+                    .map(normalizeFiletype)
+                    .filter(Boolean),
+            ),
+        ];
+
+        // DELETE + multi-row INSERT in one transactional batch — partial
+        // success would otherwise leave the row's filetype set in a state
+        // that doesn't match either `previous` or `newTypes`.
+        const entries = [
+            {
+                statement:
+                    'DELETE FROM `app_filetype_association` WHERE `app_id` = ?',
+                values: [appId],
+            },
+        ];
+        if (newTypes.length > 0) {
+            const placeholders = newTypes.map(() => '(?, ?)').join(', ');
+            const values = newTypes.flatMap((t) => [appId, t]);
+            entries.push({
+                statement: `INSERT INTO \`app_filetype_association\` (\`app_id\`, \`type\`) VALUES ${placeholders}`,
+                values,
+            });
+        }
+        await this.clients.db.batchWrite(entries);
+
+        // Cache keys are always the canonical form — normalize `previous`
+        // too, since pre-existing rows may be stored dotted.
+        const affected = new Set(
+            [...previous.map(normalizeFiletype), ...newTypes].filter(Boolean),
+        );
+        if (affected.size === 0) return;
+        const keys = [...affected].map(
+            (t) => `${FILETYPE_CACHE_KEY_PREFIX}:${t}`,
+        );
+        await this.publishCacheKeys({ keys, broadcast: true });
+    }
+
+    // -- Cache invalidation -------------------------------------------
+
+    async invalidate(app) {
+        await this.#cache.invalidate(app);
+        await this.#invalidateListCachesForApps([app]);
+    }
+
+    /** Invalidate a deleted row; pass it as read _before_ the delete. */
+    async markDeleted(app) {
+        await this.#cache.markDeleted(app);
+        await this.#invalidateListCachesForApps([app]);
+    }
+
+    async invalidateById(id) {
+        const app =
+            (await this.#cache.read(this.#cache.key('id', id))) ??
+            (await this.#readFromDb('id', id));
+        if (app) await this.invalidate(app);
+    }
+
+    async invalidateByUid(uid) {
+        const app =
+            (await this.#cache.read(this.#cache.key('uid', uid))) ??
+            (await this.#readFromDb('uid', uid));
+        if (app) await this.invalidate(app);
+    }
+
+    /** Resolve an app by either uid or name; tries uid first, then name. */
+    async resolveApp(identifier) {
+        return (
+            (await this.getByUid(identifier)) ??
+            (await this.getByName(identifier))
+        );
+    }
+
+    // -- Internals ----------------------------------------------------
+
+    async #getByProperty(prop, value) {
+        if (value === undefined || value === null) return null;
+        return this.#cache.get(this.#cache.key(prop, value), (primary) =>
+            this.#readFromDb(prop, value, { primary }),
+        );
+    }
+
+    /**
+     * The INSERT for a new row: `written`'s columns, and `timestamp` stamped
+     * from `createdAt` (unix seconds) instead of defaulted.
+     */
+    #insertStatement(written, createdAt) {
+        const db = this.clients.db;
+        const colList = [...Object.keys(written), 'timestamp']
+            .map((c) => `\`${c}\``)
+            .join(', ');
+        const placeholders = [
+            ...Object.keys(written).map(() => '?'),
+            db.timestampFromUnixSql(),
+        ].join(', ');
+        return {
+            sql: `INSERT INTO \`apps\` (${colList}) VALUES (${placeholders})${db.returningIdClause()}`,
+            values: [...Object.values(written), createdAt],
+        };
+    }
+
+    /**
+     * The row `#insertStatement` wrote, built rather than read back from the
+     * primary; cached on the way out.
+     */
+    async #createdApp(id, written, createdAt) {
+        const app = this.#normalizeRow({
+            ...APP_COLUMN_DEFAULTS,
+            ...written,
+            id,
+            timestamp: this.clients.db.timestampValue(createdAt),
+            created_epoch: createdAt,
+        });
+        try {
+            await this.#writeCache(app);
+        } catch {
+            // Best effort; the next read fills it.
+        }
+        return app;
+    }
+
+    async #readFromDb(prop, value, { primary = false } = {}) {
+        const read = primary
+            ? (sql, params) => this.clients.db.pread(sql, params)
+            : (sql, params) => this.clients.db.read(sql, params);
+
+        if (prop === 'name') {
+            // Direct match on the live `apps.name` always wins — a current
+            // owner of the name takes precedence over any historical
+            // redirect still lingering in `old_app_names`.
+            const directRows = await read(
+                `SELECT *, ${this.#createdEpochColumn()} FROM \`apps\` WHERE \`name\` = ? LIMIT 1`,
+                [value],
+            );
+            if (directRows.length > 0) {
+                return this.#normalizeRow(directRows[0]);
+            }
+            return this.#resolveByOldName(value);
+        }
+
+        const rows = await read(
+            `SELECT *, ${this.#createdEpochColumn()} FROM \`apps\` WHERE \`${prop}\` = ? LIMIT 1`,
+            [value],
+        );
+        if (rows.length === 0) return null;
+        return this.#normalizeRow(rows[0]);
+    }
+
+    /**
+     * The row's creation time as unix seconds, computed by the database: the
+     * mysql driver reads a stored UTC timestamp as local time, so parsing
+     * `timestamp` in JS can be off by the server's UTC offset.
+     */
+    #createdEpochColumn(alias = '') {
+        const column = `${alias}\`timestamp\``;
+        const epoch = this.clients.db.case({
+            postgres: `EXTRACT(EPOCH FROM ${column})::bigint`,
+            mysql: `UNIX_TIMESTAMP(${column})`,
+            otherwise: `CAST(strftime('%s', ${column}) AS INTEGER)`,
+        });
+        return `${epoch} AS \`created_epoch\``;
+    }
+
+    /** `old_app_names` timestamp below which a redirect has expired. */
+    #oldNameCutoffClause() {
+        return this.clients.db.case({
+            sqlite: `datetime('now', '-${OLD_APP_NAME_TTL_MONTHS} months')`,
+            postgres: `(NOW() - INTERVAL '${OLD_APP_NAME_TTL_MONTHS} months')`,
+            otherwise: `(NOW() - INTERVAL ${OLD_APP_NAME_TTL_MONTHS} MONTH)`,
+        });
+    }
+
+    /**
+     * Resolve an app by a previously-used name via `old_app_names`. Read-only:
+     * expired redirects are filtered here and pruned by `#recordOldAppName`.
+     */
+    async #resolveByOldName(name) {
+        const rows = await this.clients.db.read(
+            `SELECT a.*, ${this.#createdEpochColumn('a.')} FROM \`apps\` AS a
+             INNER JOIN \`old_app_names\` AS o ON o.\`app_uid\` = a.\`uid\`
+             WHERE o.\`name\` = ? AND o.\`timestamp\` >= ${this.#oldNameCutoffClause()}
+             ORDER BY o.\`timestamp\` DESC
+             LIMIT 1`,
+            [name],
+        );
+        if (rows.length === 0) return null;
+        return this.#normalizeRow(rows[0]);
+    }
+
+    /**
+     * List pages are cached under their owner's generation, or the `all`
+     * generation when unscoped; a write replaces the generation instead of
+     * finding the pages. Null when redis is unavailable.
+     */
+    async #listGeneration(ownerUserId) {
+        const key = this.#listGenerationKey(ownerUserId ?? 'all');
+        try {
+            const current = await this.clients.redis.get(key);
+            if (current) return current;
+            const fresh = uuidv4();
+            const created = await this.clients.redis.set(
+                key,
+                fresh,
+                'EX',
+                LIST_GENERATION_TTL_SECONDS,
+                'NX',
+            );
+            return created ? fresh : await this.clients.redis.get(key);
+        } catch {
+            return null;
+        }
+    }
+
+    #listGenerationKey(scope) {
+        return `${LIST_CACHE_KEY_PREFIX}:gen:${scope}`;
+    }
+
+    #cacheKeysForApp(app) {
+        return this.#cache.keysFor(app);
+    }
+
+    /** Caches `app` on this node unless it was deleted. Never throws. */
+    #writeCache(app) {
+        return this.#cache.write([app]);
+    }
+
+    async #writeListCache(cacheKey, apps) {
+        try {
+            await this.clients.redis.set(
+                cacheKey,
+                JSON.stringify(apps),
+                'EX',
+                LIST_CACHE_TTL_SECONDS,
+            );
+        } catch {
+            // The next read fills it.
+        }
+    }
+
+    /** Orphans every cached page these apps' owners, or anyone, could see. */
+    async #invalidateListCachesForApps(apps) {
+        const scopes = new Set(['all']);
+        for (const app of apps) {
+            if (app?.owner_user_id != null) scopes.add(app.owner_user_id);
+        }
+        await this.publishCacheKeys({
+            keys: [...scopes].map((scope) => this.#listGenerationKey(scope)),
+            serializedData: uuidv4(),
+            ttlSeconds: LIST_GENERATION_TTL_SECONDS,
+            broadcast: true,
+        });
+    }
+
+    async #refreshCache(app) {
+        const keys = this.#cacheKeysForApp(app);
+        // A delete can land between `update`'s read and this refresh.
+        await this.writeCacheUnlessDeleted(keys, () =>
+            this.#publishRefresh(keys, app),
+        );
+    }
+
+    async #publishRefresh(keys, app) {
+        await this.publishCacheKeys({
+            keys,
+            serializedData: JSON.stringify(app),
+            ttlSeconds: CACHE_TTL_SECONDS,
+            broadcast: true,
+        });
+    }
+
+    #filterEditable(fields) {
+        const out = {};
+        for (const [k, v] of Object.entries(fields)) {
+            if (READ_ONLY_COLUMNS.has(k)) continue;
+            out[k] =
+                APP_BOOLEAN_COLUMNS.has(k) && v !== null && v !== undefined
+                    ? this.clients.db.booleanValue(Boolean(v))
+                    : v;
+        }
+        return out;
+    }
+
+    #normalizeRow(row) {
+        if (!row) return null;
+        // Coerce booleans
+        for (const key of [
+            'godmode',
+            'background',
+            'maximize_on_start',
+            'protected',
+            'is_private',
+            'approved_for_listing',
+            'approved_for_opening_items',
+            'approved_for_incentive_program',
+            'feedback_enabled',
+        ]) {
+            if (row[key] !== undefined) row[key] = Boolean(row[key]);
+        }
+        // Parse metadata
+        if (typeof row.metadata === 'string') {
+            try {
+                row.metadata = JSON.parse(row.metadata);
+            } catch {
+                row.metadata = null;
+            }
+        }
+        if (row.created_epoch !== undefined && row.created_epoch !== null) {
+            row.created_epoch = Number(row.created_epoch);
+        }
+        // Alias created_at
+        if (row.timestamp !== undefined && row.created_at === undefined) {
+            row.created_at = row.timestamp;
+        }
+        return row;
+    }
+
+    appStatsCachePrefix = 'appstats:';
+
+    #openCountCacheKey(uid) {
+        return `${this.appStatsCachePrefix}open:${uid}`;
+    }
+    #userCountCacheKey(uid) {
+        return `${this.appStatsCachePrefix}user:${uid}`;
+    }
+
+    /**
+     * Batched, cached all-time { open_count, user_count } for a set of apps.
+     *
+     * Flow: pipelined redis MGET → on miss, one ClickHouse (or MySQL) query for
+     * all misses at once → backfill cache. Apps with no rows in `app_opens`
+     * resolve to zero counts. Returns `Map<uid, stats>`.
+     */
+    async getAppsStats(appUids) {
+        const uids = Array.isArray(appUids)
+            ? [...new Set(appUids.filter((u) => typeof u === 'string' && u))]
+            : [];
+        const stats = new Map();
+        if (uids.length === 0) return stats;
+
+        let cacheResults = [];
+        try {
+            const pipeline = this.clients.redis.pipeline();
+            for (const uid of uids) {
+                pipeline.get(this.#openCountCacheKey(uid));
+                pipeline.get(this.#userCountCacheKey(uid));
+            }
+            cacheResults = (await pipeline.exec()) ?? [];
+        } catch {
+            // Fall through — treat everything as a miss.
+        }
+
+        const missing = [];
+        for (let i = 0; i < uids.length; i++) {
+            const uid = uids[i];
+            const openEntry = cacheResults[i * 2];
+            const userEntry = cacheResults[i * 2 + 1];
+            const openVal = openEntry?.[1];
+            const userVal = userEntry?.[1];
+            if (openVal != null && userVal != null) {
+                const o = parseInt(openVal, 10);
+                const u = parseInt(userVal, 10);
+                if (!Number.isNaN(o) && !Number.isNaN(u)) {
+                    stats.set(uid, {
+                        open_count: o,
+                        user_count: u,
+                        referral_count: null,
+                    });
+                    continue;
+                }
+            }
+            missing.push(uid);
+        }
+
+        if (missing.length > 0) {
+            const fresh = await this.#queryStatsForUids(missing);
+            const writePipe = this.clients.redis.pipeline();
+            for (const uid of missing) {
+                const row = fresh.get(uid) ?? { open_count: 0, user_count: 0 };
+                stats.set(uid, { ...row, referral_count: null });
+                writePipe.set(
+                    this.#openCountCacheKey(uid),
+                    String(row.open_count),
+                    'EX',
+                    STATS_CACHE_TTL_SECONDS,
+                );
+                writePipe.set(
+                    this.#userCountCacheKey(uid),
+                    String(row.user_count),
+                    'EX',
+                    STATS_CACHE_TTL_SECONDS,
+                );
+            }
+            writePipe.exec().catch(() => {});
+        }
+
+        return stats;
+    }
+
+    /**
+     * Detailed / period-filtered / grouped stats for a single app. Deliberately
+     * uncached — UI-driven, rarely repeated with the exact same args, and
+     * ClickHouse is fast enough at interactive latency.
+     *
+     * @param {object} [options]
+     * @param {string} [options.period='all'] — today, yesterday, 7d, 30d,
+     *   this_week, last_week, this_month, last_month, this_year, last_year,
+     *   12m, all. Default is `'all'`
+     * @param {string} [options.grouping] — hour, day, week, month, year
+     * @param {number | string | Date} [options.createdAt] — app creation ts;
+     *   used to bound the `all` period
+     */
+    async getAppStatsDetailed(appUid, options = {}) {
+        const period = options.period ?? 'all';
+        const grouping = options.grouping;
+        const timeRange = this.#computeTimeRange(period, options.createdAt);
+        const clickhouse = this.clients.clickhouse;
+
+        if (grouping) {
+            if (!MYSQL_DATE_FORMATS[grouping]) {
+                throw new HttpError(
+                    400,
+                    `Invalid grouping: ${grouping}. Supported: hour, day, week, month, year`,
+                    { legacyCode: 'bad_request' },
+                );
+            }
+            return this.#queryGroupedStats(
+                appUid,
+                timeRange,
+                grouping,
+                clickhouse,
+            );
+        }
+
+        return this.#querySingleStats(appUid, timeRange, clickhouse);
+    }
+
+    // -- Stats internals ----------------------------------------------
+
+    async #queryStatsForUids(requestedUids) {
+        const out = new Map();
+        // Marketplace callers pass item ids too. One longer than an app uid
+        // can't have opens, so leave it at zero rather than query it.
+        const uids = requestedUids.filter(
+            (u) => Buffer.byteLength(u, 'utf8') <= APP_UID_MAX_BYTES,
+        );
+        if (uids.length === 0) return out;
+
+        const clickhouse = this.clients.clickhouse;
+        if (clickhouse) {
+            const res = await clickhouse.query({
+                query: `
+                    SELECT app_uid,
+                           uniqExact((user_id, intDiv(ts, ${APP_OPEN_COUNT_PERIOD_SECONDS}))) AS open_count,
+                           count(DISTINCT user_id) AS user_count
+                    FROM app_opens
+                    WHERE app_uid IN {uids:Array(String)}
+                    GROUP BY app_uid
+                `,
+                query_params: { uids: uids.map((u) => String(u)) },
+                format: 'JSONEachRow',
+            });
+            const rows = await res.json();
+            for (const row of rows) {
+                out.set(row.app_uid, {
+                    open_count: parseInt(row.open_count, 10) || 0,
+                    user_count: parseInt(row.user_count, 10) || 0,
+                });
+            }
+            return out;
+        }
+
+        const placeholders = uids.map(() => '?').join(',');
+        const rows = await this.clients.db.read(
+            `SELECT app_uid,
+                    ${this.clients.db.countDistinctUserPeriods('user_id', 'ts', APP_OPEN_COUNT_PERIOD_SECONDS)} AS open_count,
+                    COUNT(DISTINCT user_id) AS user_count
+             FROM app_opens
+             WHERE app_uid IN (${placeholders})
+             GROUP BY app_uid`,
+            uids,
+        );
+        for (const row of rows) {
+            out.set(row.app_uid, {
+                open_count: parseInt(row.open_count, 10) || 0,
+                user_count: parseInt(row.user_count, 10) || 0,
+            });
+        }
+        return out;
+    }
+
+    async #querySingleStats(appUid, timeRange, clickhouse) {
+        if (clickhouse) {
+            const query_params = { appUid: String(appUid) };
+            let timeCond = '';
+            if (timeRange) {
+                query_params.tsStart = Math.floor(timeRange.start / 1000);
+                query_params.tsEnd = Math.floor(timeRange.end / 1000);
+                timeCond = 'AND ts >= {tsStart:Int64} AND ts < {tsEnd:Int64}';
+            }
+            const res = await clickhouse.query({
+                query: `
+                    SELECT uniqExact((user_id, intDiv(ts, ${APP_OPEN_COUNT_PERIOD_SECONDS}))) AS open_count,
+                           count(DISTINCT user_id) AS user_count
+                    FROM app_opens
+                    WHERE app_uid = {appUid:String}
+                    ${timeCond}
+                `,
+                query_params,
+                format: 'JSONEachRow',
+            });
+            const rows = await res.json();
+            const row = rows[0] ?? { open_count: 0, user_count: 0 };
+            return {
+                open_count: parseInt(row.open_count, 10) || 0,
+                user_count: parseInt(row.user_count, 10) || 0,
+            };
+        }
+
+        // ts is stored as unix seconds; timeRange.start/end are ms.
+        const params = timeRange
+            ? [appUid, timeRange.start / 1000, timeRange.end / 1000]
+            : [appUid];
+        const where = timeRange ? 'AND ts >= ? AND ts < ?' : '';
+        const rows = await this.clients.db.read(
+            `SELECT ${this.clients.db.countDistinctUserPeriods('user_id', 'ts', APP_OPEN_COUNT_PERIOD_SECONDS)} AS open_count,
+                    COUNT(DISTINCT user_id) AS user_count
+             FROM app_opens
+             WHERE app_uid = ? ${where}`,
+            params,
+        );
+        const row = rows[0] ?? { open_count: 0, user_count: 0 };
+        return {
+            open_count: parseInt(row.open_count, 10) || 0,
+            user_count: parseInt(row.user_count, 10) || 0,
+            referral_count: null,
+        };
+    }
+
+    async #queryGroupedStats(appUid, timeRange, grouping, clickhouse) {
+        const allPeriods = this.#generateAllPeriods(
+            new Date(timeRange.start),
+            new Date(timeRange.end),
+            grouping,
+        );
+
+        if (clickhouse) {
+            const groupBy = CLICKHOUSE_GROUP_BY_FORMATS[grouping];
+            const res = await clickhouse.query({
+                query: `
+                    SELECT ${groupBy} AS period,
+                           uniqExact((user_id, intDiv(ts, ${APP_OPEN_COUNT_PERIOD_SECONDS}))) AS open_count,
+                           count(DISTINCT user_id) AS user_count
+                    FROM app_opens
+                    WHERE app_uid = {appUid:String}
+                    AND ts >= {tsStart:Int64} AND ts < {tsEnd:Int64}
+                    GROUP BY period
+                    ORDER BY period
+                `,
+                query_params: {
+                    appUid: String(appUid),
+                    tsStart: Math.floor(timeRange.start / 1000),
+                    tsEnd: Math.floor(timeRange.end / 1000),
+                },
+                format: 'JSONEachRow',
+            });
+            const rows = await res.json();
+            const processed = rows.map((r) => ({
+                period: new Date(r.period),
+                open_count: parseInt(r.open_count, 10) || 0,
+                user_count: parseInt(r.user_count, 10) || 0,
+            }));
+            return this.#assembleGroupedResult(processed, allPeriods, grouping);
+        }
+
+        const timeFormat = MYSQL_DATE_FORMATS[grouping];
+        const params = [appUid, timeRange.start / 1000, timeRange.end / 1000];
+        // ts is stored as unix seconds — no /1000 in the date conversion.
+        const periodExpr = this.clients.db.case({
+            mysql: `DATE_FORMAT(FROM_UNIXTIME(ts), '${timeFormat}')`,
+            sqlite: `STRFTIME('${timeFormat}', datetime(ts, 'unixepoch'))`,
+            postgres: `TO_CHAR(TO_TIMESTAMP(ts), '${this.#postgresDateFormat(grouping)}')`,
+            otherwise: `DATE_FORMAT(FROM_UNIXTIME(ts), '${timeFormat}')`,
+        });
+        const rows = await this.clients.db.read(
+            `SELECT ${periodExpr} AS period,
+                    ${this.clients.db.countDistinctUserPeriods('user_id', 'ts', APP_OPEN_COUNT_PERIOD_SECONDS)} AS open_count,
+                    COUNT(DISTINCT user_id) AS user_count
+             FROM app_opens
+             WHERE app_uid = ? AND ts >= ? AND ts < ?
+             GROUP BY period
+             ORDER BY period`,
+            params,
+        );
+        const processed = rows.map((r) => ({
+            period: r.period,
+            open_count: parseInt(r.open_count, 10) || 0,
+            user_count: parseInt(r.user_count, 10) || 0,
+        }));
+        return this.#assembleGroupedResult(processed, allPeriods, grouping);
+    }
+
+    #postgresDateFormat(grouping) {
+        switch (grouping) {
+            case 'hour':
+                return 'YYYY-MM-DD HH24:00:00';
+            case 'day':
+                return 'YYYY-MM-DD';
+            case 'week':
+                return 'YYYY-WW';
+            case 'month':
+                return 'YYYY-MM';
+            case 'year':
+                return 'YYYY';
+            default:
+                return 'YYYY-MM-DD';
+        }
+    }
+
+    #assembleGroupedResult(rows, allPeriods, grouping) {
+        // Totals come from raw rows so they survive even if a row's
+        // period key fails to match an `allPeriods` entry (e.g. week
+        // grouping format mismatches, timezone edge cases). Matches v1
+        // AppInformationService.get_stats behaviour.
+        let totalOpen = 0;
+        let totalUser = 0;
+        for (const r of rows) {
+            totalOpen += r.open_count;
+            totalUser += r.user_count;
+        }
+        const dataMap = new Map(
+            rows.map((r) => [this.#normalizePeriodKey(r.period, grouping), r]),
+        );
+        const open = [];
+        const user = [];
+        for (const p of allPeriods) {
+            const match = dataMap.get(p.period);
+            open.push({ period: p.period, count: match?.open_count ?? 0 });
+            user.push({ period: p.period, count: match?.user_count ?? 0 });
+        }
+        return {
+            open_count: totalOpen,
+            user_count: totalUser,
+            grouped_stats: { open_count: open, user_count: user },
+            referral_count: null,
+        };
+    }
+
+    #normalizePeriodKey(period, grouping) {
+        if (!(period instanceof Date)) return period;
+        switch (grouping) {
+            case 'hour':
+                return `${period.toISOString().slice(0, 13)}:00:00`;
+            case 'day':
+                return period.toISOString().slice(0, 10);
+            case 'week': {
+                const wn = String(this.#getWeekNumber(period)).padStart(2, '0');
+                return `${period.getFullYear()}-${wn}`;
+            }
+            case 'month':
+                return period.toISOString().slice(0, 7);
+            case 'year':
+                return period.getFullYear().toString();
+            default:
+                return period.toISOString();
+        }
+    }
+
+    #computeTimeRange(period, createdAt) {
+        const now = new Date();
+        const today = new Date(
+            now.getFullYear(),
+            now.getMonth(),
+            now.getDate(),
+        );
+        switch (period) {
+            case 'today':
+                return { start: today.getTime(), end: now.getTime() };
+            case 'yesterday': {
+                const y = new Date(today);
+                y.setDate(y.getDate() - 1);
+                return { start: y.getTime(), end: today.getTime() - 1 };
+            }
+            case '7d': {
+                const s = new Date(now);
+                s.setDate(s.getDate() - 7);
+                return { start: s.getTime(), end: now.getTime() };
+            }
+            case '30d': {
+                const s = new Date(now);
+                s.setDate(s.getDate() - 30);
+                return { start: s.getTime(), end: now.getTime() };
+            }
+            case 'this_week': {
+                const s = new Date(
+                    now.getFullYear(),
+                    now.getMonth(),
+                    now.getDate() - now.getDay(),
+                );
+                return { start: s.getTime(), end: now.getTime() };
+            }
+            case 'last_week': {
+                const s = new Date(
+                    now.getFullYear(),
+                    now.getMonth(),
+                    now.getDate() - now.getDay() - 7,
+                );
+                const e = new Date(
+                    now.getFullYear(),
+                    now.getMonth(),
+                    now.getDate() - now.getDay(),
+                );
+                return { start: s.getTime(), end: e.getTime() - 1 };
+            }
+            case 'this_month': {
+                const s = new Date(now.getFullYear(), now.getMonth(), 1);
+                return { start: s.getTime(), end: now.getTime() };
+            }
+            case 'last_month': {
+                const s = new Date(now.getFullYear(), now.getMonth() - 1, 1);
+                const e = new Date(now.getFullYear(), now.getMonth(), 1);
+                return { start: s.getTime(), end: e.getTime() - 1 };
+            }
+            case 'this_year': {
+                const s = new Date(now.getFullYear(), 0, 1);
+                return { start: s.getTime(), end: now.getTime() };
+            }
+            case 'last_year': {
+                const s = new Date(now.getFullYear() - 1, 0, 1);
+                const e = new Date(now.getFullYear(), 0, 1);
+                return { start: s.getTime(), end: e.getTime() - 1 };
+            }
+            case '12m': {
+                const s = new Date(now);
+                s.setMonth(s.getMonth() - 12);
+                return { start: s.getTime(), end: now.getTime() };
+            }
+            case 'all': {
+                const start = createdAt ? new Date(createdAt).getTime() : 0;
+                return { start, end: now.getTime() };
+            }
+            default:
+                return { start: 0, end: now.getTime() };
+        }
+    }
+
+    #generateAllPeriods(startDate, endDate, grouping) {
+        const out = [];
+        const cur = new Date(startDate);
+        if (Number.isNaN(cur.getTime())) return out;
+        while (cur <= endDate) {
+            let period;
+            switch (grouping) {
+                case 'hour':
+                    period = `${cur.toISOString().slice(0, 13)}:00:00`;
+                    cur.setHours(cur.getHours() + 1);
+                    break;
+                case 'day':
+                    period = cur.toISOString().slice(0, 10);
+                    cur.setDate(cur.getDate() + 1);
+                    break;
+                case 'week': {
+                    const wn = String(this.#getWeekNumber(cur)).padStart(
+                        2,
+                        '0',
+                    );
+                    period = `${cur.getFullYear()}-${wn}`;
+                    cur.setDate(cur.getDate() + 7);
+                    break;
+                }
+                case 'month':
+                    period = cur.toISOString().slice(0, 7);
+                    cur.setMonth(cur.getMonth() + 1);
+                    break;
+                case 'year':
+                    period = cur.getFullYear().toString();
+                    cur.setFullYear(cur.getFullYear() + 1);
+                    break;
+                default:
+                    return out;
+            }
+            out.push({ period, count: 0 });
+        }
+        return out;
+    }
+
+    #getWeekNumber(date) {
+        const target = new Date(date.valueOf());
+        const dayNumber = (date.getDay() + 6) % 7;
+        target.setDate(target.getDate() - dayNumber + 3);
+        const firstThursday = target.valueOf();
+        target.setMonth(0, 1);
+        if (target.getDay() !== 4) {
+            target.setMonth(0, 1 + ((4 - target.getDay() + 7) % 7));
+        }
+        return 1 + Math.ceil((firstThursday - target) / 604800000);
+    }
+}

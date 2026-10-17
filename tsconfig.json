@@ -1,0 +1,49 @@
+{
+  "compilerOptions": {
+    "target": "es2024",
+    "module": "nodenext",
+    "moduleResolution": "nodenext",
+    "rootDir": ".",
+    "outDir": "./dist",
+    "baseUrl": ".",
+    "paths": {
+      "@heyputer/backend": [
+        "src/backend/exports.ts"
+      ],
+      "@heyputer/backend/src/*": [
+        "src/backend/*"
+      ],
+      "@heyputer/backend/*": [
+        "src/backend/*"
+      ]
+    },
+    "allowJs": true,
+    "checkJs": false,
+    "noCheck": false,
+    "strict": true,
+    "esModuleInterop": true,
+    "forceConsistentCasingInFileNames": true,
+    "skipLibCheck": true,
+    "sourceMap": true,
+    "inlineSources": true,
+    "removeComments": true,
+    "noEmit": false,
+    "noEmitOnError": false,
+    "noImplicitAny": true
+  },
+  "include": [
+    "src/backend/**/*",
+    "extensions/**/*"
+  ],
+  "exclude": [
+    "**/*.test.ts",
+    "**/*.test.mts",
+    "**/*.spec.ts",
+    "**/*.spec.mts",
+    "**/tests/**",
+    "**/node_modules/**",
+    "dist/**",
+    "volatile/**",
+    "extensions/**/node_modules/**" 
+   ]
+}

@@ -1,5 +1,5 @@
-/**
- * Copyright (C) 2024 Puter Technologies Inc.
+/*
+ * Copyright (C) 2024-present Puter Technologies Inc.
  *
  * This file is part of Puter.
  *
@@ -17,7 +17,6 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-
 const Component = use('util.Component');
 
 /**
@@ -28,7 +27,7 @@ export default def(class JustHTML extends Component {
 
     static PROPERTIES = { html: { value: '' } };
     create_template ({ template }) {
-        $(template).html(`<span></span>`);
+        $(template).html('<span></span>');
     }
     on_ready ({ listen }) {
         listen('html', html => {
@@ -36,7 +35,7 @@ export default def(class JustHTML extends Component {
         });
     }
 
-    _set_dom_based_on_render_mode({ property_values }) {
+    _set_dom_based_on_render_mode ({ property_values }) {
         if ( property_values.no_shadow ) {
             this.dom_ = this;
             return;

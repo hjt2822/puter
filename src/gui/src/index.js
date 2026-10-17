@@ -1,5 +1,5 @@
-/**
- * Copyright (C) 2024 Puter Technologies Inc.
+/*
+ * Copyright (C) 2024-present Puter Technologies Inc.
  *
  * This file is part of Puter.
  *
@@ -16,7 +16,6 @@
  * You should have received a copy of the GNU Affero General Public License
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
-
 
 window.puter_gui_enabled = true;
 
@@ -46,37 +45,56 @@ window.puter_gui_enabled = true;
  * });
  */
 
-window.gui = async function(options){
+window.gui = async (options) => {
     options = options ?? {};
     // app_origin is deprecated, use gui_origin instead
-    window.gui_origin = options.gui_origin ?? options.app_origin ?? `https://puter.com`;
+    window.gui_params = options;
+    window.gui_origin = options.gui_origin ?? options.app_origin ?? 'https://puter.com';
     window.app_domain = options.app_domain ?? new URL(window.gui_origin).hostname;
     window.hosting_domain = options.hosting_domain ?? 'puter.site';
-    window.api_origin = options.api_origin ?? "https://api.puter.com";
+    window.api_origin = options.api_origin ?? 'https://api.puter.com';
     window.max_item_name_length = options.max_item_name_length ?? 500;
     window.require_email_verification_to_publish_website = options.require_email_verification_to_publish_website ?? true;
-    window.disable_temp_users = options.disable_temp_users ?? false;
+    // window.disable_temp_users might be set somewhere else, so we need to check if it is already set and if not, use the value from the options
+    window.disable_temp_users = window.disable_temp_users || (options.disable_temp_users ?? false);
     window.co_isolation_enabled = options.co_isolation_enabled;
+    window.teams_ui = options.teams_ui ?? false;
 
     // DEV: Load the initgui.js file if we are in development mode
-    if(!window.gui_env || window.gui_env === "dev"){
+    if ( !window.gui_env || window.gui_env === 'dev' ) {
         await window.loadScript('/sdk/puter.dev.js');
-        // await window.loadScript(`${options.asset_dir}/initgui.js`, {isModule: true});
+    }
+
+    if ( window.gui_env === 'dev2' ) {
+        await window.loadScript('/puter.js/v2');
+        await window.loadCSS('/dist/bundle.min.css');
     }
 
     // PROD: load the minified bundles if we are in production mode
     // note: the order of the bundles is important
     // note: Build script will prepend `window.gui_env="prod"` to the top of the file
-    else if(window.gui_env === "prod"){
-        await window.loadScript('https://js.puter.com/v2/');
+    else if ( window.gui_env === 'prod' ) {
+        // This stuff is now handled in the backend in PuterHomepageService
+
+        await window.loadScript(options.puterjs_bundle ?? 'https://js.puter.com/v2/');
         // Load the minified bundles
-        await window.loadCSS('/dist/bundle.min.css');
+        // await window.loadCSS('/dist/bundle.min.css');
+    }
+
+    // Load the captcha script alongside the GUI rather than ahead of it.
+    // Nothing during boot needs it — the challenge modal polls for the
+    // global and the signup form is opened long after — so awaiting it here
+    // only put a third-party round trip in front of every page load. Skipped
+    // entirely when no site key is configured, since every consumer gates on
+    // one.
+    if ( options.turnstileSiteKey ) {
+        window.loadScript('https://challenges.cloudflare.com/turnstile/v0/api.js', { defer: true })
+            .catch(error => console.debug('Captcha script unavailable:', error));
     }
 
     // 🚀 Launch the GUI 🚀
     window.initgui(options);
-
-}
+};
 
 /**
 * Dynamically loads an external JavaScript file.
@@ -87,7 +105,7 @@ window.gui = async function(options){
 * @param {Object} [options.dataAttributes] An object containing data attributes to add to the script element.
 * @returns {Promise} A promise that resolves once the script has loaded, or rejects on error.
 */
-window.loadScript = async function(url, options = {}) {
+window.loadScript = async function (url, options = {}) {
     return new Promise((resolve, reject) => {
         const script = document.createElement('script');
         script.src = url;
@@ -96,19 +114,19 @@ window.loadScript = async function(url, options = {}) {
         script.async = true;
 
         // Handle if it is a module
-        if (options.isModule) {
+        if ( options.isModule ) {
             script.type = 'module';
         }
 
         // Handle defer attribute
-        if (options.defer) {
+        if ( options.defer ) {
             script.defer = true;
             script.async = false; // When "defer" is true, "async" should be false as they are mutually exclusive
         }
 
         // Add arbitrary data attributes
-        if (options.dataAttributes && typeof options.dataAttributes === 'object') {
-            for (const [key, value] of Object.entries(options.dataAttributes)) {
+        if ( options.dataAttributes && typeof options.dataAttributes === 'object' ) {
+            for ( const [key, value] of Object.entries(options.dataAttributes) ) {
                 script.setAttribute(`data-${key}`, value);
             }
         }
@@ -129,7 +147,7 @@ window.loadScript = async function(url, options = {}) {
 * @param {string} url The URL of the external CSS to load.
 * @returns {Promise} A promise that resolves once the CSS has loaded, or rejects on error.
 */
-window.loadCSS = async function(url) {
+window.loadCSS = async function (url) {
     return new Promise((resolve, reject) => {
         const link = document.createElement('link');
         link.rel = 'stylesheet';
@@ -145,8 +163,9 @@ window.loadCSS = async function(url) {
 
         document.head.appendChild(link);
     });
-}
-console.log( "%c⚠️Warning⚠️\n%cPlease refrain from adding or pasting any sort of code here, as doing so could potentially compromise your account. \nYou don't get what you intended anyway, but the hacker will! \n\n%cFor further information please visit https://developer.chrome.com/blog/self-xss",
+};
+console.log(
+    "%c⚠️Warning⚠️\n%cPlease refrain from adding or pasting any sort of code here, as doing so could potentially compromise your account. \nYou don't get what you intended anyway, but the hacker will! \n\n%cFor further information please visit https://developer.chrome.com/blog/self-xss",
     "color:red; font-size:2rem; display:block; margin-left:0; margin-bottom: 20px; background: black; width: 100%; margin-top:20px; font-family: 'Helvetica Neue', HelveticaNeue, Helvetica, Arial, sans-serif;",
     "font-size:1rem; font-family: 'Helvetica Neue', HelveticaNeue, Helvetica, Arial, sans-serif;",
     "font-size:0.9rem; font-family: 'Helvetica Neue', HelveticaNeue, Helvetica, Arial, sans-serif;",

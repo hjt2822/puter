@@ -1,57 +1,122 @@
-import * as utils from '../../../lib/utils.js';
+import { dedupe } from '../../../lib/networkUtils.js';
 import getAbsolutePathForApp from '../utils/getAbsolutePathForApp.js';
+import { fsRequest, parseOperationArgs } from './scaffold.js';
+import { toShare } from './shareUtil.js';
 
-const stat = async function (...args) {
-    let options;
+/** @typedef {import('../types.js').StatOptions} StatOptions */
+/** @typedef {import('../types.js').FSItemRead} FSItemRead */
+/** @typedef {import('../types.js').FSItemWithShares} FSItemWithShares */
 
-    // If first argument is an object, it's the options
-    if (typeof args[0] === 'object' && args[0] !== null) {
-        options = args[0];
-    } else {
-        // Otherwise, we assume separate arguments are provided
-        options = {
-            path: args[0],
-            options: typeof args[1] === 'object' ? args[1] : {},
-            success: typeof args[1] === 'object' ? args[2] : args[1],
-            error: typeof args[1] === 'object' ? args[3] : args[2],
-            // Add more if needed...
-        };
+/**
+ * @typedef {{
+ *   (options: StatOptions & { returnShares: true }): Promise<FSItemWithShares>,
+ *   (options: StatOptions): Promise<FSItemRead>,
+ *   (
+ *     path: string,
+ *     options: StatOptions & { returnShares: true },
+ *     success?: (value: FSItemWithShares) => void,
+ *     error?: (reason: unknown) => void,
+ *   ): Promise<FSItemWithShares>,
+ *   (
+ *     path: string,
+ *     options?: StatOptions,
+ *     success?: (value: FSItemRead) => void,
+ *     error?: (reason: unknown) => void,
+ *   ): Promise<FSItemRead>,
+ *   (
+ *     path: string,
+ *     success: (value: FSItemRead) => void,
+ *     error?: (reason: unknown) => void,
+ *   ): Promise<FSItemRead>,
+ * }} StatOperation
+ */
+
+// Results larger than this are served but never cached.
+const MAX_CACHE_SIZE = 20 * 1024 * 1024;
+
+/**
+ * Returns information about a file or directory, addressed by `path`
+ * (relative paths resolve against the app's root directory) or by `uid`.
+ *
+ * With `consistency: 'eventual'` a cached entry may be returned instead of
+ * hitting the backend; the default `'strong'` always revalidates.
+ *
+ * @this {import('../index.js').PuterJSFileSystemModule}
+ * @param {...unknown} args
+ * @returns {Promise<FSItemRead>}
+ */
+const statImpl = async function (...args) {
+    const options = parseOperationArgs(args, ['path']);
+
+    // consistency levels
+    if ( ! options.consistency ) {
+        options.consistency = 'strong';
     }
 
-    return new Promise(async (resolve, reject) => {
-        // If auth token is not provided and we are in the web environment, 
-        // try to authenticate with Puter
-        if(!puter.authToken && puter.env === 'web'){
-            try{
-                await puter.ui.authenticateWithPuter();
-            }catch(e){
-                // if authentication fails, throw an error
-                reject('Authentication failed.');
-            }
+    // Only path-addressed entries are cached: path-based invalidation (socket
+    // events, share changes) can't reach an entry keyed by uid.
+    let cacheKey;
+    if ( options.uid === undefined && options.path ) {
+        cacheKey = puter.fsCacheKey('item', options.path);
+    }
+
+    if ( cacheKey && options.consistency === 'eventual' && !options.returnSubdomains && !options.returnPermissions && !options.returnVersions && !options.returnSize && !options.returnShares ) {
+        const cachedResult = await puter._cache.get(cacheKey);
+        if ( cachedResult ) {
+            return cachedResult;
+        }
+    }
+
+    // Same parameters share one call; origin and token keep identities apart.
+    const deduplicationKey = 'fs:stat:' + JSON.stringify({
+        apiOrigin: this.APIOrigin,
+        authToken: this.authToken,
+        path: options.path,
+        uid: options.uid,
+        returnSubdomains: options.returnSubdomains || options.returnWorkers,
+        returnPermissions: options.returnPermissions,
+        returnVersions: options.returnVersions,
+        returnSize: options.returnSize,
+        returnShares: options.returnShares,
+        consistency: options.consistency,
+    });
+
+    return await dedupe(deduplicationKey, () => {
+        const body = {};
+        if ( options.uid !== undefined ) {
+            body.uid = options.uid;
+        } else if ( options.path !== undefined ) {
+            body.path = getAbsolutePathForApp(options.path);
         }
 
-        // create xhr object
-        const xhr = utils.initXhr('/stat', this.APIOrigin, this.authToken);
+        body.return_subdomains = options.returnSubdomains || options.returnWorkers;
+        body.return_permissions = options.returnPermissions;
+        body.return_versions = options.returnVersions;
+        body.return_size = options.returnSize;
+        body.return_shares = options.returnShares;
+        body.auth_token = this.authToken;
 
-        // set up event handlers for load and error events
-        utils.setupXhrEventHandlers(xhr, options.success, options.error, resolve, reject);
+        return fsRequest.call(this, {
+            endpoint: '/stat',
+            // The token travels in the payload rather than the auth header.
+            authHeader: false,
+            body,
+            success: options.success,
+            error: options.error,
+            transform: (result) => {
+                if ( Array.isArray(result?.shares) ) {
+                    result.shares = result.shares.map(toShare);
+                }
+                // Not cached — a later plain stat must not serve share data.
+                if ( cacheKey && ! options.returnShares && JSON.stringify(result).length <= MAX_CACHE_SIZE ) {
+                    puter._cache.set(cacheKey, result);
+                }
+                return result;
+            },
+        });
+    });
+};
 
-        let dataToSend = {};
-        if (options.uid !== undefined) {
-            dataToSend.uid = options.uid;
-        } else if (options.path !== undefined) {
-            // If dirPath is not provided or it's not starting with a slash, it means it's a relative path
-            // in that case, we need to prepend the app's root directory to it
-            dataToSend.path = getAbsolutePathForApp(options.path);
-        }
-        
-        dataToSend.return_subdomains = options.returnSubdomains;
-        dataToSend.return_permissions = options.returnPermissions;
-        dataToSend.return_versions = options.returnVersions;
-        dataToSend.return_size = options.returnSize;
-
-        xhr.send(JSON.stringify(dataToSend));
-    })
-}
+const stat = /** @type {StatOperation} */ (statImpl);
 
 export default stat;

@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2024 Puter Technologies Inc.
+ * Copyright (C) 2024-present Puter Technologies Inc.
  *
  * This file is part of Puter.
  *
@@ -16,6 +16,24 @@
  * You should have received a copy of the GNU Affero General Public License
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
-import { build } from "./utils.js"
+import { build } from './utils.js';
+import { hideBin } from 'yargs/helpers';
+import yargs from 'yargs';
+import fs from 'node:fs';
+import { execSync } from 'node:child_process';
+import { Buffer } from 'node:buffer';
+
+// eslint-disable-next-line no-undef
+const argv = yargs(hideBin(process.argv)).parse();
+if ( argv.assets_url ) {
+    console.log('Extracting assets...');
+    const assetsTar = Buffer.from(await fetch(argv.assets_url).then(r => r.arrayBuffer()));
+    await fs.promises.writeFile('assets.tar.gz', assetsTar);
+    if ( fs.existsSync('src/icons') ) {
+        await fs.promises.cp('src/icons', 'src/icons.old', { recursive: true });
+    }
+    execSync('tar -xzvf assets.tar.gz');
+    fs.promises.rm('assets.tar.gz');
+}
 
 build();

@@ -1,0 +1,45 @@
+import * as utils from '../../lib/utils.js';
+import { isObject, parseOptConfigThenCallbacks } from './lib/args.js';
+import { assertKeyPresent, assertKeySize } from './lib/validate.js';
+
+/** @typedef {import('./types.js').KVOptConfig} KVOptConfig */
+
+const delDriverCall = (/** @type {import('./index.js').KVModule} */ kv, args) =>
+    utils.makeDriverMethod({
+        iface: 'puter-kvstore',
+        method: 'del',
+        argNames: ['key'],
+        puter: kv.puter,
+        preprocess: (driverArgs) => {
+            assertKeyPresent(driverArgs.key);
+            assertKeySize(driverArgs.key);
+            kv.guiCache.invalidate(driverArgs.key);
+            return driverArgs;
+        },
+    })(args);
+
+/**
+ * @overload
+ * @param {string} key
+ * @param {KVOptConfig} [optConfig]
+ * @returns {Promise<boolean>}
+ */
+/**
+ * Removes a key. Resolves to `true` even when the key does not exist.
+ *
+ * Also accepts the object form `del({ key, optConfig })` and legacy trailing
+ * success/error callbacks.
+ *
+ * @this {import('./index.js').KVModule}
+ * @param {string | { key: string, optConfig?: KVOptConfig }} keyOrObject
+ * @param {...(KVOptConfig | Function | undefined)} rest
+ * @returns {Promise<boolean>}
+ */
+export async function del (keyOrObject, ...rest) {
+    if ( isObject(keyOrObject) && rest.length === 0 ) {
+        return await delDriverCall(this, keyOrObject);
+    }
+
+    const { optConfig, success, error } = parseOptConfigThenCallbacks(rest);
+    return await delDriverCall(this, { key: keyOrObject, optConfig, success, error });
+}

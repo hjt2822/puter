@@ -1,0 +1,2471 @@
+/*
+ * Copyright (C) 2024-present Puter Technologies Inc.
+ *
+ * This file is part of Puter.
+ *
+ * Puter is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published
+ * by the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+import { GetObjectCommand } from '@aws-sdk/client-s3';
+import { Readable, Writable } from 'node:stream';
+import type { Request, Response } from 'express';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
+import { v4 as uuidv4 } from 'uuid';
+import { PuterServer } from '../../../server';
+import { HOSTED_ASSET_COOKIES } from '../../../services/auth/AuthService';
+import { setupTestServer } from '../../../testUtil';
+import type { IConfig } from '../../../types';
+import type { Actor } from '../../actor';
+import { generateDefaultFsentries } from '../../../util/userProvisioning';
+import { createPuterSiteMiddleware } from './puterSite';
+
+// ── Harness ─────────────────────────────────────────────────────────
+//
+// puterSite is a single big handler that either writes a response or
+// calls next(). We capture status / body / redirect / cookies / headers
+// — enough to assert each branch without standing up the express stack.
+//
+// File-serving paths (Range, ETag, S3 streaming) aren't exercised here:
+// they need real filesystem entries + S3 reads, which is a much bigger
+// fixture setup. The early-out branches (config gating, unknown subdomain,
+// suspended owner, missing root dir, private-host refusal) are the ones
+// security-sensitive enough to be worth pinning.
+
+interface CapturedRes {
+    statusCode?: number;
+    body?: unknown;
+    contentType?: string;
+    redirected?: { status?: number; url: string };
+    headers: Record<string, string>;
+    cookies: Record<string, string>;
+}
+
+const makeRes = () => {
+    const out: CapturedRes = { headers: {}, cookies: {} };
+    // The file-serving branch ends with `download.body.pipe(res)`, so
+    // `res` has to satisfy the WritableStream contract Node's `pipe()`
+    // expects — write/end/on/emit/etc. Use a real Writable so Node's
+    // pipe internals don't trip on missing prototype methods. Bytes
+    // piped in are captured into `out.body`.
+    const pipedChunks: Buffer[] = [];
+    const writable = new Writable({
+        write(chunk: Buffer, _enc, cb) {
+            pipedChunks.push(chunk);
+            cb();
+        },
+        final(cb) {
+            if (pipedChunks.length > 0) {
+                out.body = Buffer.concat(pipedChunks);
+            }
+            cb();
+        },
+    });
+    const res = writable as unknown as Response & {
+        status: (code: number) => Response;
+        type: (ct: string) => Response;
+        send: (payload: unknown) => Response;
+        redirect: (...args: unknown[]) => Response;
+        cookie: (name: string, value: string) => Response;
+        set: (name: string, value: string) => Response;
+        setHeader: (name: string, value: string) => Response;
+    };
+    res.status = (code: number) => {
+        out.statusCode = code;
+        return res;
+    };
+    res.type = (ct: string) => {
+        out.contentType = ct;
+        return res;
+    };
+    res.send = (payload: unknown) => {
+        out.body = payload;
+        return res;
+    };
+    res.redirect = (...args: unknown[]) => {
+        if (typeof args[0] === 'number') {
+            out.redirected = {
+                status: args[0] as number,
+                url: String(args[1]),
+            };
+        } else {
+            out.redirected = { url: String(args[0]) };
+        }
+        return res;
+    };
+    res.cookie = (name: string, value: string) => {
+        out.cookies[name] = value;
+        return res;
+    };
+    res.set = (name: string, value: string) => {
+        out.headers[name] = value;
+        return res;
+    };
+    res.setHeader = (name: string, value: string) => {
+        out.headers[name] = value;
+        return res;
+    };
+    return { res, out };
+};
+
+const makeReq = (init: {
+    hostname: string;
+    method?: string;
+    path?: string;
+    originalUrl?: string;
+    protocol?: string;
+    headers?: Record<string, string>;
+    cookies?: Record<string, string>;
+    query?: Record<string, string>;
+}): Request =>
+    ({
+        method: init.method ?? 'GET',
+        hostname: init.hostname,
+        path: init.path ?? '/',
+        // Redirect helpers use originalUrl (preserves query string).
+        // Default to `path` when caller doesn't care to distinguish.
+        originalUrl: init.originalUrl ?? init.path ?? '/',
+        protocol: init.protocol ?? 'http',
+        headers: init.headers ?? {},
+        cookies: init.cookies ?? {},
+        query: init.query ?? {},
+        // The file-serve branch wires `req.on('close', ...)` to destroy
+        // the stream on client disconnect — a no-op event surface is
+        // enough for the offline tests.
+        on: () => undefined,
+    }) as unknown as Request;
+
+const runMiddleware = async (
+    mw: ReturnType<typeof createPuterSiteMiddleware>,
+    req: Request,
+) => {
+    const { res, out } = makeRes();
+    const next = vi.fn();
+    await mw(req, res, next);
+    return { out, next };
+};
+
+// ── Server setup ────────────────────────────────────────────────────
+
+let server: PuterServer;
+const hostingConfig: IConfig = {
+    domain: 'puter.localhost',
+    static_hosting_domain: 'site.puter.localhost',
+    static_hosting_domain_alt: null,
+    private_app_hosting_domain: 'app.puter.localhost',
+    private_app_hosting_domain_alt: null,
+    protocol: 'http',
+} as unknown as IConfig;
+
+beforeAll(async () => {
+    server = await setupTestServer();
+});
+
+afterAll(async () => {
+    await server?.shutdown();
+});
+
+const buildMiddleware = (configOverride?: Partial<IConfig>) =>
+    createPuterSiteMiddleware(
+        { ...hostingConfig, ...configOverride } as IConfig,
+        {
+            clients: server.clients,
+            stores: server.stores,
+            services: server.services,
+        },
+    );
+
+const makeUser = async (suspended = false) => {
+    const username = `ps-${Math.random().toString(36).slice(2, 10)}`;
+    const created = await server.stores.user.create({
+        username,
+        uuid: uuidv4(),
+        password: null,
+        email: `${username}@test.local`,
+        free_storage: 100 * 1024 * 1024,
+        requires_email_confirmation: false,
+    } as Parameters<typeof server.stores.user.create>[0]);
+    if (suspended) {
+        // Go through the store's `update` so the user cache gets
+        // refreshed — otherwise puterSite's cached `getById` will still
+        // see the row as unsuspended.
+        await server.stores.user.update(created.id, { suspended: 1 });
+    }
+    return (await server.stores.user.getById(created.id))!;
+};
+
+// ── Config gating ───────────────────────────────────────────────────
+
+describe('createPuterSiteMiddleware — config gating', () => {
+    it('returns a no-op when no hosting domains are configured', async () => {
+        // Self-hosted deployments without user site hosting shouldn't
+        // touch any request, even ones that look like site hostnames.
+        const mw = createPuterSiteMiddleware(
+            {
+                domain: 'puter.localhost',
+                static_hosting_domain: null,
+                static_hosting_domain_alt: null,
+                private_app_hosting_domain: null,
+                private_app_hosting_domain_alt: null,
+            } as unknown as IConfig,
+            {
+                clients: server.clients,
+                stores: server.stores,
+                services: server.services,
+            },
+        );
+        const { out, next } = await runMiddleware(
+            mw,
+            makeReq({ hostname: 'beans.site.puter.localhost' }),
+        );
+        expect(next).toHaveBeenCalledTimes(1);
+        expect(out.statusCode).toBeUndefined();
+        expect(out.redirected).toBeUndefined();
+    });
+
+    it("passes through hosts that aren't one of the configured hosting domains", async () => {
+        const mw = buildMiddleware();
+        const { out, next } = await runMiddleware(
+            mw,
+            makeReq({ hostname: 'api.puter.localhost' }),
+        );
+        expect(next).toHaveBeenCalledTimes(1);
+        expect(out.statusCode).toBeUndefined();
+    });
+
+    it("passes through when the hostname can't be parsed", async () => {
+        const mw = buildMiddleware();
+        const { out, next } = await runMiddleware(
+            mw,
+            makeReq({ hostname: '' }),
+        );
+        expect(next).toHaveBeenCalledTimes(1);
+        expect(out.statusCode).toBeUndefined();
+    });
+});
+
+// ── Bare / www on hosting domain ────────────────────────────────────
+
+describe('createPuterSiteMiddleware — bare host and www', () => {
+    it('redirects the bare hosting domain to the configured main domain', async () => {
+        // Hitting `site.puter.localhost` directly (no subdomain) belongs
+        // on the app shell — 302 to the main domain so legacy bookmarks
+        // still work.
+        const mw = buildMiddleware();
+        const { out, next } = await runMiddleware(
+            mw,
+            makeReq({
+                hostname: 'site.puter.localhost',
+                protocol: 'http',
+            }),
+        );
+        expect(next).not.toHaveBeenCalled();
+        expect(out.redirected).toEqual({
+            status: 302,
+            url: 'http://puter.localhost',
+        });
+    });
+
+    it('redirects www.<hosting-domain> the same way (treated as bare)', async () => {
+        const mw = buildMiddleware();
+        const { out } = await runMiddleware(
+            mw,
+            makeReq({
+                hostname: 'www.site.puter.localhost',
+                protocol: 'http',
+            }),
+        );
+        expect(out.redirected).toEqual({
+            status: 302,
+            url: 'http://puter.localhost',
+        });
+    });
+
+    it('404s the bare host when no main domain is configured (no leak)', async () => {
+        // Without a main domain to redirect to, we'd otherwise have no
+        // landing target. Returning 404 is the safe default.
+        const mw = createPuterSiteMiddleware(
+            {
+                ...hostingConfig,
+                domain: null,
+            } as unknown as IConfig,
+            {
+                clients: server.clients,
+                stores: server.stores,
+                services: server.services,
+            },
+        );
+        const { out } = await runMiddleware(
+            mw,
+            makeReq({ hostname: 'site.puter.localhost' }),
+        );
+        expect(out.statusCode).toBe(404);
+        expect(out.body).toBe('Subdomain not found');
+    });
+});
+
+// ── Subdomain lookup ────────────────────────────────────────────────
+
+describe('createPuterSiteMiddleware — subdomain lookup', () => {
+    it('404s plain-text on an unknown subdomain (does not reveal whether any user owns it)', async () => {
+        const mw = buildMiddleware();
+        const { out } = await runMiddleware(
+            mw,
+            makeReq({
+                hostname: `never-exists-${Math.random()
+                    .toString(36)
+                    .slice(2, 10)}.site.puter.localhost`,
+            }),
+        );
+        expect(out.statusCode).toBe(404);
+        expect(out.body).toBe('Subdomain not found');
+        // Plain-text body — no HTML rendering at this stage.
+        expect(out.contentType).toBe('text/plain');
+    });
+
+    it("404s when the owning user is suspended — same 'Subdomain not found' shape as unknown-subdomain (no leak)", async () => {
+        // Critical: same status + same body as the unknown-subdomain
+        // case. A different response here would leak suspension state.
+        const owner = await makeUser(/* suspended */ true);
+        const sub = `suspended-${Math.random().toString(36).slice(2, 8)}`;
+        await server.stores.subdomain.create({
+            userId: owner.id,
+            subdomain: sub,
+        });
+        const mw = buildMiddleware();
+        const { out } = await runMiddleware(
+            mw,
+            makeReq({ hostname: `${sub}.site.puter.localhost` }),
+        );
+        expect(out.statusCode).toBe(404);
+        expect(out.body).toBe('Subdomain not found');
+    });
+
+    it('serves the HTML SUBDOMAIN_404 when the subdomain row has no root_dir_id', async () => {
+        // The site exists but the owner never registered a directory —
+        // give them the slightly friendlier HTML page rather than the
+        // bare text 404 used for unknown subdomains.
+        const owner = await makeUser();
+        const sub = `noroot-${Math.random().toString(36).slice(2, 8)}`;
+        await server.stores.subdomain.create({
+            userId: owner.id,
+            subdomain: sub,
+        });
+        const mw = buildMiddleware();
+        const { out } = await runMiddleware(
+            mw,
+            makeReq({ hostname: `${sub}.site.puter.localhost` }),
+        );
+        expect(out.statusCode).toBe(404);
+        expect(out.contentType).toBe('text/html; charset=UTF-8');
+        expect(String(out.body)).toContain('404');
+    });
+});
+
+// ── Private hosting domain → public-host redirect ───────────────────
+
+describe('createPuterSiteMiddleware — private hosting domain', () => {
+    it('302s a subdomain on the private host with no private app to the equivalent puter.site URL (covers freed-paid-app bookmarks + plain hosted sites)', async () => {
+        // Owner exists, subdomain exists, but it has no associated
+        // private app. On the *private* host this used to 404; now it
+        // mirrors the public→private redirect so a paid app whose price
+        // dropped to 0 still resolves on `puter.site` when accessed via
+        // its old `puter.app` URL.
+        const owner = await makeUser();
+        const sub = `leak-${Math.random().toString(36).slice(2, 8)}`;
+        await server.stores.subdomain.create({
+            userId: owner.id,
+            subdomain: sub,
+        });
+        const mw = buildMiddleware();
+        const { out } = await runMiddleware(
+            mw,
+            makeReq({
+                // Note: app.puter.localhost is the *private* hosting domain.
+                hostname: `${sub}.app.puter.localhost`,
+                path: '/some/deep/path.html',
+            }),
+        );
+        expect(out.redirected).toEqual({
+            status: 302,
+            url: `http://${sub}.site.puter.localhost/some/deep/path.html`,
+        });
+    });
+
+    it('uses the alt private hosting domain when configured (same redirect to the public host)', async () => {
+        // Coverage for the `private_app_hosting_domain_alt` slot — same
+        // redirect logic, but via the alternate host that the deployment
+        // can use for legacy traffic.
+        const owner = await makeUser();
+        const sub = `altleak-${Math.random().toString(36).slice(2, 8)}`;
+        await server.stores.subdomain.create({
+            userId: owner.id,
+            subdomain: sub,
+        });
+        const mw = buildMiddleware({
+            private_app_hosting_domain_alt: 'apps.alt.localhost',
+        } as Partial<IConfig>);
+        const { out } = await runMiddleware(
+            mw,
+            makeReq({ hostname: `${sub}.apps.alt.localhost` }),
+        );
+        expect(out.redirected).toEqual({
+            status: 302,
+            url: `http://${sub}.site.puter.localhost/`,
+        });
+    });
+
+    it('falls back to 404 when no public hosting domain is configured (no leak)', async () => {
+        // Without a static_hosting_domain to redirect to we have no safe
+        // target; the original refusal must still apply so a public-app
+        // subdomain doesn't accidentally serve via the private host.
+        const owner = await makeUser();
+        const sub = `nopub-${Math.random().toString(36).slice(2, 8)}`;
+        await server.stores.subdomain.create({
+            userId: owner.id,
+            subdomain: sub,
+        });
+        const mw = createPuterSiteMiddleware(
+            {
+                ...hostingConfig,
+                static_hosting_domain: null,
+            } as unknown as IConfig,
+            {
+                clients: server.clients,
+                stores: server.stores,
+                services: server.services,
+            },
+        );
+        const { out } = await runMiddleware(
+            mw,
+            makeReq({ hostname: `${sub}.app.puter.localhost` }),
+        );
+        expect(out.statusCode).toBe(404);
+        expect(out.body).toBe('Subdomain not found');
+        expect(out.redirected).toBeUndefined();
+    });
+});
+
+// ── File serving ────────────────────────────────────────────────────
+//
+// Wires a subdomain → user home dir so the FS path resolution + read
+// stream branches actually run. Uses the live FSService to write real
+// files, which goes through the in-memory S3 mock; the readContent
+// piping path then yields a real readable stream.
+
+// Variant of `makeUser` that ALSO provisions /<username> + the default
+// folder tree. The base `makeUser` doesn't, since the existing tests
+// only need a user row; the file-serving tests need a real home dir
+// to use as `root_dir_id`.
+const makeUserWithHome = async () => {
+    const username = `ps-${Math.random().toString(36).slice(2, 10)}`;
+    const created = await server.stores.user.create({
+        username,
+        uuid: uuidv4(),
+        password: null,
+        email: `${username}@test.local`,
+        free_storage: 100 * 1024 * 1024,
+        requires_email_confirmation: false,
+    } as Parameters<typeof server.stores.user.create>[0]);
+    await generateDefaultFsentries(
+        server.clients.db,
+        server.stores.user,
+        created,
+    );
+    return (await server.stores.user.getById(created.id))!;
+};
+
+const writeFile = async (
+    userId: number,
+    path: string,
+    body: Buffer,
+    contentType = 'application/octet-stream',
+) => {
+    await server.services.fs.write(userId, {
+        fileMetadata: {
+            path,
+            size: body.byteLength,
+            contentType,
+        },
+        fileContent: body,
+    });
+    return server.stores.fsEntry.getEntryByPath(path);
+};
+
+describe('createPuterSiteMiddleware — file serving', () => {
+    it('serves an existing file with the right Content-Type, ETag/length headers, and 200', async () => {
+        // Build a real subdomain pointing at the user's home dir, write
+        // a real index.html under it, then hit the middleware. Exercises
+        // the full path-resolution + readContent + header pipeline.
+        const owner = await makeUserWithHome();
+        const homePath = `/${owner.username}`;
+        const homeEntry = await server.stores.fsEntry.getEntryByPath(homePath);
+        expect(homeEntry).not.toBeNull();
+        const sub = `serve-${Math.random().toString(36).slice(2, 8)}`;
+        await server.stores.subdomain.create({
+            userId: owner.id,
+            subdomain: sub,
+            rootDirId: homeEntry!.id,
+        });
+        const body = Buffer.from('<html>hi</html>');
+        await writeFile(owner.id, `${homePath}/index.html`, body, 'text/html');
+
+        const mw = buildMiddleware();
+        const { res, out } = makeRes();
+        await mw(
+            makeReq({
+                hostname: `${sub}.site.puter.localhost`,
+                path: '/index.html',
+            }),
+            res,
+            vi.fn(),
+        );
+        // Allow the piped stream to flush.
+        await new Promise<void>((resolve) => setImmediate(resolve));
+
+        expect(out.statusCode).toBe(200);
+        expect(out.headers['Content-Type']).toMatch(/text\/html/);
+        expect(out.headers['Content-Length']).toBe(String(body.byteLength));
+        expect(out.headers['Access-Control-Allow-Origin']).toBe('*');
+        expect(out.headers['Accept-Ranges']).toBe('bytes');
+        // makeRes captures the piped stream bytes into `out.body`.
+        const piped = out.body as Buffer | undefined;
+        expect(Buffer.isBuffer(piped)).toBe(true);
+        expect(piped!.equals(body)).toBe(true);
+    });
+
+    // Metering resolves the billed account's plan from this actor, and some
+    // plans are keyed on the account's email.
+    it('bills an anonymous visit to the owner, email included', async () => {
+        const owner = await makeUserWithHome();
+        const homePath = `/${owner.username}`;
+        const homeEntry = await server.stores.fsEntry.getEntryByPath(homePath);
+        const sub = `bill-${Math.random().toString(36).slice(2, 8)}`;
+        await server.stores.subdomain.create({
+            userId: owner.id,
+            subdomain: sub,
+            rootDirId: homeEntry!.id,
+        });
+        await writeFile(owner.id, `${homePath}/index.html`, Buffer.from('hi'));
+
+        const req = makeReq({
+            hostname: `${sub}.site.puter.localhost`,
+            path: '/index.html',
+        });
+        const { res } = makeRes();
+        await buildMiddleware()(req, res, vi.fn());
+
+        expect(req.egressActor?.user).toMatchObject({
+            uuid: owner.uuid,
+            id: owner.id,
+            email: owner.email,
+        });
+    });
+
+    it('emits site.htmlServed with the original URL target including query string', async () => {
+        const owner = await makeUserWithHome();
+        const homePath = `/${owner.username}`;
+        const homeEntry = await server.stores.fsEntry.getEntryByPath(homePath);
+        const sub = `serveq-${Math.random().toString(36).slice(2, 8)}`;
+        await server.stores.subdomain.create({
+            userId: owner.id,
+            subdomain: sub,
+            rootDirId: homeEntry!.id,
+        });
+        await writeFile(
+            owner.id,
+            `${homePath}/index.html`,
+            Buffer.from('<html>hi</html>'),
+            'text/html',
+        );
+
+        const emitSpy = vi.spyOn(server.clients.event, 'emit');
+        try {
+            const mw = buildMiddleware();
+            const { res } = makeRes();
+            await mw(
+                makeReq({
+                    hostname: `${sub}.site.puter.localhost`,
+                    path: '/index.html',
+                    originalUrl: '/index.html?brand=paypal',
+                }),
+                res,
+                vi.fn(),
+            );
+
+            const htmlServedCall = emitSpy.mock.calls.find(
+                (call) => call[0] === 'site.htmlServed',
+            );
+            expect(htmlServedCall?.[1]).toMatchObject({
+                subdomain: sub,
+                requestPath: '/index.html',
+                requestUrl: '/index.html?brand=paypal',
+                mime: 'text/html',
+            });
+        } finally {
+            emitSpy.mockRestore();
+        }
+    });
+
+    it('returns 206 status when a Range header is supplied', async () => {
+        const owner = await makeUserWithHome();
+        const homePath = `/${owner.username}`;
+        const homeEntry = await server.stores.fsEntry.getEntryByPath(homePath);
+        const sub = `range-${Math.random().toString(36).slice(2, 8)}`;
+        await server.stores.subdomain.create({
+            userId: owner.id,
+            subdomain: sub,
+            rootDirId: homeEntry!.id,
+        });
+        const body = Buffer.from('abcdefghij');
+        await writeFile(
+            owner.id,
+            `${homePath}/clip.bin`,
+            body,
+            'application/octet-stream',
+        );
+
+        const mw = buildMiddleware();
+        const { res, out } = makeRes();
+        await mw(
+            makeReq({
+                hostname: `${sub}.site.puter.localhost`,
+                path: '/clip.bin',
+                headers: { range: 'bytes=0-3' },
+            }),
+            res,
+            vi.fn(),
+        );
+
+        // Range request → 206 even if the underlying mock S3 returns the
+        // full payload (Content-Range header may not appear in the in-
+        // memory mock, but the status code transition is what we care
+        // about here).
+        expect(out.statusCode).toBe(206);
+        expect(out.headers['Accept-Ranges']).toBe('bytes');
+    });
+
+    it('cuts the response off when storage fails mid-download', async () => {
+        const owner = await makeUserWithHome();
+        const homePath = `/${owner.username}`;
+        const homeEntry = await server.stores.fsEntry.getEntryByPath(homePath);
+        const sub = `cut-${Math.random().toString(36).slice(2, 8)}`;
+        await server.stores.subdomain.create({
+            userId: owner.id,
+            subdomain: sub,
+            rootDirId: homeEntry!.id,
+        });
+        const entry = await writeFile(
+            owner.id,
+            `${homePath}/movie.bin`,
+            Buffer.alloc(64, 0x42),
+        );
+
+        // One chunk, then the storage connection drops.
+        let reads = 0;
+        const body = new Readable({
+            read() {
+                reads += 1;
+                if (reads === 1) this.push('partial');
+                else this.destroy(new Error('aborted'));
+            },
+        });
+        const client = server.clients.s3.get(
+            server.stores.s3Object.resolveRegion(entry!.bucketRegion),
+        );
+        const send = client.send.bind(client);
+        const spy = vi
+            .spyOn(client, 'send')
+            .mockImplementation(((command: unknown) =>
+                command instanceof GetObjectCommand
+                    ? Promise.resolve({ Body: body, ContentLength: 64 })
+                    : send(command as never)) as never);
+
+        const mw = buildMiddleware();
+        const { res } = makeRes();
+        // A real response is torn down through its socket and never emits
+        // 'error' itself; the stand-in Writable does, so absorb it.
+        res.on('error', () => undefined);
+        try {
+            await mw(
+                makeReq({
+                    hostname: `${sub}.site.puter.localhost`,
+                    path: '/movie.bin',
+                }),
+                res,
+                vi.fn(),
+            );
+            await new Promise<void>((resolve) => setImmediate(resolve));
+        } finally {
+            spy.mockRestore();
+        }
+
+        expect(res.destroyed).toBe(true);
+        expect(res.writableFinished).toBe(false);
+        expect(body.destroyed).toBe(true);
+    });
+
+    it("rewrites a trailing slash request to /index.html under the site's root", async () => {
+        const owner = await makeUserWithHome();
+        const homePath = `/${owner.username}`;
+        const homeEntry = await server.stores.fsEntry.getEntryByPath(homePath);
+        const sub = `idx-${Math.random().toString(36).slice(2, 8)}`;
+        await server.stores.subdomain.create({
+            userId: owner.id,
+            subdomain: sub,
+            rootDirId: homeEntry!.id,
+        });
+        const body = Buffer.from('default doc');
+        await writeFile(owner.id, `${homePath}/index.html`, body, 'text/html');
+
+        const mw = buildMiddleware();
+        const { res, out } = makeRes();
+        await mw(
+            makeReq({
+                hostname: `${sub}.site.puter.localhost`,
+                // Trailing slash → driver appends `index.html`.
+                path: '/',
+            }),
+            res,
+            vi.fn(),
+        );
+
+        expect(out.statusCode).toBe(200);
+        expect(out.headers['Content-Type']).toMatch(/text\/html/);
+    });
+
+    it("returns the HTML 404 'Not Found' page when the file does not exist", async () => {
+        const owner = await makeUserWithHome();
+        const homePath = `/${owner.username}`;
+        const homeEntry = await server.stores.fsEntry.getEntryByPath(homePath);
+        const sub = `miss-${Math.random().toString(36).slice(2, 8)}`;
+        await server.stores.subdomain.create({
+            userId: owner.id,
+            subdomain: sub,
+            rootDirId: homeEntry!.id,
+        });
+        // No file is written — the path doesn't exist.
+
+        const mw = buildMiddleware();
+        const { res, out } = makeRes();
+        await mw(
+            makeReq({
+                hostname: `${sub}.site.puter.localhost`,
+                path: '/does-not-exist.html',
+            }),
+            res,
+            vi.fn(),
+        );
+
+        expect(out.statusCode).toBe(404);
+        expect(out.contentType).toBe('text/html; charset=UTF-8');
+        expect(String(out.body)).toContain('Not Found');
+    });
+
+    it('returns 404 when the resolved URL points at a directory with no index.html', async () => {
+        const owner = await makeUserWithHome();
+        const homePath = `/${owner.username}`;
+        const homeEntry = await server.stores.fsEntry.getEntryByPath(homePath);
+        const sub = `dirreq-${Math.random().toString(36).slice(2, 8)}`;
+        await server.stores.subdomain.create({
+            userId: owner.id,
+            subdomain: sub,
+            rootDirId: homeEntry!.id,
+        });
+
+        const mw = buildMiddleware();
+        const { res, out } = makeRes();
+        await mw(
+            makeReq({
+                hostname: `${sub}.site.puter.localhost`,
+                // Documents/ exists from generateDefaultFsentries but has
+                // no index.html — directory fallback must still 404.
+                path: '/Documents',
+            }),
+            res,
+            vi.fn(),
+        );
+
+        expect(out.statusCode).toBe(404);
+        expect(out.contentType).toBe('text/html; charset=UTF-8');
+    });
+
+    it('serves <folder>/index.html when the URL resolves to a folder containing one', async () => {
+        const owner = await makeUserWithHome();
+        const homePath = `/${owner.username}`;
+        const homeEntry = await server.stores.fsEntry.getEntryByPath(homePath);
+        const sub = `folderidx-${Math.random().toString(36).slice(2, 8)}`;
+        await server.stores.subdomain.create({
+            userId: owner.id,
+            subdomain: sub,
+            rootDirId: homeEntry!.id,
+        });
+        const body = Buffer.from('nested doc');
+        await writeFile(
+            owner.id,
+            `${homePath}/Documents/index.html`,
+            body,
+            'text/html',
+        );
+
+        const mw = buildMiddleware();
+        const { res, out } = makeRes();
+        await mw(
+            makeReq({
+                hostname: `${sub}.site.puter.localhost`,
+                // No trailing slash; folder exists and contains index.html.
+                path: '/Documents',
+            }),
+            res,
+            vi.fn(),
+        );
+        // Allow the piped stream to flush.
+        await new Promise<void>((resolve) => setImmediate(resolve));
+
+        expect(out.statusCode).toBe(200);
+        expect(out.headers['Content-Type']).toMatch(/text\/html/);
+        const piped = out.body as Buffer | undefined;
+        expect(Buffer.isBuffer(piped)).toBe(true);
+        expect(piped!.equals(body)).toBe(true);
+    });
+
+    it("serves the HTML SUBDOMAIN_404 when the subdomain's root_dir_id points to a missing entry", async () => {
+        // Subdomain row references a fsentry id that doesn't exist —
+        // earlier path resolution must catch this with the HTML 404 page.
+        const owner = await makeUserWithHome();
+        const sub = `missroot-${Math.random().toString(36).slice(2, 8)}`;
+        await server.stores.subdomain.create({
+            userId: owner.id,
+            subdomain: sub,
+            rootDirId: 999999, // never inserted
+        });
+
+        const mw = buildMiddleware();
+        const { res, out } = makeRes();
+        await mw(
+            makeReq({
+                hostname: `${sub}.site.puter.localhost`,
+                path: '/',
+            }),
+            res,
+            vi.fn(),
+        );
+
+        expect(out.statusCode).toBe(404);
+        expect(out.contentType).toBe('text/html; charset=UTF-8');
+    });
+
+    it('returns 404 when root_dir_id points to a file (not a directory)', async () => {
+        const owner = await makeUserWithHome();
+        const homePath = `/${owner.username}`;
+        const body = Buffer.from('not a directory');
+        // Write a file and use ITS id as the subdomain's root_dir_id —
+        // the middleware must reject because root must be a directory.
+        await writeFile(owner.id, `${homePath}/Documents/somefile.txt`, body);
+        const fileEntry = await server.stores.fsEntry.getEntryByPath(
+            `${homePath}/Documents/somefile.txt`,
+        );
+        expect(fileEntry?.isDir).toBe(false);
+        const sub = `fileroot-${Math.random().toString(36).slice(2, 8)}`;
+        await server.stores.subdomain.create({
+            userId: owner.id,
+            subdomain: sub,
+            rootDirId: fileEntry!.id,
+        });
+
+        const mw = buildMiddleware();
+        const { res, out } = makeRes();
+        await mw(
+            makeReq({
+                hostname: `${sub}.site.puter.localhost`,
+                path: '/',
+            }),
+            res,
+            vi.fn(),
+        );
+        expect(out.statusCode).toBe(404);
+    });
+
+    it('decodes URL-encoded paths before resolving', async () => {
+        // %20 in the URL must decode to a space and match the on-disk
+        // filename — proves decodeURIComponent runs before path lookup.
+        const owner = await makeUserWithHome();
+        const homePath = `/${owner.username}`;
+        const homeEntry = await server.stores.fsEntry.getEntryByPath(homePath);
+        const sub = `enc-${Math.random().toString(36).slice(2, 8)}`;
+        await server.stores.subdomain.create({
+            userId: owner.id,
+            subdomain: sub,
+            rootDirId: homeEntry!.id,
+        });
+        const body = Buffer.from('encoded');
+        await writeFile(
+            owner.id,
+            `${homePath}/hello world.txt`,
+            body,
+            'text/plain',
+        );
+
+        const mw = buildMiddleware();
+        const { res, out } = makeRes();
+        await mw(
+            makeReq({
+                hostname: `${sub}.site.puter.localhost`,
+                path: '/hello%20world.txt',
+            }),
+            res,
+            vi.fn(),
+        );
+        expect(out.statusCode).toBe(200);
+        expect(out.headers['Content-Type']).toMatch(/text\/plain/);
+    });
+
+    it('normalizes traversal-style paths so `..` cannot escape the site root', async () => {
+        // `/foo/../bar` collapses to `/bar` under the site root; without
+        // normalization an attacker could climb out and hit the FS root.
+        const owner = await makeUserWithHome();
+        const homePath = `/${owner.username}`;
+        const homeEntry = await server.stores.fsEntry.getEntryByPath(homePath);
+        const sub = `trav-${Math.random().toString(36).slice(2, 8)}`;
+        await server.stores.subdomain.create({
+            userId: owner.id,
+            subdomain: sub,
+            rootDirId: homeEntry!.id,
+        });
+        const body = Buffer.from('inside');
+        await writeFile(owner.id, `${homePath}/safe.txt`, body, 'text/plain');
+
+        const mw = buildMiddleware();
+        const { res, out } = makeRes();
+        await mw(
+            makeReq({
+                hostname: `${sub}.site.puter.localhost`,
+                // ../../etc/passwd — must normalize to /etc/passwd under
+                // the SITE ROOT, not the FS root; lookup will 404.
+                path: '/../../etc/passwd',
+            }),
+            res,
+            vi.fn(),
+        );
+        // Whatever the file branch decides, the response must NOT be
+        // a 200 with the file from /etc/passwd — it should 404 because
+        // <home>/etc/passwd doesn't exist.
+        expect(out.statusCode).toBe(404);
+    });
+});
+
+// ── .puter_site_config (custom error pages) ─────────────────────────
+//
+// Sites can drop a `.puter_site_config` JSON file at the root of their
+// hosting directory to map error codes onto custom pages — the
+// canonical use case is SPA fallback (404 → /index.html with status
+// 200). These tests pin the contract end-to-end through the real
+// FSService so we exercise parsing, path resolution, and the loop-
+// prevention guard together.
+
+describe('createPuterSiteMiddleware — site.access.check', () => {
+    const serveUnder = async (listener?: (data: unknown) => void) => {
+        const owner = await makeUserWithHome();
+        const homePath = `/${owner.username}`;
+        const homeEntry = await server.stores.fsEntry.getEntryByPath(homePath);
+        const sub = `gate-${Math.random().toString(36).slice(2, 8)}`;
+        await server.stores.subdomain.create({
+            userId: owner.id,
+            subdomain: sub,
+            rootDirId: homeEntry!.id,
+        });
+        await writeFile(
+            owner.id,
+            `${homePath}/secret.txt`,
+            Buffer.from('shh'),
+            'text/plain',
+        );
+        const seen: unknown[] = [];
+        server.clients.event.on('site.access.check', (_key, data) => {
+            if (data.subdomain !== sub) return;
+            seen.push(data);
+            listener?.(data);
+        });
+        const { out } = await runMiddleware(
+            buildMiddleware(),
+            makeReq({
+                hostname: `${sub}.site.puter.localhost`,
+                path: '/secret.txt',
+            }),
+        );
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        return { out, seen, sub };
+    };
+
+    it('asks listeners before streaming and serves when nobody objects', async () => {
+        const { out, seen, sub } = await serveUnder();
+        expect(out.statusCode).toBe(200);
+        expect(seen).toHaveLength(1);
+        expect(seen[0]).toMatchObject({
+            subdomain: sub,
+            host: `${sub}.site.puter.localhost`,
+            requestPath: '/secret.txt',
+            entry: { name: 'secret.txt' },
+            result: { allowed: true },
+        });
+    });
+
+    it('returns the plain file 404 when a listener withholds the entry', async () => {
+        const { out } = await serveUnder((data) => {
+            (data as { result: { allowed: boolean } }).result.allowed = false;
+        });
+        expect(out.statusCode).toBe(404);
+        expect(String(out.body)).toContain('Not Found');
+        expect(out.headers['Content-Type']).toBeUndefined();
+    });
+});
+
+describe('createPuterSiteMiddleware — .puter_site_config', () => {
+    const setupSiteWithConfig = async (config: unknown) => {
+        const owner = await makeUserWithHome();
+        const homePath = `/${owner.username}`;
+        const homeEntry = await server.stores.fsEntry.getEntryByPath(homePath);
+        const sub = `cfg-${Math.random().toString(36).slice(2, 8)}`;
+        await server.stores.subdomain.create({
+            userId: owner.id,
+            subdomain: sub,
+            rootDirId: homeEntry!.id,
+        });
+        await writeFile(
+            owner.id,
+            `${homePath}/.puter_site_config`,
+            Buffer.from(JSON.stringify(config)),
+            'application/json',
+        );
+        return { owner, homePath, sub };
+    };
+
+    it('serves /index.html with status 200 on 404 when configured (SPA fallback)', async () => {
+        // The user's headline use case: route any unknown path through
+        // the SPA entrypoint so client-side routing can take over,
+        // while still serving HTTP 200 so search engines don't cache
+        // the page as a hard 404.
+        const { owner, homePath, sub } = await setupSiteWithConfig({
+            errors: {
+                '404': { file: '/index.html', status: 200 },
+            },
+        });
+        const body = Buffer.from('<html>spa-shell</html>');
+        await writeFile(owner.id, `${homePath}/index.html`, body, 'text/html');
+
+        const mw = buildMiddleware();
+        const { res, out } = makeRes();
+        await mw(
+            makeReq({
+                hostname: `${sub}.site.puter.localhost`,
+                path: '/some/client-route',
+            }),
+            res,
+            vi.fn(),
+        );
+        await new Promise<void>((resolve) => setImmediate(resolve));
+
+        expect(out.statusCode).toBe(200);
+        expect(out.headers['Content-Type']).toMatch(/text\/html/);
+        const piped = out.body as Buffer | undefined;
+        expect(Buffer.isBuffer(piped)).toBe(true);
+        expect(piped!.equals(body)).toBe(true);
+    });
+
+    it('serves the configured file with the matched code when `status` is omitted', async () => {
+        // No explicit `status` → default to the matched error code
+        // (404 here). Bare `{ file: '/404.html' }` should Just Work
+        // for the classic "pretty 404 page" use case.
+        const { owner, homePath, sub } = await setupSiteWithConfig({
+            errors: { '404': { file: '/404.html' } },
+        });
+        const body = Buffer.from('<html>custom 404</html>');
+        await writeFile(owner.id, `${homePath}/404.html`, body, 'text/html');
+
+        const mw = buildMiddleware();
+        const { res, out } = makeRes();
+        await mw(
+            makeReq({
+                hostname: `${sub}.site.puter.localhost`,
+                path: '/no-such-page',
+            }),
+            res,
+            vi.fn(),
+        );
+        await new Promise<void>((resolve) => setImmediate(resolve));
+
+        expect(out.statusCode).toBe(404);
+        const piped = out.body as Buffer | undefined;
+        expect(piped!.equals(body)).toBe(true);
+    });
+
+    it('falls back to the default 404 page when the configured error file does not exist (no infinite loop)', async () => {
+        // Critical loop guard: if the error page itself is missing,
+        // we must NOT recurse through the error config again. The
+        // request must terminate with the built-in 404 page rather
+        // than spinning errors.404 → errors.404 → … .
+        const { sub } = await setupSiteWithConfig({
+            errors: { '404': { file: '/missing.html', status: 200 } },
+        });
+        // Deliberately do not write missing.html.
+
+        const mw = buildMiddleware();
+        const { res, out } = makeRes();
+        await mw(
+            makeReq({
+                hostname: `${sub}.site.puter.localhost`,
+                path: '/anything',
+            }),
+            res,
+            vi.fn(),
+        );
+
+        expect(out.statusCode).toBe(404);
+        expect(out.contentType).toBe('text/html; charset=UTF-8');
+        expect(String(out.body)).toContain('Not Found');
+    });
+
+    it('returns 404 when a visitor requests `.puter_site_config` directly (no config leak)', async () => {
+        // The config file is implementation detail — hide it the same
+        // way any other missing path would 404, so visitors can't
+        // enumerate deployment shape by guessing well-known names.
+        const { sub } = await setupSiteWithConfig({
+            errors: { '404': { file: '/index.html', status: 200 } },
+        });
+
+        const mw = buildMiddleware();
+        const { res, out } = makeRes();
+        await mw(
+            makeReq({
+                hostname: `${sub}.site.puter.localhost`,
+                path: '/.puter_site_config',
+            }),
+            res,
+            vi.fn(),
+        );
+
+        // No error-page fallback because we didn't write /index.html.
+        expect(out.statusCode).toBe(404);
+        // Body shape is the default 404, not the JSON config.
+        expect(String(out.body)).not.toContain('errors');
+    });
+
+    it('rejects `errors.404.file` paths that try to climb out of the site root', async () => {
+        // The normalizer collapses `..` segments, so an attacker who
+        // can edit the config can't pivot it into reading files
+        // outside their own subdomain root.
+        const otherOwner = await makeUserWithHome();
+        const secretPath = `/${otherOwner.username}/secret.html`;
+        await writeFile(
+            otherOwner.id,
+            secretPath,
+            Buffer.from('SECRET'),
+            'text/html',
+        );
+
+        const { sub } = await setupSiteWithConfig({
+            errors: {
+                '404': {
+                    // Tries to walk up to the other user's home dir.
+                    file: `/../${otherOwner.username}/secret.html`,
+                    status: 200,
+                },
+            },
+        });
+
+        const mw = buildMiddleware();
+        const { res, out } = makeRes();
+        await mw(
+            makeReq({
+                hostname: `${sub}.site.puter.localhost`,
+                path: '/anything',
+            }),
+            res,
+            vi.fn(),
+        );
+
+        // The collapsed path resolves under the requesting site's
+        // root, which doesn't have a `<username>/secret.html` file —
+        // so the fallback fails and we get the default 404, NOT the
+        // SECRET body.
+        expect(out.statusCode).toBe(404);
+        expect(String(out.body)).not.toContain('SECRET');
+    });
+
+    it('ignores malformed JSON configs and behaves like there is no config', async () => {
+        // A typo in the config file must not 5xx the request — the
+        // visitor still gets the default 404 on a missing path.
+        const owner = await makeUserWithHome();
+        const homePath = `/${owner.username}`;
+        const homeEntry = await server.stores.fsEntry.getEntryByPath(homePath);
+        const sub = `bad-${Math.random().toString(36).slice(2, 8)}`;
+        await server.stores.subdomain.create({
+            userId: owner.id,
+            subdomain: sub,
+            rootDirId: homeEntry!.id,
+        });
+        await writeFile(
+            owner.id,
+            `${homePath}/.puter_site_config`,
+            Buffer.from('this is not json {{{'),
+            'application/json',
+        );
+        await writeFile(
+            owner.id,
+            `${homePath}/index.html`,
+            Buffer.from('would-be-fallback'),
+            'text/html',
+        );
+
+        const mw = buildMiddleware();
+        const { res, out } = makeRes();
+        await mw(
+            makeReq({
+                hostname: `${sub}.site.puter.localhost`,
+                path: '/unknown',
+            }),
+            res,
+            vi.fn(),
+        );
+
+        expect(out.statusCode).toBe(404);
+        expect(String(out.body)).toContain('Not Found');
+        // Did NOT silently fall back to /index.html as if the config
+        // were valid — malformed config must be ignored, not partially
+        // applied.
+        expect(String(out.body)).not.toContain('would-be-fallback');
+    });
+
+    it('still serves real files normally — config only applies on 404', async () => {
+        // Sanity check: when the requested path exists, the config's
+        // error rules are not consulted, so the response is the live
+        // file at status 200 (not the error-page status override).
+        const { owner, homePath, sub } = await setupSiteWithConfig({
+            errors: { '404': { file: '/index.html', status: 200 } },
+        });
+        const body = Buffer.from('real-page');
+        await writeFile(
+            owner.id,
+            `${homePath}/page.html`,
+            body,
+            'text/html',
+        );
+
+        const mw = buildMiddleware();
+        const { res, out } = makeRes();
+        await mw(
+            makeReq({
+                hostname: `${sub}.site.puter.localhost`,
+                path: '/page.html',
+            }),
+            res,
+            vi.fn(),
+        );
+        await new Promise<void>((resolve) => setImmediate(resolve));
+
+        expect(out.statusCode).toBe(200);
+        const piped = out.body as Buffer | undefined;
+        expect(piped!.equals(body)).toBe(true);
+    });
+
+    it('reads the config only for a path that 404s', async () => {
+        const { owner, homePath, sub } = await setupSiteWithConfig({
+            errors: { '404': { file: '/index.html', status: 200 } },
+        });
+        const body = Buffer.from('<html>spa-shell</html>');
+        await writeFile(owner.id, `${homePath}/index.html`, body, 'text/html');
+        const root = await server.stores.fsEntry.getEntryByPath(homePath);
+        // The loader caches whatever it reads, so an empty slot means it
+        // never ran.
+        const cached = () =>
+            server.clients.redis.get(`puter-site-config:${root!.id}`);
+        const settle = () => new Promise((resolve) => setTimeout(resolve, 10));
+
+        const mw = buildMiddleware();
+        const served = makeRes();
+        await mw(
+            makeReq({
+                hostname: `${sub}.site.puter.localhost`,
+                path: '/index.html',
+            }),
+            served.res,
+            vi.fn(),
+        );
+        await settle();
+        expect(served.out.statusCode).toBe(200);
+        expect(await cached()).toBeNull();
+
+        const missing = makeRes();
+        await mw(
+            makeReq({
+                hostname: `${sub}.site.puter.localhost`,
+                path: '/client-route',
+            }),
+            missing.res,
+            vi.fn(),
+        );
+        await settle();
+        expect(missing.out.statusCode).toBe(200);
+        expect((missing.out.body as Buffer | undefined)?.equals(body)).toBe(
+            true,
+        );
+        expect(await cached()).not.toBeNull();
+    });
+
+    it('serves the cached config on a second request, even when the on-disk file is removed (Redis cache holds within TTL)', async () => {
+        // First request seeds the cache with the parsed config. We
+        // then delete the underlying file and fire a second request:
+        // if the cache is wired correctly, the SPA fallback still
+        // applies because we never re-read from S3. Within-TTL
+        // staleness is the explicit contract (60s default).
+        const { owner, homePath, sub } = await setupSiteWithConfig({
+            errors: { '404': { file: '/index.html', status: 200 } },
+        });
+        const body = Buffer.from('<html>spa-shell</html>');
+        await writeFile(owner.id, `${homePath}/index.html`, body, 'text/html');
+
+        const mw = buildMiddleware();
+
+        // First request → primes the cache.
+        const first = makeRes();
+        await mw(
+            makeReq({
+                hostname: `${sub}.site.puter.localhost`,
+                path: '/route-a',
+            }),
+            first.res,
+            vi.fn(),
+        );
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        expect(first.out.statusCode).toBe(200);
+
+        // Now wipe the on-disk config. If the loader hits S3 on every
+        // request, the second call below would see no config and fall
+        // through to a default 404. The cache contract is that it
+        // does NOT — within the TTL, the prior parse stands.
+        const configEntry = await server.stores.fsEntry.getEntryByPath(
+            `${homePath}/.puter_site_config`,
+        );
+        if (configEntry) {
+            await server.services.fs.remove(owner.id, { entry: configEntry });
+        }
+
+        const second = makeRes();
+        await mw(
+            makeReq({
+                hostname: `${sub}.site.puter.localhost`,
+                path: '/route-b',
+            }),
+            second.res,
+            vi.fn(),
+        );
+        await new Promise<void>((resolve) => setImmediate(resolve));
+
+        // SPA fallback still fires → cache served the deleted config.
+        expect(second.out.statusCode).toBe(200);
+        expect(
+            (second.out.body as Buffer | undefined)?.equals(body),
+        ).toBe(true);
+    });
+
+    it('ignores `errors` entries with status codes outside 4xx/5xx', async () => {
+        // A `200` key in errors is meaningless and a footgun (it
+        // could be used to silently override the happy path). The
+        // parser must drop these on the floor.
+        const { sub } = await setupSiteWithConfig({
+            errors: {
+                '200': { file: '/oops.html', status: 200 },
+                '999': { file: '/oops.html', status: 200 },
+            },
+        });
+
+        const mw = buildMiddleware();
+        const { res, out } = makeRes();
+        await mw(
+            makeReq({
+                hostname: `${sub}.site.puter.localhost`,
+                path: '/missing',
+            }),
+            res,
+            vi.fn(),
+        );
+
+        // No valid 404 rule survives the filter → default 404.
+        expect(out.statusCode).toBe(404);
+        expect(String(out.body)).toContain('Not Found');
+    });
+});
+
+// ── __workers/ (worker source) ──────────────────────────────────────
+//
+// `__workers/` at a site root holds server-side worker source. It is the
+// one thing under a site root that is NOT public: users' backend code can
+// carry trade secrets, so every route to those bytes — direct request,
+// folder fallback, custom error page — must dead-end in the same 404 a
+// missing path produces.
+
+describe('createPuterSiteMiddleware — __workers/ is never served', () => {
+    const setupSiteWithWorker = async () => {
+        const owner = await makeUserWithHome();
+        const homePath = `/${owner.username}`;
+        const homeEntry = await server.stores.fsEntry.getEntryByPath(homePath);
+        const sub = `dw-${Math.random().toString(36).slice(2, 8)}`;
+        await server.stores.subdomain.create({
+            userId: owner.id,
+            subdomain: sub,
+            rootDirId: homeEntry!.id,
+        });
+        await server.services.fs.mkdir(owner.id, {
+            path: `${homePath}/__workers`,
+            createMissingParents: true,
+        });
+        await writeFile(
+            owner.id,
+            `${homePath}/__workers/matchmaking.worker.js`,
+            Buffer.from('export default { secret: true };'),
+            'application/javascript',
+        );
+        return { owner, homePath, sub };
+    };
+
+    const request = async (sub: string, path: string) => {
+        const mw = buildMiddleware();
+        const { res, out } = makeRes();
+        await mw(
+            makeReq({ hostname: `${sub}.site.puter.localhost`, path }),
+            res,
+            vi.fn(),
+        );
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        return out;
+    };
+
+    it('404s a direct request for a worker source file that exists', async () => {
+        const { sub } = await setupSiteWithWorker();
+        const out = await request(sub, '/__workers/matchmaking.worker.js');
+        expect(out.statusCode).toBe(404);
+        expect(String(out.body)).not.toContain('secret');
+    });
+
+    it('404s the folder itself — no index.html fallback into it', async () => {
+        const { owner, homePath, sub } = await setupSiteWithWorker();
+        await writeFile(
+            owner.id,
+            `${homePath}/__workers/index.html`,
+            Buffer.from('<html>listing</html>'),
+            'text/html',
+        );
+        for (const path of ['/__workers', '/__workers/']) {
+            const out = await request(sub, path);
+            expect(out.statusCode).toBe(404);
+            expect(String(out.body)).not.toContain('listing');
+        }
+    });
+
+    it('404s case variants and URL-encoded spellings of the folder', async () => {
+        const { sub } = await setupSiteWithWorker();
+        for (const path of [
+            '/__Workers/matchmaking.worker.js',
+            '/__WORKERS/matchmaking.worker.js',
+            '/%5F%5Fworkers/matchmaking.worker.js',
+            '/a/../__workers/matchmaking.worker.js',
+        ]) {
+            const out = await request(sub, path);
+            expect(out.statusCode).toBe(404);
+            expect(String(out.body)).not.toContain('secret');
+        }
+    });
+
+    it('404s __workers/ at any depth — a site rooted above another site must not serve the inner one', async () => {
+        // Same FS layout, but the serving site is rooted one level up:
+        // the worker source now sits at /inner/__workers/… from its
+        // point of view, and must be just as unreachable.
+        const owner = await makeUserWithHome();
+        const homePath = `/${owner.username}`;
+        await server.services.fs.mkdir(owner.id, {
+            path: `${homePath}/inner/__workers`,
+            createMissingParents: true,
+        });
+        await writeFile(
+            owner.id,
+            `${homePath}/inner/__workers/matchmaking.worker.js`,
+            Buffer.from('export default { secret: true };'),
+            'application/javascript',
+        );
+        const homeEntry = await server.stores.fsEntry.getEntryByPath(homePath);
+        const sub = `dwo-${Math.random().toString(36).slice(2, 8)}`;
+        await server.stores.subdomain.create({
+            userId: owner.id,
+            subdomain: sub,
+            rootDirId: homeEntry!.id,
+        });
+        const out = await request(
+            sub,
+            '/inner/__workers/matchmaking.worker.js',
+        );
+        expect(out.statusCode).toBe(404);
+        expect(String(out.body)).not.toContain('secret');
+    });
+
+    it('refuses a custom error page that points into __workers/', async () => {
+        // `errors.404.file` aimed at worker source would publish it on
+        // every missing path — the rule is ignored and the default 404
+        // page served instead.
+        const { owner, homePath, sub } = await setupSiteWithWorker();
+        await writeFile(
+            owner.id,
+            `${homePath}/.puter_site_config`,
+            Buffer.from(
+                JSON.stringify({
+                    errors: {
+                        '404': {
+                            file: '/__workers/matchmaking.worker.js',
+                            status: 200,
+                        },
+                    },
+                }),
+            ),
+            'application/json',
+        );
+        const out = await request(sub, '/no-such-page');
+        expect(out.statusCode).toBe(404);
+        expect(String(out.body)).not.toContain('secret');
+        expect(String(out.body)).toContain('Not Found');
+    });
+
+    it('still applies an SPA fallback to __workers/ requests when the target is outside the folder', async () => {
+        // The block hides the folder; it does not exempt those URLs from
+        // the site's own 404 handling. A fallback pointing at a public
+        // file keeps working — the fiction is "this path does not exist",
+        // and this is exactly what a missing path serves.
+        const { owner, homePath, sub } = await setupSiteWithWorker();
+        const shell = Buffer.from('<html>spa-shell</html>');
+        await writeFile(owner.id, `${homePath}/index.html`, shell, 'text/html');
+        await writeFile(
+            owner.id,
+            `${homePath}/.puter_site_config`,
+            Buffer.from(
+                JSON.stringify({
+                    errors: { '404': { file: '/index.html', status: 200 } },
+                }),
+            ),
+            'application/json',
+        );
+        const out = await request(sub, '/__workers/matchmaking.worker.js');
+        expect(out.statusCode).toBe(200);
+        const piped = out.body as Buffer | undefined;
+        expect(Buffer.isBuffer(piped)).toBe(true);
+        expect(piped!.equals(shell)).toBe(true);
+    });
+
+    // SQLite compares paths bytewise; MySQL's utf8mb4_unicode_ci folds
+    // accents, fullwidth forms and zero-width chars. Emulate that fold.
+    const withCollationAlias = async (
+        alias: string,
+        real: string,
+        fn: () => Promise<void>,
+    ) => {
+        const store = server.stores.fsEntry;
+        const original = store.getEntryByPath.bind(store);
+        const spy = vi
+            .spyOn(store, 'getEntryByPath')
+            .mockImplementation((path, options) =>
+                original(
+                    path.startsWith(alias)
+                        ? real + path.slice(alias.length)
+                        : path,
+                    options,
+                ),
+            );
+        try {
+            await fn();
+        } finally {
+            spy.mockRestore();
+        }
+    };
+
+    it('404s a collation alias of __workers/ that the database resolves to the real file', async () => {
+        const { homePath, sub } = await setupSiteWithWorker();
+        await withCollationAlias(
+            `${homePath}/__wörkers/matchmaking.worker.js`,
+            `${homePath}/__workers/matchmaking.worker.js`,
+            async () => {
+                const out = await request(
+                    sub,
+                    '/__w%C3%B6rkers/matchmaking.worker.js',
+                );
+                expect(out.statusCode).toBe(404);
+                expect(String(out.body)).not.toContain('secret');
+            },
+        );
+    });
+
+    it('404s a collation alias of a folder whose index.html sits in __workers/', async () => {
+        const { owner, homePath, sub } = await setupSiteWithWorker();
+        await writeFile(
+            owner.id,
+            `${homePath}/__workers/index.html`,
+            Buffer.from('<html>listing</html>'),
+            'text/html',
+        );
+        await withCollationAlias(
+            `${homePath}/__wörkers`,
+            `${homePath}/__workers`,
+            async () => {
+                const out = await request(sub, '/__w%C3%B6rkers');
+                expect(out.statusCode).toBe(404);
+                expect(String(out.body)).not.toContain('listing');
+            },
+        );
+    });
+
+    it('404s a collation alias of .puter_site_config', async () => {
+        const { owner, homePath, sub } = await setupSiteWithWorker();
+        await writeFile(
+            owner.id,
+            `${homePath}/.puter_site_config`,
+            Buffer.from(JSON.stringify({ errors: {}, marker: 'cfg-body' })),
+            'application/json',
+        );
+        await withCollationAlias(
+            `${homePath}/.püter_site_config`,
+            `${homePath}/.puter_site_config`,
+            async () => {
+                const out = await request(sub, '/.p%C3%BCter_site_config');
+                expect(out.statusCode).toBe(404);
+                expect(String(out.body)).not.toContain('cfg-body');
+            },
+        );
+    });
+});
+
+describe('createPuterSiteMiddleware — hosting CSP', () => {
+    const POLICY = "script-src * 'unsafe-inline'; object-src 'none'";
+
+    // Serves one file at the site root and returns the captured response.
+    const serve = async (
+        filename: string,
+        contentType: string,
+        configOverride?: Partial<IConfig>,
+    ) => {
+        const owner = await makeUserWithHome();
+        const homePath = `/${owner.username}`;
+        const homeEntry = await server.stores.fsEntry.getEntryByPath(homePath);
+        const sub = `csp-${Math.random().toString(36).slice(2, 8)}`;
+        await server.stores.subdomain.create({
+            userId: owner.id,
+            subdomain: sub,
+            rootDirId: homeEntry!.id,
+        });
+        await writeFile(
+            owner.id,
+            `${homePath}/${filename}`,
+            Buffer.from('<p>hi</p>'),
+            contentType,
+        );
+
+        const mw = buildMiddleware(configOverride);
+        const { res, out } = makeRes();
+        await mw(
+            makeReq({
+                hostname: `${sub}.site.puter.localhost`,
+                path: `/${filename}`,
+            }),
+            res,
+            vi.fn(),
+        );
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        return out;
+    };
+
+    it('sends no CSP header when hosting_csp is unset', async () => {
+        // The default. Hosted sites are third-party apps, so an unconfigured
+        // deployment must not start enforcing a policy on them.
+        const out = await serve('index.html', 'text/html');
+        expect(out.statusCode).toBe(200);
+        expect(out.headers['Content-Security-Policy']).toBeUndefined();
+        expect(
+            out.headers['Content-Security-Policy-Report-Only'],
+        ).toBeUndefined();
+    });
+
+    it('enforces hosting_csp on an active document when configured', async () => {
+        const out = await serve('index.html', 'text/html', {
+            hosting_csp: POLICY,
+        });
+        expect(out.statusCode).toBe(200);
+        expect(out.headers['Content-Security-Policy']).toBe(POLICY);
+        expect(
+            out.headers['Content-Security-Policy-Report-Only'],
+        ).toBeUndefined();
+    });
+
+    it('sends the policy as Report-Only when hosting_csp_report_only is set', async () => {
+        const out = await serve('index.html', 'text/html', {
+            hosting_csp: POLICY,
+            hosting_csp_report_only: true,
+        });
+        expect(out.statusCode).toBe(200);
+        expect(out.headers['Content-Security-Policy-Report-Only']).toBe(POLICY);
+        expect(out.headers['Content-Security-Policy']).toBeUndefined();
+    });
+
+    it('leaves non-active documents alone', async () => {
+        // A CSP does nothing for a stylesheet or an image, and every header
+        // set here ships to apps we don't control.
+        const out = await serve('style.css', 'text/css', {
+            hosting_csp: POLICY,
+        });
+        expect(out.statusCode).toBe(200);
+        expect(out.headers['Content-Security-Policy']).toBeUndefined();
+    });
+});
+
+// -- Sites rooted in someone else's directory ------------------------
+//
+// Hosting serves everything under the site root with the ACL bypassed, so a
+// site published from a shared folder rides on the `manage` grant that
+// authorized it. These pin that the grant is re-read on every request, and
+// that the ordinary owner-rooted site pays nothing for it.
+
+const actorFor = (user: {
+    id: number;
+    uuid: string;
+    username: string;
+}): Actor =>
+    ({
+        user: { id: user.id, uuid: user.uuid, username: user.username },
+        effectiveApp: null,
+    }) as Actor;
+
+const descriptorFor = (path: string) => ({
+    path,
+    resolveAncestors: () => server.services.fs.getAncestorChain(path),
+});
+
+const serveSite = async (sub: string) => {
+    const mw = buildMiddleware();
+    const { res, out } = makeRes();
+    await mw(
+        makeReq({
+            hostname: `${sub}.site.puter.localhost`,
+            path: '/index.html',
+        }),
+        res,
+        vi.fn(),
+    );
+    // Allow the piped stream to flush.
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    return out;
+};
+
+describe('createPuterSiteMiddleware — delegated site roots', () => {
+    // Owner shares a directory at `manage`; the delegate points a subdomain
+    // at it, which is exactly what `SubdomainDriver` permits.
+    const publishSharedDir = async () => {
+        const owner = await makeUserWithHome();
+        const delegate = await makeUserWithHome();
+        const dirPath = `/${owner.username}/Documents`;
+        const dirEntry = (await server.stores.fsEntry.getEntryByPath(dirPath))!;
+        await writeFile(
+            owner.id,
+            `${dirPath}/index.html`,
+            Buffer.from('<html>shared</html>'),
+            'text/html',
+        );
+        await server.services.acl.setUserUser(
+            actorFor(owner),
+            actorFor(delegate),
+            descriptorFor(dirPath),
+            'manage',
+        );
+        const sub = `shared-${Math.random().toString(36).slice(2, 8)}`;
+        await server.stores.subdomain.create({
+            userId: delegate.id,
+            subdomain: sub,
+            rootDirId: dirEntry.id,
+        });
+        return { owner, delegate, dirEntry, sub };
+    };
+
+    it('serves a site whose publisher still holds `manage` on the root', async () => {
+        const { sub } = await publishSharedDir();
+        const out = await serveSite(sub);
+        expect(out.statusCode).toBe(200);
+        expect((out.body as Buffer).toString()).toBe('<html>shared</html>');
+    });
+
+    it("stops serving once the owner withdraws the publisher's `manage` grant", async () => {
+        const { owner, delegate, dirEntry, sub } = await publishSharedDir();
+        expect((await serveSite(sub)).statusCode).toBe(200);
+
+        await server.services.permission.revokeUserUserPermission(
+            actorFor(owner),
+            delegate.username,
+            `manage:fs:${dirEntry.uuid}`,
+        );
+
+        const out = await serveSite(sub);
+        expect(out.statusCode).toBe(404);
+        expect(out.contentType).toBe('text/html; charset=UTF-8');
+        expect(String(out.body)).toContain('404');
+    });
+
+    it('stops serving once the owner unshares the directory', async () => {
+        const { owner, delegate, dirEntry, sub } = await publishSharedDir();
+        expect((await serveSite(sub)).statusCode).toBe(200);
+
+        await server.services.share.unshare(actorFor(owner), {
+            uid: dirEntry.uuid,
+            recipient: { username: delegate.username },
+        });
+
+        expect((await serveSite(sub)).statusCode).toBe(404);
+    });
+
+    it('stops serving once the owner moves the root into their Trash', async () => {
+        // The grant is keyed on the node, so it survives the move — the
+        // trashed location is what makes the site unservable.
+        const { owner, dirEntry, sub } = await publishSharedDir();
+        expect((await serveSite(sub)).statusCode).toBe(200);
+
+        const trash = (await server.stores.fsEntry.getEntryByPath(
+            `/${owner.username}/Trash`,
+        ))!;
+        await server.services.fs.move(owner.id, {
+            source: dirEntry,
+            destinationParent: trash,
+        });
+
+        expect((await serveSite(sub)).statusCode).toBe(404);
+    });
+
+    it("never consults the ACL for a site rooted in the publisher's own tree", async () => {
+        const owner = await makeUserWithHome();
+        const homePath = `/${owner.username}`;
+        const homeEntry =
+            (await server.stores.fsEntry.getEntryByPath(homePath))!;
+        await writeFile(
+            owner.id,
+            `${homePath}/index.html`,
+            Buffer.from('<html>mine</html>'),
+            'text/html',
+        );
+        const sub = `own-${Math.random().toString(36).slice(2, 8)}`;
+        await server.stores.subdomain.create({
+            userId: owner.id,
+            subdomain: sub,
+            rootDirId: homeEntry.id,
+        });
+
+        const aclCheck = vi.spyOn(server.services.acl, 'check');
+        try {
+            const out = await serveSite(sub);
+            expect(out.statusCode).toBe(200);
+            expect(aclCheck).not.toHaveBeenCalled();
+        } finally {
+            aclCheck.mockRestore();
+        }
+    });
+});
+
+// ── Private app sign-in token in a top-level URL ────────────────────
+
+describe('createPuterSiteMiddleware — private app sign-in token', () => {
+    let owner: Awaited<ReturnType<typeof makeUserWithHome>>;
+    let visitor: Awaited<ReturnType<typeof makeUser>>;
+    let sub: string;
+    let host: string;
+    let appUid: string;
+    let token: string;
+    const allow = (
+        _key: string,
+        data: { appUid: string; result: { allowed: boolean } },
+    ) => {
+        if (data.appUid === appUid) data.result.allowed = true;
+    };
+
+    beforeAll(async () => {
+        owner = await makeUserWithHome();
+        visitor = await makeUser();
+        const homePath = `/${owner.username}`;
+        const homeEntry = await server.stores.fsEntry.getEntryByPath(homePath);
+        sub = `priv-${Math.random().toString(36).slice(2, 8)}`;
+        host = `${sub}.app.puter.localhost`;
+        await server.stores.subdomain.create({
+            userId: owner.id,
+            subdomain: sub,
+            rootDirId: homeEntry!.id,
+        });
+        await writeFile(
+            owner.id,
+            `${homePath}/index.html`,
+            Buffer.from('<html>app</html>'),
+            'text/html',
+        );
+        appUid = `app-${uuidv4()}`;
+        await server.clients.db.write(
+            'INSERT INTO `apps` (`uid`, `name`, `title`, `index_url`, `owner_user_id`, `is_private`) VALUES (?, ?, ?, ?, ?, ?)',
+            [appUid, sub, sub, `http://${host}/`, owner.id, 1],
+        );
+        ({ token } = await server.services.auth.createSessionToken(
+            visitor as never,
+        ));
+        server.clients.event.on('app.privateAccess.check', allow as never);
+    });
+
+    afterAll(() => {
+        server.clients.event.off('app.privateAccess.check', allow as never);
+    });
+
+    const visit = async (init: {
+        dest?: string;
+        method?: string;
+        cookies?: Record<string, string>;
+    }) => {
+        const mw = buildMiddleware();
+        const { res, out } = makeRes();
+        await mw(
+            makeReq({
+                hostname: host,
+                method: init.method,
+                path: '/',
+                originalUrl: `/?a=1&puter.auth.token=${token}&b=x%20y`,
+                query: { a: '1', 'puter.auth.token': token, b: 'x y' },
+                headers: init.dest ? { 'sec-fetch-dest': init.dest } : {},
+                cookies: init.cookies,
+            }),
+            res,
+            vi.fn(),
+        );
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        return out;
+    };
+
+    const cookieName = () => HOSTED_ASSET_COOKIES.private.name;
+
+    it('sets the cookie and redirects a top-level page to the same URL without the token', async () => {
+        const out = await visit({ dest: 'document' });
+        expect(out.redirected).toEqual({ status: 302, url: '/?a=1&b=x%20y' });
+        expect(out.cookies[cookieName()]).toBeTruthy();
+        expect(out.headers['Cache-Control']).toBe('no-store');
+    });
+
+    it('serves a framed launch with the token left in place for the SDK', async () => {
+        const out = await visit({ dest: 'iframe' });
+        expect(out.redirected).toBeUndefined();
+        expect(out.statusCode).toBe(200);
+    });
+
+    it('serves as before when the browser does not say what the request is for', async () => {
+        const out = await visit({});
+        expect(out.redirected).toBeUndefined();
+        expect(out.statusCode).toBe(200);
+    });
+
+    it('does not redirect a non-GET navigation', async () => {
+        const out = await visit({ dest: 'document', method: 'POST' });
+        expect(out.redirected).toBeUndefined();
+    });
+
+    it('still strips the token when the visitor already holds the cookie', async () => {
+        const cookie = await server.services.auth.createHostedAssetToken(
+            'private',
+            {
+                appUid,
+                userUid: visitor.uuid,
+                subdomain: sub,
+                host,
+            },
+        );
+        const out = await visit({
+            dest: 'document',
+            cookies: { [cookieName()]: cookie },
+        });
+        expect(out.redirected).toEqual({ status: 302, url: '/?a=1&b=x%20y' });
+    });
+
+    it('serves without redirecting when the cookie could not be minted', async () => {
+        // Without the cookie, the clean URL would bounce back to sign-in.
+        const spy = vi
+            .spyOn(server.services.auth, 'createHostedAssetToken')
+            .mockRejectedValueOnce(new Error('mint failed'));
+        try {
+            const out = await visit({ dest: 'document' });
+            expect(out.redirected).toBeUndefined();
+            expect(out.statusCode).toBe(200);
+        } finally {
+            spy.mockRestore();
+        }
+    });
+});
+
+// ── Owner, app and root lookups ─────────────────────────────────────
+
+describe('createPuterSiteMiddleware — site lookups', () => {
+    const failure = (what: string) => new Error(`${what} lookup failed`);
+    const isAppQuery = (sql: unknown) => /FROM `?apps`?\b/.test(String(sql));
+
+    /** Unhandled rejections raised while `fn` runs, and shortly after. */
+    const unhandledDuring = async (fn: () => Promise<void>) => {
+        const seen: unknown[] = [];
+        const onUnhandled = (reason: unknown) => seen.push(reason);
+        process.on('unhandledRejection', onUnhandled);
+        try {
+            await fn();
+            await new Promise((resolve) => setTimeout(resolve, 20));
+        } finally {
+            process.off('unhandledRejection', onUnhandled);
+        }
+        return seen;
+    };
+
+    const makeSite = async (opts: { suspended?: boolean } = {}) => {
+        const owner = await makeUserWithHome();
+        if (opts.suspended) {
+            await server.stores.user.update(owner.id, { suspended: 1 });
+        }
+        const homePath = `/${owner.username}`;
+        const homeEntry = await server.stores.fsEntry.getEntryByPath(homePath);
+        const sub = `look-${Math.random().toString(36).slice(2, 8)}`;
+        await server.stores.subdomain.create({
+            userId: owner.id,
+            subdomain: sub,
+            rootDirId: homeEntry!.id,
+        });
+        await writeFile(
+            owner.id,
+            `${homePath}/index.html`,
+            Buffer.from('<html>hi</html>'),
+            'text/html',
+        );
+        return { owner, sub, rootDirId: homeEntry!.id };
+    };
+
+    const failRootLookup = () =>
+        vi
+            .spyOn(server.stores.fsEntry, 'getEntryById')
+            .mockRejectedValueOnce(failure('root'));
+
+    const failAppLookup = () => {
+        const db = server.clients.db;
+        const realRead = db.read.bind(db);
+        return vi
+            .spyOn(db, 'read')
+            .mockImplementation((sql, params) =>
+                isAppQuery(sql)
+                    ? Promise.reject(failure('app'))
+                    : realRead(sql, params),
+            );
+    };
+
+    /** Spies on app queries and root lookups, failing both. */
+    const failAndCountLookups = () => {
+        const readSpy = failAppLookup();
+        const rootSpy = vi
+            .spyOn(server.stores.fsEntry, 'getEntryById')
+            .mockRejectedValue(failure('root'));
+        return {
+            appQueries: () =>
+                readSpy.mock.calls.filter(([sql]) => isAppQuery(sql)).length,
+            rootLookups: () => rootSpy.mock.calls.length,
+            restore: () => {
+                readSpy.mockRestore();
+                rootSpy.mockRestore();
+            },
+        };
+    };
+
+    it('starts the app and root lookups together once the owner is known', async () => {
+        const { owner, sub, rootDirId } = await makeSite();
+        const ownerRow = await server.stores.user.getById(owner.id);
+        let releaseOwner!: () => void;
+        const userSpy = vi
+            .spyOn(server.stores.user, 'getById')
+            .mockImplementationOnce(
+                () =>
+                    new Promise((resolve) => {
+                        releaseOwner = () => resolve(ownerRow);
+                    }),
+            );
+        const rootSpy = vi.spyOn(server.stores.fsEntry, 'getEntryById');
+        const db = server.clients.db;
+        const realRead = db.read.bind(db);
+        const heldAppQueries: Array<() => void> = [];
+        const readSpy = vi
+            .spyOn(db, 'read')
+            .mockImplementation(async (sql, params) => {
+                if (isAppQuery(sql)) {
+                    await new Promise<void>((resolve) => {
+                        heldAppQueries.push(resolve);
+                    });
+                }
+                return realRead(sql, params);
+            });
+        const appQueried = () =>
+            readSpy.mock.calls.some(([sql]) => isAppQuery(sql));
+        try {
+            const mw = buildMiddleware();
+            const { res, out } = makeRes();
+            const done = mw(
+                makeReq({
+                    hostname: `${sub}.site.puter.localhost`,
+                    path: '/index.html',
+                }),
+                res,
+                vi.fn(),
+            );
+            await new Promise<void>((resolve) => setImmediate(resolve));
+            expect(appQueried()).toBe(false);
+            expect(rootSpy).not.toHaveBeenCalled();
+
+            releaseOwner();
+            await vi.waitFor(() => expect(appQueried()).toBe(true));
+            expect(rootSpy).toHaveBeenCalledWith(rootDirId);
+
+            for (const release of heldAppQueries.splice(0)) release();
+            await done;
+            await new Promise<void>((resolve) => setImmediate(resolve));
+            expect(out.statusCode).toBe(200);
+        } finally {
+            for (const release of heldAppQueries.splice(0)) release();
+            userSpy.mockRestore();
+            rootSpy.mockRestore();
+            readSpy.mockRestore();
+        }
+    });
+
+    it.each([
+        ['suspended', { suspended: true }],
+        ['missing', {}],
+    ] as const)(
+        '404s a %s owner without querying the app or the root',
+        async (kind, opts) => {
+            const { sub } = await makeSite(opts);
+            const userSpy =
+                kind === 'missing'
+                    ? vi
+                          .spyOn(server.stores.user, 'getById')
+                          .mockResolvedValueOnce(null)
+                    : null;
+            const lookups = failAndCountLookups();
+            try {
+                let out: CapturedRes | undefined;
+                const unhandled = await unhandledDuring(async () => {
+                    ({ out } = await runMiddleware(
+                        buildMiddleware(),
+                        makeReq({ hostname: `${sub}.site.puter.localhost` }),
+                    ));
+                });
+                expect(out?.statusCode).toBe(404);
+                expect(out?.body).toBe('Subdomain not found');
+                expect(lookups.appQueries()).toBe(0);
+                expect(lookups.rootLookups()).toBe(0);
+                expect(unhandled).toEqual([]);
+            } finally {
+                userSpy?.mockRestore();
+                lookups.restore();
+            }
+        },
+    );
+
+    it("surfaces the owner lookup's failure before the others start", async () => {
+        const { sub } = await makeSite();
+        const userSpy = vi
+            .spyOn(server.stores.user, 'getById')
+            .mockRejectedValueOnce(failure('owner'));
+        const lookups = failAndCountLookups();
+        try {
+            const unhandled = await unhandledDuring(async () => {
+                await expect(
+                    runMiddleware(
+                        buildMiddleware(),
+                        makeReq({ hostname: `${sub}.site.puter.localhost` }),
+                    ),
+                ).rejects.toThrow('owner lookup failed');
+            });
+            expect(lookups.appQueries()).toBe(0);
+            expect(lookups.rootLookups()).toBe(0);
+            expect(unhandled).toEqual([]);
+        } finally {
+            userSpy.mockRestore();
+            lookups.restore();
+        }
+    });
+
+    it("surfaces the app lookup's failure ahead of the root's", async () => {
+        const { sub } = await makeSite();
+        const readSpy = failAppLookup();
+        const rootSpy = failRootLookup();
+        try {
+            const unhandled = await unhandledDuring(async () => {
+                await expect(
+                    runMiddleware(
+                        buildMiddleware(),
+                        makeReq({ hostname: `${sub}.site.puter.localhost` }),
+                    ),
+                ).rejects.toThrow('app lookup failed');
+            });
+            expect(unhandled).toEqual([]);
+        } finally {
+            readSpy.mockRestore();
+            rootSpy.mockRestore();
+        }
+    });
+
+    it('surfaces a failed root lookup once the gate lets the request through', async () => {
+        const { sub } = await makeSite();
+        const rootSpy = failRootLookup();
+        try {
+            const unhandled = await unhandledDuring(async () => {
+                await expect(
+                    runMiddleware(
+                        buildMiddleware(),
+                        makeReq({ hostname: `${sub}.site.puter.localhost` }),
+                    ),
+                ).rejects.toThrow('root lookup failed');
+            });
+            expect(unhandled).toEqual([]);
+        } finally {
+            rootSpy.mockRestore();
+        }
+    });
+
+    it('redirects off the private host and drops the failed root lookup', async () => {
+        const { sub } = await makeSite();
+        const rootSpy = failRootLookup();
+        try {
+            let out: CapturedRes | undefined;
+            const unhandled = await unhandledDuring(async () => {
+                ({ out } = await runMiddleware(
+                    buildMiddleware(),
+                    makeReq({ hostname: `${sub}.app.puter.localhost` }),
+                ));
+            });
+            expect(out?.redirected).toEqual({
+                status: 302,
+                url: `http://${sub}.site.puter.localhost/`,
+            });
+            expect(unhandled).toEqual([]);
+        } finally {
+            rootSpy.mockRestore();
+        }
+    });
+
+    it('asks a private-app visitor to sign in and drops the failed root lookup', async () => {
+        const { owner, sub } = await makeSite();
+        await server.clients.db.write(
+            'INSERT INTO `apps` (`uid`, `name`, `title`, `index_url`, `owner_user_id`, `is_private`) VALUES (?, ?, ?, ?, ?, ?)',
+            [
+                `app-${uuidv4()}`,
+                sub,
+                `Title ${sub}`,
+                `http://${sub}.app.puter.localhost/`,
+                owner.id,
+                1,
+            ],
+        );
+        const rootSpy = failRootLookup();
+        try {
+            let out: CapturedRes | undefined;
+            const unhandled = await unhandledDuring(async () => {
+                ({ out } = await runMiddleware(
+                    buildMiddleware(),
+                    makeReq({ hostname: `${sub}.app.puter.localhost` }),
+                ));
+            });
+            expect(out?.statusCode).toBe(200);
+            expect(String(out?.body)).toContain(`Title ${sub}`);
+            expect(String(out?.body)).toContain('Sign in required');
+            expect(unhandled).toEqual([]);
+        } finally {
+            rootSpy.mockRestore();
+        }
+    });
+});
+
+// ── Private-app gate decisions ──────────────────────────────────────
+
+describe('createPuterSiteMiddleware — private-app gate decisions', () => {
+    let entitled = false;
+    const listener = (_key: string, data: { result: { allowed: boolean } }) => {
+        if (entitled) data.result.allowed = true;
+    };
+    let visitor: Awaited<ReturnType<typeof makeUser>>;
+    let token: string;
+
+    beforeAll(async () => {
+        visitor = await makeUser();
+        ({ token } = await server.services.auth.createSessionToken(
+            visitor as never,
+        ));
+        server.clients.event.on('app.privateAccess.check', listener as never);
+    });
+
+    afterAll(() => {
+        server.clients.event.off('app.privateAccess.check', listener as never);
+    });
+
+    const makePrivateSite = async (opts: {
+        suspended?: boolean;
+        root?: 'home' | 'none' | 'foreign';
+    }) => {
+        const owner = await makeUserWithHome();
+        const sub = `gate-${Math.random().toString(36).slice(2, 8)}`;
+        let rootDirId: number | undefined;
+        if (opts.root === 'home') {
+            rootDirId = (await server.stores.fsEntry.getEntryByPath(
+                `/${owner.username}`,
+            ))!.id;
+            await writeFile(
+                owner.id,
+                `/${owner.username}/index.html`,
+                Buffer.from('<html>gated</html>'),
+                'text/html',
+            );
+        } else if (opts.root === 'foreign') {
+            const other = await makeUserWithHome();
+            rootDirId = (await server.stores.fsEntry.getEntryByPath(
+                `/${other.username}`,
+            ))!.id;
+        }
+        await server.stores.subdomain.create({
+            userId: owner.id,
+            subdomain: sub,
+            ...(rootDirId !== undefined ? { rootDirId } : {}),
+        });
+        await server.clients.db.write(
+            'INSERT INTO `apps` (`uid`, `name`, `title`, `index_url`, `owner_user_id`, `is_private`) VALUES (?, ?, ?, ?, ?, ?)',
+            [
+                `app-${uuidv4()}`,
+                sub,
+                sub,
+                `http://${sub}.app.puter.localhost/`,
+                owner.id,
+                1,
+            ],
+        );
+        if (opts.suspended) {
+            await server.stores.user.update(owner.id, { suspended: 1 });
+        }
+        return sub;
+    };
+
+    const visit = async (
+        sub: string,
+        host: 'site' | 'app',
+        identity: 'none' | 'cookie',
+    ) => {
+        const mw = buildMiddleware({ cookie_name: 'puter_session' });
+        const { res, out } = makeRes();
+        await mw(
+            makeReq({
+                hostname: `${sub}.${host}.puter.localhost`,
+                path: '/index.html',
+                cookies: identity === 'cookie' ? { puter_session: token } : {},
+            }),
+            res,
+            vi.fn(),
+        );
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        return out;
+    };
+
+    const decide = (out: CapturedRes, sub: string) => {
+        if (out.redirected) {
+            return `302 ${out.redirected.url.replaceAll(sub, 'SUB')}`;
+        }
+        const body = Buffer.isBuffer(out.body)
+            ? out.body.toString()
+            : String(out.body);
+        if (body.includes('Sign in required'))
+            return `${out.statusCode} sign-in`;
+        if (body.includes('Subdomain or site is not pointing')) {
+            return `${out.statusCode} site-404`;
+        }
+        return `${out.statusCode} ${body}`;
+    };
+
+    it.each([
+        // A suspended owner hides the app entirely, whoever asks.
+        [
+            { suspended: true, root: 'home' },
+            'app',
+            'cookie',
+            true,
+            '404 Subdomain not found',
+        ],
+        [
+            { suspended: true, root: 'home' },
+            'app',
+            'none',
+            false,
+            '404 Subdomain not found',
+        ],
+        [
+            { suspended: true, root: 'home' },
+            'site',
+            'cookie',
+            true,
+            '404 Subdomain not found',
+        ],
+        // The public host always bounces to the private one first.
+        [
+            { root: 'home' },
+            'site',
+            'cookie',
+            true,
+            '302 http://SUB.app.puter.localhost/index.html',
+        ],
+        [
+            { root: 'home' },
+            'site',
+            'none',
+            false,
+            '302 http://SUB.app.puter.localhost/index.html',
+        ],
+        [{ root: 'home' }, 'app', 'none', true, '200 sign-in'],
+        [
+            { root: 'home' },
+            'app',
+            'cookie',
+            false,
+            '302 https://puter.localhost/app/app-center/?item=SUB',
+        ],
+        [{ root: 'home' }, 'app', 'cookie', true, '200 <html>gated</html>'],
+        // Root checks run only after entitlement passes.
+        [
+            { root: 'none' },
+            'app',
+            'cookie',
+            false,
+            '302 https://puter.localhost/app/app-center/?item=SUB',
+        ],
+        [{ root: 'none' }, 'app', 'cookie', true, '404 site-404'],
+        [{ root: 'foreign' }, 'app', 'none', false, '200 sign-in'],
+        [{ root: 'foreign' }, 'app', 'cookie', true, '404 site-404'],
+    ] as const)(
+        '%o on %s host, identity %s, entitled %s → %s',
+        async (site, host, identity, allow, expected) => {
+            const sub = await makePrivateSite(site);
+            entitled = allow;
+            try {
+                expect(decide(await visit(sub, host, identity), sub)).toBe(
+                    expected,
+                );
+            } finally {
+                entitled = false;
+            }
+        },
+    );
+});

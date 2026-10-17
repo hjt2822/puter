@@ -1,0 +1,1248 @@
+/*
+ * Copyright (C) 2024-present Puter Technologies Inc.
+ *
+ * This file is part of Puter.
+ *
+ * Puter is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published
+ * by the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+import { actorOwnsRow, requireContextActor } from '../../core/actor.js';
+import { HttpError } from '../../core/http/HttpError.js';
+import {
+    DEFAULT_FREE_SUBSCRIPTION,
+    DEFAULT_TEMP_SUBSCRIPTION,
+} from '../../services/metering/consts.js';
+import {
+    isAppIconEndpointUrl,
+    isRawBase64ImageString,
+    normalizeRawBase64ImageString,
+    validateIconDataUrl,
+} from '../../util/appIcon.js';
+import { toAppReadView } from '../../util/appView.js';
+import { isUniqueViolation } from '../../util/dbError.js';
+import {
+    buildHostedSubdomainIndexUrlCandidates,
+    extractPuterHostedSubdomain,
+} from '../../util/hostedAppBacking.js';
+import {
+    normalizeLimit,
+    normalizeOffset,
+    openCursor,
+    sealCursor,
+} from '../../util/pagination.js';
+import {
+    validateArrayOfStrings,
+    validateBool,
+    validateJsonObject,
+    validateString,
+    validateUrl,
+    WEB_AND_EXTENSION_PROTOCOLS,
+} from '../../util/validation.js';
+import { PuterDriver } from '../types.js';
+import { CRUD_CONCURRENT } from '../util/crudLimits.js';
+
+/**
+ * Shared by every method that writes an app row. Each one also allocates or
+ * releases an app directory and a subdomain, so the ceiling is set by what the
+ * write costs rather than by the row itself.
+ *
+ * Not only by what a developer does by hand, though — app creation is also a
+ * programmatic step: deploying a worker creates an app to sandbox it under, so
+ * a script that provisions several in a row is ordinary rather than abusive,
+ * and a ceiling in the tens turns that into a partial deploy.
+ *
+ * @type {import('../meta.js').DriverRateLimitSpec}
+ */
+const APP_WRITE_LIMIT = {
+    limit: 240,
+    window: 60_000,
+    bySubscription: {
+        [DEFAULT_FREE_SUBSCRIPTION]: 120,
+        [DEFAULT_TEMP_SUBSCRIPTION]: 60,
+    },
+};
+
+const APP_NAME_REGEX = /^[a-zA-Z0-9_-]+$/;
+const APP_NAME_MAX_LEN = 100;
+const APP_TITLE_MAX_LEN = 100;
+const APP_DESCRIPTION_MAX_LEN = 7000;
+const APP_METADATA_MAX_BYTES = 16 * 1024;
+const APP_FILETYPE_ASSOCIATIONS_MAX = 200;
+// `type` in `app_filetype_association` is varchar(60).
+const APP_FILETYPE_MAX_LEN = 60;
+
+// Index-url uniqueness exemptions: legacy "coming soon" placeholder apps
+// that intentionally share the same hosted index_url. Anything starting
+// with one of these strings skips the uniqueness check so multiple rows
+// can keep that placeholder URL without merging into each other.
+const INDEX_URL_UNIQUENESS_EXEMPTION_CANDIDATES = [
+    'https://dev-center.puter.com/coming-soon',
+];
+
+// Sentinel host for builtin apps. The GUI rewrites index_urls on this
+// host to `<gui origin>/builtin/<name>` (see launchApp.js), so rows
+// carrying it are reserved for migration-seeded builtins — a user app
+// claiming it would load its code same-origin with the desktop.
+const BUILTIN_APPS_HOST = 'builtins.namespaces.puter.com';
+
+// Canonical-uid alias namespace. When a user-created app is merged into
+// an existing origin-bootstrap row, the source uid is mapped to the
+// canonical (kept) uid so any client that still holds the old uid keeps
+// resolving to the joined row. TTL keeps abandoned entries from
+// accumulating indefinitely.
+const APP_UID_ALIAS_KEY_PREFIX = 'app:canonicalUidAlias';
+const APP_UID_ALIAS_REVERSE_KEY_PREFIX = 'app:canonicalUidAliasReverse';
+const APP_UID_ALIAS_TTL_SECONDS = 60 * 60 * 24 * 90;
+
+const hasIndexUrlUniquenessExemption = (candidates) => {
+    for (const candidate of candidates) {
+        if (
+            INDEX_URL_UNIQUENESS_EXEMPTION_CANDIDATES.find((exception) =>
+                candidate.startsWith(exception),
+            )
+        ) {
+            return true;
+        }
+    }
+    return false;
+};
+
+/**
+ * Driver exposing the `puter-apps` interface.
+ *
+ * Wraps AppStore with input validation + permission checks. Methods follow the
+ * `crud-q` shape client SDKs expect: create, read, select, update, upsert,
+ * delete
+ *
+ * Permission model:
+ *
+ * - Owner (apps.owner_user_id === actor.user.id) has full access
+ * - App actor matching app_owner has full access
+ * - `system:es:write-all-owners` grants blanket write
+ * - `app:uid#<app_uid>:access` grants protected-app access
+ */
+export class AppDriver extends PuterDriver {
+    driverInterface = 'puter-apps';
+    // `es:app` is the wire name puter-js sends in `/drivers/call`'s `driver`
+    // field. Origin/main registered the service under that exact key; keep
+    // it so existing clients + hardcoded permission keys (`service:es\Capp:…`)
+    // resolve without a translation layer.
+    driverName = 'es:app';
+    isDefault = true;
+
+    // Inherited from the pre-v2 `temp.es` / `user.es` policies that lived
+    // on permission grants in `hardcoded-permissions.js`. Re-expressed
+    // here as subscription-tier overrides — the metering service maps
+    // anonymous users to `temp_free` and registered users to `user_free`.
+    /** @type {import('../meta.js').DriverRateLimitConfig} */
+    rateLimit = {
+        default: {
+            limit: 100,
+            window: 10_000,
+            bySubscription: {
+                [DEFAULT_FREE_SUBSCRIPTION]: 100,
+                [DEFAULT_TEMP_SUBSCRIPTION]: 50,
+            },
+        },
+        methods: {
+            // The blanket envelope above is sized for `read`/`select`,
+            // which desktop boot calls repeatedly. Writing an app row also
+            // allocates an app directory and a subdomain, so it does not
+            // belong on a read-shaped budget.
+            create: APP_WRITE_LIMIT,
+            update: APP_WRITE_LIMIT,
+            upsert: APP_WRITE_LIMIT,
+            delete: APP_WRITE_LIMIT,
+            // Answers "does this name exist?" for any name, so it is a
+            // name-enumeration oracle regardless of how cheap it is.
+            isNameAvailable: {
+                limit: 60,
+                window: 60_000,
+                bySubscription: {
+                    [DEFAULT_FREE_SUBSCRIPTION]: 30,
+                    [DEFAULT_TEMP_SUBSCRIPTION]: 10,
+                },
+            },
+        },
+    };
+
+    concurrent = CRUD_CONCURRENT;
+
+    get appStore() {
+        return this.stores.app;
+    }
+    get permService() {
+        return this.services.permission;
+    }
+
+    // -- Driver methods -----------------------------------------------
+
+    async create({ object, options } = {}) {
+        if (!object || typeof object !== 'object') {
+            throw new HttpError(400, 'Missing or invalid `object`', {
+                legacyCode: 'bad_request',
+            });
+        }
+        const actor = requireContextActor();
+        this.#requireUserOrAppActor(actor);
+
+        const fields = await this.#validateInput(object, { isCreate: true });
+
+        // Puter-hosted index_url handling. Order matches v1 AppES:
+        //   1. Refuse if the index_url's subdomain isn't owned by this user.
+        //   2. Try to merge into an existing row with the same index_url
+        //      (origin-bootstrap takeover, or claiming an unowned row).
+        //   3. Otherwise enforce index_url uniqueness so two rows can't
+        //      share a hosted URL.
+        await this.#ensurePuterSiteSubdomainIsOwned(
+            fields.index_url,
+            actor.user,
+        );
+        const joinedApp = await this.#maybeJoinOwnedHostedIndexUrlApp({
+            object,
+            options,
+            user: actor.user,
+        });
+        if (joinedApp) {
+            return joinedApp;
+        }
+        await this.#ensureIndexUrlNotAlreadyInUse({
+            indexUrl: fields.index_url,
+        });
+
+        // Name conflict handling
+        if (await this.appStore.existsByName(fields.name)) {
+            if (options?.dedupe_name) {
+                let candidate;
+                let i = 0;
+                do {
+                    const randString = Math.random().toString(36).slice(2, 6);
+                    candidate = `${fields.name}-${randString}`;
+
+                    if (i >= 3)
+                        throw new HttpError(400, 'Failed to dedupe app name', {
+                            legacyCode: 'app_name_already_in_use',
+                        });
+                    i++;
+                } while (await this.appStore.existsByName(candidate));
+                fields.name = candidate;
+            } else {
+                throw new HttpError(
+                    400,
+                    'An app with this name already exists',
+                    { legacyCode: 'app_name_already_in_use' },
+                );
+            }
+        }
+
+        const filetypes = fields.filetype_associations;
+        delete fields.filetype_associations;
+
+        // Ownership is passed as a separate, privileged arg — the store
+        // filters `owner_user_id` / `app_owner` out of `fields` (both are
+        // in READ_ONLY_COLUMNS), so the only way to stamp ownership is
+        // through this explicit contract. Keeps any future caller that
+        // forwards raw input into `create` from spoofing the owner.
+        // The name check above is a check-then-insert, so a name claimed in
+        // between only gets caught by the unique index. Report it the way the
+        // check reports it instead of letting the driver error escape as a 500.
+        let app;
+        try {
+            app = await this.appStore.create(fields, {
+                ownerUserId: actor.user.id,
+                appOwner: actor.effectiveApp?.id ?? null,
+            });
+        } catch (err) {
+            if (!isUniqueViolation(err)) throw err;
+            throw new HttpError(400, 'An app with this name already exists', {
+                legacyCode: 'app_name_already_in_use',
+            });
+        }
+        if (filetypes)
+            await this.appStore.setFiletypeAssociations(app.id, filetypes);
+
+        this.#emitAppChanged({ app, action: 'created' });
+
+        return this.#toClient(app, actor);
+    }
+
+    async read({ uid, id, params = {}, ...rest } = {}) {
+        const actor = requireContextActor();
+        const app = await this.#resolve({ uid, id });
+        if (!app)
+            throw new HttpError(404, 'App not found', {
+                legacyCode: 'not_found',
+            });
+
+        await this.#checkReadAccess(app, actor);
+
+        // puter-js's `puter.apps.get(name, opts)` packages opts under `params`
+        // (see `make_driver_method` / `Apps.get`), so stats options live at
+        // `args.params.stats_period` rather than the top level. Accept both
+        // shapes for forward-compat with anything that still flattens.
+        const stats_period = params.stats_period ?? rest.stats_period;
+        const stats_grouping = params.stats_grouping ?? rest.stats_grouping;
+
+        const needsStats =
+            params.stats !== false && (stats_period || stats_grouping);
+
+        // Detailed period/grouping is per-app only — skip the batch cache
+        // and go straight to the live query. The default (no options) goes
+        // through the cached batched path.
+        const hasDetailed = Boolean(stats_period || stats_grouping);
+        const stats = !needsStats
+            ? undefined
+            : hasDetailed
+              ? await this.appStore.getAppStatsDetailed(app.uid, {
+                    period: stats_period,
+                    grouping: stats_grouping,
+                    createdAt: app.created_at ?? app.timestamp,
+                })
+              : (await this.appStore.getAppsStats([app.uid])).get(app.uid);
+
+        return this.#toClient(app, actor, { ...params, stats });
+    }
+
+    /**
+     * Paged app listing. Unlike `/query/app`, which answers only for apps named
+     * by the caller and so must not confirm ones it may not see, this is the
+     * listing surface a launcher reads: `protected` apps are filtered by the
+     * permission check below, and everything else is listable by design. Narrow
+     * it with `predicate: ['user-can-edit']` to the caller's own.
+     */
+    async select(args = {}) {
+        const { predicate, params = {} } = args;
+        const actor = requireContextActor();
+        this.#requireUserOrAppActor(actor);
+
+        const limit = normalizeLimit(args.limit, { cap: 5000 }) ?? 500;
+        const offset = normalizeOffset(args.offset);
+        const hasCursor = Object.prototype.hasOwnProperty.call(args, 'cursor');
+        const payload = openCursor(args.cursor, this.config.jwt_secret_v2);
+        if (payload && offset !== undefined) {
+            throw new HttpError(400, 'cursor and offset cannot be combined', {
+                legacyCode: 'bad_request',
+            });
+        }
+        const includeTotal = args.includeTotal === true;
+        const paginated = hasCursor || offset !== undefined || includeTotal;
+
+        const filters = {};
+        // predicate: ['user-can-edit'] → scope to owner
+        const ownerScoped =
+            Array.isArray(predicate) && predicate[0] === 'user-can-edit';
+        if (ownerScoped) {
+            filters.ownerUserId = actor.user.id;
+        }
+
+        let apps = await this.appStore.list({
+            ...filters,
+            limit: paginated ? limit + 1 : limit,
+            offset,
+            afterId: payload?.id !== undefined ? Number(payload.id) : undefined,
+        });
+
+        let cursor;
+        if (paginated && apps.length > limit) {
+            apps = apps.slice(0, limit);
+            // The cursor tracks the last fetched row, not the last visible
+            // one, so rows hidden by the permission filter below aren't
+            // re-scanned on the next page.
+            cursor = sealCursor(
+                { id: Number(apps[apps.length - 1].id) },
+                this.config.jwt_secret_v2,
+            );
+        }
+
+        // Protected apps are filtered by one batched grant check; stats and
+        // the shared views are each one batched lookup across the page.
+        const visible = await this.services.app.filterReadable(apps, actor);
+        const [statsByUid, views] = await Promise.all([
+            this.appStore.getAppsStats(visible.map((a) => a.uid)),
+            this.services.app.views(visible, actor),
+        ]);
+        const items = visible.map((app, i) =>
+            toAppReadView(app, views[i], {
+                viewer: actor.user,
+                stats: statsByUid.get(app.uid),
+                iconSize: params.icon_size,
+            }),
+        );
+        if (!paginated) return items;
+
+        let total;
+        if (includeTotal) {
+            total = ownerScoped
+                ? await this.appStore.count({ ownerUserId: actor.user.id })
+                : await this.appStore.count({
+                      visibleToUserId: actor.user?.id ?? null,
+                  });
+        }
+
+        return {
+            items,
+            ...(cursor ? { cursor } : {}),
+            ...(total !== undefined ? { total } : {}),
+        };
+    }
+
+    async update({ uid, id, object } = {}) {
+        if (!object || typeof object !== 'object') {
+            throw new HttpError(400, 'Missing or invalid `object`', {
+                legacyCode: 'bad_request',
+            });
+        }
+        const actor = requireContextActor();
+        this.#requireUserOrAppActor(actor);
+
+        const app = await this.#resolve({ uid, id });
+        if (!app)
+            throw new HttpError(404, 'App not found', {
+                legacyCode: 'not_found',
+            });
+
+        await this.#checkWriteAccess(app, actor);
+
+        const fields = await this.#validateInput(object, {
+            isCreate: false,
+            existing: app,
+        });
+
+        // Puter-hosted index_url handling on update — same flow as create
+        // but only when the index_url is actually changing. Self-app is
+        // excluded from the conflict search via `excludeAppId`.
+        if (fields.index_url && fields.index_url !== app.index_url) {
+            await this.#ensurePuterSiteSubdomainIsOwned(
+                fields.index_url,
+                actor.user,
+            );
+            const joinedApp = await this.#maybeJoinOwnedHostedIndexUrlApp({
+                object,
+                options: undefined,
+                user: actor.user,
+                sourceAppUid: app.uid,
+                excludeAppId: app.id,
+            });
+            if (joinedApp) {
+                return joinedApp;
+            }
+            await this.#ensureIndexUrlNotAlreadyInUse({
+                indexUrl: fields.index_url,
+                excludeAppId: app.id,
+            });
+            if (
+                app.is_private &&
+                (await this.services.auth.originHeldByOtherUser(
+                    fields.index_url,
+                    app.owner_user_id,
+                ))
+            ) {
+                throw new HttpError(
+                    400,
+                    "A private app can't use an index_url whose origin belongs to another user's app or site",
+                    {
+                        legacyCode: 'app_index_url_already_in_use',
+                        fields: { index_url: fields.index_url },
+                    },
+                );
+            }
+        }
+
+        // Name conflict check (only if name is changing)
+        if (fields.name && fields.name !== app.name) {
+            if (await this.appStore.existsByName(fields.name)) {
+                throw new HttpError(
+                    409,
+                    'An app with this name already exists',
+                    { legacyCode: 'conflict' },
+                );
+            }
+        }
+
+        const filetypes = fields.filetype_associations;
+        delete fields.filetype_associations;
+
+        let updated;
+        try {
+            updated = await this.appStore.update(app.id, fields);
+        } catch (err) {
+            if (!isUniqueViolation(err)) throw err;
+            throw new HttpError(409, 'An app with this name already exists', {
+                legacyCode: 'conflict',
+            });
+        }
+        if (filetypes !== undefined) {
+            await this.appStore.setFiletypeAssociations(app.id, filetypes);
+        }
+
+        this.#emitAppChanged({ app: updated, old_app: app, action: 'updated' });
+        if (fields.name && fields.name !== app.name) {
+            this.#emitAppRename({
+                app: updated,
+                old_name: app.name,
+                new_name: fields.name,
+            });
+        }
+
+        return this.#toClient(updated, actor);
+    }
+
+    async upsert({ uid, id, object, options } = {}) {
+        const existing = uid || id ? await this.#resolve({ uid, id }) : null;
+        if (existing) return this.update({ uid: existing.uid, object });
+        return this.create({ object, options });
+    }
+
+    async delete({ uid, id } = {}) {
+        const actor = requireContextActor();
+        this.#requireUserOrAppActor(actor);
+
+        const app = await this.#resolve({ uid, id });
+        if (!app)
+            throw new HttpError(404, 'App not found', {
+                legacyCode: 'not_found',
+            });
+
+        if (app.protected) {
+            throw new HttpError(403, 'Cannot delete a protected app', {
+                legacyCode: 'forbidden',
+            });
+        }
+
+        await this.#checkWriteAccess(app, actor);
+        await this.appStore.delete(app.id);
+
+        this.#emitAppChanged({ app: null, old_app: app, action: 'deleted' });
+
+        return { success: true, uid: app.uid };
+    }
+
+    // -- Event emission -----------------------------------------------
+    //
+    // Consumers (AppIconService, future cf-file-cache port, billing
+    // event handlers) key off `app_uid`; the full `app` / `old_app`
+    // payload lets cache invalidators compute exact origins.
+
+    #emitAppChanged({ app, old_app, action }) {
+        const app_uid = app?.uid ?? old_app?.uid;
+        if (!app_uid) return;
+        try {
+            this.clients.event.emit(
+                'app.changed',
+                { app_uid, app, old_app, action },
+                {},
+            );
+        } catch {
+            // Non-critical.
+        }
+    }
+
+    #emitAppRename({ app, old_name, new_name }) {
+        try {
+            this.clients.event.emit(
+                'app.rename',
+                {
+                    app_uid: app.uid,
+                    old_name,
+                    new_name,
+                    app,
+                },
+                {},
+            );
+        } catch {
+            // Non-critical.
+        }
+    }
+
+    // -- Public helpers (used by AppController) ----------------------
+
+    /** Check if an app name is available. Mirrors the REST endpoint behaviour. */
+    async isNameAvailable(name) {
+        validateString(name, {
+            key: 'name',
+            maxLen: APP_NAME_MAX_LEN,
+            regex: APP_NAME_REGEX,
+        });
+        return !(await this.appStore.existsByName(name));
+    }
+
+    // -- Validation ---------------------------------------------------
+
+    async #validateInput(object, { isCreate, existing }) {
+        const out = {};
+
+        if (isCreate || object.name !== undefined) {
+            out.name = validateString(object.name, {
+                key: 'name',
+                maxLen: APP_NAME_MAX_LEN,
+                regex: APP_NAME_REGEX,
+                required: isCreate,
+            });
+        }
+        if (isCreate || object.title !== undefined) {
+            out.title = validateString(object.title, {
+                key: 'title',
+                maxLen: APP_TITLE_MAX_LEN,
+                required: isCreate,
+            });
+        }
+        if (object.description !== undefined) {
+            out.description = validateString(object.description, {
+                key: 'description',
+                maxLen: APP_DESCRIPTION_MAX_LEN,
+                required: false,
+                allowEmpty: true,
+            });
+        }
+        if (isCreate || object.index_url !== undefined) {
+            out.index_url = validateUrl(object.index_url, {
+                key: 'index_url',
+                maxLen: 3000,
+                required: isCreate,
+                protocols: WEB_AND_EXTENSION_PROTOCOLS,
+            });
+            // Only enforce on new/changed values so rows that already
+            // carry a reserved host (migration-seeded builtins) can still
+            // have their other fields updated.
+            if (
+                out.index_url !== undefined &&
+                out.index_url !== existing?.index_url
+            ) {
+                this.#assertIndexUrlHostAllowed(out.index_url);
+            }
+        }
+        if (object.icon !== undefined) {
+            validateString(object.icon, {
+                key: 'icon',
+                maxLen: 5 * 1024 * 1024,
+                required: false,
+                allowEmpty: true,
+            });
+            let iconStr = object.icon;
+            // Accepted shapes (mirrors v1's `image-base64` proptype so
+            // puter-js callers keep working):
+            //   1. Empty string — unset
+            //   2. Raw base64 (no prefix) of a real image — normalized to a
+            //      data URL carrying the sniffed MIME
+            //   3. `data:image/<mime>;base64,<image>` with an allow-listed
+            //      MIME that matches the decoded payload
+            //   4. `/app-icon/<uid>` endpoint URL (relative, or absolute
+            //      on a host we control)
+            // Anything else (including arbitrary http(s) URLs) is rejected:
+            // the unauthenticated GET /app-icon/:uid would otherwise 302
+            // there and turn this endpoint into a Puter-branded open
+            // redirector (cached publicly for 15 min).
+            if (iconStr && iconStr.length > 0) {
+                // Raw base64 → wrap as data URL (v1 parity)
+                if (isRawBase64ImageString(iconStr)) {
+                    iconStr = normalizeRawBase64ImageString(iconStr);
+                }
+                if (iconStr.startsWith('data:')) {
+                    // Validates the whole URL, payload included — a MIME
+                    // prefix check alone let arbitrary text (quotes, tags)
+                    // through, which a Dev Center template then interpolated
+                    // into markup.
+                    const verdict = validateIconDataUrl(iconStr);
+                    if (!verdict.ok) {
+                        throw new HttpError(400, `\`icon\` ${verdict.reason}`, {
+                            legacyCode: 'bad_request',
+                        });
+                    }
+                    // Store the canonical form, not the caller's spelling.
+                    iconStr = verdict.normalized;
+                } else if (!isAppIconEndpointUrl(iconStr, this.config)) {
+                    throw new HttpError(
+                        400,
+                        '`icon` must be base64, a data:image/… URL, or an app-icon endpoint URL',
+                        { legacyCode: 'bad_request' },
+                    );
+                }
+            }
+            out.icon = iconStr;
+        }
+        if (object.maximize_on_start !== undefined) {
+            out.maximize_on_start = validateBool(object.maximize_on_start, {
+                key: 'maximize_on_start',
+            })
+                ? 1
+                : 0;
+        }
+        if (object.background !== undefined) {
+            out.background = validateBool(object.background, {
+                key: 'background',
+            })
+                ? 1
+                : 0;
+        }
+        if (object.feedback_enabled !== undefined) {
+            out.feedback_enabled = validateBool(object.feedback_enabled, {
+                key: 'feedback_enabled',
+            })
+                ? 1
+                : 0;
+        }
+        if (object.metadata !== undefined) {
+            const meta = validateJsonObject(object.metadata, {
+                key: 'metadata',
+                maxBytes: APP_METADATA_MAX_BYTES,
+            });
+            out.metadata = JSON.stringify(meta);
+        }
+        if (object.filetype_associations) {
+            out.filetype_associations = validateArrayOfStrings(
+                object.filetype_associations,
+                {
+                    key: 'filetype_associations',
+                    maxItems: APP_FILETYPE_ASSOCIATIONS_MAX,
+                    maxItemLen: APP_FILETYPE_MAX_LEN,
+                },
+            );
+        }
+
+        return out;
+    }
+
+    /**
+     * App iframes run with `allow-same-origin allow-scripts`, so an index_url
+     * loading from the GUI host would execute third-party code same-origin with
+     * the desktop — a full sandbox escape. The API host is reserved for the
+     * same reason, and the builtin sentinel host is rewritten by the GUI to
+     * `<gui origin>/builtin/…` (see BUILTIN_APPS_HOST above). Host comparison
+     * (rather than full origin) deliberately also catches scheme/port variants
+     * of these hosts.
+     */
+    #assertIndexUrlHostAllowed(indexUrl) {
+        let hostname;
+        try {
+            hostname = new URL(indexUrl).hostname;
+        } catch {
+            // Unparseable values are rejected by `validateUrl` upstream.
+            return;
+        }
+
+        const config = this.config ?? {};
+        const reserved = new Set([BUILTIN_APPS_HOST]);
+        // `origin`/`api_base_url` are computed at boot from `domain`; the
+        // domain-based fallbacks cover callers (tests, embedders) that
+        // construct a server without that normalization step.
+        const candidates = [config.origin, config.api_base_url];
+        if (config.domain) {
+            candidates.push(
+                `http://${config.domain}`,
+                `http://api.${config.domain}`,
+            );
+        }
+        for (const candidate of candidates) {
+            if (!candidate) continue;
+            try {
+                reserved.add(new URL(candidate).hostname);
+            } catch {
+                // Malformed config value — nothing to reserve from it.
+            }
+        }
+
+        if (reserved.has(hostname)) {
+            throw new HttpError(
+                400,
+                '`index_url` cannot point at a Puter system host',
+                { legacyCode: 'bad_request' },
+            );
+        }
+    }
+
+    // -- Permission checks --------------------------------------------
+
+    #requireUserOrAppActor(actor) {
+        if (!actor.user)
+            throw new HttpError(403, 'User actor required', {
+                legacyCode: 'forbidden',
+            });
+    }
+
+    async #resolve({ uid, id }) {
+        if (uid) return this.#getByUidWithAlias(uid);
+        if (id?.uid) return this.#getByUidWithAlias(id.uid);
+        if (id?.name) return this.appStore.getByName(id.name);
+        if (id?.id) return this.appStore.getById(id.id);
+        if (typeof id === 'number') return this.appStore.getById(id);
+        if (typeof id === 'string') return this.#getByUidWithAlias(id);
+        return null;
+    }
+
+    /**
+     * Uid lookup with canonical-uid alias fallback. When two app rows have been
+     * merged (see {@link #maybeJoinOwnedHostedIndexUrlApp}), the source uid is
+     * recorded as an alias to the canonical uid. A direct uid miss therefore
+     * re-queries with the canonical uid so any client still holding the old uid
+     * keeps resolving to the joined row. Mirrors v1 AppES's `#read` alias
+     * plumbing.
+     *
+     * The alias is an uncached system KV read, so it waits for a direct miss.
+     */
+    async #getByUidWithAlias(uid) {
+        const direct = await this.appStore.getByUid(uid);
+        if (direct) return direct;
+        const canonicalUid = await this.#readCanonicalAppUidAlias(uid);
+        if (
+            typeof canonicalUid === 'string' &&
+            canonicalUid &&
+            canonicalUid !== uid
+        ) {
+            return this.appStore.getByUid(canonicalUid);
+        }
+        return null;
+    }
+
+    async #checkReadAccess(app, actor) {
+        const [readable] = await this.services.app.filterReadable([app], actor);
+        if (readable) return;
+        throw new HttpError(403, 'Access denied', { legacyCode: 'forbidden' });
+    }
+
+    async #checkWriteAccess(app, actor) {
+        const owns = actorOwnsRow(actor, {
+            ownerUserId: app.owner_user_id,
+            appOwnerId: app.app_owner,
+        });
+        if (owns) return;
+        if (await this.permService.check(actor, 'system:es:write-all-owners')) {
+            return;
+        }
+        throw new HttpError(403, 'Access denied', { legacyCode: 'forbidden' });
+    }
+
+    // -- Serialization ------------------------------------------------
+
+    async #toClient(app, actor, params = {}) {
+        if (!app) return null;
+        const [clientView] = await this.services.app.views([app], actor);
+        return toAppReadView(app, clientView, {
+            viewer: actor?.user,
+            stats: params.stats,
+            iconSize: params.icon_size,
+        });
+    }
+
+    #extractPuterHostedSubdomain(indexUrl) {
+        return extractPuterHostedSubdomain(indexUrl, this.config);
+    }
+
+    #isPuterHostedIndexUrl(indexUrl) {
+        return !!this.#extractPuterHostedSubdomain(indexUrl);
+    }
+
+    /**
+     * Read normalized origin-alias groups from config. Each group is a deduped
+     * list of lowercased, trimmed bare hosts. Malformed entries are skipped so
+     * a bad config row doesn't brick app create/update for everyone else.
+     */
+    #getOriginAliasGroups() {
+        const config = this.config ?? {};
+        const raw = config.app_origin_aliases;
+        if (!Array.isArray(raw)) return [];
+
+        const groups = [];
+        for (const group of raw) {
+            if (!Array.isArray(group)) continue;
+            const normalized = [
+                ...new Set(
+                    group
+                        .filter((h) => typeof h === 'string')
+                        .map((h) => h.trim().toLowerCase())
+                        .filter((h) => h.length > 0),
+                ),
+            ];
+            if (normalized.length > 0) groups.push(normalized);
+        }
+        return groups;
+    }
+
+    /**
+     * Return the alias group containing this index_url's host, or null when the
+     * host isn't claimed by any group.
+     */
+    #findOriginAliasGroupForIndexUrl(indexUrl) {
+        if (typeof indexUrl !== 'string' || !indexUrl) return null;
+        let hostname;
+        try {
+            hostname = new URL(indexUrl).hostname.toLowerCase();
+        } catch {
+            return null;
+        }
+        for (const group of this.#getOriginAliasGroups()) {
+            if (group.includes(hostname)) return group;
+        }
+        return null;
+    }
+
+    /**
+     * Generate the set of equivalent index_url strings that should collide with
+     * a given input. We only collapse trailing-slash and `/index.html` variants
+     * — the underlying `apps.index_url` column is matched by exact string, so
+     * anything not in this list won't be deduped. Mirrors v1 AppES exactly.
+     */
+    #buildEquivalentIndexUrlCandidates(indexUrl) {
+        if (typeof indexUrl !== 'string' || !indexUrl.trim()) {
+            return [];
+        }
+
+        try {
+            const parsed = new URL(indexUrl);
+            const origin = `${parsed.protocol}//${parsed.host.toLowerCase()}`;
+            const pathname = parsed.pathname || '/';
+
+            const candidates = new Set();
+            if (pathname === '/' || pathname.toLowerCase() === '/index.html') {
+                candidates.add(origin);
+                candidates.add(`${origin}/`);
+                candidates.add(`${origin}/index.html`);
+            } else {
+                const normalizedPath = pathname.endsWith('/')
+                    ? pathname.slice(0, -1)
+                    : pathname;
+                candidates.add(`${origin}${normalizedPath}`);
+                candidates.add(`${origin}${normalizedPath}/`);
+            }
+
+            return [...candidates];
+        } catch {
+            return [indexUrl.trim()];
+        }
+    }
+
+    async #findIndexUrlConflictRow({ indexUrl, excludeAppId } = {}) {
+        const aliasGroup = this.#findOriginAliasGroupForIndexUrl(indexUrl);
+        if (!this.#isPuterHostedIndexUrl(indexUrl) && !aliasGroup) return null;
+
+        const candidates = new Set(
+            this.#buildEquivalentIndexUrlCandidates(indexUrl),
+        );
+
+        // The same subdomain on any other hosting domain is the same site.
+        const hostedSubdomain = this.#extractPuterHostedSubdomain(indexUrl);
+        if (hostedSubdomain) {
+            for (const candidate of buildHostedSubdomainIndexUrlCandidates(
+                hostedSubdomain,
+                this.config,
+            )) {
+                candidates.add(candidate);
+            }
+        }
+
+        // For alias-group hosts, treat the group as a host-level reservation:
+        // any row whose index_url is the root URL of any group member counts
+        // as a conflict, so a single app owns the whole group.
+        if (aliasGroup) {
+            for (const host of aliasGroup) {
+                for (const proto of ['https', 'http']) {
+                    const base = `${proto}://${host}`;
+                    candidates.add(base);
+                    candidates.add(`${base}/`);
+                    candidates.add(`${base}/index.html`);
+                }
+            }
+        }
+
+        if (candidates.size === 0) return null;
+        const candidateList = [...candidates];
+        if (hasIndexUrlUniquenessExemption(candidateList)) return null;
+
+        return this.appStore.findByIndexUrlCandidates(candidateList, {
+            excludeAppId,
+        });
+    }
+
+    async #ensureIndexUrlNotAlreadyInUse({ indexUrl, excludeAppId } = {}) {
+        const conflictRow = await this.#findIndexUrlConflictRow({
+            indexUrl,
+            excludeAppId,
+        });
+        if (conflictRow) {
+            throw new HttpError(400, 'App index_url already in use', {
+                legacyCode: 'app_index_url_already_in_use',
+                fields: {
+                    index_url: indexUrl,
+                    app_uid: conflictRow.uid,
+                },
+            });
+        }
+    }
+
+    async #ensurePuterSiteSubdomainIsOwned(indexUrl, user) {
+        if (!user) return;
+        const subdomain = this.#extractPuterHostedSubdomain(indexUrl);
+        if (!subdomain) return;
+
+        let row = await this.stores.subdomain.getBySubdomain(subdomain);
+        if (!row) {
+            // Deploys create the subdomain and immediately point the app
+            // at it, so a replica or peer-cache miss here would wrongly
+            // refuse the owner. Confirm against the primary before failing.
+            row = await this.stores.subdomain.getBySubdomain(subdomain, {
+                primary: true,
+            });
+        }
+        if (!row || row.user_id !== user.id) {
+            throw new HttpError(400, 'Subdomain not owned by user', {
+                legacyCode: 'subdomain_not_owned',
+                fields: { subdomain },
+            });
+        }
+    }
+
+    /**
+     * Origin-bootstrap detection: rows auto-created when an unknown origin
+     * first needed an app row (no human-supplied metadata). Marker is `name ===
+     * uid && title === uid` and a description starting with "App created from
+     * origin ". Only these rows are eligible for same-owner merging — refusing
+     * to merge arbitrary same-owner apps prevents accidental data loss.
+     */
+    #isOriginBootstrapApp(app) {
+        if (!app || typeof app !== 'object') return false;
+        if (typeof app.uid !== 'string' || !app.uid) return false;
+        if (app.name !== app.uid) return false;
+        if (app.title !== app.uid) return false;
+        if (typeof app.description !== 'string') return false;
+        return app.description.startsWith('App created from origin ');
+    }
+
+    // -- Canonical-uid alias kvstore pair -----------------------------
+    //
+    // After a merge, the source app uid → canonical uid mapping is
+    // kept in `stores.kv` (system namespace) so any client that still
+    // holds the old uid keeps resolving to the joined row via
+    // `#getByUidWithAlias`. Reverse map lets callers enumerate aliases
+    // for a canonical uid (matches v1 plumbing).
+
+    #buildCanonicalAppUidAliasKey(oldAppUid) {
+        return `${APP_UID_ALIAS_KEY_PREFIX}:${oldAppUid}`;
+    }
+
+    #buildCanonicalAppUidAliasReverseKey(canonicalAppUid) {
+        return `${APP_UID_ALIAS_REVERSE_KEY_PREFIX}:${canonicalAppUid}`;
+    }
+
+    #normalizeCanonicalAliasUidList(value) {
+        if (!Array.isArray(value)) return [];
+        const out = [];
+        const seen = new Set();
+        for (const item of value) {
+            if (typeof item !== 'string' || !item) continue;
+            if (seen.has(item)) continue;
+            seen.add(item);
+            out.push(item);
+        }
+        return out;
+    }
+
+    async #readCanonicalAppUidAlias(oldAppUid) {
+        if (typeof oldAppUid !== 'string' || !oldAppUid) return null;
+        const key = this.#buildCanonicalAppUidAliasKey(oldAppUid);
+        try {
+            const { res } = await this.stores.kv.get({ key });
+            if (typeof res === 'string' && res) return res;
+        } catch {
+            // Alias reads are best-effort.
+        }
+        return null;
+    }
+
+    async #writeCanonicalAppUidAlias({ oldAppUid, canonicalAppUid }) {
+        if (typeof oldAppUid !== 'string' || !oldAppUid) return;
+        if (typeof canonicalAppUid !== 'string' || !canonicalAppUid) return;
+        if (oldAppUid === canonicalAppUid) return;
+
+        const key = this.#buildCanonicalAppUidAliasKey(oldAppUid);
+        const reverseKey =
+            this.#buildCanonicalAppUidAliasReverseKey(canonicalAppUid);
+        const expireAt =
+            Math.floor(Date.now() / 1000) + APP_UID_ALIAS_TTL_SECONDS;
+        try {
+            const { res: reverseValue } = await this.stores.kv.get({
+                key: reverseKey,
+            });
+            const reverseAliases =
+                this.#normalizeCanonicalAliasUidList(reverseValue);
+            if (!reverseAliases.includes(oldAppUid)) {
+                reverseAliases.push(oldAppUid);
+            }
+
+            await this.stores.kv.set({
+                key,
+                value: canonicalAppUid,
+                expireAt,
+            });
+            await this.stores.kv.set({
+                key: reverseKey,
+                value: reverseAliases,
+                expireAt,
+            });
+        } catch {
+            // Alias writes are best-effort.
+        }
+    }
+
+    /**
+     * Merge an incoming create/update into an existing app row that already
+     * owns the same puter-hosted or alias-group index_url. Returns the joined
+     * (client-shaped) app on success, or `null` when no merge applied. Throws
+     * `app_index_url_already_in_use` when a conflict exists but cannot be
+     * merged (different owner, or same-owner non-bootstrap).
+     *
+     * `sourceAppUid` is set when called from update — when present and
+     * different from the conflict row's uid, the source row is deleted and an
+     * alias is recorded so old-uid clients keep resolving.
+     */
+    async #maybeJoinOwnedHostedIndexUrlApp({
+        object,
+        options,
+        user,
+        sourceAppUid,
+        excludeAppId,
+    } = {}) {
+        const indexUrl = object?.index_url;
+        // Alias-group hosts (`app_origin_aliases`) get the same merge
+        // treatment as puter-hosted subdomains. Without this, a bootstrap
+        // stub on a custom domain could never be absorbed — and since
+        // `#findIndexUrlConflictRow` *does* honor alias groups, the
+        // uniqueness check below would hard-reject the owner's own
+        // create/update instead of merging into the stub.
+        if (
+            !this.#isPuterHostedIndexUrl(indexUrl) &&
+            !this.#findOriginAliasGroupForIndexUrl(indexUrl)
+        ) {
+            return null;
+        }
+
+        const conflictRow = await this.#findIndexUrlConflictRow({
+            indexUrl,
+            excludeAppId,
+        });
+        if (!conflictRow) return null;
+
+        const conflictOwnerUserId = Number(conflictRow.owner_user_id);
+        if (
+            Number.isInteger(conflictOwnerUserId) &&
+            conflictOwnerUserId > 0 &&
+            conflictOwnerUserId !== user.id
+        ) {
+            throw new HttpError(400, 'App index_url already in use', {
+                legacyCode: 'app_index_url_already_in_use',
+                fields: {
+                    index_url: indexUrl,
+                    app_uid: conflictRow.uid,
+                },
+            });
+        }
+
+        // Unowned (origin-bootstrap) row → claim it before merging.
+        if (
+            !Number.isInteger(conflictOwnerUserId) ||
+            conflictOwnerUserId <= 0
+        ) {
+            await this.appStore.claimOwnership(conflictRow.id, user.id);
+        }
+
+        const appToJoin = await this.appStore.getByUid(conflictRow.uid);
+        if (!appToJoin || appToJoin.uid !== conflictRow.uid) {
+            throw new HttpError(400, 'App index_url already in use', {
+                legacyCode: 'app_index_url_already_in_use',
+                fields: {
+                    index_url: indexUrl,
+                    app_uid: conflictRow.uid,
+                },
+            });
+        }
+        if (appToJoin.owner_user_id !== user.id) {
+            throw new HttpError(400, 'App index_url already in use', {
+                legacyCode: 'app_index_url_already_in_use',
+                fields: {
+                    index_url: indexUrl,
+                    app_uid: conflictRow.uid,
+                },
+            });
+        }
+        if (
+            Number.isInteger(conflictOwnerUserId) &&
+            conflictOwnerUserId === user.id &&
+            !this.#isOriginBootstrapApp(appToJoin)
+        ) {
+            // Prevent merging arbitrary same-owner apps; only allow the
+            // auto-created origin bootstrap row to be absorbed.
+            throw new HttpError(400, 'App index_url already in use', {
+                legacyCode: 'app_index_url_already_in_use',
+                fields: {
+                    index_url: indexUrl,
+                    app_uid: conflictRow.uid,
+                },
+            });
+        }
+
+        // Build the joined input. Pass the original (unvalidated)
+        // object through the recursive `update` so its `#validateInput`
+        // re-runs cleanly — `fields` is post-validation (stringified
+        // metadata, 0/1 bools) and would fail a second pass.
+        const joinedObject = { ...object };
+        const requestedJoinedName =
+            (typeof joinedObject.name === 'string'
+                ? joinedObject.name.trim()
+                : '') || null;
+        const shouldReapplyRequestedNameAfterMerge =
+            !!sourceAppUid && !!requestedJoinedName;
+        // When called from update, defer the rename until after the
+        // source row is deleted — otherwise the rename would collide
+        // with the still-existing source app's name.
+        if (sourceAppUid && joinedObject.name !== undefined) {
+            delete joinedObject.name;
+        }
+
+        let joinedApp = await this.update({
+            uid: appToJoin.uid,
+            object: joinedObject,
+            options,
+        });
+
+        if (sourceAppUid && sourceAppUid !== appToJoin.uid) {
+            await this.#writeCanonicalAppUidAlias({
+                oldAppUid: sourceAppUid,
+                canonicalAppUid: appToJoin.uid,
+            });
+            const sourceApp = await this.appStore.getByUid(sourceAppUid);
+            if (sourceApp) {
+                // The source app's sites and workers follow it into the
+                // joined row; `app_owner` cascades on delete otherwise.
+                await this.stores.subdomain.reassignAppOwner(
+                    sourceApp.id,
+                    appToJoin.id,
+                );
+                await this.appStore.delete(sourceApp.id);
+                this.#emitAppChanged({
+                    app: null,
+                    old_app: sourceApp,
+                    action: 'deleted',
+                });
+            }
+        }
+
+        if (shouldReapplyRequestedNameAfterMerge) {
+            joinedApp = await this.update({
+                uid: appToJoin.uid,
+                object: { name: requestedJoinedName },
+                options,
+            });
+        }
+
+        return joinedApp;
+    }
+}

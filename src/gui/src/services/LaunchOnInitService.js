@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2024 Puter Technologies Inc.
+ * Copyright (C) 2024-present Puter Technologies Inc.
  *
  * This file is part of Puter.
  *
@@ -16,16 +16,16 @@
  * You should have received a copy of the GNU Affero General Public License
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
-import UIAlert from "../UI/UIAlert.js";
+import UIAlert from '../UI/UIAlert.js';
 
-import { Service } from "../definitions.js";
+import { Service } from '../definitions.js';
 
 export class LaunchOnInitService extends Service {
     _construct () {
         this.commands = {
             'window-call': ({ fn_name, args }) => {
                 window[fn_name](...args);
-            }
+            },
         };
     }
     async _init () {
@@ -34,7 +34,6 @@ export class LaunchOnInitService extends Service {
 
         if ( launch_options.on_initialized ) {
             for ( const command of launch_options.on_initialized ) {
-                console.log('running', command)
                 this.run_(command);
             }
         }

@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2024 Puter Technologies Inc.
+ * Copyright (C) 2024-present Puter Technologies Inc.
  *
  * This file is part of Puter.
  *
@@ -29,13 +29,13 @@ export default class ValueHolder {
             get: this.get_.bind(this),
         });
 
-        if (initial_value !== undefined) {
+        if ( initial_value !== undefined ) {
             this.set(initial_value);
         }
     }
 
     static adapt (value) {
-        if (value instanceof ValueHolder) {
+        if ( value instanceof ValueHolder ) {
             return value;
         } else {
             return new ValueHolder(value);

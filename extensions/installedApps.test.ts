@@ -1,0 +1,218 @@
+import type { Request, Response } from 'express';
+import { v4 as uuidv4 } from 'uuid';
+import {
+    afterAll,
+    beforeAll,
+    describe,
+    expect,
+    it,
+    vi,
+} from 'vitest';
+import { runWithContext } from '../src/backend/core/context.ts';
+import { extension } from '../src/backend/extensions.ts';
+import { PuterServer } from '../src/backend/server.ts';
+import { setupTestServer } from '../src/backend/testUtil.ts';
+import { handleInstalledApps } from './installedApps.ts';
+
+interface CapturedResponse {
+    body: unknown;
+}
+
+const makeReq = (query: Record<string, unknown> = {}): Request =>
+    ({ query }) as unknown as Request;
+
+const makeRes = () => {
+    const captured: CapturedResponse = { body: undefined };
+    const res = {
+        json: vi.fn((value: unknown) => {
+            captured.body = value;
+            return res;
+        }),
+    };
+    return { res: res as unknown as Response, captured };
+};
+
+let server: PuterServer;
+
+beforeAll(async () => {
+    server = await setupTestServer();
+});
+
+afterAll(async () => {
+    await server?.shutdown();
+});
+
+const seedUser = async () => {
+    const slug = Math.random().toString(36).slice(2, 8);
+    return server.stores.user.create({
+        username: `iauser_${slug}`,
+        uuid: uuidv4(),
+        password: 'x',
+        email: null,
+    });
+};
+
+const seedApp = async (ownerUserId: number, overrides = {}) => {
+    const slug = Math.random().toString(36).slice(2, 8);
+    return server.stores.app.create(
+        {
+            name: `iaapp_${slug}`,
+            title: `Installed App ${slug}`,
+            index_url: `https://example.com/${slug}`,
+            ...overrides,
+        },
+        { ownerUserId },
+    );
+};
+
+const grantInstalled = async (appId: number, userId: number) => {
+    // Mimic the `flag:app-is-authenticated` perm row the handler joins on.
+    await server.clients.db.write(
+        `INSERT INTO user_to_app_permissions (user_id, app_id, permission, extra) VALUES (?, ?, ?, ?)`,
+        [userId, appId, 'flag:app-is-authenticated', null],
+    );
+};
+
+describe('installedApps extension — handleInstalledApps', () => {
+    it('throws HttpError(400) when orderBy is not in the allowlist', async () => {
+        const user = await seedUser();
+        const { res } = makeRes();
+        await expect(
+            runWithContext(
+                {
+                    actor: {
+                        user: { uuid: user.uuid, id: user.id as number },
+                    },
+                },
+                () =>
+                    handleInstalledApps(
+                        // SQL injection attempt — must be rejected.
+                        makeReq({ orderBy: 'apps.id; DROP TABLE apps;--' }),
+                        res,
+                    ),
+            ),
+        ).rejects.toMatchObject({
+            statusCode: 400,
+            message: expect.stringContaining('Invalid orderBy'),
+        });
+    });
+
+    it('returns an empty list for a user with no installed apps', async () => {
+        const user = await seedUser();
+        const { res, captured } = makeRes();
+
+        await runWithContext(
+            { actor: { user: { uuid: user.uuid, id: user.id as number } } },
+            () => handleInstalledApps(makeReq({}), res),
+        );
+
+        expect(captured.body).toEqual([]);
+    });
+
+    it('returns the caller’s installed apps with an iconUrl field', async () => {
+        const user = await seedUser();
+        const app = await seedApp(user.id as number);
+        await grantInstalled(app!.id as number, user.id as number);
+
+        const { res, captured } = makeRes();
+        await runWithContext(
+            { actor: { user: { uuid: user.uuid, id: user.id as number } } },
+            () => handleInstalledApps(makeReq({}), res),
+        );
+
+        const list = captured.body as Array<Record<string, unknown>>;
+        expect(list).toHaveLength(1);
+        expect(list[0].uid).toBe(app!.uid);
+        expect(list[0].name).toBe(app!.name);
+        expect(list[0].title).toBe(app!.title);
+        // index_url is required so the dashboard can derive a hostname title
+        // for anonymous (app-…) apps.
+        expect(list[0].index_url).toBe(app!.index_url);
+        expect(Object.prototype.hasOwnProperty.call(list[0], 'iconUrl')).toBe(
+            true,
+        );
+        // An owned app is not external, and the raw owner id must not leak.
+        expect(list[0].external).toBe(false);
+        expect(
+            Object.prototype.hasOwnProperty.call(list[0], 'owner_user_id'),
+        ).toBe(false);
+    });
+
+    it('pairs iconUrl with the direct subdomain URL for a generated icon', async () => {
+        const user = await seedUser();
+        // The resize pipeline leaves an http(s) icon column behind, which is
+        // what says the sized PNG is on the icons subdomain.
+        const app = await seedApp(user.id as number, {
+            icon: 'https://api.puter.com/app-icon/x',
+        });
+        await grantInstalled(app!.id as number, user.id as number);
+
+        const { res, captured } = makeRes();
+        await runWithContext(
+            { actor: { user: { uuid: user.uuid, id: user.id as number } } },
+            () => handleInstalledApps(makeReq({}), res),
+        );
+
+        const list = captured.body as Array<Record<string, unknown>>;
+        const { protocol, static_hosting_domain } = extension.config;
+        expect(list[0].iconCdnUrl).toBe(
+            `${protocol}://puter-app-icons.${static_hosting_domain}/${app!.uid}-256.png`,
+        );
+    });
+
+    it('reports no subdomain URL for an app with no generated icon', async () => {
+        const user = await seedUser();
+        const app = await seedApp(user.id as number);
+        await grantInstalled(app!.id as number, user.id as number);
+
+        const { res, captured } = makeRes();
+        await runWithContext(
+            { actor: { user: { uuid: user.uuid, id: user.id as number } } },
+            () => handleInstalledApps(makeReq({}), res),
+        );
+
+        const list = captured.body as Array<Record<string, unknown>>;
+        expect(list[0].iconCdnUrl).toBeNull();
+    });
+
+    it('flags apps with no owner_user_id as external', async () => {
+        const user = await seedUser();
+        const slug = Math.random().toString(36).slice(2, 8);
+        // createFromOrigin bootstraps an app with owner_user_id = null.
+        const app = await server.stores.app.createFromOrigin(
+            `app-${slug}`,
+            `https://external-${slug}.example.com`,
+        );
+        await grantInstalled(app!.id as number, user.id as number);
+
+        const { res, captured } = makeRes();
+        await runWithContext(
+            { actor: { user: { uuid: user.uuid, id: user.id as number } } },
+            () => handleInstalledApps(makeReq({}), res),
+        );
+
+        const list = captured.body as Array<Record<string, unknown>>;
+        expect(list).toHaveLength(1);
+        expect(list[0].external).toBe(true);
+        expect(
+            Object.prototype.hasOwnProperty.call(list[0], 'owner_user_id'),
+        ).toBe(false);
+    });
+
+    it('clamps page/limit to safe ranges (page>=1, 1<=limit<=100)', async () => {
+        const user = await seedUser();
+        const { res, captured } = makeRes();
+
+        // page=0 and limit=999 should be clamped without throwing.
+        await runWithContext(
+            { actor: { user: { uuid: user.uuid, id: user.id as number } } },
+            () =>
+                handleInstalledApps(
+                    makeReq({ page: 0, limit: 999, desc: '1' }),
+                    res,
+                ),
+        );
+
+        expect(Array.isArray(captured.body)).toBe(true);
+    });
+});

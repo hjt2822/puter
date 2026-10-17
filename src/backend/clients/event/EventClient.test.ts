@@ -1,0 +1,460 @@
+import { trace } from '@opentelemetry/api';
+import {
+    BasicTracerProvider,
+    InMemorySpanExporter,
+    SimpleSpanProcessor,
+} from '@opentelemetry/sdk-trace-base';
+import {
+    afterAll,
+    afterEach,
+    beforeAll,
+    beforeEach,
+    describe,
+    expect,
+    it,
+    vi,
+} from 'vitest';
+import { extensionStore } from '../../extensions.ts';
+import { PuterServer } from '../../server.ts';
+import { setupTestServer } from '../../testUtil.ts';
+import type { EventClient } from './EventClient.js';
+
+describe('EventClient', () => {
+    let server: PuterServer;
+    let target: EventClient;
+
+    beforeAll(async () => {
+        server = await setupTestServer();
+        target = server.clients.event as unknown as EventClient;
+    });
+
+    afterAll(async () => {
+        await server?.shutdown();
+    });
+
+    // Each test gets a fresh key so listeners registered by earlier tests
+    // never collide with later ones.
+    let key: string;
+    beforeEach(() => {
+        key = `test.${Math.random().toString(36).slice(2)}`;
+    });
+
+    describe('on / emit', () => {
+        it('invokes a listener registered for the exact key', () => {
+            const listener = vi.fn();
+            target.on(key, listener);
+            target.emit(key, { hello: 'world' }, { source: 'test' });
+            expect(listener).toHaveBeenCalledTimes(1);
+            expect(listener).toHaveBeenCalledWith(
+                key,
+                { hello: 'world' },
+                { source: 'test' },
+            );
+        });
+
+        it('does not invoke listeners registered under a different key', () => {
+            const other = vi.fn();
+            target.on(`${key}.other`, other);
+            target.emit(key, {}, {});
+            expect(other).not.toHaveBeenCalled();
+        });
+
+        it('invokes every listener registered for the same key', () => {
+            const a = vi.fn();
+            const b = vi.fn();
+            target.on(key, a);
+            target.on(key, b);
+            target.emit(key, {}, {});
+            expect(a).toHaveBeenCalledTimes(1);
+            expect(b).toHaveBeenCalledTimes(1);
+        });
+
+        it('does nothing when emitting a key with no listeners', () => {
+            // Just asserts that no exception is thrown.
+            expect(() =>
+                target.emit(`${key}.nobody-home`, {}, {}),
+            ).not.toThrow();
+        });
+
+        it('continues firing later listeners after one throws', () => {
+            const errSpy = vi
+                .spyOn(console, 'error')
+                .mockImplementation(() => {});
+            const bad = vi.fn(() => {
+                throw new Error('boom');
+            });
+            const good = vi.fn();
+            target.on(key, bad);
+            target.on(key, good);
+            target.emit(key, {}, {});
+            expect(bad).toHaveBeenCalledTimes(1);
+            expect(good).toHaveBeenCalledTimes(1);
+            errSpy.mockRestore();
+        });
+    });
+
+    describe('wildcard subscriptions', () => {
+        it('matches every dot-extended descendant of a wildcard prefix', () => {
+            const listener = vi.fn();
+            target.on(`${key}.*`, listener);
+            target.emit(`${key}.foo`, { v: 1 }, {});
+            target.emit(`${key}.foo.bar`, { v: 2 }, {});
+            expect(listener).toHaveBeenCalledTimes(2);
+            expect(listener).toHaveBeenNthCalledWith(
+                1,
+                `${key}.foo`,
+                { v: 1 },
+                {},
+            );
+            expect(listener).toHaveBeenNthCalledWith(
+                2,
+                `${key}.foo.bar`,
+                { v: 2 },
+                {},
+            );
+        });
+
+        it('fires both wildcard and exact-key subscribers for one emit', () => {
+            const wild = vi.fn();
+            const exact = vi.fn();
+            target.on(`${key}.*`, wild);
+            target.on(`${key}.thing`, exact);
+            target.emit(`${key}.thing`, {}, {});
+            expect(wild).toHaveBeenCalledTimes(1);
+            expect(exact).toHaveBeenCalledTimes(1);
+        });
+
+        it('does not fire a wildcard listener for the prefix itself', () => {
+            const wild = vi.fn();
+            target.on(`${key}.*`, wild);
+            target.emit(key, {}, {});
+            expect(wild).not.toHaveBeenCalled();
+        });
+
+        it('fires wildcards at every nesting level for a deep emit', () => {
+            const top = vi.fn();
+            const mid = vi.fn();
+            target.on(`${key}.*`, top);
+            target.on(`${key}.a.*`, mid);
+            target.emit(`${key}.a.b.c`, {}, {});
+            expect(top).toHaveBeenCalledTimes(1);
+            expect(mid).toHaveBeenCalledTimes(1);
+        });
+    });
+
+    describe('repeat emits', () => {
+        it('reaches listeners added after the key was first emitted', () => {
+            target.emit(`${key}.a.b`, {}, {});
+            const wildcard = vi.fn();
+            const exact = vi.fn();
+            target.on(`${key}.a.*`, wildcard);
+            target.on(`${key}.a.b`, exact);
+            target.emit(`${key}.a.b`, {}, {});
+            expect(wildcard).toHaveBeenCalledTimes(1);
+            expect(exact).toHaveBeenCalledTimes(1);
+            expect(target.hasListeners(`${key}.a.b`)).toBe(true);
+        });
+
+        it('does not skip a listener when an earlier one unsubscribes mid-dispatch', () => {
+            const second = vi.fn();
+            const first = vi.fn(() => target.off(key, first));
+            target.on(key, first);
+            target.on(key, second);
+            target.emit(key, {}, {});
+            expect(first).toHaveBeenCalledTimes(1);
+            expect(second).toHaveBeenCalledTimes(1);
+        });
+    });
+
+    describe('emitAndWait', () => {
+        it('awaits async listeners before resolving', async () => {
+            let resolved = false;
+            target.on(key, async () => {
+                await new Promise((r) => setTimeout(r, 10));
+                resolved = true;
+            });
+            await target.emitAndWait(key, {}, {});
+            expect(resolved).toBe(true);
+        });
+
+        it('runs listeners sequentially so later ones see earlier mutations', async () => {
+            target.on(key, (_k, data) => {
+                (data as { steps: string[] }).steps.push('first');
+            });
+            target.on(key, async (_k, data) => {
+                await new Promise((r) => setTimeout(r, 5));
+                (data as { steps: string[] }).steps.push('second');
+            });
+            const data = { steps: [] as string[] };
+            await target.emitAndWait(key, data, {});
+            expect(data.steps).toEqual(['first', 'second']);
+        });
+
+        it('continues the chain when a listener throws', async () => {
+            const errSpy = vi
+                .spyOn(console, 'error')
+                .mockImplementation(() => {});
+            const after = vi.fn();
+            target.on(key, () => {
+                throw new Error('boom');
+            });
+            target.on(key, after);
+            await target.emitAndWait(key, {}, {});
+            expect(after).toHaveBeenCalledTimes(1);
+            errSpy.mockRestore();
+        });
+
+        it('awaits wildcard listeners too', async () => {
+            let resolved = false;
+            target.on(`${key}.*`, async () => {
+                await new Promise((r) => setTimeout(r, 10));
+                resolved = true;
+            });
+            await target.emitAndWait(`${key}.child`, {}, {});
+            expect(resolved).toBe(true);
+        });
+
+        describe('tracing', () => {
+            const exporter = new InMemorySpanExporter();
+            const provider = new BasicTracerProvider({
+                spanProcessors: [new SimpleSpanProcessor(exporter)],
+            });
+            const spansFor = (eventKey: string) =>
+                exporter
+                    .getFinishedSpans()
+                    .filter(
+                        (s) =>
+                            s.name === 'event.emitAndWait' &&
+                            s.attributes['event.key'] === eventKey,
+                    );
+
+            beforeAll(() => {
+                trace.setGlobalTracerProvider(provider);
+            });
+
+            afterAll(async () => {
+                await provider.shutdown();
+                trace.disable();
+            });
+
+            it('resolves without a span when nothing listens', async () => {
+                const meta: { listener_failed?: boolean } = {};
+                await expect(
+                    target.emitAndWait(`${key}.child`, {}, meta),
+                ).resolves.toBeUndefined();
+                expect(meta).toEqual({});
+                expect(spansFor(`${key}.child`)).toHaveLength(0);
+            });
+
+            it('spans the wait whenever a listener matches, wildcards included', async () => {
+                target.on(`${key}.*`, vi.fn());
+                await expect(
+                    target.emitAndWait(`${key}.child`, {}, {}),
+                ).resolves.toBeUndefined();
+                expect(spansFor(`${key}.child`)).toHaveLength(1);
+
+                extensionStore.events[`${key}.ext`] = [vi.fn()];
+                try {
+                    await target.emitAndWait(`${key}.ext`, {}, {});
+                } finally {
+                    delete extensionStore.events[`${key}.ext`];
+                }
+                expect(spansFor(`${key}.ext`)).toHaveLength(1);
+            });
+        });
+    });
+
+    describe('emitAndWaitConcurrently', () => {
+        it('runs every listener at once, wildcards included, and awaits them all', async () => {
+            let inFlight = 0;
+            let peak = 0;
+            const contribute =
+                (share: number) => async (_k: string, data: unknown) => {
+                    inFlight++;
+                    peak = Math.max(peak, inFlight);
+                    await new Promise((r) => setTimeout(r, 10));
+                    inFlight--;
+                    (data as { total: number }).total += share;
+                };
+            target.on(`${key}.*`, contribute(1));
+            target.on(`${key}.child`, contribute(10));
+            target.on(`${key}.child`, contribute(100));
+
+            const data = { total: 0 };
+            await target.emitAndWaitConcurrently(`${key}.child`, data, {});
+
+            expect(peak).toBe(3);
+            expect(data.total).toBe(111);
+        });
+
+        it('flags a failed exact-key listener and still awaits the rest', async () => {
+            const errSpy = vi
+                .spyOn(console, 'error')
+                .mockImplementation(() => {});
+            let finished = false;
+            target.on(key, () => {
+                throw new Error('boom');
+            });
+            target.on(key, async () => {
+                await new Promise((r) => setTimeout(r, 5));
+                finished = true;
+            });
+            const meta: Record<string, unknown> = {};
+            await target.emitAndWaitConcurrently(key, {}, meta);
+            expect(finished).toBe(true);
+            expect(meta.listener_failed).toBe(true);
+            expect(errSpy).toHaveBeenCalledWith(
+                'Error in event listener for event',
+                key,
+                expect.any(Error),
+            );
+            errSpy.mockRestore();
+        });
+
+        it('leaves the flag alone when only a wildcard listener fails', async () => {
+            const errSpy = vi
+                .spyOn(console, 'error')
+                .mockImplementation(() => {});
+            target.on(`${key}.*`, () => {
+                throw new Error('observer');
+            });
+            const meta: Record<string, unknown> = {};
+            await target.emitAndWaitConcurrently(`${key}.child`, {}, meta);
+            expect(meta.listener_failed).toBeUndefined();
+            errSpy.mockRestore();
+        });
+
+        it('resolves at once with nobody listening', async () => {
+            await expect(
+                target.emitAndWaitConcurrently(`${key}.nobody`, {}, {}),
+            ).resolves.toBeUndefined();
+        });
+    });
+
+    describe('off', () => {
+        it('stops delivering to a removed listener', () => {
+            const kept = vi.fn();
+            const removed = vi.fn();
+            target.on(key, kept);
+            target.on(key, removed);
+
+            target.off(key, removed);
+            target.emit(key, {}, {});
+
+            expect(kept).toHaveBeenCalledTimes(1);
+            expect(removed).not.toHaveBeenCalled();
+        });
+
+        it('ignores a key nobody ever subscribed to', () => {
+            expect(() => target.off(key, vi.fn())).not.toThrow();
+        });
+
+        it('leaves the list alone when the listener was never registered', () => {
+            const listener = vi.fn();
+            target.on(key, listener);
+
+            target.off(key, vi.fn());
+            target.emit(key, {}, {});
+
+            expect(listener).toHaveBeenCalledTimes(1);
+        });
+    });
+
+    describe('hasListeners', () => {
+        it('is false for a key nobody subscribed to', () => {
+            expect(target.hasListeners(key)).toBe(false);
+        });
+
+        it('is true for an exact subscriber', () => {
+            target.on(key, vi.fn());
+            expect(target.hasListeners(key)).toBe(true);
+        });
+
+        it('is true when only a wildcard prefix matches', () => {
+            target.on(`${key}.*`, vi.fn());
+            expect(target.hasListeners(`${key}.child.deep`)).toBe(true);
+        });
+
+        it('is true for an extension-registered listener', () => {
+            extensionStore.events[key] = [vi.fn()];
+            try {
+                expect(target.hasListeners(key)).toBe(true);
+            } finally {
+                delete extensionStore.events[key];
+            }
+        });
+
+        it('goes back to false once the last listener is removed', () => {
+            const listener = vi.fn();
+            target.on(key, listener);
+            target.off(key, listener);
+            expect(target.hasListeners(key)).toBe(false);
+        });
+    });
+
+    describe('extension-registered listeners', () => {
+        afterEach(() => {
+            delete extensionStore.events[key];
+        });
+
+        it('fires alongside listeners registered on the client', () => {
+            const fromExtension = vi.fn();
+            const fromClient = vi.fn();
+            extensionStore.events[key] = [fromExtension];
+            target.on(key, fromClient);
+
+            target.emit(key, { n: 1 }, { source: 'test' });
+
+            expect(fromExtension).toHaveBeenCalledWith(
+                key,
+                { n: 1 },
+                { source: 'test' },
+            );
+            expect(fromClient).toHaveBeenCalledTimes(1);
+        });
+
+        it('is awaited by emitAndWait', async () => {
+            const order: string[] = [];
+            extensionStore.events[key] = [
+                async () => {
+                    await new Promise((resolve) => setTimeout(resolve, 5));
+                    order.push('extension');
+                },
+            ];
+            target.on(key, () => {
+                order.push('client');
+            });
+
+            await target.emitAndWait(key, {}, {});
+
+            expect(order).toEqual(['client', 'extension']);
+        });
+    });
+
+    describe('lifecycle hooks', () => {
+        it('onServerStart emits a serverStart event', () => {
+            const listener = vi.fn();
+            target.on('serverStart', listener);
+            target.onServerStart();
+            expect(listener).toHaveBeenCalledWith('serverStart', {}, {});
+        });
+
+        it('onServerPrepareShutdown emits a serverPrepareShutdown event', () => {
+            const listener = vi.fn();
+            target.on('serverPrepareShutdown', listener);
+            target.onServerPrepareShutdown();
+            expect(listener).toHaveBeenCalledWith(
+                'serverPrepareShutdown',
+                {},
+                {},
+            );
+        });
+
+        it('onServerShutdown emits a serverShutdown event', () => {
+            const listener = vi.fn();
+            target.on('serverShutdown', listener);
+            target.onServerShutdown();
+            expect(listener).toHaveBeenCalledWith('serverShutdown', {}, {});
+        });
+    });
+});

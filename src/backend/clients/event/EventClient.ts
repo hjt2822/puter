@@ -1,0 +1,250 @@
+/*
+ * Copyright (C) 2024-present Puter Technologies Inc.
+ *
+ * This file is part of Puter.
+ *
+ * Puter is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published
+ * by the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+import { extensionStore } from '../../extensions';
+import { BoundedTtlMap } from '../../util/boundedTtlMap.js';
+import { withSpan } from '../../util/span.js';
+import { PuterClient } from '../types';
+import {
+    EventListener,
+    EventMap,
+    EventMetadata,
+    ListenKey,
+    MatchingEvents,
+} from './types';
+
+const NO_LISTENERS: readonly EventListener[] = [];
+
+export class EventClient extends PuterClient {
+    #eventListeners: Partial<Record<ListenKey, EventListener[]>> = {};
+    #matchKeyMemo = new BoundedTtlMap<string, readonly ListenKey[]>({
+        maxEntries: 1024,
+    });
+
+    onServerStart() {
+        this.emit('serverStart', {}, {});
+    }
+    onServerPrepareShutdown() {
+        this.emit('serverPrepareShutdown', {}, {});
+    }
+    onServerShutdown() {
+        this.emit('serverShutdown', {}, {});
+    }
+
+    /**
+     * Dispatch an event to every matching subscriber.
+     *
+     * Match semantics: emit walks every dot-separated prefix of `key`, looking
+     * up `<prefix>.*` listeners for prefixes shorter than the full key, and
+     * exact-key listeners on the final iteration. So emitting
+     * `outer.gui.item.removed` fires subscribers on:
+     *
+     * - `outer.*`
+     * - `outer.gui.*`
+     * - `outer.gui.item.*`
+     * - `outer.gui.item.removed`
+     *
+     * Subscribers are still keyed in a single map — wildcards just live under
+     * their literal `<prefix>.*` string. No regex, no per-emit scan of every
+     * listener.
+     */
+    emit<T extends keyof EventMap>(
+        key: T,
+        data: EventMap[T],
+        meta: EventMetadata,
+    ) {
+        for (const matchKey of this.#matchKeys(key)) {
+            for (const listener of this.#listenersFor(matchKey)) {
+                this.#emitEvent(listener, key, data, meta);
+            }
+        }
+    }
+
+    /**
+     * Like `emit`, but awaits every matched listener before resolving.
+     *
+     * Use this when the emitter needs to act on mutations the handlers made to
+     * `data` — e.g. validation hooks where a listener can set `data.allow =
+     * false` to reject, or pre-commit pipelines where every stage must complete
+     * before the next step runs. Regular `emit` is fire-and-forget and can't
+     * observe handler state changes.
+     *
+     * Listeners run sequentially in the order they're registered so an earlier
+     * handler's mutation is visible to later ones. A listener that throws is
+     * logged and the chain continues, with `meta.listener_failed` set.
+     */
+    async emitAndWait<T extends keyof EventMap>(
+        key: T,
+        data: EventMap[T],
+        meta: EventMetadata,
+    ) {
+        if (!this.hasListeners(key)) return;
+        // Spanned because callers block on listeners — this is where time
+        // spent in extension hooks (e.g. `ip.validate`) gets attributed.
+        return withSpan('event.emitAndWait', { 'event.key': key }, async () => {
+            for (const matchKey of this.#matchKeys(key)) {
+                // A wildcard listener observes the event; it does not implement it.
+                const isExact = matchKey === key;
+                for (const listener of this.#listenersFor(matchKey)) {
+                    try {
+                        await listener(key, data, meta);
+                    } catch (e) {
+                        // The chain continues, but the caller is told: a hook
+                        // that could not run is not a hook that approved.
+                        if (isExact) meta.listener_failed = true;
+                        console.error(
+                            'Error in event listener for event',
+                            key,
+                            e,
+                        );
+                    }
+                }
+            }
+        });
+    }
+
+    /**
+     * Like `emitAndWait`, but every matched listener runs at once, so none sees
+     * another's mutation of `data` before all have finished. Only for events
+     * whose listeners each add an independent share, written after their own
+     * awaits (`const v = await x; data.n += v`).
+     */
+    async emitAndWaitConcurrently<T extends keyof EventMap>(
+        key: T,
+        data: EventMap[T],
+        meta: EventMetadata,
+    ) {
+        const matched = this.#matchKeys(key).flatMap((matchKey) =>
+            this.#listenersFor(matchKey).map((listener) => ({
+                listener,
+                // A wildcard listener observes the event; it does not implement it.
+                isExact: matchKey === key,
+            })),
+        );
+        if (matched.length === 0) return;
+        return withSpan('event.emitAndWait', { 'event.key': key }, async () => {
+            await Promise.all(
+                matched.map(async ({ listener, isExact }) => {
+                    try {
+                        await listener(key, data, meta);
+                    } catch (e) {
+                        if (isExact) meta.listener_failed = true;
+                        console.error(
+                            'Error in event listener for event',
+                            key,
+                            e,
+                        );
+                    }
+                }),
+            );
+        });
+    }
+
+    /**
+     * Whether anything would run if `key` were emitted, wildcards included.
+     *
+     * For emitters whose work is only worth doing when someone is listening —
+     * gathering the payload costs a round trip, say. Emitting into the void is
+     * otherwise perfectly cheap and doesn't need this.
+     */
+    hasListeners<T extends keyof EventMap>(key: T): boolean {
+        for (const matchKey of this.#matchKeys(key)) {
+            if (this.#eventListeners[matchKey]?.length) return true;
+            if (extensionStore.events[matchKey]?.length) return true;
+        }
+        return false;
+    }
+
+    /**
+     * Subscribe to an event by exact key OR a wildcard prefix.
+     *
+     * Wildcards: a key ending in `.*` matches every event whose name starts
+     * with the prefix. `outer.*` matches `outer.gui.item.removed`,
+     * `outer.fs.write-hash`, and any other dot-extended descendant. Exact keys
+     * still match exactly. See `emit()` for the dispatch order.
+     *
+     * Callback receives the full `(key, data, meta)` tuple as passed to
+     * `emit()` — wildcard subscribers can branch on the triggering event name.
+     */
+    on<P extends ListenKey>(
+        key: P,
+        callback: (
+            key: MatchingEvents<P>,
+            data: EventMap[MatchingEvents<P>],
+            meta: EventMetadata,
+        ) => Promise<void> | void,
+    ) {
+        const listeners: EventListener[] =
+            this.#eventListeners[key] ?? (this.#eventListeners[key] = []);
+        listeners.push(callback as EventListener);
+    }
+    off<P extends ListenKey>(
+        key: P,
+        callback: (
+            key: MatchingEvents<P>,
+            data: EventMap[MatchingEvents<P>],
+            meta: EventMetadata,
+        ) => Promise<void> | void,
+    ) {
+        const listeners = this.#eventListeners[key];
+        if (!listeners) return;
+        const idx = listeners.indexOf(callback as EventListener);
+        if (idx !== -1) listeners.splice(idx, 1);
+    }
+    /**
+     * The keys a listener can be registered under to hear `key`: each
+     * `<prefix>.*` shorter than the key, then the key itself. Memoized, since
+     * the same few keys are emitted on every request.
+     */
+    #matchKeys(key: string): readonly ListenKey[] {
+        const cached = this.#matchKeyMemo.get(key);
+        if (cached) return cached;
+        const parts = key.split('.');
+        const matchKeys = parts.map(
+            (_, i) =>
+                (i === parts.length - 1
+                    ? key
+                    : `${parts.slice(0, i + 1).join('.')}.*`) as ListenKey,
+        );
+        this.#matchKeyMemo.set(key, matchKeys);
+        return matchKeys;
+    }
+
+    #listenersFor(matchKey: ListenKey): readonly EventListener[] {
+        const own = this.#eventListeners[matchKey];
+        const fromExtensions = extensionStore.events[matchKey];
+        if (!own?.length && !fromExtensions?.length) return NO_LISTENERS;
+        // A copy, so a listener that unsubscribes mid-dispatch can't make the
+        // loop skip its neighbour.
+        return (own ?? []).concat(fromExtensions ?? []);
+    }
+
+    async #emitEvent<T extends keyof EventMap>(
+        listener: EventListener,
+        key: T,
+        data: EventMap[T],
+        meta: EventMetadata,
+    ) {
+        try {
+            await listener(key, data, meta);
+        } catch (e) {
+            console.error('Error in event listener for event', key, e);
+        }
+    }
+}

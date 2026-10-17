@@ -1,0 +1,353 @@
+---
+title: puter.ai.txt2speech()
+description: Convert text to speech with AI using multiple languages, voices, and engine types.
+platforms: [websites, apps, nodejs, workers]
+---
+
+Converts text into speech using AI. Supports multiple languages and voices.
+
+## Syntax
+
+```js
+puter.ai.txt2speech(text, testMode = false)
+puter.ai.txt2speech(text, options)
+puter.ai.txt2speech(text, language, testMode = false)
+puter.ai.txt2speech(text, language, voice, testMode = false)
+puter.ai.txt2speech(text, language, voice, engine, testMode = false)
+```
+
+## Parameters
+
+#### `text` (String) (required)
+
+A string containing the text you want to convert to speech. The text can be up to 3,000 characters long. Longer text is rejected with an `input_too_large` error. Defaults to AWS Polly provider when no options are provided.
+
+#### `testMode` (Boolean) (optional)
+
+When `true`, the call returns a sample audio so you can perform tests without incurring usage. Defaults to `false`.
+
+#### `options` (Object) (optional)
+
+Additional settings for the generation request. Available options depend on the provider.
+
+| Option | Type | Description |
+|--------|------|-------------|
+| `provider` | `String` | TTS provider to use. `'aws-polly'` (default), `'openai'`, `'elevenlabs'`, `'gemini'`, `'xai'`, `'speechify'`. Common aliases (`'eleven'`, `'google'`, `'grok'`, `'polly'`, `'simba'`, …) are also accepted; anything else is rejected with a `bad_request` error |
+| `model` | `String` | Model identifier (provider-specific) |
+| `voice` | `String` | Voice ID used for synthesis (provider-specific) |
+| `test_mode` | `Boolean` | When `true`, returns a sample audio without using credits |
+
+#### AWS Polly Options
+
+Available when `provider: 'aws-polly'` (default):
+
+| Option | Type | Description |
+|--------|------|-------------|
+| `voice` | `String` | Voice ID. Defaults to `'Joanna'`. See [available voices](https://docs.aws.amazon.com/polly/latest/dg/available-voices.html) |
+| `engine` | `String` | Synthesis engine. Available: `'standard'` (default), `'neural'`, `'long-form'`, `'generative'` |
+| `language` | `String` | Language code. Defaults to `'en-US'`. See [supported languages](https://docs.aws.amazon.com/polly/latest/dg/supported-languages.html) |
+| `ssml` | `Boolean` | When `true`, text is treated as SSML markup |
+
+#### OpenAI Options
+
+Available when `provider: 'openai'`:
+
+| Option | Type | Description |
+|--------|------|-------------|
+| `model` | `String` | TTS model. Available: `'gpt-4o-mini-tts'` (default), `'tts-1'`, `'tts-1-hd'` |
+| `voice` | `String` | Voice ID. Available: `'alloy'` (default), `'ash'`, `'coral'`, `'echo'`, `'fable'`, `'nova'`, `'onyx'`, `'sage'`, `'shimmer'`; `gpt-4o-mini-tts` also offers `'ballad'`, `'verse'`, `'marin'`, and `'cedar'` (other models reject them with `bad_request`) |
+| `response_format` | `String` | Output format. Available: `'mp3'` (default), `'wav'`, `'opus'`, `'aac'`, `'flac'`, `'pcm'` |
+| `instructions` | `String` | Additional guidance for voice style (tone, speed, mood, etc.) |
+
+For more details about each option, see the [OpenAI TTS API reference](https://platform.openai.com/docs/api-reference/audio/createSpeech).
+
+#### ElevenLabs Options
+
+Available when `provider: 'elevenlabs'`:
+
+| Option | Type | Description |
+|--------|------|-------------|
+| `model` | `String` | TTS model. Available: `'eleven_multilingual_v2'` (default), `'eleven_v4'`, `'eleven_v4_turbo'`, `'eleven_v3'`, `'eleven_v3_conversational'`, `'eleven_flash_v2_5'`, `'eleven_flash_v2'` |
+| `voice` | `String` | Voice ID, or a case-sensitive voice name from `listVoices({ provider: 'elevenlabs' })`. Premade voices also match their short name, so `'Bella'` selects `'Bella - Professional, Bright, Warm'`. Defaults to `'21m00Tcm4TlvDq8ikWAM'` |
+| `output_format` | `String` | Output format as `codec_samplerate[_bitrate]`: `'mp3_22050_32'`, `'mp3_24000_48'`, `'mp3_44100_32'`, `'mp3_44100_64'`, `'mp3_44100_96'`, `'mp3_44100_128'` (default), `'mp3_44100_192'`, `'opus_48000_32'` through `'opus_48000_192'`, `'pcm_8000'` through `'pcm_48000'`, `'wav_8000'` through `'wav_48000'`, `'ulaw_8000'`, or `'alaw_8000'`. `response_format` is accepted as a fallback; the short names `'mp3'`, `'opus'`, `'pcm'`, and `'wav'` map to `'mp3_44100_128'`, `'opus_48000_128'`, `'pcm_24000'`, and `'wav_24000'`. See [ElevenLabs output formats](https://elevenlabs.io/docs/api-reference/text-to-speech/convert). |
+| `voice_settings` | `Object` | Voice tuning options (stability, similarity boost, speed) |
+
+Unknown voices and names matching multiple voices are rejected with HTTP 400 (`field_invalid`). Use a voice ID when names are ambiguous. An unsupported `output_format` is also rejected with HTTP 400 (`field_invalid`) before any credits are reserved.
+
+For more details about each option, see the [ElevenLabs API reference](https://elevenlabs.io/docs/api-reference/text-to-speech).
+
+#### Gemini Options
+
+Available when `provider: 'gemini'`:
+
+| Option | Type | Description |
+|--------|------|-------------|
+| `model` | `String` | TTS model. Available: `'gemini-3.8-flash-tts'` (default), `'gemini-3.8-flash-lite-tts'` |
+| `voice` | `String` | Voice name. Defaults to `'Kore'`. Available: `'Zephyr'`, `'Puck'`, `'Charon'`, `'Kore'`, `'Fenrir'`, `'Leda'`, `'Orus'`, `'Aoede'`, `'Callirrhoe'`, `'Autonoe'`, `'Enceladus'`, `'Iapetus'`, `'Umbriel'`, `'Algieba'`, `'Despina'`, `'Erinome'`, `'Algenib'`, `'Rasalgethi'`, `'Laomedeia'`, `'Achernar'`, `'Alnilam'`, `'Schedar'`, `'Gacrux'`, `'Pulcherrima'`, `'Achird'`, `'Zubenelgenubi'`, `'Vindemiatrix'`, `'Sadachbia'`, `'Sadaltager'`, `'Sulafat'` |
+| `instructions` | `String` | Natural language instructions to control speaking style (tone, speed, mood, etc.), up to 3,000 characters |
+
+Gemini generates speech from the `text` field. The `instructions` string isn't included in the generated audio. It guides delivery (tone, pacing, accent, emotion). Instructions count toward input tokens. Longer instructions are rejected with an `input_too_large` error. Audio is returned as WAV.
+
+A Gemini request is charged for the tokens Gemini reports, even when it fails or returns no audio. If Gemini returns audio without reporting its token usage, the request fails with an `upstream_failed` error.
+
+For more details about Gemini TTS, see the [Google Gemini speech generation documentation](https://ai.google.dev/gemini-api/docs/speech-generation).
+
+#### xAI (Grok) Options
+
+Available when `provider: 'xai'`:
+
+| Option | Type | Description |
+|--------|------|-------------|
+| `voice` | `String` | Voice ID. Available: `'eve'` (default, energetic), `'ara'` (warm), `'rex'` (confident), `'sal'` (smooth), `'leo'` (authoritative) |
+| `language` | `String` | BCP-47 language code. Defaults to `'en'`. Supports `'auto'` for auto-detection and 20+ languages |
+| `output_format` | `String` | Output codec. Available: `'mp3'` (default), `'wav'`, `'pcm'`, `'mulaw'`, `'alaw'` |
+
+Text supports inline speech tags like `[pause]`, `[laugh]` and wrapping tags like `<whisper>text</whisper>` for expressive delivery.
+
+For more details, see the [xAI TTS documentation](https://x.ai/news/grok-stt-and-tts-apis).
+
+#### Speechify Options
+
+Available when `provider: 'speechify'`:
+
+| Option | Type | Description |
+|--------|------|-------------|
+| `model` | `String` | TTS model. Available: `'simba-3.2'` (default) |
+| `voice` | `String` | Voice ID. Available: `'geffen_32'` (default), `'dominic_32'`, `'harper_32'`, `'hugh_32'`, `'imogen_32'` |
+| `output_format` | `String` | Output format. Available: `'mp3'` (default), `'wav'`, `'ogg'`, `'aac'` |
+
+For more details, see the [Speechify API documentation](https://docs.speechify.ai/).
+
+## Return value
+
+A `Promise` that resolves to an `HTMLAudioElement`. The element’s `src` points at a blob or remote URL containing the synthesized audio.
+
+## Examples
+
+<strong class="example-title">Convert text to speech (Shorthand)</strong>
+
+```html;ai-txt2speech
+<html>
+<body>
+    <script src="https://js.puter.com/v2/"></script>
+    <button id="play">Speak!</button>
+    <script>
+        document.getElementById('play').addEventListener('click', ()=>{
+            puter.ai.txt2speech(`Hello world! Puter is pretty amazing, don't you agree?`).then((audio)=>{
+                audio.play();
+            });
+        });
+    </script>
+</body>
+</html>
+```
+
+<strong class="example-title">Convert text to speech using options</strong>
+
+```html;ai-txt2speech-options
+<html>
+<body>
+    <script src="https://js.puter.com/v2/"></script>
+    <button id="play">Speak with options!</button>
+    <script>
+        document.getElementById('play').addEventListener('click', ()=>{
+            puter.ai.txt2speech(`Hello world! This is using a neural voice.`, {
+                voice: "Joanna",
+                engine: "neural",
+                language: "en-US"
+            }).then((audio)=>{
+                audio.play();
+            });
+        });
+    </script>
+</body>
+</html>
+```
+
+<strong class="example-title">Use OpenAI voices</strong>
+
+```html;ai-txt2speech-openai
+<html>
+<body>
+    <script src="https://js.puter.com/v2/"></script>
+    <button id="play">Use OpenAI voice</button>
+    <script>
+        document.getElementById('play').addEventListener('click', async ()=>{
+            const audio = await puter.ai.txt2speech(
+                "Hello! This sample uses the OpenAI alloy voice.",
+                {
+                    provider: "openai",
+                    model: "gpt-4o-mini-tts",
+                    voice: "alloy",
+                    response_format: "mp3",
+                    instructions: "Sound cheerful but not overly fast."
+                }
+            );
+            audio.play();
+        });
+    </script>
+</body>
+</html>
+```
+
+<strong class="example-title">Use ElevenLabs voices</strong>
+
+```html;ai-txt2speech-elevenlabs
+<html>
+<body>
+    <script src="https://js.puter.com/v2/"></script>
+    <button id="play">Use ElevenLabs voice</button>
+    <script>
+        document.getElementById('play').addEventListener('click', async ()=>{
+            const audio = await puter.ai.txt2speech(
+                "Hello! This sample uses an ElevenLabs voice.",
+                {
+                    provider: "elevenlabs",
+                    model: "eleven_multilingual_v2",
+                    voice: "21m00Tcm4TlvDq8ikWAM",
+                    output_format: "mp3_44100_128"
+                }
+            );
+            audio.play();
+        });
+    </script>
+</body>
+</html>
+```
+
+<strong class="example-title">Use Gemini voices</strong>
+
+```html;ai-txt2speech-gemini
+<html>
+<body>
+    <script src="https://js.puter.com/v2/"></script>
+    <button id="play">Use Gemini voice</button>
+    <script>
+        document.getElementById('play').addEventListener('click', async ()=>{
+            const audio = await puter.ai.txt2speech(
+                "Hello! This sample uses the Gemini Puck voice.",
+                {
+                    provider: "gemini",
+                    model: "gemini-3.8-flash-tts",
+                    voice: "Puck",
+                    instructions: "Speak in a friendly, upbeat tone."
+                }
+            );
+            audio.play();
+        });
+    </script>
+</body>
+</html>
+```
+
+<strong class="example-title">Use xAI (Grok) voices</strong>
+
+```html;ai-txt2speech-xai
+<html>
+<body>
+    <script src="https://js.puter.com/v2/"></script>
+    <button id="play">Use xAI voice</button>
+    <script>
+        document.getElementById('play').addEventListener('click', async ()=>{
+            const audio = await puter.ai.txt2speech(
+                "Hello! This sample uses the xAI Eve voice.",
+                {
+                    provider: "xai",
+                    voice: "eve",
+                    language: "en"
+                }
+            );
+            audio.play();
+        });
+    </script>
+</body>
+</html>
+```
+
+<strong class="example-title">Use Speechify voices</strong>
+
+```html;ai-txt2speech-speechify
+<html>
+<body>
+    <script src="https://js.puter.com/v2/"></script>
+    <button id="play">Use Speechify voice</button>
+    <script>
+        document.getElementById('play').addEventListener('click', async ()=>{
+            const audio = await puter.ai.txt2speech(
+                "Hello! This sample uses the Speechify Geffen voice.",
+                {
+                    provider: "speechify",
+                    model: "simba-3.2",
+                    voice: "geffen_32"
+                }
+            );
+            audio.play();
+        });
+    </script>
+</body>
+</html>
+```
+
+<strong class="example-title">Compare different engines</strong>
+
+```html;ai-txt2speech-engines
+<html>
+<head>
+    <style>
+        body { font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; }
+        textarea { width: 100%; height: 80px; margin: 10px 0; }
+        button { margin: 5px; padding: 10px 15px; cursor: pointer; }
+        .status { margin: 10px 0; padding: 5px; font-size: 14px; }
+    </style>
+</head>
+<body>
+    <script src="https://js.puter.com/v2/"></script>
+    
+    <h1>Text-to-Speech Engine Comparison</h1>
+    
+    <textarea id="text-input" placeholder="Enter text to convert to speech...">Hello world! This is a test of the text-to-speech engines.</textarea>
+    
+    <div>
+        <button onclick="playAudio('standard')">Standard Engine</button>
+        <button onclick="playAudio('neural')">Neural Engine</button>
+        <button onclick="playAudio('generative')">Generative Engine</button>
+    </div>
+    
+    <div id="status" class="status"></div>
+
+    <script>
+        const textInput = document.getElementById('text-input');
+        const statusDiv = document.getElementById('status');
+        
+        async function playAudio(engine) {
+            const text = textInput.value.trim();
+            
+            if (!text) {
+                statusDiv.textContent = 'Please enter some text first!';
+                return;
+            }
+            
+            if (text.length > 3000) {
+                statusDiv.textContent = 'Text must be less than 3000 characters!';
+                return;
+            }
+            
+            statusDiv.textContent = `Converting with ${engine} engine...`;
+            
+            try {
+                const audio = await puter.ai.txt2speech(text, {
+                    voice: "Joanna",
+                    engine: engine,
+                    language: "en-US"
+                });
+                
+                statusDiv.textContent = `Playing ${engine} audio`;
+                audio.play();
+            } catch (error) {
+                statusDiv.textContent = `Error: ${error.message}`;
+            }
+        }
+    </script>
+</body>
+</html>
+```

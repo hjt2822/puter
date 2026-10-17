@@ -1,0 +1,1079 @@
+/*
+ * Copyright (C) 2024-present Puter Technologies Inc.
+ *
+ * This file is part of Puter.
+ *
+ * Puter is free software: you can redistribute it and/or modify it under the
+ * terms of the GNU Affero General Public License as published by the Free
+ * Software Foundation, either version 3 of the License, or (at your option) any
+ * later version.
+ *
+ * This program is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+ * FOR A PARTICULAR PURPOSE. See the GNU Affero General Public License for more
+ * details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program. If not, see
+ * [https://www.gnu.org/licenses/](https://www.gnu.org/licenses/).
+ */
+
+import crypto from 'node:crypto';
+import { withSpan } from '../../../util/span.js';
+import { HttpError } from '../HttpError.js';
+import { subscriptionOverride } from '../../../services/metering/consts.js';
+
+/**
+ * Sliding-window rate limiter with swappable, **co-resident** backends.
+ *
+ * Three backend implementations are registered at boot via
+ * `configureRateLimit(...)`; they all stay live simultaneously so that
+ * different routes / driver methods can pick whichever storage best fits their
+ * access pattern:
+ *
+ * - `redis`: Redis sorted sets — atomic per key across a cluster. Production
+ *   default; ioredis-mock in dev.
+ * - `kv`: one row per hit in the system KV (DynamoDB), with TTL. `kv.list()`
+ *   already drops expired rows, so "entries under the prefix" == "entries still
+ *   in the window".
+ * - `memory`: per-process counters. Capped + actively swept; does not coordinate
+ *   across nodes, so use only for hot, ephemeral counters or when redis is
+ *   absent.
+ *
+ * Each backend exports a `check(key, limit, windowMs)` that returns `true` (and
+ * records the hit) or `false` (rate-limited). Callers select one via the
+ * `backend` option; omitting it uses the configured default.
+ */
+
+// -- Backend names ----------------------------------------------------
+
+export const RATE_LIMIT_BACKENDS = ['memory', 'redis', 'kv'];
+
+// -- Memory backend --------------------------------------------------
+
+// Hard cap and retention bound memory in the worst case. Without them,
+// one-shot keys (visited once, never again) leak forever: their single
+// timestamp prevents the empty-array sweep from collecting them, even
+// after the window has long passed.
+const MEMORY_MAX_KEYS = 10_000;
+const MEMORY_MAX_RETAIN_MS = 60 * 60_000;
+
+/**
+ * Key → `{ ts, windowMs }`. The window is kept alongside the timestamps because
+ * the sweep has to know it: collecting on `MEMORY_MAX_RETAIN_MS` alone would
+ * drop the state of any limit whose window is longer than the retention floor,
+ * which silently shortens that limit to the floor. Day-scale windows are a real
+ * shape — a "few per day" grant, for one — and under `memory` they were being
+ * reset every hour. Retention is therefore whichever is longer, and the key cap
+ * below is what actually bounds memory.
+ */
+const memoryWindows = new Map();
+
+/**
+ * Drop memory buckets that can no longer affect a decision. Runs on a timer
+ * below; exported as a test seam because the timer isn't drivable from a test
+ * (it's created at module load, before any fake clock is installed).
+ */
+export function sweepMemoryWindows() {
+    const now = Date.now();
+    for (const [k, entry] of memoryWindows) {
+        const retainMs = Math.max(MEMORY_MAX_RETAIN_MS, entry.windowMs);
+        if (
+            entry.ts.length === 0 ||
+            entry.ts[entry.ts.length - 1] < now - retainMs
+        )
+            memoryWindows.delete(k);
+    }
+}
+
+{
+    const sweep = setInterval(sweepMemoryWindows, 60_000);
+    sweep.unref?.();
+}
+
+async function checkMemory(key, limit, windowMs) {
+    const now = Date.now();
+    const cutoff = now - windowMs;
+    let entry = memoryWindows.get(key);
+    if (!entry) {
+        // Map preserves insertion order; FIFO-evict before adding so a
+        // unique-key flood between sweep ticks can't blow up memory.
+        if (memoryWindows.size >= MEMORY_MAX_KEYS) {
+            const oldest = memoryWindows.keys().next().value;
+            memoryWindows.delete(oldest);
+        }
+        entry = { ts: [], windowMs };
+        memoryWindows.set(key, entry);
+    } else {
+        // A scope's window can change across a deploy; the live value wins.
+        entry.windowMs = windowMs;
+    }
+    const timestamps = entry.ts;
+    while (timestamps.length > 0 && timestamps[0] < cutoff) timestamps.shift();
+    if (timestamps.length >= limit) return false;
+    timestamps.push(now);
+    return true;
+}
+
+/**
+ * Spend up to `units` from one bucket at once and report how many fit: the
+ * many-unit form of `checkMemory`, for a caller that would otherwise loop.
+ */
+async function claimMemory(key, limit, windowMs, units) {
+    const now = Date.now();
+    let entry = memoryWindows.get(key);
+    if (!entry) {
+        if (memoryWindows.size >= MEMORY_MAX_KEYS) {
+            const oldest = memoryWindows.keys().next().value;
+            memoryWindows.delete(oldest);
+        }
+        entry = { ts: [], windowMs };
+        memoryWindows.set(key, entry);
+    } else {
+        entry.windowMs = windowMs;
+    }
+    const timestamps = entry.ts;
+    const cutoff = now - windowMs;
+    while (timestamps.length > 0 && timestamps[0] < cutoff) timestamps.shift();
+    const admitted = Math.max(0, Math.min(units, limit - timestamps.length));
+    for (let i = 0; i < admitted; i++) timestamps.push(now);
+    return admitted;
+}
+
+/**
+ * Read a bucket's state without spending from it. For gates whose budget is
+ * consumed by something other than the request being admitted — a failed
+ * credential check, say — where charging the check itself would bill every
+ * caller for the attacker's attempts.
+ */
+async function peekMemory(key, limit, windowMs) {
+    const entry = memoryWindows.get(key);
+    if (!entry) return true;
+    const cutoff = Date.now() - windowMs;
+    const timestamps = entry.ts;
+    while (timestamps.length > 0 && timestamps[0] < cutoff) timestamps.shift();
+    return timestamps.length < limit;
+}
+
+// -- Redis backend ---------------------------------------------------
+
+// ioredis MULTI/EXEC reports per-command failures inside the exec() result
+// (as `[err, res]` pairs) rather than throwing, so a failed command's result
+// reads as `undefined` — and `Number(undefined)` is NaN, which every
+// comparison below treats as "under the limit". Pull results through this so
+// a command failure surfaces like a thrown one instead of silently admitting.
+function multiResult(results, i) {
+    const entry = results[i];
+    if (Array.isArray(entry)) {
+        if (entry[0]) throw entry[0];
+        return entry[1];
+    }
+    return entry;
+}
+
+async function checkRedis(
+    /** @type {import('ioredis').Cluster} */
+    redis,
+    /** @type {string} */
+    key,
+    /** @type {number} */
+    limit,
+    /** @type {number} */
+    windowMs,
+) {
+    const redisKey = `rate:${key}`;
+    const now = Date.now();
+    const cutoff = now - windowMs;
+    const member = `${now}:${crypto.randomUUID()}`;
+
+    // Valkey/Redis MULTI/EXEC keeps this standard-command path compatible with
+    // managed clusters where Lua scripting may be restricted. Add before
+    // counting so concurrent requests cannot all observe count < limit and
+    // over-admit; if the post-add count is too high, remove this request's
+    // member and reject. Races can be conservative, but not permissive.
+    const results = await redis
+        .multi()
+        .zremrangebyscore(redisKey, 0, cutoff)
+        .zadd(redisKey, now, member)
+        .zcard(redisKey)
+        .pexpire(redisKey, windowMs)
+        .exec();
+
+    const count = Number(multiResult(results, 2));
+    if (count > limit) {
+        await redis.zrem(redisKey, member);
+        return false;
+    }
+    return true;
+}
+
+/**
+ * `checkRedis` for many units in one round trip: add them all, count, and take
+ * back however many landed over the limit. Same add-then-count shape, so
+ * concurrent claims can under-admit but never over-admit.
+ */
+async function claimRedis(redis, key, limit, windowMs, units) {
+    const redisKey = `rate:${key}`;
+    const now = Date.now();
+    const members = Array.from(
+        { length: units },
+        () => `${now}:${crypto.randomUUID()}`,
+    );
+    const results = await redis
+        .multi()
+        .zremrangebyscore(redisKey, 0, now - windowMs)
+        .zadd(redisKey, ...members.flatMap((member) => [now, member]))
+        .zcard(redisKey)
+        .pexpire(redisKey, windowMs)
+        .exec();
+
+    const count = Number(multiResult(results, 2));
+    const excess = Math.min(units, Math.max(0, count - limit));
+    if (excess > 0) await redis.zrem(redisKey, ...members.slice(-excess));
+    return units - excess;
+}
+
+async function peekRedis(redis, key, limit, windowMs) {
+    const redisKey = `rate:${key}`;
+    const results = await redis
+        .multi()
+        .zremrangebyscore(redisKey, 0, Date.now() - windowMs)
+        .zcard(redisKey)
+        .exec();
+    return Number(multiResult(results, 1)) < limit;
+}
+
+// -- KV backend ------------------------------------------------------
+
+async function checkKv(kv, key, limit, windowMs) {
+    const prefix = `rate:${key}:`;
+    // `list` filters by TTL already, so a non-expired row ⇒ in-window.
+    // Cap the fetch at `limit + 1` — once we know it's over, the exact
+    // count doesn't matter. The cap applies before expired rows are dropped,
+    // so read newest first: unswept rows from past windows sort oldest.
+    const { res } = await kv.list({
+        as: 'keys',
+        pattern: prefix,
+        limit: limit + 1,
+        reverse: true,
+    });
+    const keys = Array.isArray(res) ? res : (res?.items ?? []);
+    if (keys.length >= limit) return false;
+
+    const now = Date.now();
+    await kv.set({
+        key: `${prefix}${now}:${crypto.randomUUID()}`,
+        value: 1,
+        expireAt: Math.ceil((now + windowMs) / 1000),
+    });
+    return true;
+}
+
+// `checkKv` for many units: one read, then a row per admitted unit. Newest
+// first for the same reason `checkKv` reads that way.
+async function claimKv(kv, key, limit, windowMs, units) {
+    const prefix = `rate:${key}:`;
+    const { res } = await kv.list({
+        as: 'keys',
+        pattern: prefix,
+        limit: limit + 1,
+        reverse: true,
+    });
+    const keys = Array.isArray(res) ? res : (res?.items ?? []);
+    const admitted = Math.max(0, Math.min(units, limit - keys.length));
+    const now = Date.now();
+    await Promise.all(
+        Array.from({ length: admitted }, () =>
+            kv.set({
+                key: `${prefix}${now}:${crypto.randomUUID()}`,
+                value: 1,
+                expireAt: Math.ceil((now + windowMs) / 1000),
+            }),
+        ),
+    );
+    return admitted;
+}
+
+// `list` filters by TTL, so a non-expired row is in-window — same read
+// `checkKv` does, minus the write.
+async function peekKv(kv, key, limit) {
+    const { res } = await kv.list({
+        as: 'keys',
+        pattern: `rate:${key}:`,
+        limit: limit + 1,
+        reverse: true,
+    });
+    const keys = Array.isArray(res) ? res : (res?.items ?? []);
+    return keys.length < limit;
+}
+
+// -- Concurrent in-flight backends -----------------------------------
+//
+// Concurrent limiting is the *other* shape: rather than "no more than X
+// hits in Y window", it's "no more than X requests in flight at once".
+// Each backend's `acquire(key, limit)` returns either `{ ok: false }`
+// (slot full → reject) or `{ ok: true, release }` (caller MUST call
+// release exactly once when the request finishes, success or not).
+//
+// Lifecycle is the wedge between rate and concurrent limits: rate just
+// records a tick, concurrent has to track "still in flight" → "done"
+// across a request boundary. The route middleware hooks `res.finish` /
+// `res.close`; the driver helper wraps the invocation in `try/finally`.
+
+// Orphan TTL safety nets — used when the process dies between acquire
+// and release. Memory backend doesn't need one (the process is also
+// gone); redis/kv do, otherwise a stale slot pins the bucket forever.
+const ORPHAN_SAFETY_TTL_SEC = 60 * 60; // 1 hour
+const ORPHAN_SAFETY_TTL_MS = ORPHAN_SAFETY_TTL_SEC * 1000;
+
+const memoryConcurrentCounts = new Map();
+
+async function acquireMemoryConcurrent(key, limit) {
+    const current = memoryConcurrentCounts.get(key) ?? 0;
+    if (current >= limit) return { ok: false };
+    memoryConcurrentCounts.set(key, current + 1);
+    return {
+        ok: true,
+        release: () => {
+            const c = memoryConcurrentCounts.get(key) ?? 0;
+            if (c <= 1) memoryConcurrentCounts.delete(key);
+            else memoryConcurrentCounts.set(key, c - 1);
+        },
+        // Nothing expires a memory slot but the process holding it, so there
+        // is no staleness to renew away.
+        renew: async () => {},
+    };
+}
+
+async function acquireRedisConcurrent(redis, key, limit, retried = false) {
+    const redisKey = `concurrent:${key}`;
+    const member = `${Date.now()}-${crypto.randomUUID()}`;
+    // One sorted-set member per held slot, scored by acquire time — the same
+    // shape `checkRedis` uses for windows, and for the same reason: expiry has
+    // to be per-slot, not per-key.
+    //
+    // A counter with a key-wide TTL cannot express that. Whoever touches the
+    // key last decides when *every* slot on it expires, so a rejected acquire
+    // extends the life of the slots that rejected it — and a client that
+    // retries on rejection (a websocket reconnect loop is the pointed case)
+    // holds a leaked bucket open forever, locking its owner out of a resource
+    // nobody is actually using. Here the sweep below drops each slot on its own
+    // age, so a leak drains on schedule no matter how hard anyone retries.
+    const now = Date.now();
+    let count;
+    try {
+        const results = await redis
+            .multi()
+            // Slots older than the orphan window belonged to a process that
+            // died before releasing; drop them before counting.
+            .zremrangebyscore(redisKey, 0, now - ORPHAN_SAFETY_TTL_MS)
+            .zadd(redisKey, now, member)
+            .zcard(redisKey)
+            // Key-level TTL is only garbage collection for a bucket that goes
+            // quiet — the per-member sweep above is what bounds a live one.
+            .expire(redisKey, ORPHAN_SAFETY_TTL_SEC)
+            .exec();
+        count = Number(multiResult(results, 2));
+    } catch (err) {
+        // Keys left behind by the INCR-counter version of this backend are
+        // plain strings, so every zset command above fails WRONGTYPE — while
+        // the EXPIRE at the end still succeeds, meaning steady traffic keeps
+        // refreshing the stale key and it never ages out on its own. Drop the
+        // legacy key and count against a clean one.
+        if (!retried && /WRONGTYPE/.test(err?.message ?? '')) {
+            await redis.del(redisKey);
+            return acquireRedisConcurrent(redis, key, limit, true);
+        }
+        throw err;
+    }
+    if (count > limit) {
+        await redis.zrem(redisKey, member);
+        return { ok: false };
+    }
+    return {
+        ok: true,
+        release: async () => {
+            await redis.zrem(redisKey, member);
+        },
+        renew: async () => {
+            // Re-score in place so a slot held longer than the orphan window
+            // isn't mistaken for one whose owner died. `ZADD XX` only touches
+            // a member that's still there, so renewing after release (or after
+            // a sweep) can't resurrect the slot.
+            await redis.zadd(redisKey, 'XX', Date.now(), member);
+            await redis.expire(redisKey, ORPHAN_SAFETY_TTL_SEC);
+        },
+    };
+}
+
+async function acquireKvConcurrent(kv, key, limit) {
+    // KV has no atomic increment. Use the row-per-slot pattern: each
+    // in-flight request owns a unique row under a shared prefix; count
+    // by listing the prefix. Same race profile as `checkKv` — best
+    // effort, conservative bias. Newest first, as in `checkKv`, so unswept
+    // orphan slots don't fill the capped fetch.
+    const prefix = `concurrent:${key}:`;
+    const { res } = await kv.list({
+        as: 'keys',
+        pattern: prefix,
+        limit: limit + 1,
+        reverse: true,
+    });
+    const keys = Array.isArray(res) ? res : (res?.items ?? []);
+    if (keys.length >= limit) return { ok: false };
+
+    const slotKey = `${prefix}${Date.now()}:${crypto.randomUUID()}`;
+    await kv.set({
+        key: slotKey,
+        value: 1,
+        // TTL safety net so an orphaned slot eventually clears.
+        expireAt: Math.ceil((Date.now() + ORPHAN_SAFETY_TTL_MS) / 1000),
+    });
+    return {
+        ok: true,
+        release: async () => {
+            await kv.del({ key: slotKey });
+        },
+        renew: async () => {
+            // Push the row's own TTL out; a slot that outlives the orphan
+            // window is held, not abandoned.
+            await kv.set({
+                key: slotKey,
+                value: 1,
+                expireAt: Math.ceil((Date.now() + ORPHAN_SAFETY_TTL_MS) / 1000),
+            });
+        },
+    };
+}
+
+// -- Backend registry ------------------------------------------------
+//
+// All registered backends stay live simultaneously; selection happens
+// per call via the `backend` option. The `default` slot is what callers
+// get when they don't specify. Each backend entry holds both shapes —
+// the single-shot `rate` check and the `acquire` for concurrent
+// limiting — so route / driver code never has to reason about which
+// backend is wired for which mode.
+
+/**
+ * Wrap a backend pair so every rate / acquire call runs inside a span tagged
+ * with the backend name. Applied at registration, so all gates (route
+ * middleware, driver helpers, imperative checks) are covered.
+ */
+function instrumentBackendPair(name, pair) {
+    const attrs = { 'rate_limit.backend': name };
+    return {
+        rate: (key, limit, windowMs) =>
+            withSpan('rate_limit.check', attrs, () =>
+                pair.rate(key, limit, windowMs),
+            ),
+        peek: (key, limit, windowMs) =>
+            withSpan('rate_limit.peek', attrs, () =>
+                pair.peek(key, limit, windowMs),
+            ),
+        claim: (key, limit, windowMs, units) =>
+            withSpan('rate_limit.claim', attrs, () =>
+                pair.claim(key, limit, windowMs, units),
+            ),
+        acquire: (key, limit) =>
+            withSpan('rate_limit.acquire', attrs, () =>
+                pair.acquire(key, limit),
+            ),
+    };
+}
+
+const memoryBackendPair = instrumentBackendPair('memory', {
+    rate: checkMemory,
+    peek: peekMemory,
+    claim: claimMemory,
+    acquire: acquireMemoryConcurrent,
+});
+
+const backends = {
+    memory: memoryBackendPair,
+};
+let defaultBackendName = 'memory';
+
+// Metering service is wired here so the concurrency gate can resolve
+// per-subscription limits without threading services through every
+// middleware factory. Set by `configureRateLimit({ metering })`; stays
+// `null` until then, in which case `bySubscription` overrides are
+// silently skipped (the top-level `limit` applies to everyone).
+let meteringService = null;
+
+/**
+ * Wire backend implementations. Call once during server boot, after
+ * clients/stores are built. All backends with their dependency available are
+ * registered concurrently — a route or driver method picks one per-call via the
+ * `backend` option. The `default` slot selects the fallback for callers that
+ * omit `backend`.
+ *
+ * ConfigureRateLimit({ default: 'redis', redis, kv, metering })
+ * configureRateLimit({ default: 'memory', redis }) // kv routes // would fall
+ * back configureRateLimit() // memory only
+ *
+ * `metering` is optional; pass the MeteringService instance to enable
+ * `concurrent.bySubscription` overrides. Without it, the top-level `limit`
+ * applies uniformly regardless of subscription tier.
+ *
+ * Throws if `default` names a backend whose dependency is missing — a typo in
+ * config should surface loudly, not silently downgrade.
+ */
+export function configureRateLimit({
+    default: defaultName,
+    redis,
+    kv,
+    metering,
+} = {}) {
+    // Reset (test reconfigure clears stale wiring).
+    for (const name of Object.keys(backends)) delete backends[name];
+    backends.memory = memoryBackendPair;
+    if (redis) {
+        backends.redis = instrumentBackendPair('redis', {
+            rate: (key, limit, windowMs) =>
+                checkRedis(redis, key, limit, windowMs),
+            peek: (key, limit, windowMs) =>
+                peekRedis(redis, key, limit, windowMs),
+            claim: (key, limit, windowMs, units) =>
+                claimRedis(redis, key, limit, windowMs, units),
+            acquire: (key, limit) => acquireRedisConcurrent(redis, key, limit),
+        });
+    }
+    if (kv) {
+        backends.kv = instrumentBackendPair('kv', {
+            rate: (key, limit, windowMs) => checkKv(kv, key, limit, windowMs),
+            peek: (key, limit) => peekKv(kv, key, limit),
+            claim: (key, limit, windowMs, units) =>
+                claimKv(kv, key, limit, windowMs, units),
+            acquire: (key, limit) => acquireKvConcurrent(kv, key, limit),
+        });
+    }
+
+    meteringService = metering ?? null;
+
+    if (defaultName) {
+        if (!backends[defaultName]) {
+            throw new Error(
+                `rate-limit: default backend '${defaultName}' requires its dependency`,
+            );
+        }
+        defaultBackendName = defaultName;
+    } else {
+        defaultBackendName = 'memory';
+    }
+}
+
+/** Used by tests / boot to inspect what's wired. */
+export function listConfiguredRateLimitBackends() {
+    return { available: Object.keys(backends), default: defaultBackendName };
+}
+
+/**
+ * Resolve the `{ rate, peek, acquire }` backend pair for a named backend.
+ * Unknown / unconfigured names log once and fall through to the default so a
+ * typo in a route or driver decorator doesn't 500 every request — rate limiting
+ * is best-effort security.
+ */
+function resolveBackend(name) {
+    if (!name) return backends[defaultBackendName];
+    const bk = backends[name];
+    if (bk) return bk;
+    console.warn(
+        `[rate-limit] backend '${name}' not configured; using default '${defaultBackendName}'`,
+    );
+    return backends[defaultBackendName];
+}
+
+// -- Key strategies --------------------------------------------------
+
+/**
+ * Build a rate-limit key from the request.
+ *
+ * Strategies: 'fingerprint' — network hash (IP + headers), refined by the
+ * client's device fingerprint when one was supplied (default). Good for
+ * unauthenticated endpoints where the same IP may serve many users (offices,
+ * VPNs). 'ip' — bare IP. Simpler but coarser. 'user' — the authenticated actor
+ * (user, plus the app and worker it acts through; see `actorKey`). Use for
+ * authenticated endpoints where you want per-account limits regardless of IP.
+ * function — custom `(req) => string`.
+ */
+function resolveKey(req, scope, strategy) {
+    const prefix = scope ? `${scope}:` : '';
+
+    if (typeof strategy === 'function') {
+        return prefix + strategy(req);
+    }
+
+    switch (strategy) {
+        case 'user': {
+            const id = req.actor?.user?.id;
+            if (!id) {
+                // Fall back to fingerprint if no actor (shouldn't happen
+                // on requireAuth routes, but be safe)
+                return prefix + fingerprint(req);
+            }
+            return prefix + actorKey(req.actor, id);
+        }
+        case 'ip':
+            return prefix + ip(req);
+        case 'fingerprint':
+        default:
+            return prefix + fingerprint(req);
+    }
+}
+
+/**
+ * Bucket identity for an authenticated actor: `<user>[:<app>][:<worker>]`.
+ *
+ * The app segment is the app the actor acts as, so an access token minted by an
+ * app lands in that app's bucket. The worker segment is the worker's session
+ * uid, unique per (user, app, worker name). Without these, a busy app or worker
+ * drains the limit shared by everything else the same user runs.
+ */
+function actorKey(actor, userId) {
+    const parts = [userId];
+    const appUid = actor.effectiveApp?.uid;
+    if (appUid) parts.push(appUid);
+    if (actor.session?.kind === 'worker' && actor.session.uid) {
+        parts.push(actor.session.uid);
+    }
+    return parts.join(':');
+}
+
+function ip(req) {
+    // `req.ip` honors the app-level `trust proxy` setting — it returns the
+    // leftmost untrusted XFF address when behind the configured proxy chain
+    // and the direct socket peer otherwise. Reading XFF directly would let a
+    // client forge their rate-limit key by spoofing the header.
+    return req.ip || req.socket?.remoteAddress || 'unknown';
+}
+
+/**
+ * A coarse network fingerprint for a request: a short hash of the (proxy-aware)
+ * IP plus the headers a client can't trivially vary per-request without also
+ * changing how the request looks. Anchors the default rate-limit key here, and
+ * exported so the global fingerprint middleware can stamp the identical value
+ * on `req.networkFingerprint` (one key space shared by both).
+ */
+export function computeNetworkFingerprint(req) {
+    const parts = [
+        ip(req),
+        req.headers?.['user-agent'] || '',
+        req.headers?.['accept-language'] || '',
+        req.headers?.['accept-encoding'] || '',
+    ];
+    return crypto
+        .createHash('sha256')
+        .update(parts.join('|'))
+        .digest('base64url')
+        .slice(0, 16);
+}
+
+/**
+ * The device fingerprint (validated and stamped by the fingerprint middleware)
+ * refines the bucket so devices behind one NAT don't crowd each other's limit.
+ * It stays anchored to the network hash because the value is client-supplied:
+ * alone it could be spoofed to drain another device's bucket, and rotating it
+ * to mint fresh buckets is caught by the same stacked 'ip' backstop that
+ * catches User-Agent rotation.
+ */
+function fingerprint(req) {
+    const network = req.networkFingerprint ?? computeNetworkFingerprint(req);
+    return req.deviceFingerprint
+        ? `${network}:${req.deviceFingerprint}`
+        : network;
+}
+
+// -- Shared charge path ----------------------------------------------
+
+const noop = async () => {};
+
+/**
+ * The one path every entry point charges through: resolve the limit (with any
+ * `bySubscription` override for `req`'s actor), then `rate`, `peek` or
+ * `acquire` against `backend`. A backend error fails open — `true`, or `null`
+ * in place of a slot — so a broken Redis/KV doesn't fail every request it
+ * guards. With `failOpen: false` the error is thrown instead.
+ */
+async function charge(
+    req,
+    key,
+    spec,
+    { mode, backend, failOpen = true, label },
+) {
+    try {
+        const limit = await resolveSubscriptionLimit(req, spec);
+        return mode === 'acquire'
+            ? await backend.acquire(key, limit)
+            : await backend[mode](key, limit, spec.window);
+    } catch (err) {
+        if (!failOpen) throw err;
+        console.error(`${label} failed, failing open:`, err);
+        return mode === 'acquire' ? null : true;
+    }
+}
+
+/** Bucket key for a route-shaped spec: its `key` strategy within its scope. */
+function routeKey(req, spec) {
+    return resolveKey(
+        req,
+        spec.scope ?? req.route?.path ?? 'route',
+        spec.key ?? 'fingerprint',
+    );
+}
+
+/**
+ * Wrap an acquired slot so `release` runs at most once and neither it nor
+ * `renew` ever rejects: a failed release is logged, not thrown into the
+ * caller's `finally` or a response listener.
+ */
+function guardSlot(slot, label) {
+    let released = false;
+    return {
+        ok: true,
+        release: async () => {
+            if (released) return;
+            released = true;
+            try {
+                await slot.release();
+            } catch (err) {
+                console.error(`${label} release failed:`, err);
+            }
+        },
+        renew: async () => {
+            if (released) return;
+            try {
+                await slot.renew?.();
+            } catch (err) {
+                console.error(`${label} renew failed:`, err);
+            }
+        },
+    };
+}
+
+// -- Route middleware ------------------------------------------------
+
+/**
+ * Express middleware factory. Reads from the materialised route option:
+ *
+ * { rateLimit: { limit: 10, window: 15 * 60_000, key: 'user' } } { rateLimit: {
+ * limit: 100, window: 60_000, backend: 'memory' } }
+ *
+ * Rejects with 429. Fails open on backend error.
+ */
+export function rateLimitGate(opts) {
+    const backend = resolveBackend(opts.backend);
+
+    return async (req, _res, next) => {
+        const allowed = await charge(req, routeKey(req, opts), opts, {
+            mode: 'rate',
+            backend,
+            label: '[rate-limit] backend check',
+        });
+        if (!allowed) {
+            next(
+                new HttpError(429, 'Too many requests.', {
+                    legacyCode: 'too_many_requests',
+                }),
+            );
+            return;
+        }
+        next();
+    };
+}
+
+// -- Driver-call helper ----------------------------------------------
+
+function driverCaller(req) {
+    const actor = req.actor;
+    return actor?.user?.uuid
+        ? actorKey(actor, actor.user.uuid)
+        : fingerprint(req);
+}
+
+/**
+ * Check rate limit for a driver call. Called from DriverController's /call
+ * handler. Keyed by actor (user, app, worker — see `actorKey`) +
+ * interface:method so different drivers, methods, apps and workers don't crowd
+ * each other.
+ *
+ * `opts` is the resolved per-method spec from the driver's decorator (or
+ * imperative `rateLimit` field) — see `resolveDriverRateLimit` in
+ * `drivers/meta.ts`. When `opts` is omitted (driver declares nothing) we apply
+ * a loose 600/min default that's chatty enough for UI patterns (app listings,
+ * repeated `puter-apps:es:app:read` during desktop boot, kv polling) while
+ * still catching runaway loops.
+ *
+ * Returns true if allowed, false if rate-limited.
+ */
+export async function checkDriverRateLimit(req, ifaceName, method, opts = {}) {
+    return charge(
+        req,
+        `driver:${ifaceName}:${method}:${driverCaller(req)}`,
+        {
+            limit: opts.limit ?? 600,
+            window: opts.window ?? 60_000,
+            bySubscription: opts.bySubscription,
+        },
+        {
+            mode: 'rate',
+            backend: resolveBackend(opts.backend),
+            label: '[rate-limit] driver check',
+        },
+    );
+}
+
+// -- Imperative helper -----------------------------------------------
+
+/**
+ * Imperative rate-limit check (no middleware shape). For handlers that need a
+ * second-axis limit after their route-level limit fires — e.g. `/login` clamps
+ * per IP at the route, then tighter still on the requests that carry an
+ * `auth_id` hint. Returns true if allowed, false if rate-limited.
+ *
+ * Fails open on backend error, like the rest of this module; pass `{ failOpen:
+ * false }` for a limit that must hold even then; the backend error is thrown
+ * instead.
+ */
+export async function checkRateLimit(
+    key,
+    limit,
+    windowMs,
+    backend,
+    { failOpen = true } = {},
+) {
+    return charge(
+        undefined,
+        key,
+        { limit, window: windowMs },
+        {
+            mode: 'rate',
+            backend: resolveBackend(backend),
+            failOpen,
+            label: '[rate-limit] imperative check',
+        },
+    );
+}
+
+/**
+ * `checkRateLimit` for `units` hits at once, in one backend round trip.
+ * Resolves to how many were admitted (0..units) and spent; the rest were not
+ * charged. Fails open, admitting every unit, like the rest of this module.
+ */
+export async function claimRateLimit(key, limit, windowMs, units, backend) {
+    if (!(units > 0)) return 0;
+    const bk = resolveBackend(backend);
+    try {
+        return await bk.claim(key, limit, windowMs, units);
+    } catch (err) {
+        console.error(
+            '[rate-limit] imperative claim failed, failing open:',
+            err,
+        );
+        return units;
+    }
+}
+
+/**
+ * Charge a route-shaped rate-limit spec from inside a handler.
+ *
+ * `rateLimitGate` takes one static spec per route, which is wrong for a route
+ * whose cost depends on a request parameter: `stat` with `return_shares` does
+ * the same work as the share-listing route, and should spend from the same
+ * budget. This resolves the key and the per-subscription limit exactly as the
+ * gate does — same spec in, same bucket out — so a handler can charge a second
+ * scope conditionally. Returns true if allowed; fails open on backend error.
+ * Takes the array form too; windows charge in order, no refund on refusal.
+ */
+export async function consumeRouteRateLimit(req, spec) {
+    if (Array.isArray(spec)) {
+        for (const window of spec) {
+            if (!(await consumeRouteRateLimit(req, window))) return false;
+        }
+        return true;
+    }
+    return charge(req, routeKey(req, spec), spec, {
+        mode: 'rate',
+        backend: resolveBackend(spec.backend),
+        label: '[rate-limit] handler charge',
+    });
+}
+
+/**
+ * `consumeRouteRateLimit` without the spend: same spec, same bucket. Pair the
+ * two when only a successful outcome should count — peek before the work,
+ * consume after it succeeds. Single-window specs only. Fails open.
+ */
+export async function peekRouteRateLimit(req, spec) {
+    return charge(req, routeKey(req, spec), spec, {
+        mode: 'peek',
+        backend: resolveBackend(spec.backend),
+        label: '[rate-limit] handler peek',
+    });
+}
+
+/**
+ * Read whether `key` still has budget, without spending any. The twin to
+ * `checkRateLimit` for gates whose budget is consumed by an outcome rather than
+ * by the request: a failed-credential counter has to be readable before the
+ * work that might fail, or the check itself charges every honest caller. Fails
+ * open on backend error, matching the rest of this module's policy.
+ */
+export async function peekRateLimit(key, limit, windowMs, backend) {
+    return charge(
+        undefined,
+        key,
+        { limit, window: windowMs },
+        {
+            mode: 'peek',
+            backend: resolveBackend(backend),
+            label: '[rate-limit] imperative peek',
+        },
+    );
+}
+
+/**
+ * Imperative concurrency acquire — the `acquire` twin to `checkRateLimit`, for
+ * long-lived things that aren't a request/response pair and so can't use
+ * `concurrencyGate`. The websocket handshake is the motivating case: the slot
+ * has to be held for the life of the connection, not the life of a response.
+ *
+ * Caller MUST invoke `release()` exactly once when the thing being counted ends
+ * (`ok: false` still returns a no-op `release`, so callers can release
+ * unconditionally). Fails open on backend error.
+ *
+ * `release()` returns a promise that settles once the slot is actually back —
+ * await it when the next observation has to see the freed slot. Fire-and-forget
+ * is fine for the usual case (an event handler on connection close), which is
+ * why it never rejects.
+ *
+ * A holder that can outlive `ORPHAN_SAFETY_TTL_MS` must call `renew()` on a
+ * timer, or the orphan sweep will reclaim its slot as abandoned and the cap
+ * stops counting it. Anything that finishes in seconds can ignore it.
+ */
+export async function acquireConcurrent(key, limit, backend) {
+    const slot = await charge(
+        undefined,
+        key,
+        { limit },
+        {
+            mode: 'acquire',
+            backend: resolveBackend(backend),
+            label: '[concurrent] imperative acquire',
+        },
+    );
+    if (!slot) return { ok: true, release: noop, renew: noop };
+    if (!slot.ok) return { ok: false, release: noop, renew: noop };
+    return guardSlot(slot, '[concurrent] imperative');
+}
+
+/**
+ * How long a held slot stays valid without a `renew()`. Exported so a
+ * long-lived holder can pick a renewal cadence from it rather than hardcoding
+ * one that drifts out of step.
+ */
+export const CONCURRENT_SLOT_TTL_MS = ORPHAN_SAFETY_TTL_MS;
+
+// -- Subscription-aware limit resolution -----------------------------
+
+/**
+ * Per-request limit resolution shared by every entry point. The base value is
+ * `opts.limit`; if `bySubscription` is set and we have an authenticated actor
+ * plus a metering service, we look up the actor's subscription policy and
+ * prefer the matching entry. Failure to resolve (no actor, no metering,
+ * metering throws) falls through to the base — rate / concurrency limiting
+ * should never _amplify_ a request failure path.
+ */
+async function resolveSubscriptionLimit(req, opts) {
+    const base = opts.limit;
+    if (!opts.bySubscription || !meteringService) return base;
+    const actor = req?.actor;
+    if (!actor?.user?.uuid) return base;
+    try {
+        const sub = await meteringService.getActorSubscription(actor);
+        const override = subscriptionOverride(opts.bySubscription, sub.id);
+        return typeof override === 'number' ? override : base;
+    } catch {
+        return base;
+    }
+}
+
+// -- Concurrency gate + driver helper --------------------------------
+
+/**
+ * Express middleware factory for concurrent in-flight limiting:
+ *
+ * { concurrent: { limit: 5, key: 'user' } } { concurrent: { limit: 5,
+ * bySubscription: { user_free: 2, unlimited: 50 } } } { concurrent: { limit:
+ * 10, backend: 'redis', scope: 'expensive-op' } }
+ *
+ * On accept, schedules release on `res.finish` / `res.close` so even aborted
+ * requests give their slot back. On reject, 429 with the same
+ * `too_many_requests` legacyCode as the rate gate (clients already handle that
+ * branch). Fails open on backend error.
+ */
+export function concurrencyGate(opts) {
+    const backend = resolveBackend(opts.backend);
+
+    return async (req, res, next) => {
+        const slot = await charge(req, routeKey(req, opts), opts, {
+            mode: 'acquire',
+            backend,
+            label: '[concurrent] backend acquire',
+        });
+        if (!slot) {
+            next();
+            return;
+        }
+        if (!slot.ok) {
+            next(
+                new HttpError(429, 'Too many concurrent requests.', {
+                    legacyCode: 'too_many_requests',
+                }),
+            );
+            return;
+        }
+
+        // `finish` (response sent) and `close` (connection closed, possibly
+        // aborted before finish) can both fire; the guard releases once.
+        const { release } = guardSlot(slot, '[concurrent]');
+        const onDone = () => void release();
+        res.once('finish', onDone);
+        res.once('close', onDone);
+        if (res.destroyed || res.writableFinished) onDone();
+        next();
+    };
+}
+
+/**
+ * Acquire a concurrent slot for a driver call. Mirrors `checkDriverRateLimit`
+ * but returns an acquisition handle: caller MUST invoke `release()` on the
+ * returned object exactly once, even on thrown errors — typically in a
+ * `finally`. `ok: false` means the slot was full; callers should reject with
+ * 429 in that case.
+ *
+ * `opts` is the resolved per-method spec from the driver's decorator (or
+ * imperative `concurrent` field). Omitting `opts` (driver declares nothing)
+ * yields `{ ok: true, release: noop }` — drivers without a declared concurrency
+ * limit are unbounded, which matches today's behaviour. Apply a limit
+ * explicitly to opt in.
+ */
+export async function acquireDriverConcurrent(req, ifaceName, method, opts) {
+    if (!opts || typeof opts.limit !== 'number') {
+        return { ok: true, release: noop };
+    }
+    const slot = await charge(
+        req,
+        `driver:${ifaceName}:${method}:${driverCaller(req)}`,
+        opts,
+        {
+            mode: 'acquire',
+            backend: resolveBackend(opts.backend),
+            label: '[concurrent] driver acquire',
+        },
+    );
+    if (!slot) return { ok: true, release: noop };
+    if (!slot.ok) return { ok: false, release: noop };
+    const { release } = guardSlot(slot, '[concurrent] driver');
+    return { ok: true, release };
+}

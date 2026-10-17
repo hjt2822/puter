@@ -1,5 +1,5 @@
 /**
- * Copyright (C) 2024 Puter Technologies Inc.
+ * Copyright (C) 2024-present Puter Technologies Inc.
  *
  * This file is part of Puter.
  *
@@ -24,9 +24,7 @@
 }
 
 html {
-    width: 100vw;
     height: 100vh;
-    background-color: #eff1f5
 }
 
 body{
@@ -37,7 +35,7 @@ body{
     flex: 1;
 }
 
-h1 .app-count{
+h1 .app-count, h1 .worker-count, h1 .website-count{
     font-size: 20px;
     color: #6d767d;
     font-weight: 400;
@@ -46,6 +44,7 @@ h1 .app-count{
     padding: 2px 10px;
     border-radius: 3px;
 }
+
 /* ------------------------------------
    Button
    ------------------------------------*/
@@ -72,10 +71,6 @@ h1 .app-count{
     border-style: solid;
     border-width: 1px;
     line-height: 35px;
-    background: -webkit-gradient(linear, left top, left bottom, from(#f6f6f6), to(#e1e1e1));
-    background: linear-gradient(#f6f6f6, #e1e1e1);
-    -webkit-box-shadow: inset 0px 1px 0px rgb(255 255 255 / 30%), 0 1px 2px rgb(0 0 0 / 15%);
-    box-shadow: inset 0px 1px 0px rgb(255 255 255 / 30%), 0 1px 2px rgb(0 0 0 / 15%);
     border-radius: 4px;
     outline: none;
 
@@ -206,6 +201,25 @@ h1 .app-count{
     padding: 0 24px;
 }
 
+.refresh-app-list, .refresh-worker-list, .refresh-website-list {
+    width:40px; 
+    padding: 10px; 
+    float: right; 
+    margin-right: 10px;
+    background-color: white;
+    border: none;
+    color: #0d6efd;
+    font-size: 13px;
+    cursor: pointer;
+    opacity: 0.9;
+}
+
+.refresh-app-list:hover, .refresh-worker-list:hover, .refresh-website-list:hover {
+    opacity: 1;
+}
+.refresh-icon{
+    width: 18px; height: 18px; margin-top: -2px; display: block;
+}
 a {
     color: #0d6efd;
     text-decoration: none;
@@ -223,20 +237,23 @@ section {
     padding: 10px;
     overflow: hidden;
     width: 100%;
-    padding-right: 20px;
-    padding-left: 20px;
+    padding-right: 40px;
+    padding-left: 40px;
     box-sizing: border-box;
 }
-#app-list{
+#app-list, #website-list, #worker-list {
     display: none;
 }
-#app-list-table > thead{
-    font-size:14px; background-color: #f7fafc; border-top: 1px solid #DDD; text-transform: uppercase; color: #6d767d;
+#app-list-table > thead, #website-list-table > thead, #worker-list-table > thead{
+    font-size:14px; 
+    border-top: 1px solid #DDD; 
+    text-transform: uppercase; 
+    color: #6d767d;
     cursor: default;
 }
-.app-card {
+.app-card, .website-card, .worker-card {
     padding: 12px;
-    border-top: 1px solid #d8dce5;
+    border-top: 1px solid #f1f2f5;
     border-radius: 0;
     clear: both;
     background: white;
@@ -244,25 +261,33 @@ section {
     position: relative;
 }
 
-.app-card:hover {
-    background-color: #e8eff66e;
+.app-card:hover, .website-card:hover, .worker-card:hover {
+    background-color: #f0f5fb6e;
 }
-.app-card.active {
-    background-color: #e8eff6;
-}
-
-.app-card:hover .app-row-toolbar{
-    display: block;
+.app-card.active, .website-card.active, .worker-card.active {
+    background-color: #ebeff39a;
 }
 
-.app-card h1 {
+
+.app-card:hover .app-row-toolbar, .website-card:hover .website-row-toolbar, .worker-card:hover .worker-row-toolbar {
+    visibility: visible;
+    opacity: 1;
+}
+
+.app-toolbar-container, .website-toolbar-container, .worker-toolbar-container {
+  height: 16px;
+  overflow: hidden;
+  position: relative;
+}
+
+.app-card h1, .website-card h1, .worker-card h1 {
     margin-top: 0;
     color: #657188;
     font-weight: 400;
     font-size: 25px;
 }
 
-#create-app-success {
+#create-app-success, #create-website-success, #create-worker-success {
     height: calc(100vh - 40px);
     overflow: hidden;
     text-align: center;
@@ -277,7 +302,7 @@ label, input[type="text"] {
     user-select: none;
 }
 
-#delete-app {
+#delete-app, #delete-website, #delete-worker {
     cursor: pointer;
     float: left;
     margin-top: 30px;
@@ -285,7 +310,7 @@ label, input[type="text"] {
     font-size: 13px;
 }
 
-#delete-app:hover {
+#delete-app:hover, #delete-website:hover, #delete-worker:hover {
     text-decoration: underline;
 }
 
@@ -338,7 +363,7 @@ label {
 #edit-app{
     display: none;
 }
-#create-app-error, #edit-app-error, #jip-error {
+#create-app-error,#deploy-app-error, #edit-app-error, #jip-error {
     display: none;
 }
 
@@ -411,7 +436,7 @@ label {
 }
 
 .app-card-link:hover{
-    text-decoration: underline;
+    text-decoration: underline !important;
 }
 
 .edit-app img {
@@ -430,16 +455,48 @@ label {
     left: 0;
     z-index: 1000;
     display: block;
-    padding: 20px;
+    padding: 40px 16px 0;
     overflow-x: hidden;
     overflow-y: auto;
-    background-color: white;
-    border-right: 1px solid #e1e1e1;
-    width: 250px;
+    background-color: rgb(249, 249, 249);
+    border-right: 1px solid #eeeeee;
     color: rgb(51, 51, 51);
     font-weight: 400;
+    width: 25px;
 }
-
+.sidebar .sidebar-content{
+    display: none;
+    position: relative;
+    height: 100%;
+}
+.sidebar.open{
+    width: 250px;
+}
+.sidebar.open .sidebar-content{
+    display: block;
+}
+.sidebar-toggle{
+    display: block;
+    width: 10px;
+    height: 10px;
+    position: absolute;
+    right: 0;
+    top: 0;
+    padding: 10px;
+    background-size: 25px;
+    background-repeat: no-repeat;
+    background-position: center;
+    cursor: pointer;
+    background-image: url("data:image/svg+xml,%3C%3Fxml%20version%3D%221.0%22%20encoding%3D%22utf-8%22%3F%3E%3C!--%20Uploaded%20to%3A%20SVG%20Repo%2C%20www.svgrepo.com%2C%20Generator%3A%20SVG%20Repo%20Mixer%20Tools%20--%3E%3Csvg%20fill%3D%22%23000000%22%20width%3D%22800px%22%20height%3D%22800px%22%20viewBox%3D%220%200%2024%2024%22%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%3E%3Cpath%20d%3D%22M15.2928932%2C12%20L12.1464466%2C8.85355339%20C11.9511845%2C8.65829124%2011.9511845%2C8.34170876%2012.1464466%2C8.14644661%20C12.3417088%2C7.95118446%2012.6582912%2C7.95118446%2012.8535534%2C8.14644661%20L16.8535534%2C12.1464466%20C17.0488155%2C12.3417088%2017.0488155%2C12.6582912%2016.8535534%2C12.8535534%20L12.8535534%2C16.8535534%20C12.6582912%2C17.0488155%2012.3417088%2C17.0488155%2012.1464466%2C16.8535534%20C11.9511845%2C16.6582912%2011.9511845%2C16.3417088%2012.1464466%2C16.1464466%20L15.2928932%2C13%20L4.5%2C13%20C4.22385763%2C13%204%2C12.7761424%204%2C12.5%20C4%2C12.2238576%204.22385763%2C12%204.5%2C12%20L15.2928932%2C12%20Z%20M19%2C5.5%20C19%2C5.22385763%2019.2238576%2C5%2019.5%2C5%20C19.7761424%2C5%2020%2C5.22385763%2020%2C5.5%20L20%2C19.5%20C20%2C19.7761424%2019.7761424%2C20%2019.5%2C20%20C19.2238576%2C20%2019%2C19.7761424%2019%2C19.5%20L19%2C5.5%20Z%22%2F%3E%3C%2Fsvg%3E");
+    opacity: 0.6;
+    margin-top: 5px;
+}
+.open .sidebar-toggle{
+    background-image: url("data:image/svg+xml,%3C%3Fxml%20version%3D%221.0%22%20encoding%3D%22utf-8%22%3F%3E%3C!--%20Uploaded%20to%3A%20SVG%20Repo%2C%20www.svgrepo.com%2C%20Generator%3A%20SVG%20Repo%20Mixer%20Tools%20--%3E%3Csvg%20fill%3D%22%23000000%22%20width%3D%22800px%22%20height%3D%22800px%22%20viewBox%3D%220%200%2024%2024%22%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%3E%3Cpath%20d%3D%22M8.70710678%2C12%20L19.5%2C12%20C19.7761424%2C12%2020%2C12.2238576%2020%2C12.5%20C20%2C12.7761424%2019.7761424%2C13%2019.5%2C13%20L8.70710678%2C13%20L11.8535534%2C16.1464466%20C12.0488155%2C16.3417088%2012.0488155%2C16.6582912%2011.8535534%2C16.8535534%20C11.6582912%2C17.0488155%2011.3417088%2C17.0488155%2011.1464466%2C16.8535534%20L7.14644661%2C12.8535534%20C6.95118446%2C12.6582912%206.95118446%2C12.3417088%207.14644661%2C12.1464466%20L11.1464466%2C8.14644661%20C11.3417088%2C7.95118446%2011.6582912%2C7.95118446%2011.8535534%2C8.14644661%20C12.0488155%2C8.34170876%2012.0488155%2C8.65829124%2011.8535534%2C8.85355339%20L8.70710678%2C12%20L8.70710678%2C12%20Z%20M4%2C5.5%20C4%2C5.22385763%204.22385763%2C5%204.5%2C5%20C4.77614237%2C5%205%2C5.22385763%205%2C5.5%20L5%2C19.5%20C5%2C19.7761424%204.77614237%2C20%204.5%2C20%20C4.22385763%2C20%204%2C19.7761424%204%2C19.5%20L4%2C5.5%20Z%22%2F%3E%3C%2Fsvg%3E");
+}
+.sidebar-toggle:hover{
+    opacity: 1;
+}
 .sidebar-nav {
     padding-left: 0;
     list-style: none;
@@ -454,22 +511,30 @@ label {
     display: block;
     padding: 10px 20px;
     cursor: pointer;
+    margin-bottom: 10px;
+    margin-left: 10px;
+    margin-right: 10px;
+    border-radius: 7px;
+}
+
+.sidebar-nav>li:hover {
+    background-color: #656c771b;
 }
 
 .sidebar-nav>li.active {
     color: #fff;
-    background-color: #3273dc;
+    background-color: #3a85ff;
 }
 
-.sidebar-nav > li .app-count{
-    font-size: 14px;
+.sidebar-nav > li .app-count, .sidebar-nav > li .worker-count, .sidebar-nav > li .website-count {
+    font-size: 16px;
     color: #6d767d;
     font-weight: 400;
     margin-left: 10px;
     float: right;
 }
 
-.tab-btn.active .app-count{
+.tab-btn.active .app-count, .tab-btn.active .worker-count, .tab-btn.active .website-count{
     color: #f6f6f6;
 }
 
@@ -481,34 +546,39 @@ label {
 }
 
 .main {
-    width: calc(100% - 265px);
-    left: 250px;
+    width: calc(100% - 35px);
+    left: 25px;
     top: 0px;
     position: absolute;
     box-sizing: border-box;
-    padding: 20px;
+    padding: 12px 20px;
     padding-right: 0;
     display: flex;
     flex-direction: column;
 }
 
+.sidebar-open .main {
+    width: calc(100% - 250px);
+    left: 240px;
+}
+
 .main>section {
     background-color: white;
-    box-shadow: 0px 0px 3px #E1E1E1;
-    border: 1px solid #e1e1e1;
     border-radius: 3px;
 }
 
 .link-to-docs{
     color: #586373; 
-    font-size: 15px;
-}
-.link-to-docs, .link-to-docs:hover {
+    font-size: 14px;
     text-decoration: none;
+}
+.link-to-docs:hover {
+    text-decoration: underline !important;
 }
 .link-to-docs img{
     width: 12px; 
     margin-bottom: -1px;
+    margin-left: 5px;
 }
 .tab-btn {
     background-size: 20px;
@@ -526,6 +596,19 @@ label {
     background-image: url(../img/apps-outline-black.svg);
 }
 
+.tab-btn[data-tab="websites"] {
+    background-image: url(../img/website.svg);
+}
+.tab-btn.active[data-tab="websites"] {
+    background-image: url(../img/website-white.svg);
+}
+
+.tab-btn[data-tab="workers"] {
+    background-image: url(../img/workers.svg);
+}
+.tab-btn.active[data-tab="workers"] {
+    background-image: url(../img/workers-white.svg);
+}
 .tab-btn[data-tab="payout-method"] {
     background-image: url(../img/wallet.svg);
 }
@@ -547,7 +630,7 @@ label {
     box-sizing: border-box;
 }
 
-#no-apps-notice, #loading {
+#no-apps-notice, #no-workers-notice, #no-websites-notice, #loading {
     display: flex;
     flex-direction: column;
     justify-content: center;
@@ -584,7 +667,7 @@ table {
 
 .table>thead>tr>th {
     vertical-align: bottom;
-    border-bottom: 2px solid #ddd;
+    border-bottom: 1px solid #ddd;
 }
 
 .table>thead>tr>th, .table>tbody>tr>th, .table>tfoot>tr>th, .table>thead>tr>td, .table>tbody>tr>td, .table>tfoot>tr>td {
@@ -594,10 +677,17 @@ table {
 }
 .table>thead>tr>th{
     padding: 5px;
+    background-color: #f8f9fa;
+    font-weight: 600;
+    color: #676e77;
+    text-transform: uppercase;
+    font-size: 0.75rem;
+    letter-spacing: 0.05em;
 }
 th {
     text-align: left;
     padding-bottom: 0 !important;
+    font-size: 12px;
 }
 
 td, th {
@@ -674,23 +764,34 @@ th.sorted{
     user-select: none !important;
 }
 
-.my-apps-title {
-    font-size: 27px;
+.my-apps-title, .my-workers-title, .my-websites-title {
+    font-size: 22px;
     margin-top: 0px;
     float: left;
     font-weight: 500;
-    margin-bottom: 15px;
+    margin-bottom: 0;
     color: #394254;
+    flex-grow: 1;
 }
 
-.app-row-toolbar{
-    margin-top: -7px;
-    display: none;
-    width: 350px;
+.app-row-toolbar {
+    visibility: hidden;
+    opacity: 0;
+    transition: opacity 0.2s ease;
+    height: auto; /* allow full content */
+    overflow: visible; /* allow overflow */
+    display: flex;
+    align-items: center;
+    gap: 4px; /* adjust spacing here */
+      font-size: 12px;
+  padding-top: 2px;
+ margin-top: -4px; 
+ 
 }
 
 .app-row-toolbar img {
     opacity: 0.5;
+    transition: opacity 0.2s ease;
 }
 
 .app-row-toolbar img:hover {
@@ -778,7 +879,7 @@ ol li:before {
     position: relative;
     display: block;
     padding: 10px 15px;
-    margin-right: 5px;
+    margin-right: 15px;
     line-height: 1.42857143;
     border: 1px solid transparent;
     border-radius: 4px 4px 0 0;
@@ -863,14 +964,23 @@ ol li:before {
     background-color: rgba(0, 0, 0, 0.4);
 }
   
-.create-an-app-btn{
-    float:right; margin-bottom: 10px;
+.create-an-app-btn, .create-a-website-btn{
+    float:right; 
+    margin-bottom: 0px;
 }
-.create-an-app-btn img{
-    width: 20px;
+.create-an-app-btn img, .create-a-website-btn img, .create-a-worker-btn img{
+    width: 25px;
+    height: 25px;
     margin-bottom: -5px; 
     margin-right: 10px;
+    margin-bottom: -7px;
+    margin-right: 4px;
 }
+.create-a-worker-btn, .create-a-website-btn{
+    float:right; 
+    margin-bottom: 0px;
+}
+
 .jip-submit-btn{
     float: left; 
     margin-top: 10px; 
@@ -879,8 +989,13 @@ ol li:before {
 .ip-terms-notice{
     font-size: 12px; margin-top: 20px; margin-bottom: 0;
 }
-.app-list-nav{
-    overflow: hidden; margin-bottom: 40px; margin-top: 10px;
+.app-list-nav, .worker-list-nav, .website-list-nav{
+    overflow: hidden;
+    margin-bottom: 40px;
+    margin-top: 10px;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
 }
 .back-to-main-btn{
     float:right; margin-bottom: 10px;
@@ -892,7 +1007,7 @@ ol li:before {
     display: flex;
     align-items: center;
 }
-.app-title{
+.app-title, .website-title{
     margin-top:0px; 
     margin-bottom: 0;
 }
@@ -916,6 +1031,12 @@ ol li:before {
     float: right; 
     margin-top: 20px; 
     margin-bottom: 20px;
+}
+.edit-app-reset-btn{
+    float: right; 
+    margin-top: 20px; 
+    margin-bottom: 20px;
+    margin-right: 10px;
 }
 input:read-only {
     background-color: rgb(242 242 242);
@@ -1028,20 +1149,36 @@ dialog{
     width: 100%;
     box-sizing: border-box;
     background-color: white;
-    padding: 5px;
-    background-size: 20px;
+    padding: 8px;
+    background-size: 15px;
     background-position-y: center;
-    background-position-x: 5px;
+    background-position-x: 9px;
     padding-left: 35px;
     padding-right: 35px;
-    border: 2px solid #CCC;
+    border: 2px solid #ebebeb;
+    font-size: 14px;
 }
-
+.search-container{
+    margin-bottom: 10px; 
+    position: relative; 
+    width: 300px; 
+    float:left;
+}
+.search::placeholder {
+    opacity: 0.7;
+}
+.search:focus, .search:focus-within, .search:active, .search:focus-visible {
+    border: 2px solid #cbcbcb !important;
+    outline: none !important;
+}
+.search.has-value{
+    border: 2px solid #0066d2 !important;
+}
 .search-clear {
     display: none;
     position: absolute;
     right: 6px;
-    top: 6px;
+    top: 8px;
     opacity: 0.3;
     height: 20px;
 }
@@ -1057,28 +1194,310 @@ dialog{
     margin-top: 0; 
     display: block;
     width: 170px;
-    clear: both;
-    margin-bottom: 3px;
+    margin-bottom: 0;
+    width: 20px;
+    height: 20px;
+    margin-right: 3px;
+    filter: grayscale(100%);
+    color: green;
+    background: #c6f6c6;
+    border: 3px solid #00d251;
+    opacity: 0.4;
+    background-position: center;
+    background-size: contain;
 }
 
 .approval-badge-lsiting{
-    color: green;
-    background: #c6f6c6;
-    border:1px solid green;
+    background-image: url("data:image/svg+xml,%3C%3Fxml%20version%3D%221.0%22%20encoding%3D%22utf-8%22%3F%3E%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%20500%20500%22%3E%3Cg%20transform%3D%22matrix(1.235356%2C%200%2C%200%2C%201.216956%2C%202.740952%2C%205.645954)%22%20style%3D%22%22%3E%3ClinearGradient%20id%3D%22SVGID_1_%22%20gradientUnits%3D%22userSpaceOnUse%22%20x1%3D%2285.941%22%20y1%3D%22446.6405%22%20x2%3D%22282.8565%22%20y2%3D%2220.8316%22%20gradientTransform%3D%22matrix(1%200%200%20-1%200%20400)%22%3E%3Cstop%20offset%3D%220%22%20style%3D%22stop-color%3A%23f0f2f5%22%2F%3E%3Cstop%20offset%3D%221%22%20style%3D%22stop-color%3A%23F5F3FF%22%2F%3E%3C%2FlinearGradient%3E%3Cpath%20class%3D%22st0%22%20d%3D%22M338.8%2C400H61.2C27.4%2C400%2C0%2C372.6%2C0%2C338.8V61.2C0%2C27.4%2C27.4%2C0%2C61.2%2C0h277.6C372.6%2C0%2C400%2C27.4%2C400%2C61.2v277.6%20%20%20C400%2C372.6%2C372.6%2C400%2C338.8%2C400z%22%20style%3D%22fill%3A%20%23ffffff00%3B%22%2F%3E%3C%2Fg%3E%3ClinearGradient%20id%3D%22linear-gradient%22%20gradientUnits%3D%22userSpaceOnUse%22%20x1%3D%22215.26%22%20x2%3D%22107.98%22%20y1%3D%22215.26%22%20y2%3D%22107.98%22%3E%3Cstop%20offset%3D%220%22%20stop-color%3D%22%23ef3739%22%2F%3E%3Cstop%20offset%3D%220.54%22%20stop-color%3D%22%23ef3739%22%2F%3E%3Cstop%20offset%3D%221%22%20stop-color%3D%22%23ff8c8b%22%2F%3E%3C%2FlinearGradient%3E%3ClinearGradient%20id%3D%22linear-gradient-2%22%20gradientUnits%3D%22userSpaceOnUse%22%20x1%3D%22213.43%22%20x2%3D%22110.21%22%20y1%3D%22401.8%22%20y2%3D%22298.58%22%3E%3Cstop%20offset%3D%220%22%20stop-color%3D%22%231eb4eb%22%2F%3E%3Cstop%20offset%3D%220.54%22%20stop-color%3D%22%231eb4eb%22%2F%3E%3Cstop%20offset%3D%221%22%20stop-color%3D%22%2392f4fe%22%2F%3E%3C%2FlinearGradient%3E%3ClinearGradient%20id%3D%22linear-gradient-3%22%20gradientUnits%3D%22userSpaceOnUse%22%20x1%3D%22402.59%22%20x2%3D%22298.14%22%20y1%3D%22223.82%22%20y2%3D%22119.37%22%3E%3Cstop%20offset%3D%220%22%20stop-color%3D%22%23fe7838%22%2F%3E%3Cstop%20offset%3D%220.54%22%20stop-color%3D%22%23fe7636%22%2F%3E%3Cstop%20offset%3D%221%22%20stop-color%3D%22%23ffad8a%22%2F%3E%3C%2FlinearGradient%3E%3ClinearGradient%20id%3D%22linear-gradient-4%22%20gradientUnits%3D%22userSpaceOnUse%22%20x1%3D%22411.68%22%20x2%3D%22289.18%22%20y1%3D%22411.68%22%20y2%3D%22289.18%22%3E%3Cstop%20offset%3D%220%22%20stop-color%3D%22%236f2efe%22%2F%3E%3Cstop%20offset%3D%220.36%22%20stop-color%3D%22%236f2efe%22%2F%3E%3Cstop%20offset%3D%221%22%20stop-color%3D%22%23ae90ff%22%2F%3E%3C%2FlinearGradient%3E%3Cg%20transform%3D%22matrix(1%2C%200%2C%200%2C%201%2C%20-6.481849%2C%20-8.898556)%22%3E%3Ccircle%20cx%3D%22161.62%22%20cy%3D%22161.62%22%20fill%3D%22url(%23linear-gradient)%22%20r%3D%2275.86%22%2F%3E%3Cpath%20d%3D%22m92.28%20419.73c8.68%208.68%2022.77%208.68%2031.45%200l37.19-37.19%2013.92%2022c9.77%2015.43%2033.27%2011.63%2037.66-6.1l24.33-98.13c3.76-15.16-9.96-28.89-25.13-25.13l-98.13%2024.33c-17.73%204.39-21.53%2027.9-6.1%2037.66l22%2013.92-37.19%2037.19c-8.68%208.68-8.68%2022.76%200%2031.45z%22%20fill%3D%22url(%23linear-gradient-2)%22%2F%3E%3Cpath%20d%3D%22m416.26%20136.29c-12.88-2.11-25.73-4.2-38.56-6.22-5.87-11.69-11.73-23.43-17.43-35.16-4.15-8.54-15.66-8.54-19.81%200-5.7%2011.73-11.56%2023.47-17.43%2035.16-12.82%202.01-25.68%204.1-38.56%206.22-9.36%201.58-13.38%2012.63-6.62%2018.93%209.27%208.72%2018.69%2017.69%2028.11%2026.78-2.02%2012.64-3.86%2025.24-5.44%2037.76-1.1%209.06%208.68%2016.58%2016.53%2012.5%2010.89-5.63%2022.02-11.56%2033.31-17.62%2011.29%206.06%2022.43%2011.98%2033.31%2017.62%207.85%204.08%2017.62-3.43%2016.53-12.5-1.58-12.53-3.42-25.12-5.44-37.76%209.42-9.09%2018.84-18.07%2028.11-26.78%206.75-6.31%202.73-17.36-6.62-18.93z%22%20fill%3D%22url(%23linear-gradient-3)%22%2F%3E%3Cpath%20d%3D%22m390.52%20277.7c-9.5-1.58-22.43-3.06-40.09-3.08-17.66.02-30.59%201.5-40.09%203.08-15.66%202.77-29.88%2016.99-32.64%2032.64-1.58%209.5-3.06%2022.43-3.08%2040.09.02%2017.66%201.5%2030.59%203.08%2040.09%202.77%2015.66%2016.99%2029.88%2032.64%2032.64%209.5%201.58%2022.43%203.06%2040.09%203.08%2017.66-.02%2030.59-1.5%2040.09-3.08%2015.66-2.77%2029.88-16.99%2032.64-32.64%201.58-9.5%203.06-22.43%203.08-40.09-.02-17.66-1.5-30.59-3.08-40.09-2.77-15.66-16.99-29.88-32.64-32.64z%22%20fill%3D%22url(%23linear-gradient-4)%22%2F%3E%3C%2Fg%3E%3C%2Fsvg%3E");
 }
 
 .approval-badge-incentive{
-    color: #0074ce;
-    background: #d8efff;
-    border:1px solid #0074ce;
+    background-image: url("data:image/svg+xml,%3Csvg%20fill%3D%22none%22%20height%3D%2232%22%20viewBox%3D%220%200%2032%2032%22%20width%3D%2232%22%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20xmlns%3Axlink%3D%22http%3A%2F%2Fwww.w3.org%2F1999%2Fxlink%22%3E%3Cfilter%20id%3D%22a%22%20color-interpolation-filters%3D%22sRGB%22%20filterUnits%3D%22userSpaceOnUse%22%20height%3D%2222.0859%22%20width%3D%2224.5625%22%20x%3D%224.44214%22%20y%3D%227.88281%22%3E%3CfeFlood%20flood-opacity%3D%220%22%20result%3D%22BackgroundImageFix%22%2F%3E%3CfeBlend%20in%3D%22SourceGraphic%22%20in2%3D%22BackgroundImageFix%22%20mode%3D%22normal%22%20result%3D%22shape%22%2F%3E%3CfeColorMatrix%20in%3D%22SourceAlpha%22%20result%3D%22hardAlpha%22%20type%3D%22matrix%22%20values%3D%220%200%200%200%200%200%200%200%200%200%200%200%200%200%200%200%200%200%20127%200%22%2F%3E%3CfeOffset%20dx%3D%221%22%20dy%3D%22-1.5%22%2F%3E%3CfeGaussianBlur%20stdDeviation%3D%221.75%22%2F%3E%3CfeComposite%20in2%3D%22hardAlpha%22%20k2%3D%22-1%22%20k3%3D%221%22%20operator%3D%22arithmetic%22%2F%3E%3CfeColorMatrix%20type%3D%22matrix%22%20values%3D%220%200%200%200%200.713726%200%200%200%200%200.321569%200%200%200%200%200.211765%200%200%200%201%200%22%2F%3E%3CfeBlend%20in2%3D%22shape%22%20mode%3D%22normal%22%20result%3D%22effect1_innerShadow_18_21307%22%2F%3E%3C%2Ffilter%3E%3Cfilter%20id%3D%22b%22%20color-interpolation-filters%3D%22sRGB%22%20filterUnits%3D%22userSpaceOnUse%22%20height%3D%225.70781%22%20width%3D%228.64821%22%20x%3D%2211.8493%22%20y%3D%221.85938%22%3E%3CfeFlood%20flood-opacity%3D%220%22%20result%3D%22BackgroundImageFix%22%2F%3E%3CfeBlend%20in%3D%22SourceGraphic%22%20in2%3D%22BackgroundImageFix%22%20mode%3D%22normal%22%20result%3D%22shape%22%2F%3E%3CfeColorMatrix%20in%3D%22SourceAlpha%22%20result%3D%22hardAlpha%22%20type%3D%22matrix%22%20values%3D%220%200%200%200%200%200%200%200%200%200%200%200%200%200%200%200%200%200%20127%200%22%2F%3E%3CfeOffset%20dx%3D%22-.2%22%20dy%3D%22.2%22%2F%3E%3CfeGaussianBlur%20stdDeviation%3D%22.15%22%2F%3E%3CfeComposite%20in2%3D%22hardAlpha%22%20k2%3D%22-1%22%20k3%3D%221%22%20operator%3D%22arithmetic%22%2F%3E%3CfeColorMatrix%20type%3D%22matrix%22%20values%3D%220%200%200%200%201%200%200%200%200%200.92549%200%200%200%200%200.403922%200%200%200%201%200%22%2F%3E%3CfeBlend%20in2%3D%22shape%22%20mode%3D%22normal%22%20result%3D%22effect1_innerShadow_18_21307%22%2F%3E%3CfeColorMatrix%20in%3D%22SourceAlpha%22%20result%3D%22hardAlpha%22%20type%3D%22matrix%22%20values%3D%220%200%200%200%200%200%200%200%200%200%200%200%200%200%200%200%200%200%20127%200%22%2F%3E%3CfeOffset%20dx%3D%22.1%22%20dy%3D%22-.25%22%2F%3E%3CfeGaussianBlur%20stdDeviation%3D%22.25%22%2F%3E%3CfeComposite%20in2%3D%22hardAlpha%22%20k2%3D%22-1%22%20k3%3D%221%22%20operator%3D%22arithmetic%22%2F%3E%3CfeColorMatrix%20type%3D%22matrix%22%20values%3D%220%200%200%200%200.788235%200%200%200%200%200.364706%200%200%200%200%200.12549%200%200%200%201%200%22%2F%3E%3CfeBlend%20in2%3D%22effect1_innerShadow_18_21307%22%20mode%3D%22normal%22%20result%3D%22effect2_innerShadow_18_21307%22%2F%3E%3C%2Ffilter%3E%3Cfilter%20id%3D%22c%22%20color-interpolation-filters%3D%22sRGB%22%20filterUnits%3D%22userSpaceOnUse%22%20height%3D%2214.4657%22%20width%3D%226.82797%22%20x%3D%2212.586%22%20y%3D%2213.1578%22%3E%3CfeFlood%20flood-opacity%3D%220%22%20result%3D%22BackgroundImageFix%22%2F%3E%3CfeBlend%20in%3D%22SourceGraphic%22%20in2%3D%22BackgroundImageFix%22%20mode%3D%22normal%22%20result%3D%22shape%22%2F%3E%3CfeGaussianBlur%20result%3D%22effect1_foregroundBlur_18_21307%22%20stdDeviation%3D%22.15%22%2F%3E%3C%2Ffilter%3E%3Cfilter%20id%3D%22d%22%20color-interpolation-filters%3D%22sRGB%22%20filterUnits%3D%22userSpaceOnUse%22%20height%3D%2214.2157%22%20width%3D%226.47797%22%20x%3D%2212.9859%22%20y%3D%2213.1562%22%3E%3CfeFlood%20flood-opacity%3D%220%22%20result%3D%22BackgroundImageFix%22%2F%3E%3CfeBlend%20in%3D%22SourceGraphic%22%20in2%3D%22BackgroundImageFix%22%20mode%3D%22normal%22%20result%3D%22shape%22%2F%3E%3CfeColorMatrix%20in%3D%22SourceAlpha%22%20result%3D%22hardAlpha%22%20type%3D%22matrix%22%20values%3D%220%200%200%200%200%200%200%200%200%200%200%200%200%200%200%200%200%200%20127%200%22%2F%3E%3CfeOffset%20dx%3D%22.15%22%20dy%3D%22-.2%22%2F%3E%3CfeGaussianBlur%20stdDeviation%3D%22.15%22%2F%3E%3CfeComposite%20in2%3D%22hardAlpha%22%20k2%3D%22-1%22%20k3%3D%221%22%20operator%3D%22arithmetic%22%2F%3E%3CfeColorMatrix%20type%3D%22matrix%22%20values%3D%220%200%200%200%200.352941%200%200%200%200%200.168627%200%200%200%200%200.188235%200%200%200%201%200%22%2F%3E%3CfeBlend%20in2%3D%22shape%22%20mode%3D%22normal%22%20result%3D%22effect1_innerShadow_18_21307%22%2F%3E%3CfeColorMatrix%20in%3D%22SourceAlpha%22%20result%3D%22hardAlpha%22%20type%3D%22matrix%22%20values%3D%220%200%200%200%200%200%200%200%200%200%200%200%200%200%200%200%200%200%20127%200%22%2F%3E%3CfeOffset%20dx%3D%22-.1%22%20dy%3D%22.15%22%2F%3E%3CfeGaussianBlur%20stdDeviation%3D%22.11%22%2F%3E%3CfeComposite%20in2%3D%22hardAlpha%22%20k2%3D%22-1%22%20k3%3D%221%22%20operator%3D%22arithmetic%22%2F%3E%3CfeColorMatrix%20type%3D%22matrix%22%20values%3D%220%200%200%200%200.670588%200%200%200%200%200.458824%200%200%200%200%200.403922%200%200%200%201%200%22%2F%3E%3CfeBlend%20in2%3D%22effect1_innerShadow_18_21307%22%20mode%3D%22normal%22%20result%3D%22effect2_innerShadow_18_21307%22%2F%3E%3C%2Ffilter%3E%3Cfilter%20id%3D%22e%22%20color-interpolation-filters%3D%22sRGB%22%20filterUnits%3D%22userSpaceOnUse%22%20height%3D%222.70938%22%20width%3D%225.73438%22%20x%3D%2213.3328%22%20y%3D%226.76719%22%3E%3CfeFlood%20flood-opacity%3D%220%22%20result%3D%22BackgroundImageFix%22%2F%3E%3CfeBlend%20in%3D%22SourceGraphic%22%20in2%3D%22BackgroundImageFix%22%20mode%3D%22normal%22%20result%3D%22shape%22%2F%3E%3CfeColorMatrix%20in%3D%22SourceAlpha%22%20result%3D%22hardAlpha%22%20type%3D%22matrix%22%20values%3D%220%200%200%200%200%200%200%200%200%200%200%200%200%200%200%200%200%200%20127%200%22%2F%3E%3CfeOffset%20dy%3D%22-.6%22%2F%3E%3CfeGaussianBlur%20stdDeviation%3D%22.5%22%2F%3E%3CfeComposite%20in2%3D%22hardAlpha%22%20k2%3D%22-1%22%20k3%3D%221%22%20operator%3D%22arithmetic%22%2F%3E%3CfeColorMatrix%20type%3D%22matrix%22%20values%3D%220%200%200%200%200.388235%200%200%200%200%200.223529%200%200%200%200%200.109804%200%200%200%201%200%22%2F%3E%3CfeBlend%20in2%3D%22shape%22%20mode%3D%22normal%22%20result%3D%22effect1_innerShadow_18_21307%22%2F%3E%3C%2Ffilter%3E%3CradialGradient%20id%3D%22f%22%20cx%3D%220%22%20cy%3D%220%22%20gradientTransform%3D%22matrix(-3.21876612%2018.12501307%20-18.98387517%20-3.37128884%2019.4421%2011.3125)%22%20gradientUnits%3D%22userSpaceOnUse%22%20r%3D%221%22%3E%3Cstop%20offset%3D%220%22%20stop-color%3D%22%23f6c93b%22%2F%3E%3Cstop%20offset%3D%221%22%20stop-color%3D%22%23e88340%22%2F%3E%3C%2FradialGradient%3E%3CradialGradient%20id%3D%22g%22%20cx%3D%220%22%20cy%3D%220%22%20gradientTransform%3D%22matrix(-4.8125163%205.12498858%20-8.5863706%20-8.06285668%2024.0671%2014.1875)%22%20gradientUnits%3D%22userSpaceOnUse%22%20r%3D%221%22%3E%3Cstop%20offset%3D%220%22%20stop-color%3D%22%23ffe065%22%2F%3E%3Cstop%20offset%3D%221%22%20stop-color%3D%22%23ffe065%22%20stop-opacity%3D%220%22%2F%3E%3C%2FradialGradient%3E%3CradialGradient%20id%3D%22h%22%20cx%3D%220%22%20cy%3D%220%22%20gradientTransform%3D%22matrix(4.56250153%202.81250392%20-6.970389%2011.30750795%206.06714%2014.1875)%22%20gradientUnits%3D%22userSpaceOnUse%22%20r%3D%221%22%3E%3Cstop%20offset%3D%22.187216%22%20stop-color%3D%22%23ffa45d%22%2F%3E%3Cstop%20offset%3D%221%22%20stop-color%3D%22%23ffa45d%22%20stop-opacity%3D%220%22%2F%3E%3C%2FradialGradient%3E%3CradialGradient%20id%3D%22i%22%20cx%3D%220%22%20cy%3D%220%22%20gradientTransform%3D%22matrix(0%20-16.3125%2024.5772%200%2016.2234%2025.25)%22%20gradientUnits%3D%22userSpaceOnUse%22%20r%3D%221%22%3E%3Cstop%20offset%3D%22.928161%22%20stop-color%3D%22%23f3bd46%22%20stop-opacity%3D%220%22%2F%3E%3Cstop%20offset%3D%22.979885%22%20stop-color%3D%22%23917011%22%2F%3E%3C%2FradialGradient%3E%3ClinearGradient%20id%3D%22j%22%20gradientUnits%3D%22userSpaceOnUse%22%20x1%3D%2217.4773%22%20x2%3D%2216.2234%22%20y1%3D%223.89063%22%20y2%3D%227.36719%22%3E%3Cstop%20offset%3D%220%22%20stop-color%3D%22%23f3c048%22%2F%3E%3Cstop%20offset%3D%221%22%20stop-color%3D%22%23e67a41%22%2F%3E%3C%2FlinearGradient%3E%3ClinearGradient%20id%3D%22k%22%20gradientUnits%3D%22userSpaceOnUse%22%20x1%3D%2216%22%20x2%3D%2216%22%20y1%3D%2213.789%22%20y2%3D%2226.6015%22%3E%3Cstop%20offset%3D%220%22%20stop-color%3D%22%23a6782c%22%2F%3E%3Cstop%20offset%3D%221%22%20stop-color%3D%22%23b95940%22%2F%3E%3C%2FlinearGradient%3E%3ClinearGradient%20id%3D%22l%22%20gradientUnits%3D%22userSpaceOnUse%22%20x1%3D%2219.6609%22%20x2%3D%2213.0859%22%20y1%3D%2221.8749%22%20y2%3D%2221.8749%22%3E%3Cstop%20offset%3D%220%22%20stop-color%3D%22%239d6360%22%2F%3E%3Cstop%20offset%3D%221%22%20stop-color%3D%22%23724a4d%22%2F%3E%3C%2FlinearGradient%3E%3ClinearGradient%20id%3D%22m%22%20gradientUnits%3D%22userSpaceOnUse%22%20x1%3D%2214.1296%22%20x2%3D%2219.0671%22%20y1%3D%228.42188%22%20y2%3D%228.42188%22%3E%3Cstop%20offset%3D%220%22%20stop-color%3D%22%23834b41%22%2F%3E%3Cstop%20offset%3D%221%22%20stop-color%3D%22%23735854%22%2F%3E%3C%2FlinearGradient%3E%3CradialGradient%20id%3D%22n%22%20cx%3D%220%22%20cy%3D%220%22%20gradientTransform%3D%22matrix(-1.86719%200%200%20-1.40625%2018.0671%208.09375)%22%20gradientUnits%3D%22userSpaceOnUse%22%20r%3D%221%22%3E%3Cstop%20offset%3D%220%22%20stop-color%3D%22%237d5a54%22%2F%3E%3Cstop%20offset%3D%221%22%20stop-color%3D%22%237d5a54%22%20stop-opacity%3D%220%22%2F%3E%3C%2FradialGradient%3E%3CradialGradient%20id%3D%22o%22%20cx%3D%220%22%20cy%3D%220%22%20gradientTransform%3D%22matrix(-5.53125%200%200%20-4.43103%2018.3171%208.42187)%22%20gradientUnits%3D%22userSpaceOnUse%22%20r%3D%221%22%3E%3Cstop%20offset%3D%22.694915%22%20stop-color%3D%22%23b3624d%22%20stop-opacity%3D%220%22%2F%3E%3Cstop%20offset%3D%22.960452%22%20stop-color%3D%22%23b3624d%22%2F%3E%3C%2FradialGradient%3E%3Cg%20filter%3D%22url(%23a)%22%3E%3Cpath%20d%3D%22m4.44214%2020.8828c0-6.3513%205.14872-11.49999%2011.49996-11.49999h.5625c6.3513%200%2011.5%205.14869%2011.5%2011.49999v.2859c0%204.8602-3.9399%208.8001-8.8%208.8001h-5.9625c-4.86007%200-8.79996-3.9399-8.79996-8.8001z%22%20fill%3D%22url(%23f)%22%2F%3E%3Cpath%20d%3D%22m4.44214%2020.8828c0-6.3513%205.14872-11.49999%2011.49996-11.49999h.5625c6.3513%200%2011.5%205.14869%2011.5%2011.49999v.2859c0%204.8602-3.9399%208.8001-8.8%208.8001h-5.9625c-4.86007%200-8.79996-3.9399-8.79996-8.8001z%22%20fill%3D%22url(%23g)%22%2F%3E%3C%2Fg%3E%3Cpath%20d%3D%22m4.44214%2020.8828c0-6.3513%205.14872-11.49999%2011.49996-11.49999h.5625c6.3513%200%2011.5%205.14869%2011.5%2011.49999v.2859c0%204.8602-3.9399%208.8001-8.8%208.8001h-5.9625c-4.86007%200-8.79996-3.9399-8.79996-8.8001z%22%20fill%3D%22url(%23h)%22%2F%3E%3Cpath%20d%3D%22m4.44214%2020.8828c0-6.3513%205.14872-11.49999%2011.49996-11.49999h.5625c6.3513%200%2011.5%205.14869%2011.5%2011.49999v.2859c0%204.8602-3.9399%208.8001-8.8%208.8001h-5.9625c-4.86007%200-8.79996-3.9399-8.79996-8.8001z%22%20fill%3D%22url(%23i)%22%2F%3E%3Cg%20filter%3D%22url(%23b)%22%3E%3Cpath%20d%3D%22m12.1611%204.69522c.4705.80115%201.1549%201.82883%202.035%202.67197h4.0547c.88-.84314%201.5645-1.87082%202.0349-2.67197.2426-.41312.0748-.94037-.3522-1.15765-.3206-.16321-.6967-.08573-1.0076.09543-.7016.40878-1.1068-.07312-1.7259-1.01972-.3114-.47595-.7862-.50131-.9766-.5039-.1904.00259-.6652.02795-.9765.5039-.6192.9466-1.0244%201.4285-1.726%201.01972-.3109-.18116-.6869-.25864-1.0076-.09543-.427.21728-.5948.74453-.3522%201.15765z%22%20fill%3D%22url(%23j)%22%2F%3E%3C%2Fg%3E%3Cg%20filter%3D%22url(%23c)%22%3E%3Cpath%20d%3D%22m16.8%2014.2578c0-.4419-.3582-.8-.8-.8-.4419%200-.8.3581-.8.8v.755c0%20.1789-.1198.3338-.2869.3977-.2771.1059-.5538.2528-.808.4432-.6375.4771-1.1566%201.249-1.1566%202.3259%200%201.0601.4778%201.8283%201.1266%202.3205.6182.469%201.3644.6721%201.9604.7263.2416.0219.6022.0861.901.2746.2581.1628.5156.4421.57%201.0401.052.5724-.1805.912-.4839%201.1433-.3502.267-.7568.3515-.86.3515-.2409%200-.654-.032-1.0032-.2215-.294-.1596-.6109-.4618-.6765-1.198-.0393-.4401-.4278-.765-.8679-.7258s-.765.4278-.7258.8679c.1141%201.2794.7503%202.0514%201.507%202.4621.1671.0907.3361.1618.5011.2174.1751.059.3027.2173.3027.4021v.6833c0%20.4418.3581.8.8.8.4418%200%20.8-.3582.8-.8v-.6761c0-.1808.122-.337.2916-.3994.3007-.1108.6144-.2726.9009-.491.6648-.5067%201.2174-1.3506%201.1074-2.5606-.1018-1.1207-.6639-1.7949-1.3201-2.2089-.6156-.3882-1.2897-.5163-1.625-.5468-.9084-.0471-1.6063-.5485-1.6063-1.461%200-.5012.1988-.8691.4937-1.0898.6087-.5156%201.644-.4455%202.1329.2025.2164.2868.3133.6029.3352.8873.0338.4405.4149.7917.8554.7578.4405-.0338.7691-.3786.7352-.8191-.0354-.4604-.1877-1.1343-.6531-1.7512-.304-.4028-.8784-.7891-1.3507-.9836-.1704-.0702-.2971-.2293-.2971-.4135z%22%20fill%3D%22url(%23k)%22%2F%3E%3C%2Fg%3E%3Cg%20filter%3D%22url(%23d)%22%3E%3Cpath%20d%3D%22m16.9999%2014.1562c0-.4418-.3582-.8-.8-.8s-.8.3582-.8.8v.755c0%20.1789-.1198.3339-.2869.3978-.2771.1059-.5538.2528-.808.4431-.6374.4772-1.1565%201.249-1.1565%202.326%200%201.06.4777%201.8282%201.1266%202.3205.6182.469%201.3643.672%201.9603.7262.2417.022.6023.0861.9011.2746.2581.1628.5156.4421.57%201.0402.052.5723-.1805.912-.484%201.1433-.3502.2669-.7567.3514-.86.3514-.2409%200-.6539-.0319-1.0031-.2214-.294-.1596-.6109-.4619-.6766-1.198-.0392-.4401-.4278-.7651-.8678-.7259-.4401.0393-.7651.4278-.7259.8679.1141%201.2795.7503%202.0515%201.5071%202.4622.1671.0907.3361.1617.5011.2173.1751.0591.3026.2174.3026.4022v.6832c0%20.4419.3582.8.8.8s.8-.3581.8-.8v-.6761c0-.1807.1221-.3369.2917-.3994.3006-.1108.6144-.2726.9009-.4909.6647-.5068%201.2174-1.3507%201.1074-2.5607-.1019-1.1207-.6639-1.7949-1.3202-2.2088-.6155-.3883-1.2897-.5164-1.625-.5469-.9083-.047-1.6062-.5485-1.6062-1.4609%200-.5012.1988-.8691.4937-1.0899.6086-.5156%201.644-.4455%202.1329.2026.2163.2867.3132.6029.3351.8873.0339.4405.4149.7917.8555.7578.4405-.0339.769-.3787.7351-.8192-.0354-.4604-.1877-1.1342-.6531-1.7511-.304-.4029-.8783-.7892-1.3506-.9837-.1704-.0701-.2972-.2292-.2972-.4135z%22%20fill%3D%22url(%23l)%22%2F%3E%3C%2Fg%3E%3Cg%20filter%3D%22url(%23e)%22%3E%3Crect%20fill%3D%22url(%23m)%22%20height%3D%222.10938%22%20rx%3D%221.05078%22%20width%3D%225.73438%22%20x%3D%2213.3328%22%20y%3D%227.36719%22%2F%3E%3Crect%20fill%3D%22url(%23n)%22%20height%3D%222.10938%22%20rx%3D%221.05078%22%20width%3D%225.73438%22%20x%3D%2213.3328%22%20y%3D%227.36719%22%2F%3E%3C%2Fg%3E%3Crect%20fill%3D%22url(%23o)%22%20height%3D%222.10938%22%20rx%3D%221.05078%22%20width%3D%225.73438%22%20x%3D%2213.3328%22%20y%3D%227.36719%22%2F%3E%3C%2Fsvg%3E");
 }
 
 .approval-badge-opening{
-    color: #bb00ff;
-    background: #ffeaff;
-    border:1px solid #bb00ff;
+    background-image: url("data:image/svg+xml,%3Csvg%20fill%3D%22none%22%20height%3D%2248%22%20viewBox%3D%220%200%2048%2048%22%20width%3D%2248%22%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%3E%3Cpath%20d%3D%22m0%200h48v48h-48z%22%20fill%3D%22%23fff%22%20fill-opacity%3D%22.01%22%2F%3E%3Cg%20stroke%3D%22%23000%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%20stroke-width%3D%224%22%3E%3Cpath%20d%3D%22m24%204v8%22%2F%3E%3Cpath%20clip-rule%3D%22evenodd%22%20d%3D%22m22%2022%2020%204-6%204%206%206-6%206-6-6-4%206z%22%20fill%3D%22%232f88ff%22%20fill-rule%3D%22evenodd%22%2F%3E%3Cpath%20d%3D%22m38.1421%209.85795-5.6568%205.65685%22%2F%3E%3Cpath%20d%3D%22m9.85787%2038.1421%205.65683-5.6569%22%2F%3E%3Cpath%20d%3D%22m4%2024h8%22%2F%3E%3Cpath%20d%3D%22m9.85783%209.85787%205.65687%205.65683%22%2F%3E%3C%2Fg%3E%3C%2Fsvg%3E")
 }
 
-td .approval-badge:last-child{
-    margin-bottom: 0;
+.approval-badge.active{
+    filter: none;
+    opacity: 1;
 }
+
+/* 
+    App Social Image
+*/
+
+#edit-app-social-image {
+    width: 300px;
+    height: 157px; /* Maintains 1200x630 aspect ratio at smaller scale */
+    border: 2px dashed #ccc;
+    border-radius: 5px;
+    cursor: pointer;
+    background-size: cover;
+    background-position: center;
+    background-repeat: no-repeat;
+    position: relative;
+    margin-bottom: 5px;
+}
+
+#change-social-image {
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    color: #666;
+    text-align: center;
+    font-size: 14px;
+    opacity: 0;
+    transition: opacity 0.2s;
+}
+
+#edit-app-social-image:hover #change-social-image {
+    opacity: 1;
+    background: rgba(255, 255, 255, 0.9);
+    padding: 10px;
+    border-radius: 5px;
+}
+
+#edit-app-social-image-delete {
+    display: none;
+    color: #ff4444;
+    cursor: pointer;
+    font-size: 13px;
+    margin-top: 5px;
+}
+
+.social-image-help {
+    color: #666;
+    font-size: 13px;
+    margin-top: 5px;
+}
+
+.preview-images-help {
+    color: #666;
+    font-size: 13px;
+    margin-top: 5px;
+    margin-bottom: 10px;
+}
+
+.preview-images-container {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+    gap: 15px;
+    margin-top: 10px;
+}
+
+.preview-device {
+    border: 1px solid #e5e5e5;
+    border-radius: 6px;
+    padding: 12px;
+    background: #fafafa;
+}
+
+.preview-device-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 10px;
+}
+
+.preview-device-title {
+    font-weight: 600;
+    color: #333;
+}
+
+.preview-count {
+    font-weight: 400;
+    color: #666;
+    margin-left: 6px;
+    font-size: 13px;
+}
+
+.preview-grid {
+    display: flex;
+    gap: 10px;
+    flex-wrap: wrap;
+    min-height: 90px;
+}
+
+.preview-thumb {
+    width: 120px;
+    height: 90px;
+    border-radius: 5px;
+    background-size: cover;
+    background-position: center;
+    background-repeat: no-repeat;
+    position: relative;
+    border: 1px solid #ddd;
+    overflow: hidden;
+}
+
+.remove-preview-image {
+    position: absolute;
+    top: 4px;
+    right: 6px;
+    background: rgba(0, 0, 0, 0.6);
+    color: #fff;
+    border-radius: 50%;
+    width: 18px;
+    height: 18px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    font-size: 12px;
+}
+
+.app-categories {
+    margin-top: 4px;
+    display: flex;
+    gap: 8px;
+}
+
+.app-category {
+    font-size: 12px;
+    padding: 2px 8px;
+    border-radius: 12px;
+    display: inline-block;
+    background-color: #e3f2fd;
+    color: #1976d2;
+    background-color: #f3f4f6;
+    color: #374151;
+    padding: 1px 6px;
+    border-radius: 4px;
+    font-size: 12px;
+    font-weight: 500;
+    margin: 1px 0 0 0;
+    max-width: fit-content;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.category-select {
+    width: 300px;
+    padding: 8px;
+    margin-bottom: 16px;
+    border: 1px solid #ddd;
+    border-radius: 4px;
+    font-size: 14px;
+}
+.stats-cell{
+    width: 100px; 
+    display: inline-block; 
+    font-size: 14px;
+    opacity: 0.7; 
+}
+.stats-cell:hover{
+    cursor: pointer;
+    opacity: 1 !important;
+}
+.stats-cell img{
+    width: 18px; margin-right: 5px; margin-bottom: -4px;
+}
+.category-badge {
+    display: inline-block;
+    background-color: #f2f2f2;
+    color: #555;
+    font-size: 12px;
+    font-weight: 500;
+    padding: 2px 6px;
+    margin-left: 8px;
+    border-radius: 6px;
+    vertical-align: middle;
+}
+.app-category {
+    display: inline-block;
+    background-color: #f3f4f6;
+    color: #374151;
+    padding: 1px 6px;
+    border-radius: 4px;
+    font-size: 11px;
+    font-weight: 500;
+    margin-top: 2px;
+    max-height: 18px;
+    line-height: 1.2;
+    white-space: nowrap;
+    border: 1px solid #CCC;
+}
+
+.app-row-toolbar span {
+  margin: 0 4px;
+  font-size: 12px;
+  line-height: 1;
+  vertical-align: middle;
+  padding: 2px 4px;
+}
+
+.app-row-toolbar span:hover {
+    text-decoration: underline;
+    cursor: pointer;
+    color: #000; /* Optional: darken on hover */
+}
+
+.options-icon {
+    cursor: pointer;
+    opacity: 0.7;
+    width: 30px;
+    height: 30px;
+    border-radius: 5px;
+}
+
+.options-icon:hover {
+    opacity: 1;
+    background-color: #edededb4;
+}
+
+.worker-checkbox, .app-checkbox, .website-checkbox {
+    width: 15px; height: 20px;
+}
+
+.no-hover:hover {
+    background-color: transparent !important;
+}
+
+.root-dir-name{
+    cursor: pointer;
+}
+
+.worker-file-path{
+    cursor: pointer;
+}
+
+.tab-btn-separator{
+    display: none;
+}
+
+
+.deploy-app-card-container {
+  max-width: 100%;
+  margin: auto;
+}
+
+.deploy-app-card {
+  background: #fff;
+  border: 1.5px solid #dbe3f0;
+  border-radius: 14px;
+  padding: 20px;
+  margin-bottom: 24px;
+  transition: border-color 0.2s ease;
+}
+
+.deploy-app-card.deploy-app-active {
+  border-color: #3a85ff;
+}
+
+.deploy-app-card-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+}
+
+.deploy-app-card-or {
+  text-align: center;
+  margin: 10px 0 20px;
+  color: #9ca3af;
+  font-weight: 500;
+}
+

@@ -1,5 +1,5 @@
-/**
- * Copyright (C) 2024 Puter Technologies Inc.
+/*
+ * Copyright (C) 2024-present Puter Technologies Inc.
  *
  * This file is part of Puter.
  *
@@ -18,10 +18,13 @@
  */
 
 import ar from './ar.js';
+import bg from './bg.js';
 import bn from './bn.js';
 import br from './br.js';
+import cs from './cs.js';
 import da from './da.js';
 import de from './de.js';
+import emoji from './emoji.js';
 import en from './en.js';
 import es from './es.js';
 import fa from './fa.js';
@@ -29,12 +32,15 @@ import fi from './fi.js';
 import fr from './fr.js';
 import he from './he.js';
 import hi from './hi.js';
+import hu from './hu.js';
 import hy from './hy.js';
+import id from './id.js';
 import it from './it.js';
 import ig from './ig.js';
 import ja from './ja.js';
 import ko from './ko.js';
 import ku from './ku.js';
+import my from './my.js';
 import nb from './nb.js';
 import nl from './nl.js';
 import nn from './nn.js';
@@ -42,27 +48,26 @@ import pl from './pl.js';
 import pt from './pt.js';
 import ro from './ro.js';
 import ru from './ru.js';
+import sl from './sl.js';
 import sv from './sv.js';
 import ta from './ta.js';
 import th from './th.js';
 import tr from './tr.js';
-import ur from './ur.js';
 import ua from './ua.js';
+import ur from './ur.js';
+import vi from './vi.js';
 import zh from './zh.js';
-import hu from './hu.js';
 import zhtw from './zhtw.js';
-import vi from "./vi.js";
-import emoji from './emoji.js';
-import id from './id.js';
-
-
 
 export default {
     ar,
+    bg,
     bn,
     br,
+    cs,
     da,
     de,
+    emoji,
     en,
     es,
     fa,
@@ -70,29 +75,30 @@ export default {
     fr,
     he,
     hi,
+    hu,
     hy,
-    it,
+    id,
     ig,
+    it,
     ja,
     ko,
     ku,
+    my,
     nb,
     nl,
     nn,
-    ro,
-    ru,
     pl,
     pt,
+    ro,
+    ru,
+    sl,
     sv,
     ta,
     th,
     tr,
     ua,
-    zh,
-    hu,
-    zhtw,
     ur,
     vi,
-    emoji,
-    id,
+    zh,
+    zhtw,
 };

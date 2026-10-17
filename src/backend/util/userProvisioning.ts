@@ -1,0 +1,205 @@
+/*
+ * Copyright (C) 2024-present Puter Technologies Inc.
+ *
+ * This file is part of Puter.
+ *
+ * Puter is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published
+ * by the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+import { v4 as uuidv4 } from 'uuid';
+import type { AbstractDatabaseClient } from '../clients/database/DatabaseClient';
+import { HttpError } from '../core/http/HttpError';
+import type { GroupStore } from '../stores/group/GroupStore';
+import type { UserRow, UserStore } from '../stores/user/UserStore';
+import type { IConfig } from '../types';
+
+const DEFAULT_FOLDERS = [
+    'Trash',
+    'AppData',
+    'Desktop',
+    'Documents',
+    'Pictures',
+    'Videos',
+    'Public',
+] as const;
+type FolderName = (typeof DEFAULT_FOLDERS)[number];
+
+/**
+ * Creates a user's default FS tree: `/<username>` (home) and the seven standard
+ * children (Trash, AppData, Desktop, Documents, Pictures, Videos, Public).
+ * Records each folder's `uuid` + `id` on the `user` row so callers can look
+ * them up without an extra SELECT.
+ *
+ * Safe to call once per user (e.g. after signup or during admin bootstrap).
+ * Callers should check `user.trash_uuid` / similar up-front if they need
+ * idempotency.
+ *
+ * Folder IDs are resolved by re-SELECTing by UUID rather than inferring them
+ * from a multi-row `INSERT`'s single `insertId` return — that approach is
+ * engine-dependent (MySQL returns the first inserted id; SQLite returns the
+ * last). One extra round-trip, zero ambiguity.
+ */
+export async function generateDefaultFsentries(
+    db: AbstractDatabaseClient,
+    userStore: UserStore,
+    user: UserRow,
+): Promise<void> {
+    // Idempotency guard: if trash_uuid is already set, the tree exists.
+    // Cheap check vs. a redundant INSERT + UPDATE on retries / re-runs.
+    if (user.trash_uuid) return;
+
+    // Callers check the name is free before provisioning, so this only fires
+    // on drift that predates those checks. A home written on top of another
+    // row gives both accounts a tree answering to one path.
+    const occupied = (await db.pread(
+        'SELECT id FROM fsentries WHERE path = ? LIMIT 1',
+        [`/${user.username}`],
+    )) as Array<{ id: number }>;
+    if (occupied.length > 0) {
+        throw new HttpError(400, 'This username is not available.', {
+            legacyCode: 'username_already_in_use',
+        });
+    }
+
+    const home_uuid = uuidv4();
+    const folderUuids: Record<FolderName, string> = {
+        Trash: uuidv4(),
+        AppData: uuidv4(),
+        Desktop: uuidv4(),
+        Documents: uuidv4(),
+        Pictures: uuidv4(),
+        Videos: uuidv4(),
+        Public: uuidv4(),
+    };
+    const ts = Math.floor(Date.now() / 1000);
+
+    // Rows: [uuid, parent_uid, name, path]
+    const rows: Array<[string, string | null, string, string]> = [
+        [home_uuid, null, user.username, `/${user.username}`],
+        ...DEFAULT_FOLDERS.map((name): [string, string, string, string] => [
+            folderUuids[name],
+            home_uuid,
+            name,
+            `/${user.username}/${name}`,
+        ]),
+    ];
+
+    // Each row: uuid, parent_uid, user_id, name, path, created, modified.
+    // is_dir and immutable are hardcoded to the database's true literal.
+    const trueLiteral = db.booleanLiteral(true);
+    const placeholders = rows
+        .map(() => `(?, ?, ?, ?, ?, ${trueLiteral}, ?, ?, ${trueLiteral})`)
+        .join(', ');
+    const params: unknown[] = [];
+    for (const [uuid, parent, name, path] of rows) {
+        params.push(uuid, parent, user.id, name, path, ts, ts);
+    }
+
+    await db.write(
+        `INSERT INTO fsentries
+            (uuid, parent_uid, user_id, name, path, is_dir, created, modified, immutable)
+         VALUES ${placeholders}`,
+        params,
+    );
+
+    // Resolve auto-increment IDs by UUID so we can pin them on the user row.
+    const folderUuidList = Object.values(folderUuids);
+    const idPlaceholders = folderUuidList.map(() => '?').join(', ');
+    const idRows = (await db.pread(
+        `SELECT id, uuid FROM fsentries WHERE user_id = ? AND uuid IN (${idPlaceholders})`,
+        [user.id, ...folderUuidList],
+    )) as Array<{ id: number; uuid: string }>;
+    const idByUuid = new Map(idRows.map((r) => [String(r.uuid), Number(r.id)]));
+
+    await userStore.update(user.id, {
+        trash_uuid: folderUuids.Trash,
+        appdata_uuid: folderUuids.AppData,
+        desktop_uuid: folderUuids.Desktop,
+        documents_uuid: folderUuids.Documents,
+        pictures_uuid: folderUuids.Pictures,
+        videos_uuid: folderUuids.Videos,
+        public_uuid: folderUuids.Public,
+        trash_id: idByUuid.get(folderUuids.Trash) ?? null,
+        appdata_id: idByUuid.get(folderUuids.AppData) ?? null,
+        desktop_id: idByUuid.get(folderUuids.Desktop) ?? null,
+        documents_id: idByUuid.get(folderUuids.Documents) ?? null,
+        pictures_id: idByUuid.get(folderUuids.Pictures) ?? null,
+        videos_id: idByUuid.get(folderUuids.Videos) ?? null,
+        public_id: idByUuid.get(folderUuids.Public) ?? null,
+    });
+}
+
+/**
+ * Insert a user row, put it in `group`, and give it its default folders. The
+ * group and the folders are best-effort: a failure is logged and the account is
+ * still returned, re-read so it carries the folder columns.
+ */
+export async function provisionUser(
+    deps: {
+        db: AbstractDatabaseClient;
+        userStore: UserStore;
+        groupStore: GroupStore;
+    },
+    fields: Parameters<UserStore['create']>[0],
+    group: string | null | undefined,
+): Promise<UserRow> {
+    const created = await deps.userStore.create(fields);
+    if (group) {
+        try {
+            await deps.groupStore.addUsers(group, [created.username]);
+        } catch (e) {
+            console.warn('[provision] group assignment failed:', e);
+        }
+    }
+    try {
+        await generateDefaultFsentries(deps.db, deps.userStore, created);
+    } catch (e) {
+        console.warn('[provision] generateDefaultFsentries failed:', e);
+    }
+    return (
+        (await deps.userStore.getById(created.id, { force: true })) ?? created
+    );
+}
+
+/**
+ * Moves a user from the default _temp_ group to the default _user_ group. Call
+ * after a user's `email_confirmed` flips to 1.
+ *
+ * Best-effort on both sides: missing temp membership is common (e.g. OIDC
+ * signups that come in already-verified), and a failing user-group add
+ * shouldn't fail the response — we just log it.
+ */
+export async function promoteToVerifiedGroup(
+    groupStore: GroupStore,
+    config: IConfig,
+    user: UserRow,
+): Promise<void> {
+    const tempGroup = config.default_temp_group;
+    const userGroup = config.default_user_group;
+
+    if (tempGroup) {
+        try {
+            await groupStore.removeUsers(tempGroup, [user.username]);
+        } catch {
+            // Expected when the user was never in the temp group.
+        }
+    }
+    if (userGroup) {
+        try {
+            await groupStore.addUsers(userGroup, [user.username]);
+        } catch (e) {
+            console.warn('[verified-group] add to user group failed:', e);
+        }
+    }
+}

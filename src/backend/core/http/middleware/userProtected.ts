@@ -1,0 +1,298 @@
+/*
+ * Copyright (C) 2024-present Puter Technologies Inc.
+ *
+ * This file is part of Puter.
+ *
+ * Puter is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published
+ * by the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+import type { Request, RequestHandler, Response, NextFunction } from 'express';
+import bcrypt from 'bcrypt';
+import { isPlainUserActor } from '../../actor';
+import { HttpError } from '../HttpError';
+import { checkRateLimit } from './rateLimit.js';
+import type { IConfig } from '../../../types';
+import type { UserStore, UserRow } from '../../../stores/user/UserStore';
+import type { OIDCService } from '../../../services/auth/OIDCService';
+import type { TokenService } from '../../../services/auth/TokenService';
+
+/**
+ * Gate for security-critical account endpoints mounted under
+ * `/user-protected/*`.
+ *
+ * Runs AFTER the built-in `requireUserActor` + `antiCsrf` gates; adds four
+ * extra checks:
+ *
+ * 1. **Session-cookie only** — reject API tokens, GUI tokens, `x-api-key` headers,
+ *    query-string tokens. `authProbe` stashes the token it resolved as
+ *    `req.token`; if that doesn't match the session cookie value, the request
+ *    came in via a non-cookie source and is rejected.
+ * 2. **Cache-bypass user refresh** — a suspended account whose session row is
+ *    still cached would otherwise pass; re-fetch with `{ force: true }` and
+ *    reject anything suspended.
+ * 3. **Temp-user block** — temporary accounts (no password + no email) can only
+ *    reach `/delete-own-user`. Opt in by constructing with `{ allowTempUsers:
+ *    true }` on that route.
+ * 4. **Password OR OIDC revalidation cookie** — `req.body.password` is verified
+ *    via bcrypt against the user row; otherwise a valid `puter_revalidation`
+ *    cookie (signed via `services.token.sign('oidc-state')`) is required.
+ *    OIDC-only accounts (no password) MUST use the revalidation cookie —
+ *    password path returns `oidc_revalidation_required` with a `revalidate_url`
+ *    so the GUI can open the OIDC popup. Each password check is charged to a
+ *    per-account, per-route hourly budget, so a route behind this gate is
+ *    bounded whether or not it declares a limit of its own.
+ */
+
+const REVALIDATION_COOKIE_NAME = 'puter_revalidation';
+
+interface RevalidationPayload {
+    user_uuid: string;
+    purpose: string;
+}
+
+export interface UserProtectedGateDeps {
+    config: IConfig;
+    userStore: UserStore;
+    oidcService: OIDCService;
+    tokenService: TokenService;
+}
+
+/**
+ * Cookie-only credential check. Rejects API tokens, GUI tokens, `x-api-key`
+ * headers, and query-string tokens — only a request whose resolved `req.token`
+ * matches the session cookie passes. Used both by `createUserProtectedGate` (as
+ * its first stage) and standalone by routes that need session-cookie-only
+ * credentials without the full password-revalidation gate (e.g.
+ * `/auth/revoke-*`, where an access token shouldn't be able to revoke its own
+ * issuing web session).
+ */
+export const createSessionCookieGate = (config: IConfig): RequestHandler => {
+    const cookieName = config.cookie_name ?? 'puter_token';
+    return (req, _res, next) => {
+        const cookieValue = req.cookies?.[cookieName];
+        if (!cookieValue || (req.token && req.token !== cookieValue)) {
+            return next(
+                new HttpError(401, 'Session cookie required', {
+                    legacyCode: 'session_required',
+                }),
+            );
+        }
+        next();
+    };
+};
+
+/**
+ * Same intent as `createSessionCookieGate` ("an access token can't revoke its
+ * issuing web session") but identity-shape based instead of cookie- value
+ * based, so it works for the cross-subdomain GUI -> api.puter.com call path
+ * where the session cookie isn't sent. Accepts a plain user actor
+ * (web/session/gui-token); rejects app-under-user actors and access-token
+ * actors. Pair with `antiCsrf: true` on the route.
+ */
+export const createWebSessionActorGate = (): RequestHandler => {
+    return (req, _res, next) => {
+        const actor = req.actor;
+        if (!actor?.user || !actor.session || !isPlainUserActor(actor)) {
+            return next(
+                new HttpError(401, 'Web session required', {
+                    legacyCode: 'session_required',
+                }),
+            );
+        }
+        next();
+    };
+};
+
+export interface UserProtectedGateOptions {
+    /** Allow temp accounts (no password + no email) through. Default: false. */
+    allowTempUsers?: boolean;
+}
+
+// Extend Request so the middleware chain can hand the refreshed row off to
+// the handler without re-fetching.
+declare module 'express-serve-static-core' {
+    interface Request {
+        userProtected?: { user: UserRow };
+    }
+}
+
+async function buildRevalidateFields(
+    config: IConfig,
+    oidcService: OIDCService,
+    user: UserRow,
+): Promise<Record<string, string> | undefined> {
+    const origin = (config.origin ?? '').replace(/\/$/, '');
+    if (!origin) return undefined;
+    const provider = await oidcService.getLinkedProviderForUser(user.id);
+    if (!provider) return undefined;
+    return {
+        revalidate_url: `${origin}/auth/oidc/${provider}/start?flow=revalidate&user_uuid=${encodeURIComponent(user.uuid)}`,
+    };
+}
+
+/** Password checks per account per route per hour, as the siblings bound. */
+const PASSWORD_ATTEMPT_LIMIT = 10;
+const PASSWORD_ATTEMPT_WINDOW_MS = 60 * 60_000;
+const PASSWORD_ATTEMPT_SCOPE = 'user-protected-password';
+
+export const createUserProtectedGate = (
+    deps: UserProtectedGateDeps,
+    options: UserProtectedGateOptions = {},
+): RequestHandler[] => {
+    const { config, userStore, oidcService, tokenService } = deps;
+    const allowTemp = !!options.allowTempUsers;
+
+    // 1. Session cookie only. Shared with the standalone cookie-only gate.
+    const requireSessionCookie = createSessionCookieGate(config);
+
+    // 2. Fresh user row (bypass cache to catch just-suspended accounts).
+    // `getById` doesn't take options; go through `getByProperty` with
+    // `{ force: true }` to force a primary read.
+    const refreshUser: RequestHandler = async (
+        req: Request,
+        _res: Response,
+        next: NextFunction,
+    ) => {
+        const actor = req.actor;
+        if (!actor?.user?.id)
+            throw new HttpError(401, 'User required', {
+                legacyCode: 'unauthorized',
+            });
+        const user = await userStore.getByProperty('id', actor.user.id, {
+            force: true,
+        });
+        if (!user)
+            throw new HttpError(404, 'User not found', {
+                legacyCode: 'not_found',
+            });
+        if (user.suspended)
+            throw new HttpError(403, 'Account is suspended', {
+                legacyCode: 'account_suspended',
+            });
+        req.userProtected = { user };
+        next();
+    };
+
+    // 3. Password (bcrypt) OR valid OIDC revalidation cookie.
+    //
+    //   - Temp users (no password + no email) pass only when the route was
+    //     registered with `allowTempUsers: true` (delete-own-user).
+    //   - `req.body.password` → bcrypt match against user row. OIDC-only
+    //     accounts bounce with `oidc_revalidation_required` + a
+    //     `revalidate_url` helper so the GUI can open the OIDC popup.
+    //   - Otherwise accept a valid `puter_revalidation` cookie. Expiry,
+    //     `purpose === 'revalidate'`, matching `user_uuid` all required.
+    //   - Password account, neither credential → 403 `password_required`.
+    const verifyIdentity: RequestHandler = async (
+        req: Request,
+        _res: Response,
+        next: NextFunction,
+    ) => {
+        const user = req.userProtected?.user;
+        if (!user)
+            throw new HttpError(500, 'user-protected state missing', {
+                legacyCode: 'internal_error',
+            });
+
+        const isTemp = user.password === null && user.email === null;
+        if (isTemp) {
+            if (allowTemp) return next();
+            throw new HttpError(403, 'Temporary account', {
+                legacyCode: 'temporary_account',
+            });
+        }
+
+        const bodyPassword =
+            typeof req.body?.password === 'string' ? req.body.password : null;
+        if (bodyPassword) {
+            if (user.password === null) {
+                const fields = await buildRevalidateFields(
+                    config,
+                    oidcService,
+                    user,
+                );
+                throw new HttpError(403, 'OIDC revalidation required', {
+                    legacyCode: 'oidc_revalidation_required',
+                    fields,
+                });
+            }
+            // Charged before the comparison, or everything already in
+            // flight is answered before any of it is spent. Per route, so
+            // one exhausted budget cannot close the other five.
+            const budgetKey =
+                `${PASSWORD_ATTEMPT_SCOPE}:${req.route?.path ?? req.path}` +
+                `:${user.id}`;
+            if (
+                !(await checkRateLimit(
+                    budgetKey,
+                    PASSWORD_ATTEMPT_LIMIT,
+                    PASSWORD_ATTEMPT_WINDOW_MS,
+                ))
+            ) {
+                throw new HttpError(429, 'Too many requests.', {
+                    legacyCode: 'too_many_requests',
+                });
+            }
+            let match = false;
+            try {
+                match = await bcrypt.compare(
+                    bodyPassword,
+                    String(user.password),
+                );
+            } catch {
+                match = false;
+            }
+            if (!match)
+                throw new HttpError(400, 'Password mismatch', {
+                    legacyCode: 'password_mismatch',
+                });
+            return next();
+        }
+
+        const cookieValue = req.cookies?.[REVALIDATION_COOKIE_NAME];
+        if (cookieValue) {
+            try {
+                const payload = tokenService.verify<RevalidationPayload>(
+                    'oidc-state',
+                    cookieValue,
+                );
+                if (
+                    payload?.purpose === 'revalidate' &&
+                    payload.user_uuid === user.uuid
+                ) {
+                    return next();
+                }
+            } catch {
+                // Fall through to the no-credentials branch.
+            }
+        }
+
+        if (user.password === null) {
+            const fields = await buildRevalidateFields(
+                config,
+                oidcService,
+                user,
+            );
+            throw new HttpError(403, 'OIDC revalidation required', {
+                legacyCode: 'oidc_revalidation_required',
+                fields,
+            });
+        }
+        throw new HttpError(403, 'Password required', {
+            legacyCode: 'password_required',
+        });
+    };
+
+    return [requireSessionCookie, refreshUser, verifyIdentity];
+};

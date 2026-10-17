@@ -1,0 +1,49 @@
+import * as utils from '../../lib/utils.js';
+import { isObject } from './lib/args.js';
+import { assertKeyPresent, assertKeySize } from './lib/validate.js';
+
+/** @typedef {import('./types.js').KVOptConfig} KVOptConfig */
+/** @typedef {import('./types.js').KVValue} KVValue */
+
+/**
+ * Removes values from a key by one or more dot-separated paths (e.g.
+ * `"profile.bio"`), returning the updated value. An `optConfig` object may
+ * trail the paths. Removing the root path (`''`) deletes the key and
+ * resolves to `null`, as does a call on another app's data the caller may
+ * delete from but not read.
+ *
+ * @this {import('./index.js').KVModule}
+ * @param {string} key
+ * @param {...(string | KVOptConfig)} pathsAndOptConfig
+ * @returns {Promise<KVValue>}
+ */
+export async function remove (key, ...pathsAndOptConfig) {
+    if ( pathsAndOptConfig.length === 0 ) {
+        throw { message: 'At least one path is required', code: 'arguments_required' };
+    }
+
+    const paths = [...pathsAndOptConfig];
+    let optConfig;
+
+    if ( isObject(paths[paths.length - 1]) ) {
+        optConfig = paths.pop();
+    }
+
+    if ( Array.isArray(paths[0]) && paths.length === 1 ) {
+        throw { message: 'Paths must be provided as separate arguments', code: 'paths_invalid' };
+    }
+
+    assertKeyPresent(key);
+    assertKeySize(key);
+
+    if ( paths.length === 0 ) {
+        throw { message: 'At least one path is required', code: 'arguments_required' };
+    }
+
+    if ( paths.some((path) => typeof path !== 'string') ) {
+        throw { message: 'All paths must be strings', code: 'paths_invalid' };
+    }
+    this.guiCache.invalidate(key);
+
+    return await utils.makeDriverMethod({ iface: 'puter-kvstore', method: 'remove', argNames: ['key', 'paths'], puter: this.puter })({ key, paths, optConfig });
+}

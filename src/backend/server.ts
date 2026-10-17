@@ -1,0 +1,1717 @@
+/*
+ * Copyright (C) 2024-present Puter Technologies Inc.
+ *
+ * This file is part of Puter.
+ *
+ * Puter is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published
+ * by the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+/* eslint-disable @typescript-eslint/no-explicit-any */
+import compression from 'compression';
+import cookieParser from 'cookie-parser';
+import express from 'express';
+import type { IRouter, Request, RequestHandler, Router } from 'express';
+import helmet from 'helmet';
+import uaParser from 'ua-parser-js';
+import { existsSync, readdirSync, readFileSync } from 'node:fs';
+import path from 'node:path';
+import { pathToFileURL } from 'node:url';
+import { parseArgs } from 'node:util';
+import http from 'node:http';
+import { puterClients } from './clients';
+import { puterControllers } from './controllers';
+import { createAuthProbe } from './core/http/middleware/authProbe';
+import { createRequestContextMiddleware } from './core/http/middleware/requestContext';
+import { createFingerprintMiddleware } from './core/http/middleware/fingerprint';
+import { createErrorHandler } from './core/http/middleware/errorHandler';
+import { actorUid, type Actor } from './core/actor';
+import { isHttpError } from './core/http/HttpError';
+import {
+    adminOnlyGate,
+    allowedAppIdsGate,
+    noUserSessionGate,
+    requireAnyVerifiedGate,
+    requireAuthGate,
+    requireCardVerifiedGate,
+    requireCreditsGate,
+    requirePhoneVerifiedGate,
+    requireReputationGate,
+    requireSubscriptionGate,
+    requireTeam2fa,
+    requireVerifiedAccount,
+    requireNonAccessTokenGate,
+    requireUserActorGate,
+    requireVerifiedGate,
+    subdomainGate,
+} from './core/http/middleware/gates';
+import { guiOriginGate } from './core/http/middleware/originGate';
+import { validateReputationRequirement } from './core/reputation';
+import {
+    actorOnPaidPlan,
+    validateSubscriptionRequirement,
+} from './services/metering/enforcement';
+import { createStepUpGate } from './core/http/middleware/stepUpSession';
+import { createUserProtectedGate } from './core/http/middleware/userProtected';
+import { internalAuthGate } from './core/http/middleware/internalAuth';
+import { createNotFoundHandler } from './core/http/middleware/notFoundHandler';
+import { cardFallbackDepsFrom } from './util/cardFallback';
+import { installProcessGuards } from './util/processGuards';
+import { activeSubdomain, subdomainOffsetForDomain } from './util/subdomains';
+import {
+    requireAntiCsrf,
+    setAntiCsrfRedis,
+} from './core/http/middleware/antiCsrf';
+import { captchaGate, setCaptchaRedis } from './core/http/middleware/captcha';
+import {
+    concurrencyGate,
+    configureRateLimit,
+    rateLimitGate,
+} from './core/http/middleware/rateLimit';
+import {
+    createWwwRedirect,
+    createUserSubdomainNotFound,
+    createNativeAppStatic,
+} from './core/http/middleware/hostRedirects';
+import { createEgressMeteringMiddleware } from './core/http/middleware/egressMetering';
+import { createLocalWorkerProxyMiddleware } from './core/http/middleware/localWorkerProxy';
+import { createPuterSiteMiddleware } from './core/http/middleware/puterSite';
+import { PuterRouter } from './core/http/PuterRouter';
+import {
+    createRouteLifecycleMiddleware,
+    routeEventKeyBase,
+} from './core/http/routeLifecycle';
+import {
+    PREFIX_METADATA_KEY,
+    PREFLIGHT_MAX_AGE,
+    type RouteDescriptor,
+    type RouteOptions,
+} from './core/http/types';
+import type { AuthService } from './services/auth/AuthService';
+import { puterDrivers } from './drivers';
+import {
+    clientsContainers,
+    configContainer,
+    controllersContainers,
+    driversContainers,
+    servicesContainers,
+    storesContainers,
+} from './exports';
+import { extensionStore } from './extensions';
+import { puterServices } from './services';
+import { puterStores } from './stores';
+import type {
+    IConfig,
+    LayerInstances,
+    PagerSeverity,
+    WithControllerRegistration,
+    WithLifecycle,
+} from './types';
+
+/** Idle keep-alive timeout used when `keep_alive_timeout` is unset. */
+const DEFAULT_KEEP_ALIVE_TIMEOUT = 620_000;
+
+/** Route options a claimed subdomain's routes may use. */
+const CLAIMED_ROUTE_OPTIONS = new Set([
+    'subdomain',
+    'middleware',
+    'bodyJson',
+    'bodyRaw',
+    'bodyText',
+    'bodyUrlencoded',
+    'rateLimit',
+    'concurrent',
+    'errorRenderer',
+]);
+
+export class PuterServer {
+    clients!: LayerInstances<typeof puterClients>;
+    stores!: LayerInstances<typeof puterStores>;
+    services!: LayerInstances<typeof puterServices>;
+    controllers!: LayerInstances<typeof puterControllers>;
+    drivers!: LayerInstances<typeof puterDrivers>;
+    #config: IConfig;
+    #app!: ReturnType<typeof express>;
+    #server: ReturnType<ReturnType<typeof express>['listen']> | null = null;
+    #removeProcessGuards: (() => void) | null = null;
+    /** Routes for each claimed subdomain, served only past its `authorize`. */
+    #claimRouters = new Map<string, Router>();
+
+    #ready: Promise<boolean>;
+
+    constructor(
+        config: IConfig,
+        clients: typeof puterClients = puterClients,
+        stores: typeof puterStores = puterStores,
+        services: typeof puterServices = puterServices,
+        controllers: typeof puterControllers = puterControllers,
+        drivers: typeof puterDrivers = puterDrivers,
+    ) {
+        this.#config = config;
+        // Expose config to the extension API (extension.config)
+        Object.assign(configContainer, config);
+        this.#ready = this.#setupServer(
+            clients,
+            stores,
+            services,
+            controllers,
+            drivers,
+        );
+    }
+
+    async #setupServer(
+        clients: typeof puterClients,
+        stores: typeof puterStores,
+        services: typeof puterServices,
+        controllers: typeof puterControllers,
+        drivers: typeof puterDrivers,
+    ) {
+        // Load prod extensions from configured directories (dynamic)
+        const extensionDirs = this.#config.extensions;
+        await this.#importExtensions(extensionDirs);
+
+        // Each layer is built from its built-ins then its extensions, and is
+        // handed the layers beneath it plus itself (so a later peer can reach
+        // an earlier one).
+        this.clients = {} as typeof this.clients;
+        this.#instantiateLayer(
+            clients,
+            extensionStore.clients,
+            this.clients,
+            clientsContainers,
+            [this.#config],
+        );
+        this.stores = {} as typeof this.stores;
+        this.#instantiateLayer(
+            stores,
+            extensionStore.stores,
+            this.stores,
+            storesContainers,
+            [this.#config, this.clients, this.stores],
+        );
+        this.services = {} as typeof this.services;
+        this.#instantiateLayer(
+            services,
+            extensionStore.services,
+            this.services,
+            servicesContainers,
+            [this.#config, this.clients, this.stores, this.services],
+        );
+
+        // Wire the rate-limiter to its configured backend now that clients
+        // and stores exist. Memory is the default; `redis` needs a redis
+        // client, `kv` needs the system KV store (DynamoDB-backed).
+        this.#configureRateLimiter();
+
+        // Anti-CSRF tokens live in redis so they survive cross-node hops
+        // (issue on node A, consume on node B).
+        setAntiCsrfRedis(this.clients.redis);
+        setCaptchaRedis(this.clients.redis);
+
+        // init express server here
+        this.#app = express();
+        // `trust proxy` MUST be set before any middleware reads `req.ip` /
+        // `req.ips` / `req.protocol`, since express derives those from XFF
+        // only when this flag is set. Default is `false` (no proxy trusted)
+        // — deployments behind a reverse proxy chain must set
+        // `config.trust_proxy` to the hop count (e.g. `1` for a single
+        // Cloudflare/nginx hop). Never `true` in prod: that trusts every hop
+        // and makes XFF forgeable.
+        this.#app.set('trust proxy', this.#config.trust_proxy ?? false);
+        // Every subdomain gate reads `req.subdomains`, which express derives by
+        // dropping `subdomain offset` labels from the right of the hostname.
+        // The offset is the root domain's own label count, so a deployment on
+        // `puter.example.com` doesn't read `puter` as an active subdomain.
+        this.#app.set(
+            'subdomain offset',
+            subdomainOffsetForDomain(this.#config.domain),
+        );
+        this.#installGlobalMiddleware();
+
+        // Instantiate drivers BEFORE controllers so controllers can receive
+        // a typed `drivers` reference. The `/drivers/*` HTTP surface lives
+        // on `DriverController` (a regular controller) which reads from
+        // `this.drivers` — no separate registry object here any more.
+        this.drivers = {} as typeof this.drivers;
+        this.#instantiateLayer(
+            drivers,
+            extensionStore.drivers,
+            this.drivers,
+            driversContainers,
+            [this.#config, this.clients, this.stores, this.services],
+        );
+
+        this.controllers = {} as typeof this.controllers;
+        this.#instantiateLayer(
+            controllers,
+            extensionStore.controllers,
+            this.controllers,
+            controllersContainers,
+            [
+                this.#config,
+                this.clients,
+                this.stores,
+                this.services,
+                this.drivers,
+            ],
+            (name, controller) =>
+                this.#registerControllerRoutes(
+                    name,
+                    controller as WithControllerRegistration,
+                ),
+        );
+
+        // Extension routes are shaped as `RouteDescriptor`s too, so they
+        // flow through the same materializer as controller routes — same
+        // option → middleware translation (subdomain, auth, body parsers, …).
+        // The extension-layer "prefix" is always empty; extensions compose
+        // their own path strings.
+        for (const route of extensionStore.routeHandlers) {
+            this.#materializeRoute(this.#app, '', route);
+        }
+
+        // Terminal middleware MUST install last — after every route + extension
+        // route is registered, so the catch-all 404 only fires for genuinely
+        // unmatched requests, and the error handler is reachable from any
+        // thrown error in the stack above it.
+        this.#installTerminalMiddleware();
+
+        return true;
+    }
+
+    /**
+     * Instantiate one layer: built-ins, then extension additions, each a class
+     * constructed with `args` or an instance used as is. Every instance lands
+     * in `layer` and in the layer's shared export container.
+     */
+    #instantiateLayer(
+        builtIns: object,
+        extensionAdditions: object,
+        layer: object,
+        container: object,
+        args: unknown[],
+        onInstance?: (name: string, instance: unknown) => void,
+    ): void {
+        for (const [name, Layer] of [
+            ...Object.entries(builtIns),
+            ...Object.entries(extensionAdditions),
+        ]) {
+            const instance =
+                typeof Layer === 'object' ? Layer : new (Layer as any)(...args);
+            (layer as Record<string, unknown>)[name] = instance;
+            onInstance?.(name, instance);
+            (container as Record<string, unknown>)[name] = instance;
+        }
+    }
+
+    /**
+     * Register every rate-limit backend whose dependency is available, so
+     * routes / drivers can mix and match per call. `config.rate_limit.backend`
+     * selects the _default_ applied when a caller doesn't specify a backend;
+     * it's no longer an exclusive choice. A typo or missing dependency for the
+     * chosen default falls back to memory with a warning so boot doesn't
+     * break.
+     */
+    #configureRateLimiter() {
+        // Default to `redis` — the redis client is always present (falls
+        // back to ioredis-mock in dev when no nodes are configured), and
+        // sorted-set rate limiting scales across nodes for free. Set
+        // `rate_limit.backend` in config to switch to `memory` or `kv`.
+        const defaultBackend = this.#config.rate_limit?.backend ?? 'redis';
+        // Metering is wired so the concurrency gate can resolve
+        // `bySubscription` overrides per actor. Optional — without it,
+        // the base `limit` applies uniformly.
+        const metering = this.services?.metering as unknown;
+        try {
+            configureRateLimit({
+                default: defaultBackend,
+                redis: this.clients.redis,
+                kv: this.stores.kv,
+                metering,
+            });
+        } catch (e) {
+            console.warn(
+                `[rate-limit] default backend '${defaultBackend}' unavailable, falling back to memory:`,
+                (e as Error).message,
+            );
+            configureRateLimit({
+                redis: this.clients.redis,
+                kv: this.stores.kv,
+                metering,
+            });
+        }
+    }
+
+    /**
+     * Install always-on middleware on the express app, in the order they must
+     * run at request time. Ordering note:
+     *
+     * - `express.json` must run before `authProbe` so `req.body.auth_token` is
+     *   readable.
+     * - `authProbe` never rejects; it only populates `req.actor` if a valid token
+     *   is present.
+     * - Per-route gate middleware (requireAuth, adminOnly, ...) lands in
+     *   `#materializeRoute` as those options ship.
+     */
+    #installGlobalMiddleware() {
+        // -- Egress metering -----------------------------------------
+        // First, so the byte counter wraps `res.write` before compression
+        // does and therefore counts what actually goes out rather than what
+        // the handler produced. Reads the actor when the response ends, by
+        // which point the auth probe below has run.
+        this.#app.use(
+            createEgressMeteringMiddleware({ services: this.services }),
+        );
+
+        this.#app.use(cookieParser());
+
+        this.#app.use(compression());
+
+        this.#app.use(helmet.noSniff());
+        this.#app.use(helmet.hsts());
+        this.#app.use(helmet.ieNoOpen());
+        this.#app.use(helmet.permittedCrossDomainPolicies());
+        this.#app.use(helmet.xssFilter());
+        // Don't leak full URLs (which can carry signed tokens / file paths)
+        // to cross-origin destinations. Per-user hosted sites tighten this
+        // further to `no-referrer` in the puterSite middleware.
+        this.#app.use(
+            helmet.referrerPolicy({
+                policy: 'strict-origin-when-cross-origin',
+            }),
+        );
+        this.#app.disable('x-powered-by');
+
+        // Cross-Origin-Resource-Policy: always allow cross-origin reads.
+        // The stricter COOP+COEP pair (for SharedArrayBuffer) is deferred
+        // until the hosting layer lands — it requires UA + context gating.
+        this.#app.use((_req, res, next) => {
+            res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
+            next();
+        });
+
+        // -- Query param sanitization --------------------------------
+        // Strip non-primitive query values. Express 5's default simple
+        // parser mostly avoids these, but when `extended` qs is enabled
+        // (or a client tricks the parser) arrays/objects can sneak in.
+        this.#app.use((req, _res, next) => {
+            if (req.query) {
+                const allowed = ['string', 'number', 'boolean'];
+                for (const k of Object.keys(req.query)) {
+                    const v = req.query[k];
+                    if (v != null && !allowed.includes(typeof v)) {
+                        delete req.query[k];
+                    }
+                }
+            }
+            next();
+        });
+
+        // -- UA parsing ----------------------------------------------
+        // Parsed on first read and kept on the request: most requests never
+        // look at it.
+        const ownUa = (req: Request, value: Request['ua']) =>
+            Object.defineProperty(req, 'ua', {
+                value,
+                writable: true,
+                enumerable: true,
+                configurable: true,
+            });
+        Object.defineProperty(this.#app.request, 'ua', {
+            configurable: true,
+            get(this: Request) {
+                const header = this.headers['user-agent'];
+                const ua = header ? uaParser(header) : undefined;
+                ownUa(this, ua);
+                return ua;
+            },
+            set(this: Request, value: Request['ua']) {
+                ownUa(this, value);
+            },
+        });
+
+        // -- Host header validation ----------------------------------
+        this.#installHostValidation();
+
+        // -- Host handling (www → root, user subdomain on main domain → 404)
+        // Installed after host validation so we know the host is allowed,
+        // and before CORS/body-parsing so we short-circuit without burning
+        // work. A subdomain an extension claimed is answered here too.
+        this.#app.use(createWwwRedirect(this.#config));
+        this.#app.use(
+            createUserSubdomainNotFound(this.#config, (name) => {
+                const claim = extensionStore.claimedSubdomains.get(name);
+                if (!claim) return undefined;
+                return {
+                    authorize: claim.authorize,
+                    handler: this.#claimRouters.get(name),
+                };
+            }),
+        );
+
+        // -- Native app static serving (editor.*, docs.*, …) ---------
+        // No-op when `native_apps_root` is unset.
+        this.#app.use(createNativeAppStatic(this.#config));
+
+        // -- CORS headers --------------------------------------------
+        this.#installCors();
+
+        // -- IP validation -------------------------------------------
+        if (this.#config.enable_ip_validation) {
+            this.#installIpValidation();
+        }
+
+        // -- OPTIONS preflight ---------------------------------------
+        // WebDAV is exempt: OPTIONS is how a DAV client discovers the server,
+        // and the reply has to carry `DAV:` and `Allow:` for the mount to
+        // proceed. Answering it here with a bare 200 tells the client this
+        // isn't a WebDAV server at all, so let it fall through to the
+        // controller, which builds the real response.
+        this.#app.options('/*splat', (req, res, next) => {
+            if (activeSubdomain(req) === 'dav') {
+                next();
+                return;
+            }
+            // The reply depends only on Origin and host, both part of the
+            // browser's preflight cache key.
+            res.setHeader('Access-Control-Max-Age', PREFLIGHT_MAX_AGE);
+            res.sendStatus(200);
+        });
+
+        // -- Local Worker proxy (*.workers.puter.localhost) ----------
+        // Dev-only Miniflare dispatch, gated on `config.workers.localServer`.
+        // Mounted BEFORE body parsing so the Worker receives the raw request
+        // stream; no-op in production (real Cloudflare via WorkerDriver).
+        this.#app.use(
+            createLocalWorkerProxyMiddleware(this.#config, {
+                clients: this.clients,
+                stores: this.stores,
+                services: this.services,
+            }),
+        );
+
+        // -- Body parsing (JSON + text-as-json shim) -----------------
+        const captureRawBody: NonNullable<
+            Parameters<typeof express.json>[0]
+        >['verify'] = (req, _res, buf) => {
+            // body-parser hands over a fresh buffer and never writes to it.
+            (req as { rawBody?: Buffer }).rawBody = buf;
+        };
+        this.#app.use(express.json({ limit: '50mb', verify: captureRawBody }));
+        this.#app.use(
+            express.json({
+                limit: '50mb',
+                type: (req) =>
+                    req.headers['content-type'] === 'text/plain;actually=json',
+                verify: captureRawBody,
+            }),
+        );
+        // Form-encoded bodies (e.g. `/down` from the GUI's iframe-triggered
+        // download form). Needs to run before the auth probe so
+        // `req.body.auth_token` is populated for urlencoded POSTs the same
+        // way it is for JSON POSTs. Small cap — this parser is only here to
+        // cover the auth_token / anti_csrf field shape, not file uploads.
+        this.#app.use(express.urlencoded({ extended: true, limit: '100kb' }));
+
+        // -- Auth probe ----------------------------------------------
+        const authService = this.services.auth as AuthService | undefined;
+        if (authService) {
+            this.#app.use(
+                createAuthProbe({
+                    authService,
+                    cookieName: this.#config.cookie_name,
+                }),
+            );
+        }
+
+        // -- Request fingerprints ------------------------------------
+        // Stamp `req.networkFingerprint` (server-derived) and
+        // `req.deviceFingerprint` (client-supplied, from body/header). Runs
+        // AFTER body parsing so the body fingerprint is readable, and before
+        // the ALS context so the snapshot carries them.
+        this.#app.use(createFingerprintMiddleware());
+
+        // -- Per-request ALS context ---------------------------------
+        // Runs AFTER auth probe so `req.actor` is already populated when
+        // we snapshot it into the context.
+        this.#app.use(createRequestContextMiddleware());
+
+        // -- User-hosted sites (*.puter.site, *.puter.app) -----------
+        // Short-circuits hosting-domain hosts before any API/GUI
+        // controller route has a chance to match. Needs DI layers for
+        // subdomain lookup, private-app gate, and file streaming.
+        this.#app.use(
+            createPuterSiteMiddleware(this.#config, {
+                clients: this.clients,
+                stores: this.stores,
+                services: this.services,
+            }),
+        );
+
+        extensionStore.globalMiddlewares.forEach((mw) => {
+            this.#app.use(mw);
+        });
+    }
+
+    // -- Host header validation --------------------------------------
+
+    #installHostValidation() {
+        const config = this.#config;
+
+        // Hostname missing — malformed request from a broken client.
+        this.#app.use((req, res, next) => {
+            if (req.hostname === undefined) {
+                res.status(400).send(
+                    'Please verify your browser is up-to-date.',
+                );
+                return;
+            }
+            next();
+        });
+
+        // Build the allowed-domain set from config.
+        this.#app.use((req, res, next) => {
+            if (config.allow_all_host_values) {
+                next();
+                return;
+            }
+
+            if (!config.allow_no_host_header && !req.headers.host) {
+                res.status(400).send('Missing Host header.');
+                return;
+            }
+
+            // /healthcheck is always reachable regardless of host.
+            if (req.path === '/healthcheck') {
+                next();
+                return;
+            }
+
+            const hostName = (req.headers.host ?? '')
+                .split(':')[0]
+                .trim()
+                .toLowerCase();
+            const allowed = this.#getAllowedDomains();
+
+            if (
+                allowed.some((d) => PuterServer.#hostMatchesDomain(hostName, d))
+            ) {
+                next();
+                return;
+            }
+
+            if (config.custom_domains_enabled) {
+                req.is_custom_domain = true;
+                next();
+                return;
+            }
+
+            res.status(400).send('Invalid Host header.');
+        });
+    }
+
+    #allowedDomainsCache: string[] | null = null;
+
+    #getAllowedDomains(): string[] {
+        if (this.#allowedDomainsCache) return this.#allowedDomainsCache;
+        const cfg = this.#config;
+        const raw = [
+            cfg.domain,
+            cfg.static_hosting_domain,
+            cfg.static_hosting_domain_alt,
+            cfg.private_app_hosting_domain,
+            cfg.private_app_hosting_domain_alt,
+        ];
+        const staticDomain = PuterServer.#normalizeDomain(
+            cfg.static_hosting_domain,
+        );
+        if (staticDomain) raw.push(`at.${staticDomain}`);
+        if (cfg.allow_nipio_domains) raw.push('nip.io');
+
+        this.#allowedDomainsCache = raw
+            .map(PuterServer.#normalizeDomain)
+            .filter((d): d is string => d !== null);
+        return this.#allowedDomainsCache;
+    }
+
+    static #normalizeDomain(d: string | undefined | null): string | null {
+        if (!d || typeof d !== 'string') return null;
+        const trimmed = d.trim().toLowerCase();
+        return trimmed.length > 0 ? trimmed : null;
+    }
+
+    static #hostMatchesDomain(hostname: string, domain: string): boolean {
+        return hostname === domain || hostname.endsWith(`.${domain}`);
+    }
+
+    // -- CORS headers -------------------------------------------------
+
+    #installCors() {
+        const config = this.#config;
+        const allowedMethods =
+            'GET, POST, OPTIONS, PUT, PATCH, DELETE, PROPFIND, PROPPATCH, MKCOL, COPY, MOVE, LOCK, UNLOCK';
+        const allowedHeaders = [
+            'Origin',
+            'X-Requested-With',
+            'Content-Type',
+            'Accept',
+            'Authorization',
+            'Cache-Control',
+            'Pragma',
+            'sentry-trace',
+            'baggage',
+            'Depth',
+            'Destination',
+            'Overwrite',
+            'If',
+            'Lock-Token',
+            'Timeout',
+            'X-Expected-Entity-Length',
+            'DAV',
+            'stripe-signature',
+        ].join(', ');
+
+        // What a browser DAV client is allowed to read back off a response.
+        // Everything below is a header the WebDAV controller sets and a client
+        // acts on: without this list `fetch` hands the page a response whose
+        // ETag, lock token and content range are all invisible, so it can't
+        // cache, lock, or resume anything.
+        const davExposedHeaders = [
+            'DAV',
+            'MS-Author-Via',
+            'Allow',
+            'ETag',
+            'Last-Modified',
+            'Content-Length',
+            'Content-Range',
+            'Accept-Ranges',
+            'Location',
+            'Lock-Token',
+            'WWW-Authenticate',
+        ].join(', ');
+
+        this.#app.use((req, res, next) => {
+            const origin = req.headers.origin;
+            const subdomain = activeSubdomain(req);
+
+            // Allow any origin. puter.js is meant to be consumed from
+            // arbitrary third-party sites, so reflect the caller's origin
+            // (or fall back to `*` for non-browser clients).
+            res.setHeader('Access-Control-Allow-Origin', origin ?? '*');
+            if (origin) res.vary('Origin');
+
+            // Sticky cookies require api to allow credentials, but only for the API subdomain, and be careful not to set any other credentials on it
+            if (subdomain === 'api' && origin) {
+                res.setHeader('Access-Control-Allow-Credentials', 'true');
+            } else if (subdomain === 'dav') {
+                res.setHeader('Access-Control-Allow-Credentials', 'false');
+                res.setHeader(
+                    'Access-Control-Expose-Headers',
+                    davExposedHeaders,
+                );
+            }
+
+            res.setHeader('Access-Control-Allow-Methods', allowedMethods);
+            res.setHeader('Access-Control-Allow-Headers', allowedHeaders);
+
+            res.setHeader('Access-Control-Allow-Private-Network', 'true');
+
+            // Disable iframes on the main domain
+            if (req.hostname === config.domain) {
+                res.setHeader('X-Frame-Options', 'SAMEORIGIN');
+            }
+
+            next();
+        });
+    }
+
+    // -- IP validation -----------------------------------------------
+
+    #installIpValidation() {
+        this.#app.use(async (req, res, next) => {
+            // `req.ip` reflects `trust proxy`: it's the leftmost untrusted
+            // address from XFF when behind a configured proxy chain, and the
+            // direct socket peer otherwise. Reading XFF directly would let a
+            // client forge the value when traffic isn't behind the expected
+            // proxy.
+            const ip = req.ip;
+            const event = { allow: true, ip: ip! };
+            // emitAndWait so listeners that do async work (IP-reputation
+            // lookups, Redis checks) can complete before we read
+            // `event.allow` and decide the gate.
+            await this.clients.event.emitAndWait('ip.validate', event, {});
+            if (!event.allow) {
+                res.status(403).send('Forbidden');
+                return;
+            }
+            next();
+        });
+    }
+
+    /**
+     * Install end-of-pipeline middleware. Order matters:
+     *
+     * 1. The 404 catch-all runs only when no earlier route matched, so it must be
+     *    installed _after_ every controller + extension route.
+     * 2. The error handler is the express terminal — it catches everything thrown
+     *    by routes, gates, and the 404 above. Express 5 auto-forwards thrown
+     *    errors (sync and async), so handlers can `throw new HttpError(...)`
+     *    without `next(err)` ceremony.
+     */
+    #installTerminalMiddleware() {
+        this.#app.use(
+            createNotFoundHandler({ guiDomain: this.#config.domain }),
+        );
+        this.#app.use(
+            createErrorHandler({
+                onError: (err, req) => {
+                    // Page on 5xx only — skip 4xx HttpErrors, which are
+                    // expected client-caused failures. Non-HttpError values
+                    // are treated as unexpected 500s. De-dupe alarms by
+                    // route + error signature so a hot loop of the same
+                    // crash lands as a single alarm with N occurrences
+                    // instead of N pages.
+                    //
+                    // FORCED_ALERT_CODES override the 5xx-only rule: a
+                    // status < 500 still alarms if its legacyCode is in
+                    // the map. Use this for things we want to know about
+                    // even though we expose them as 4xx to users (e.g.
+                    // sustained upstream provider rate limits). They are
+                    // not our own crashes, so each maps to the severity it
+                    // deserves rather than paging.
+                    //
+                    // SKIP_ALERT_PREFIXES override the 5xx rule the other
+                    // direction: an error tagged as caused by an upstream
+                    // provider or a misbehaving client gets exposed to
+                    // the user but does not alarm at all.
+                    //
+                    // `noAlarm` beats both: the call site already decided
+                    // this failure isn't worth recording (e.g. an upstream
+                    // rate limit on a free model, where the volume tracks
+                    // traffic and there's nothing to act on).
+                    const FORCED_ALERT_CODES = new Map<string, PagerSeverity>([
+                        ['upstream_rate_limited', 'info'],
+                        // Our credentials for a provider stopped working —
+                        // everything through it fails until someone looks.
+                        ['upstream_auth_failed', 'warning'],
+                        // A vendor account is dry — everything through it fails until someone tops up.
+                        ['upstream_credits_exhausted', 'warning'],
+                    ]);
+                    const SKIP_ALERT_PREFIXES = /^(upstream_|client_)/;
+                    const isHttp = isHttpError(err);
+                    if (isHttp && err.noAlarm) return;
+                    const status = isHttp ? err.statusCode : 500;
+                    const legacyCode = isHttp ? (err.legacyCode ?? '') : '';
+                    const forcedSeverity =
+                        (isHttp ? err.alarmSeverity : undefined) ??
+                        FORCED_ALERT_CODES.get(legacyCode);
+                    if (!forcedSeverity) {
+                        if (status < 500) return;
+                        if (SKIP_ALERT_PREFIXES.test(legacyCode)) return;
+                    }
+                    const signature = !isHttp
+                        ? err instanceof Error
+                            ? err.message
+                            : String(err)
+                        : status >= 500 || err.alarmSeverity
+                          ? `${err.legacyCode || err.code || 'http'}:${err.message}`
+                          : err.legacyCode || err.code || err.message;
+                    const routePath =
+                        (req as unknown as { route?: { path?: string } }).route
+                            ?.path ?? req.path;
+                    const alarmId = `http_${status}:${req.method}:${routePath}:${signature}`;
+                    // Alarms leave the process, so carry identifiers only:
+                    // bodies and query strings hold passwords, codes and
+                    // tokens, and the actor carries the whole user row.
+                    const urlPath = req.originalUrl.split('?')[0];
+                    const body = req.body as unknown;
+                    this.clients.alarm.create(
+                        alarmId,
+                        `HTTP ${status} on ${req.method} ${urlPath}: ${signature}`,
+                        {
+                            // What the thrower attached (an AI chain's
+                            // per-provider attempts, say) rides under one key
+                            // so it can't shadow the request fields below, and
+                            // a repeat from another thrower on the same id
+                            // replaces it rather than merging into it.
+                            ...(isHttp && err.fields !== undefined
+                                ? { details: err.fields }
+                                : {}),
+                            error: err instanceof Error ? err : undefined,
+                            status,
+                            method: req.method,
+                            path: urlPath,
+                            queryKeys: Object.keys(req.query ?? {}),
+                            bodyKeys:
+                                body && typeof body === 'object'
+                                    ? Object.keys(body)
+                                    : [],
+                            route: routePath,
+                            actor: req.actor ? actorUid(req.actor) : undefined,
+                        },
+                        // An unhandled server error is the one thing that
+                        // still pages on-call.
+                        forcedSeverity ?? 'critical',
+                        // The id pins route + error signature, so repeats are
+                        // the same fault and belong on one incident.
+                        { dedup: true },
+                    );
+                },
+            }),
+        );
+    }
+
+    /**
+     * Walk a controller's declared routes (via `PuterRouter`) and register each
+     * one against the underlying express app. Per-route option → middleware
+     * translation lives here — when we add auth/subdomain/body-parsing options,
+     * they get wired in at this single point without touching any controller
+     * call site.
+     */
+    #registerControllerRoutes(
+        controllerName: string,
+        controller: WithControllerRegistration,
+    ) {
+        if (!controller.registerRoutes) {
+            throw new Error(
+                `Controller ${controllerName} does not have registerRoutes method`,
+            );
+        }
+
+        // A controller may gate its own registration behind a config flag.
+        // Skipping here means its paths 404 rather than existing and refusing.
+        const isEnabled = (controller as { isEnabled?: () => boolean })
+            .isEnabled;
+        if (typeof isEnabled === 'function' && !isEnabled.call(controller)) {
+            return;
+        }
+
+        // Controllers annotated with `@Controller('/prefix')` carry the prefix
+        // on their prototype; bare (imperative) controllers default to ''.
+        const prefix = (controller as unknown as Record<string, unknown>)[
+            PREFIX_METADATA_KEY
+        ] as string | undefined;
+        const router = new PuterRouter(prefix ?? '');
+        controller.registerRoutes(router);
+
+        for (const route of router.routes) {
+            this.#materializeRoute(this.#app, router.prefix, route);
+        }
+    }
+
+    #materializeRoute(
+        app: IRouter,
+        routerPrefix: string,
+        route: RouteDescriptor,
+    ) {
+        const mwChain: RequestHandler[] = [];
+        const opts = route.options;
+
+        // A route for a claimed subdomain lives behind that claim's
+        // `authorize`, on its own router, never on the main app.
+        const claimed = PuterServer.#claimedSubdomainOf(
+            opts,
+            `route ${route.method.toUpperCase()} ${routerPrefix}${String(route.path)}`,
+        );
+        if (claimed) app = this.#claimRouter(claimed);
+
+        // Validated here rather than trusted, and by the same function the
+        // driver decorator uses: a malformed requirement is a boot failure
+        // naming the route, never a gate that quietly admits everyone.
+        const subscriptionRequirement =
+            opts.requireSubscription === undefined
+                ? undefined
+                : validateSubscriptionRequirement(
+                      opts.requireSubscription,
+                      `route ${route.method.toUpperCase()} ${routerPrefix}${String(route.path)}: requireSubscription`,
+                  );
+        const requiresSubscription =
+            subscriptionRequirement !== undefined &&
+            subscriptionRequirement !== false;
+
+        const reputationRequirement =
+            opts.requireReputation === undefined
+                ? undefined
+                : validateReputationRequirement(
+                      opts.requireReputation,
+                      `route ${route.method.toUpperCase()} ${routerPrefix}${String(route.path)}: requireReputation`,
+                  );
+        const requiresReputation =
+            reputationRequirement !== undefined &&
+            reputationRequirement !== false;
+
+        // 1. Subdomain routing. Routes that specify `subdomain` only match
+        // that subdomain(s). Routes WITHOUT a `subdomain` option (and that
+        // aren't `use` middleware) are restricted to the root origin — this
+        // prevents API-subdomain requests from accidentally hitting a root-
+        // only route. Explicit `subdomain: '*'` disables the gate entirely.
+        //
+        // For `use` routes, `next('route')` in a middleware doesn't skip the
+        // handler (that's only reliable inside `app.METHOD`/`router.METHOD`
+        // chains). We handle subdomain gating by wrapping the handler for
+        // `use` routes further down — don't push `subdomainGate` here.
+        const isUse = route.method === 'use';
+        if (opts.subdomain !== undefined) {
+            if (opts.subdomain !== '*' && !isUse) {
+                mwChain.push(subdomainGate(opts.subdomain));
+            }
+            // subdomain: '*' → no gate, match any subdomain
+        } else if (!isUse) {
+            // No subdomain specified + not a `use()` middleware → root only.
+            // Root = no subdomain present (req.subdomains is empty).
+            mwChain.push((req, _res, next) => {
+                if (req.subdomains && req.subdomains.length > 0) {
+                    next('route');
+                    return;
+                }
+                next();
+            });
+        }
+
+        // A route that wants its errors in a vendor-compatible envelope
+        // (the Anthropic/OpenAI-compatible wire surface) stashes its
+        // renderer on `res.locals`, early — before any gate below can
+        // reject the request — so the terminal `errorHandler` picks it up
+        // for every error this route produces, gate failures included.
+        if (opts.errorRenderer) {
+            const { errorRenderer } = opts;
+            mwChain.push((_req, res, next) => {
+                res.locals.errorRenderer = errorRenderer;
+                next();
+            });
+        }
+
+        // 1b. Origin gate. Runs before auth, rate limiting, and captcha so an
+        // off-origin caller is rejected on the header alone — it never reaches
+        // the credential comparison, and it can't burn another request's rate
+        // limit budget on the way. Unauthenticated by nature: the routes that
+        // opt in are the ones that *hand out* a credential.
+        if (opts.guiOriginOnly) {
+            mwChain.push(guiOriginGate(this.#config));
+        }
+
+        // 2. Auth gates. Implication graph:
+        //   adminOnly        => requireAuth
+        //   allowedAppIds    => requireAuth
+        //   requireUserActor => requireAuth
+        //   userProtected    => requireUserActor
+        // Dedupe: only push requireAuthGate once when *any* of these are set.
+        const requireUserActor = Boolean(
+            opts.requireUserActor || opts.userProtected,
+        );
+        const needsAuth = Boolean(
+            opts.requireAuth ||
+            requireUserActor ||
+            opts.adminOnly ||
+            opts.allowedAppIds ||
+            opts.requireVerified ||
+            opts.noUserSession ||
+            opts.requirePhoneVerified ||
+            opts.requireCardVerified ||
+            opts.requireAnyVerified ||
+            requiresSubscription ||
+            requiresReputation,
+        );
+        if (needsAuth) {
+            mwChain.push(requireAuthGate());
+        }
+
+        // Default-on account-verification gate. Every authenticated route
+        // rejects accounts still pending any signup-time verification —
+        // email confirmation, SMS phone verification, or card verification —
+        // unless `allowUnconfirmed` opts out. This is what keeps low-reputation
+        // signups (which the abuse harness flags instead of hard-blocking) out
+        // of AI, FS, driver, etc. endpoints server-side, not just behind the
+        // GUI modal, while still allowing essential flows (logout,
+        // confirm-email / -phone, card verification, whoami, save-account, …).
+        if (needsAuth && !opts.allowUnconfirmed) {
+            mwChain.push(requireVerifiedAccount());
+            // Same opt-out: a member owing 2FA must still reach those routes.
+            mwChain.push(requireTeam2fa(this.stores?.team));
+        }
+
+        // block access tokens by default
+        if (needsAuth && !opts.allowAccessToken) {
+            mwChain.push(requireNonAccessTokenGate());
+        }
+
+        // `requireVerified` intentionally does NOT imply `requireUserActor`:
+        // FS routes (and similar) want the user's email to be confirmed even
+        // when an app acts on the user's behalf. `requireVerifiedGate` reads
+        // `req.actor?.user?.email_confirmed`, which app-under-user actors
+        // carry, so it works for either actor shape.
+        //
+        // `adminOnly` also does NOT imply `requireUserActor`: admin endpoints
+        // stay callable from scripts/automation using an admin's full-access
+        // token, not only from browser sessions — both are root tokens.
+        // Beyond the username check, `adminOnlyGate` requires a root token
+        // (rejecting an admin acting through a third-party app) unless the
+        // route is also appId-gated, in which case `allowedAppIdsGate` governs
+        // which apps may pass.
+        if (requireUserActor) {
+            mwChain.push(
+                requireUserActorGate({
+                    allowFullAccess: opts.allowFullAccessToken,
+                }),
+            );
+        }
+
+        // Bare user-session ("root" token) rejection. Runs after
+        // `requireUserActor` so that on routes combining both, an app is
+        // rejected with the user-actor message and only a bare session gets
+        // the "use an app or API token" message.
+        if (opts.noUserSession) {
+            mwChain.push(noUserSessionGate());
+        }
+
+        if (opts.adminOnly) {
+            const extras = Array.isArray(opts.adminOnly) ? opts.adminOnly : [];
+            mwChain.push(
+                adminOnlyGate(extras, {
+                    appGated: Boolean(opts.allowedAppIds),
+                }),
+            );
+            // An admin username on a leaked session isn't enough — also require
+            // a recent re-authentication. Exempt only a token that carries one
+            // of the route's allowlisted app ids: an admin acting through an
+            // allowlisted app can't elevate (apps have no password/TOTP; see
+            // createStepUpGate). A root/human session — no app id in the token —
+            // still requires step-up, and `allowedAppIdsGate` still enforces the
+            // allowlist for the app path.
+            mwChain.push(
+                createStepUpGate({
+                    tokenService: this.services.token,
+                    allowedAppUids: opts.allowedAppIds,
+                }),
+            );
+        }
+
+        if (opts.allowedAppIds) {
+            mwChain.push(allowedAppIdsGate(opts.allowedAppIds));
+        }
+
+        // 2a. Email verification. Keyed off `strict_email_verification_required`
+        // so self-hosted boxes without SMTP don't break every fs route.
+        if (opts.requireVerified) {
+            mwChain.push(
+                requireVerifiedGate(
+                    Boolean(this.#config.strict_email_verification_required),
+                ),
+            );
+        }
+
+        // 2a'. Per-factor verification gates. Opt-in, and independent of the
+        // default-on pending-verification gate above: these require the factor
+        // to have actually been verified, for routes worth that friction.
+        if (opts.requirePhoneVerified) {
+            mwChain.push(requirePhoneVerifiedGate());
+        }
+        // A paying account has a card on file already, so both card-aware
+        // gates take a paid plan as the card factor.
+        const hasPaidPlan = (actor: Actor) =>
+            actorOnPaidPlan(this.services.metering, actor);
+        if (opts.requireCardVerified) {
+            mwChain.push(requireCardVerifiedGate({ hasPaidPlan }));
+        }
+        if (opts.requireAnyVerified) {
+            // Same stance as the subscription requirement: an empty list reads
+            // as gated while admitting everyone, so it fails the boot instead.
+            if (opts.requireAnyVerified.length === 0) {
+                throw new Error(
+                    `route ${route.method.toUpperCase()} ${routerPrefix}${String(route.path)}: requireAnyVerified: expected at least one factor`,
+                );
+            }
+            if (this.#config.verifiedFactorGate?.enabled !== false) {
+                mwChain.push(
+                    requireAnyVerifiedGate(opts.requireAnyVerified, {
+                        ...cardFallbackDepsFrom(this.clients),
+                        hasPaidPlan,
+                    }),
+                );
+            }
+        }
+
+        // 2a''. Reputation floor. Ahead of the plan gate and everything
+        // after it: whether an account is trusted enough to be here at all is
+        // a different question from what it pays for, and the cheaper one —
+        // the score rides on the actor. A tier the config doesn't define
+        // enforces nothing, so this is inert until a deployment says what its
+        // tiers are worth.
+        if (requiresReputation) {
+            mwChain.push(
+                requireReputationGate(this.#config, reputationRequirement!),
+            );
+        }
+
+        // 2a'''. Plan enforcement. Before the rate limit — the same order the
+        // driver dispatch path uses — so an account on a plan that never
+        // included this route is told to upgrade rather than to slow down,
+        // and doesn't spend a rate-limit token on a request that can never
+        // pass. Also before the budget gate: "your plan doesn't include this"
+        // beats "you're out of credits" that a top-up wouldn't fix.
+        if (requiresSubscription) {
+            mwChain.push(
+                requireSubscriptionGate(
+                    this.services.metering,
+                    this.#config,
+                    subscriptionRequirement!,
+                    {
+                        events: this.clients.event,
+                        surface: routeEventKeyBase(
+                            route.method,
+                            route.path !== undefined
+                                ? PuterServer.#joinPath(
+                                      routerPrefix,
+                                      route.path,
+                                  )
+                                : undefined,
+                        ),
+                    },
+                ),
+            );
+        }
+
+        // 2b. Rate limiting. Runs after auth so 'user' key strategy
+        // has access to req.actor. An array applies each limit as its
+        // own gate — a request must pass all of them.
+        if (opts.rateLimit) {
+            const limits = Array.isArray(opts.rateLimit)
+                ? opts.rateLimit
+                : [opts.rateLimit];
+            for (const rl of limits) {
+                mwChain.push(rateLimitGate(rl) as unknown as RequestHandler);
+            }
+        }
+
+        // 2b''. Budget enforcement. After the rate limit so a caller over
+        // both gets the cheaper, more specific answer, and before the
+        // concurrency slot so a rejected request never takes one. Answered
+        // from the metering service's per-actor cache, so ordering it here
+        // costs a map lookup rather than a store read.
+        if (opts.requireCredits) {
+            mwChain.push(
+                requireCreditsGate(this.services.metering, this.#config),
+            );
+        }
+
+        // 2b'. Concurrent in-flight limiting. Same auth-ordering reason
+        // (user key + bySubscription resolution needs req.actor); installed
+        // after rateLimitGate so a rate-rejection short-circuits before
+        // we acquire a concurrency slot. Slot is released on res finish/close.
+        if (opts.concurrent) {
+            mwChain.push(
+                concurrencyGate(opts.concurrent) as unknown as RequestHandler,
+            );
+        }
+
+        // 2c. Captcha verification. Reads captchaToken + captchaAnswer
+        // from req.body — body is already parsed by the global JSON
+        // middleware at this point.
+        if (opts.captcha) {
+            const enabled = Boolean(this.#config.captcha?.enabled);
+            mwChain.push(captchaGate(enabled) as unknown as RequestHandler);
+        }
+
+        // 2d. Anti-CSRF token consumption.
+        if (opts.antiCsrf) {
+            mwChain.push(requireAntiCsrf() as unknown as RequestHandler);
+        }
+
+        // 3. Per-route body parsers. Each is a no-op when the request's
+        // content-type doesn't match — multiple can coexist. The global
+        // `application/json` parser already ran in `#installGlobalMiddleware`,
+        // so by default the only reason to opt into one of these is to handle
+        // a non-JSON body shape (raw bytes, plain text, urlencoded form) or
+        // to override JSON limits on a hot path.
+        // bodyJson is `false | { limit?, type? }`. Truthiness check excludes
+        // both `undefined` (no opt) and `false` (explicit opt-out).
+        if (opts.bodyJson) {
+            mwChain.push(
+                express.json({
+                    limit: opts.bodyJson.limit,
+                    type: opts.bodyJson.type,
+                }),
+            );
+        }
+
+        if (opts.bodyRaw) {
+            const raw = opts.bodyRaw === true ? {} : opts.bodyRaw;
+            mwChain.push(
+                express.raw({
+                    limit: raw.limit,
+                    type: raw.type,
+                }),
+            );
+        }
+
+        if (opts.bodyText) {
+            const text = opts.bodyText === true ? {} : opts.bodyText;
+            mwChain.push(
+                express.text({
+                    limit: text.limit,
+                    type: text.type,
+                }),
+            );
+        }
+
+        if (opts.bodyUrlencoded) {
+            const ue = opts.bodyUrlencoded === true ? {} : opts.bodyUrlencoded;
+            mwChain.push(
+                express.urlencoded({
+                    limit: ue.limit,
+                    extended: ue.extended ?? true,
+                }),
+            );
+        }
+
+        // 3b. Shared-secret check on service-to-service routes.
+        if (opts.internalAuth) {
+            const { internalAuth } = opts;
+            mwChain.push(internalAuthGate(() => internalAuth(this.#config)));
+        }
+
+        // 3c. Password (or OIDC revalidation) re-check on account routes.
+        if (opts.userProtected) {
+            mwChain.push(
+                ...createUserProtectedGate(
+                    {
+                        config: this.#config,
+                        userStore: this.stores.user,
+                        oidcService: this.services.oidc,
+                        tokenService: this.services.token,
+                    },
+                    opts.userProtected === true ? {} : opts.userProtected,
+                ),
+            );
+        }
+
+        // 4. Caller-supplied middleware runs after gates + parsers, before the handler.
+        if (opts.middleware) mwChain.push(...opts.middleware);
+
+        const fullPath =
+            route.path !== undefined
+                ? PuterServer.#joinPath(routerPrefix, route.path)
+                : undefined;
+
+        // 5. Per-endpoint lifecycle events. Skipped for `use` middleware
+        // (those aren't endpoints). Pushed last so the `before` hook sees a
+        // fully-authenticated request, and only when the event client is
+        // wired (minimal test harnesses may omit it).
+        if (route.method !== 'use' && this.clients.event) {
+            mwChain.push(
+                createRouteLifecycleMiddleware(
+                    this.clients.event,
+                    route.method,
+                    fullPath,
+                ),
+            );
+        }
+
+        if (route.method === 'use') {
+            // Subdomain check for `use` middleware lives INSIDE the handler
+            // wrapper — `next('route')` from a stand-alone subdomainGate
+            // doesn't reliably skip a `use` handler in Express 5.
+            let handler = route.handler;
+            if (opts.subdomain !== undefined && opts.subdomain !== '*') {
+                const allowList = Array.isArray(opts.subdomain)
+                    ? opts.subdomain
+                    : [opts.subdomain];
+                const original = handler;
+                handler = (req, res, next) => {
+                    const active =
+                        req.subdomains?.[req.subdomains.length - 1] ?? '';
+                    if (!allowList.includes(active)) return next();
+                    return original(req, res, next);
+                };
+            }
+            if (fullPath !== undefined) {
+                app.use(fullPath as any, ...mwChain.flat(), handler);
+            } else {
+                app.use(...mwChain.flat(), handler);
+            }
+            return;
+        }
+
+        if (fullPath === undefined) {
+            throw new Error(`Route method '${route.method}' requires a path`);
+        }
+
+        // All express + WebDAV verbs accept the same (path, ...handlers) shape.
+        // The `RouteMethod` union is the allowlist of method names we expose.
+        const method = (app as unknown as Record<string, unknown>)[
+            route.method
+        ];
+        if (typeof method !== 'function') {
+            throw new Error(
+                `Express app does not support method: ${route.method}`,
+            );
+        }
+        (method as (...args: unknown[]) => unknown).call(
+            app,
+            fullPath,
+            ...mwChain,
+            route.handler,
+        );
+    }
+
+    #claimRouter(name: string): Router {
+        let router = this.#claimRouters.get(name);
+        if (!router) {
+            router = express.Router();
+            this.#claimRouters.set(name, router);
+        }
+        return router;
+    }
+
+    /**
+     * The claimed subdomain a route is declared for, if any. Claimed hosts
+     * authenticate through the claim's `authorize`, so options that rely on the
+     * main pipeline's actor or origin handling fail the boot instead.
+     */
+    static #claimedSubdomainOf(
+        opts: RouteOptions,
+        label: string,
+    ): string | undefined {
+        const claims = extensionStore.claimedSubdomains;
+        const labels = [opts.subdomain ?? []].flat();
+        for (const name of labels) {
+            const lower = name.toLowerCase();
+            if (lower !== name && claims.has(lower)) {
+                throw new Error(
+                    `${label}: claimed subdomain '${lower}' must be written in lowercase`,
+                );
+            }
+        }
+        if (Array.isArray(opts.subdomain)) {
+            const mixed = opts.subdomain.find((s) => claims.has(s));
+            if (mixed !== undefined) {
+                throw new Error(
+                    `${label}: claimed subdomain '${mixed}' must be the route's only subdomain`,
+                );
+            }
+            return undefined;
+        }
+        if (typeof opts.subdomain !== 'string') return undefined;
+        const claim = claims.get(opts.subdomain);
+        if (!claim) return undefined;
+        for (const [key, value] of Object.entries(opts)) {
+            if (value === undefined || value === false) continue;
+            if (!CLAIMED_ROUTE_OPTIONS.has(key)) {
+                throw new Error(
+                    `${label}: '${key}' is not available on a claimed subdomain`,
+                );
+            }
+        }
+        const limits = [opts.rateLimit, opts.concurrent].flat();
+        for (const limit of limits) {
+            if (limit && (limit.key !== 'ip' || limit.bySubscription)) {
+                throw new Error(
+                    `${label}: limits on a claimed subdomain must key on 'ip'`,
+                );
+            }
+        }
+        try {
+            claim.checkRoute?.(opts, label);
+        } catch (err) {
+            throw new Error(`${label}: ${(err as Error)?.message ?? err}`);
+        }
+        return opts.subdomain;
+    }
+
+    /**
+     * Join a controller's prefix with a route path. RegExp / array paths are
+     * passed through unprefixed (consistent with express's behavior; decorator
+     * paths are assumed to be strings).
+     */
+    static #joinPath(
+        prefix: string,
+        path: NonNullable<RouteDescriptor['path']>,
+    ): string | RegExp | Array<string | RegExp> {
+        if (typeof path !== 'string') return path;
+        if (!prefix) return path;
+        return `${prefix}/${path}`.replace(/\/+/g, '/');
+    }
+
+    async #importExtensions(extensionDirs: string[]) {
+        for (const extDir of extensionDirs) {
+            // `withFileTypes: true` gives us `Dirent` objects so we can
+            // distinguish files from directories without extra stat calls
+            // (and without relying on a dot-in-name heuristic, which breaks
+            // for data-bearing sidecar dirs like `pages.assets/`).
+            for (const entry of readdirSync(extDir, { withFileTypes: true })) {
+                const entryPath = `${extDir}/${entry.name}`;
+
+                if (entry.isFile()) {
+                    const name = entry.name;
+                    let shouldImport: boolean;
+                    if (this.#config.import_ts_extensions) {
+                        // Extensions ship as compiled .js at runtime, but
+                        // transform-capable runtimes (the test harness)
+                        // import the .ts sources directly. Skip tests and
+                        // declarations, and skip built .js siblings of a
+                        // .ts source so a previously-built tree doesn't
+                        // double-register.
+                        if (name.endsWith('.ts')) {
+                            shouldImport =
+                                !name.endsWith('.test.ts') &&
+                                !name.endsWith('.d.ts');
+                        } else {
+                            shouldImport =
+                                /\.(js|mjs|cjs)$/.test(name) &&
+                                !/\.test\.(js|mjs|cjs)$/.test(name) &&
+                                !existsSync(
+                                    entryPath.replace(/\.(js|mjs|cjs)$/, '.ts'),
+                                );
+                        }
+                    } else {
+                        shouldImport = /\.(js|mjs|cjs)$/.test(name);
+                    }
+                    if (shouldImport) {
+                        console.log(`Importing extension file ${entryPath}`);
+                        await import(pathToFileURL(entryPath).href);
+                    }
+                    continue;
+                }
+
+                if (!entry.isDirectory()) continue; // symlinks, etc. — skip
+
+                // Prefer package.json "main"; fall back to index.{js,mjs,cjs}.
+                // Dirs that match neither (e.g. data-only sidecars) are
+                // silently ignored rather than crashing the boot.
+                let mainPath: string | null = null;
+                const pkgPath = `${entryPath}/package.json`;
+                if (existsSync(pkgPath)) {
+                    try {
+                        const pkg = JSON.parse(
+                            readFileSync(pkgPath, 'utf-8'),
+                        ) as { main?: string };
+                        if (pkg.main) mainPath = `${entryPath}/${pkg.main}`;
+                    } catch (e) {
+                        console.warn(
+                            `[extensions] invalid package.json at ${pkgPath}:`,
+                            e,
+                        );
+                        continue;
+                    }
+                }
+                if (!mainPath) {
+                    for (const cand of ['index.js', 'index.mjs', 'index.cjs']) {
+                        if (existsSync(`${entryPath}/${cand}`)) {
+                            mainPath = `${entryPath}/${cand}`;
+                            break;
+                        }
+                    }
+                }
+                if (!mainPath) continue;
+
+                console.log(`Importing extension file ${mainPath}`);
+                await import(pathToFileURL(mainPath).href);
+            }
+        }
+    }
+
+    async start(noHttpServer = false) {
+        await this.#ready;
+
+        // Installed before anything starts serving, so a fault during boot is
+        // reported too. Logging is unconditional; whether an uncaught exception
+        // ends the process is a deployment decision, hence the config gate.
+        this.#removeProcessGuards = installProcessGuards({
+            keepAliveOnUncaught: this.#config.keep_alive_on_uncaught ?? false,
+        });
+
+        // Create the http server explicitly (instead of `app.listen()`) so we
+        // have the server reference BEFORE listen starts — anything that needs
+        // to hook into the raw server (socket.io upgrades, WebSockets, …) runs
+        // its `attachHttpServer(server)` here, pre-listen.
+        const httpServer = http.createServer(this.#app);
+        // Keep-alive has to outlive the idle timeout of any proxy in front: if
+        // this server closes a pooled connection first, a request the proxy
+        // dispatches onto it reaches the client as a 502. Node's 5s default is
+        // below every common proxy setting. `headersTimeout` counts from a
+        // request's first byte, so it needs no matching bump.
+        httpServer.keepAliveTimeout =
+            this.#config.keep_alive_timeout ?? DEFAULT_KEEP_ALIVE_TIMEOUT;
+        for (const service of Object.values(this.services) as Array<
+            WithLifecycle & {
+                attachHttpServer?: (s: http.Server) => void | Promise<void>;
+            }
+        >) {
+            if (typeof service.attachHttpServer === 'function') {
+                await service.attachHttpServer(httpServer);
+            }
+        }
+
+        if (!noHttpServer) {
+            // Await 'listening' (and full boot below) so callers can rely on
+            // the server being reachable once start() resolves — test
+            // harnesses connect real clients immediately after.
+            this.#server = httpServer.listen(this.#config.port);
+            await new Promise<void>((resolve, reject) => {
+                const onError = (err: Error) => reject(err);
+                httpServer.once('error', onError);
+                httpServer.once('listening', () => {
+                    // Detach so post-boot 'error' events aren't swallowed
+                    // by a no-op reject on this settled promise.
+                    httpServer.removeListener('error', onError);
+                    resolve();
+                });
+            });
+
+            const cfg = this.#config;
+            const liveUrl =
+                cfg.origin ??
+                `${cfg.protocol ?? 'http'}://${cfg.domain ?? 'localhost'}:${this.#config.port}`;
+            console.log(
+                '\n************************************************************',
+            );
+            console.log(`* Puter is now live at: ${liveUrl}`);
+            console.log(
+                '************************************************************\n',
+            );
+
+            await this.#runHook('bottomUp', 'onServerStart');
+            console.log('PuterServer has fully booted.');
+
+            // CLI: `--server` (optionally `--puter-backend=<gui-origin>`)
+            // runs the AuthMe flow against a remote Puter (default
+            // puter.com), then opens the local GUI already logged in and
+            // pointed at that backend. Restores the v1 WebServerService
+            // `--server` behavior; works in any env. When set, it takes
+            // over browser launch so we don't also open a plain tab.
+            const { values: cliArgs } = parseArgs({
+                args: process.argv.slice(2),
+                options: {
+                    server: { type: 'boolean' },
+                    'puter-backend': { type: 'string' },
+                },
+                strict: false,
+            });
+
+            if (cliArgs.server) {
+                try {
+                    // tools/auth_gui.js is not compiled into dist/, so
+                    // resolve it from the package root (cwd, per the
+                    // `start` script) rather than relative to this module.
+                    const authGuiUrl = pathToFileURL(
+                        path.resolve(process.cwd(), 'tools/auth_gui.js'),
+                    ).href;
+                    const authGui = (await import(authGuiUrl)).default;
+                    await authGui(
+                        cliArgs['puter-backend'] as string | undefined,
+                    );
+                } catch (e) {
+                    console.log(
+                        '[server] could not start AuthMe browser flow:',
+                        (e as Error).message,
+                    );
+                }
+            } else if (this.#config.env === 'dev' && !cfg.no_browser_launch) {
+                // Auto-launch the browser on dev boot (matches v1
+                // WebServerService). Opt out via `no_browser_launch: true`.
+                try {
+                    const openModule = await import('open');
+                    await openModule.default(liveUrl);
+                } catch (e) {
+                    console.log(
+                        '[server] could not auto-open browser:',
+                        (e as Error).message,
+                    );
+                }
+            }
+        } else {
+            this.#server = {
+                close: (cb: (error?: Error) => void | undefined) => {
+                    console.debug('PuterServer mock close called');
+                    cb?.();
+                },
+                closeAllConnections: () => {
+                    console.debug(
+                        'PuterServer mock closeAllConnections called',
+                    );
+                },
+            } as unknown as http.Server;
+            // Tests still need onServerStart to fire so stores can
+            // bootstrap (e.g. SystemKVStore creates its dynalite table).
+            await this.#runHook('bottomUp', 'onServerStart');
+        }
+    }
+
+    /**
+     * Run `hook` on every instance of every layer. Bottom-up starts each layer
+     * after the ones it depends on; top-down shuts each down while the layers
+     * it writes through are still up.
+     */
+    async #runHook(
+        order: 'bottomUp' | 'topDown',
+        hook: 'onServerStart' | 'onServerPrepareShutdown' | 'onServerShutdown',
+    ) {
+        const layers = [
+            this.clients,
+            this.stores,
+            this.services,
+            this.controllers,
+            this.drivers,
+        ];
+        if (order === 'topDown') layers.reverse();
+        for (const layer of layers) {
+            for (const instance of Object.values(layer) as WithLifecycle[]) {
+                await instance[hook]?.();
+            }
+        }
+    }
+
+    #prepareShutdownHooksRan = false;
+
+    /**
+     * Run every layer's `onServerPrepareShutdown` exactly once, whichever of
+     * `prepareShutdown()` / `shutdown()` gets there first.
+     */
+    async #runPrepareShutdownHooks() {
+        if (this.#prepareShutdownHooksRan) return;
+        this.#prepareShutdownHooksRan = true;
+        await this.#runHook('bottomUp', 'onServerPrepareShutdown');
+    }
+
+    async prepareShutdown() {
+        if (this.#server) {
+            this.#server.close(async () => {
+                console.log(
+                    'PuterServer has stopped accepting new connections',
+                );
+                await this.#runPrepareShutdownHooks();
+            });
+        }
+    }
+
+    async shutdown() {
+        this.#removeProcessGuards?.();
+        this.#removeProcessGuards = null;
+        if (this.#server) {
+            console.log('PuterServer is shutting down');
+            // Prepare hooks come first: SocketService's hook closes
+            // socket.io, disconnecting upgraded websocket connections that
+            // `closeAllConnections()` does not cover — without this,
+            // `close()` waits forever on any connected socket.io client.
+            await this.#runPrepareShutdownHooks();
+            // Stop accepting new connections, then sever live ones; the
+            // close callback fires once the listener is fully released.
+            const closed = new Promise<void>((resolve) => {
+                this.#server!.close(() => resolve());
+            });
+            this.#server.closeAllConnections();
+            await closed;
+            await this.#runHook('topDown', 'onServerShutdown');
+        }
+    }
+}

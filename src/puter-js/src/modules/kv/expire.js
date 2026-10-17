@@ -1,0 +1,32 @@
+import * as utils from '../../lib/utils.js';
+import { assertKeyPresent, assertKeySize } from './lib/validate.js';
+
+/** @typedef {import('./types.js').KVOptConfig} KVOptConfig */
+
+/**
+ * @overload
+ * @param {string} key
+ * @param {number} ttlSeconds
+ * @param {KVOptConfig} [optConfig]
+ * @returns {Promise<boolean>}
+ */
+/**
+ * Sets the time-to-live for a key, in seconds; after that the key is
+ * deleted. Prefer this over `expireAt` when the timestamp should be set by
+ * the server, to avoid issues with clock drift.
+ *
+ * A missing or already-expired key becomes an empty key with the TTL, rather
+ * than staying absent. `ttl <= 0` expires the key immediately.
+ *
+ * @this {import('./index.js').KVModule}
+ * @param {string} key
+ * @param {number} ttl
+ * @param {KVOptConfig} [optConfig]
+ * @returns {Promise<boolean>}
+ */
+export async function expire (key, ttl, optConfig) {
+    assertKeyPresent(key);
+    assertKeySize(key);
+    this.guiCache.invalidate(key);
+    return await utils.makeDriverMethod({ iface: 'puter-kvstore', method: 'expire', argNames: ['key', 'ttl'], puter: this.puter })({ key, ttl, optConfig });
+}

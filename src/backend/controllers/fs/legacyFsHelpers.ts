@@ -1,0 +1,650 @@
+/*
+ * Copyright (C) 2024-present Puter Technologies Inc.
+ *
+ * This file is part of Puter.
+ *
+ * Puter is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published
+ * by the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+import { posix as pathPosix } from 'node:path';
+import { contentType as contentTypeFromMime } from 'mime-types';
+import type { FSEntry } from '../../stores/fs/FSEntry.js';
+import type { FSEntryStore } from '../../stores/fs/FSEntryStore.js';
+import type { FSService } from '../../services/fs/FSService.js';
+import type { NodeRef } from '../../services/fs/resolveNode.js';
+import {
+    FS_ROUTE_REFUSAL,
+    type ACLService,
+    type AclMode,
+    type AclRefusalOptions,
+    type ResourceDescriptor,
+} from '../../services/acl/ACLService.js';
+import type { Actor } from '../../core/actor.js';
+import { Context } from '../../core/context.js';
+import type { EventClient } from '../../clients/event/EventClient.js';
+import { HttpError } from '../../core/http/HttpError.js';
+import {
+    resolveNode,
+    normalizeAbsolutePath,
+    isOwnersTrash,
+    assertChildName,
+    joinChildPath,
+    expandTildePath,
+} from '../../services/fs/resolveNode.js';
+import {
+    maskEntryPath,
+    resolveSharePath,
+} from '../../services/fs/sharePathMask.js';
+import {
+    NON_OWNER_SIGNATURE_TTL_SECONDS,
+    signFile,
+    type SigningConfig,
+    type SignedFile,
+} from '../../util/fileSigning.js';
+import type { IConfig } from '../../types.js';
+
+/**
+ * Shared helpers used by the legacy FS route shims (LegacyFSController).
+ *
+ * Legacy clients speak snake_case and expect specific response shapes — these
+ * helpers encapsulate that translation so the route handlers stay terse.
+ */
+
+// -- Body parsing -----------------------------------------------------
+
+export function asRecord(value: unknown): Record<string, unknown> {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
+    return value as Record<string, unknown>;
+}
+
+export function getString(
+    record: Record<string, unknown>,
+    ...keys: string[]
+): string | undefined {
+    for (const key of keys) {
+        const value = record[key];
+        if (typeof value === 'string' && value.length > 0) return value;
+    }
+    return undefined;
+}
+
+export function getBoolean(
+    record: Record<string, unknown>,
+    ...keys: string[]
+): boolean | undefined {
+    for (const key of keys) {
+        const value = record[key];
+        if (typeof value === 'boolean') return value;
+        if (typeof value === 'number') {
+            if (value === 1) return true;
+            if (value === 0) return false;
+        }
+        if (typeof value === 'string') {
+            const normalized = value.trim().toLowerCase();
+            if (['1', 'true', 'yes', 'on'].includes(normalized)) return true;
+            if (['0', 'false', 'no', 'off'].includes(normalized)) return false;
+        }
+    }
+    return undefined;
+}
+
+// Accepts either `{ path }` or `{ uid }` or `{ id }` or `{ parent, name }`
+// from a legacy body field. Returns a resolved entry (throwing 404 if not
+// found or 400 if no usable ref is present).
+//
+// `~` / `~/...` paths are expanded to `/<username>/...` using the actor's
+// username, read from the ALS-backed Context. Legacy clients send tilde-
+// rooted paths (e.g. `~/AppData/<app-uid>/...`); FSController does the same
+// expansion via its own `#normalizePath` helper.
+/**
+ * Everything a client-authored path needs before it names a row: `~` expanded,
+ * and a masked share path turned back into the owner's real one.
+ */
+export async function expandClientPath(
+    fsEntryStore: FSEntryStore,
+    raw: string,
+    username?: string,
+): Promise<string> {
+    return resolveSharePath(
+        fsEntryStore,
+        Context.get('actor'),
+        expandTildePath(raw, username),
+    );
+}
+
+// Nested `{parent, name}` selectors recurse; unbounded depth overflows the stack.
+const MAX_SELECTOR_DEPTH = 4;
+
+/**
+ * Resolve `ref`, reporting any miss as the same 404 an unreadable entry gets,
+ * so a lookup never echoes a resolved path or tells missing from hidden.
+ */
+export async function resolveOrNotFound(
+    fsEntryStore: FSEntryStore,
+    ref: NodeRef,
+): Promise<FSEntry> {
+    try {
+        const entry = await resolveNode(fsEntryStore, ref, { required: true });
+        if (entry) return entry;
+    } catch (err) {
+        if (!(err instanceof HttpError && err.statusCode === 404)) throw err;
+    }
+    throw new HttpError(404, 'Subject does not exist', {
+        legacyCode: 'subject_does_not_exist',
+    });
+}
+
+async function resolveV1SelectorAtDepth(
+    fsEntryStore: FSEntryStore,
+    raw: unknown,
+    depth: number,
+): Promise<FSEntry> {
+    const username = Context.get('actor')?.user?.username;
+
+    // String shorthand — either an absolute path (`/a/b/c`) or a UUID.
+    // The legacy API accepts both interchangeably; dispatch on the leading
+    // character rather than guessing by regex. Anything that doesn't start
+    // with `/` is treated as a uid. Tilde-rooted paths are path-shaped.
+    if (typeof raw === 'string') {
+        const isPath = raw.startsWith('/') || raw.startsWith('~');
+        const ref = isPath
+            ? { path: await expandClientPath(fsEntryStore, raw, username) }
+            : { uid: raw };
+        return resolveOrNotFound(fsEntryStore, ref);
+    }
+
+    const record = asRecord(raw);
+
+    // {parent, name}: "child selector" — resolve parent, then child by name.
+    if (record.parent !== undefined && typeof record.name === 'string') {
+        if (depth >= MAX_SELECTOR_DEPTH) {
+            throw new HttpError(400, 'Selector is nested too deeply', {
+                legacyCode: 'bad_request',
+            });
+        }
+        // Before the parent lookup, so a bad name can't tell whether the
+        // parent exists.
+        assertChildName(record.name);
+        const parent = await resolveV1SelectorAtDepth(
+            fsEntryStore,
+            record.parent,
+            depth + 1,
+        );
+        return resolveOrNotFound(fsEntryStore, {
+            path: joinChildPath(parent.path, record.name),
+        });
+    }
+
+    const rawPath = typeof record.path === 'string' ? record.path : undefined;
+    const ref = {
+        path:
+            rawPath !== undefined
+                ? await expandClientPath(fsEntryStore, rawPath, username)
+                : undefined,
+        uid:
+            typeof record.uid === 'string'
+                ? record.uid
+                : typeof record.uuid === 'string'
+                  ? record.uuid
+                  : undefined,
+        id:
+            typeof record.id === 'number' || typeof record.id === 'string'
+                ? record.id
+                : undefined,
+    };
+    return resolveOrNotFound(fsEntryStore, ref);
+}
+
+export async function resolveV1Selector(
+    fsEntryStore: FSEntryStore,
+    raw: unknown,
+): Promise<FSEntry> {
+    return resolveV1SelectorAtDepth(fsEntryStore, raw, 0);
+}
+
+// -- ACL --------------------------------------------------------------
+
+/**
+ * The filesystem refusal, except that an app is told a path it can't reach
+ * doesn't exist, so a sibling user's or another app's files don't show up as
+ * merely forbidden.
+ */
+const LEGACY_REFUSAL: AclRefusalOptions = {
+    ...FS_ROUTE_REFUSAL,
+    hideFromApps: true,
+};
+
+/** `_fsService` is unused; the call sites still pass it. */
+export async function assertAccess(
+    aclService: ACLService,
+    _fsService: FSService,
+    actor: Actor,
+    path: string | ResourceDescriptor,
+    mode: AclMode,
+): Promise<void> {
+    await aclService.assertFsAccess(actor, path, mode, LEGACY_REFUSAL);
+}
+
+/** `ACLService.assertFsCreate`, refused the legacy way. */
+export async function assertCanCreate(
+    aclService: ACLService,
+    _fsService: FSService,
+    actor: Actor,
+    targetPath: string,
+): Promise<void> {
+    await aclService.assertFsCreate(actor, targetPath, LEGACY_REFUSAL);
+}
+
+/** `write` on the destination parent, unless it is the entry's own Trash. */
+export async function assertCanMoveInto(
+    aclService: ACLService,
+    fsService: FSService,
+    actor: Actor,
+    source: FSEntry,
+    destinationParent: FSEntry,
+): Promise<void> {
+    if (isOwnersTrash(source, destinationParent)) return;
+    await assertAccess(
+        aclService,
+        fsService,
+        actor,
+        destinationParent.path,
+        'write',
+    );
+}
+
+// -- Response shaping ------------------------------------------------
+
+type AppRowLookup = {
+    getByIds: (ids: number[]) => Promise<Map<number, Record<string, unknown>>>;
+};
+
+const toIntBool = (v: unknown): number => (v ? 1 : 0);
+
+/**
+ * Convert an AppStore-normalized app row into the v1 `associated_app` shape
+ * embedded in legacy FS entries. Booleans round-trip back to integers (0/1)
+ * because the v1 wire contract emits them that way and existing clients key off
+ * it. Other columns pass through as-is — `metadata` is already parsed.
+ *
+ * Two redactions, because `associatedAppId` can name an app the actor does not
+ * own (the column is client-writable display metadata, never trusted for authz
+ * — see FSController) and may point cross-tenant:
+ *
+ * - Owner identifiers (`owner_user_id`, `app_owner`) are never emitted — they're
+ *   internal user references with no client-side display use.
+ * - For private or protected apps, the direct hosting URL and launch capability
+ *   flags (`index_url`, `godmode`, `maximize_on_start`, `background`,
+ *   `metadata`) are dropped. This mirrors AppDriver, which withholds
+ *   `index_url` from callers without read entitlement. Display fields (name,
+ *   icon, title) still pass through so the GUI can label the file's associated
+ *   app.
+ */
+function mapAppForLegacyAssociatedApp(
+    app: Record<string, unknown>,
+): Record<string, unknown> {
+    const gated = Boolean(app.is_private) || Boolean(app.protected);
+    return {
+        id: app.id,
+        uid: app.uid,
+        icon: app.icon,
+        name: app.name,
+        title: app.title,
+        description: app.description,
+        godmode: gated ? 0 : toIntBool(app.godmode),
+        maximize_on_start: gated ? 0 : toIntBool(app.maximize_on_start),
+        index_url: gated ? null : app.index_url,
+        approved_for_listing: toIntBool(app.approved_for_listing),
+        approved_for_opening_items: toIntBool(app.approved_for_opening_items),
+        approved_for_incentive_program: toIntBool(
+            app.approved_for_incentive_program,
+        ),
+        timestamp: app.timestamp ?? null,
+        last_review: app.last_review ?? null,
+        tags: app.tags ?? null,
+        background: gated ? 0 : toIntBool(app.background),
+        metadata: gated ? null : (app.metadata ?? null),
+        protected: toIntBool(app.protected),
+        is_private: toIntBool(app.is_private),
+    };
+}
+
+/**
+ * Batch-load `associated_app` payloads for a set of entries. Dedupes app ids
+ * across the input, hands them to `AppStore.getByIds` (one pipelined Redis
+ * MGET
+ *
+ * - A single `id IN (…)` query for any cache misses), and returns a map keyed by
+ *   app id holding the v1-shaped embed. Callers pass the result to
+ *   `toLegacyEntry` via `opts.appsById` so each entry hydrates without a second
+ *   round-trip.
+ *
+ * Empty input short-circuits — readdir on a directory of plain files makes zero
+ * extra calls.
+ */
+export async function loadLegacyAssociatedApps(
+    appStore: AppRowLookup,
+    entries: FSEntry[],
+): Promise<Map<number, Record<string, unknown>>> {
+    const ids = [
+        ...new Set(
+            entries
+                .map((e) => e.associatedAppId)
+                .filter((id): id is number => typeof id === 'number'),
+        ),
+    ];
+    const out = new Map<number, Record<string, unknown>>();
+    if (ids.length === 0) return out;
+    const apps = await appStore.getByIds(ids);
+    for (const [id, app] of apps) {
+        out.set(id, mapAppForLegacyAssociatedApp(app));
+    }
+    return out;
+}
+
+/**
+ * The v1 `type` field: a MIME content-type (e.g. "image/png; charset=utf-8")
+ * for files, or "folder" for directories. The GUI's icon lookup keys off
+ * `type.startsWith('image/')`, so a bare extension breaks icon selection.
+ */
+export function fsEntryMimeType(entry: {
+    isDir: boolean;
+    name: string;
+}): string | null {
+    return entry.isDir ? 'folder' : contentTypeFromMime(entry.name) || null;
+}
+
+/**
+ * Swap an S3 thumbnail key for a signed URL via the thumbnail extension
+ * (`thumbnail.read` event). Returns the input unchanged when there's no
+ * thumbnail or no event client; returns null if signing yields nothing.
+ */
+export async function signEntryThumbnail(
+    eventClient: EventClient | undefined,
+    uuid: string,
+    thumbnail: string | null,
+): Promise<string | null> {
+    if (
+        typeof thumbnail !== 'string' ||
+        thumbnail.length === 0 ||
+        !eventClient
+    ) {
+        return thumbnail ?? null;
+    }
+    const thumbnailEntry = { uuid, thumbnail };
+    try {
+        // emitAndWait — listener mutates `thumbnail` on the payload; plain
+        // `emit` is fire-and-forget and would drop the rewrite.
+        await eventClient.emitAndWait('thumbnail.read', thumbnailEntry, {});
+    } catch {
+        // ignore — non-critical.
+    }
+    return typeof thumbnailEntry.thumbnail === 'string' &&
+        thumbnailEntry.thumbnail.length > 0
+        ? thumbnailEntry.thumbnail
+        : null;
+}
+
+/**
+ * Produce the snake_case entry shape legacy clients expect. If `thumbnail` is
+ * set, asks the thumbnail extension (via `thumbnail.read` event) to swap an S3
+ * URL for a signed one. Pass `fsEntryStore`/`userStore` to hydrate `is_empty`
+ * (directories) and `owner` — both are required fields per the legacy stat
+ * contract but need extra DB lookups. Pass `appsById` (built via
+ * `loadLegacyAssociatedApps`) to populate `associated_app`. Pass `parentUid`
+ * (even as `null`, via `clientParentUid`) to override `parent_id`/`parent_uid`
+ * — callers reading a scoped access token's home use it to hide the uuid.
+ */
+export async function toLegacyEntry(
+    eventClient: EventClient | undefined,
+    entry: FSEntry,
+    opts: {
+        fsEntryStore?: FSEntryStore;
+        userStore?: {
+            getById: (id: number) => Promise<Record<string, unknown> | null>;
+        };
+        appsById?: Map<number, Record<string, unknown>>;
+        /** Omitted from the response when undefined. */
+        isShared?: boolean | null;
+        /** Skip the mask: the mask is the actor's, and only they can read it. */
+        forOwner?: boolean;
+        parentUid?: string | null;
+    } = {},
+): Promise<Record<string, unknown>> {
+    // Someone else's entry is published under its masked path; the owner's
+    // real one, and everything above the share, stays server-side.
+    const publishedPath = opts.forOwner ? entry.path : maskEntryPath(entry);
+    const dirname = pathPosix.dirname(publishedPath);
+    const mimeType = fsEntryMimeType(entry);
+
+    const pathComponents = entry.path.split('/');
+    const appdata_app =
+        pathComponents[2] === 'AppData' ? pathComponents[3] : undefined;
+
+    const parentUid =
+        opts.parentUid !== undefined
+            ? opts.parentUid
+            : (entry.parentUid ?? null);
+
+    const response: Record<string, unknown> = {
+        id: entry.uuid,
+        uid: entry.uuid,
+        uuid: entry.uuid,
+        parent_id: parentUid,
+        parent_uid: parentUid,
+        path: publishedPath,
+        dirname,
+        dirpath: dirname,
+        name: entry.name,
+        is_dir: Boolean(entry.isDir),
+        is_shortcut: entry.isShortcut ? 1 : 0,
+        shortcut_to: entry.shortcutTo,
+        is_symlink: entry.isSymlink ? 1 : 0,
+        symlink_path: entry.symlinkPath,
+        type: mimeType,
+        writable: true,
+        is_public: entry.isPublic,
+        thumbnail: entry.thumbnail,
+        immutable: Boolean(entry.immutable),
+        metadata: entry.metadata,
+        modified: entry.modified,
+        created: entry.created,
+        accessed: entry.accessed,
+        size: entry.size,
+        layout: entry.layout,
+        subdomains: entry.subdomains,
+        workers: entry.workers,
+        has_website: entry.hasWebsite ?? entry.subdomains.length > 0,
+        suggested_apps: entry.suggestedApps,
+        associated_app:
+            entry.associatedAppId !== null && opts.appsById
+                ? (opts.appsById.get(entry.associatedAppId) ?? null)
+                : null,
+        appdata_app,
+        ...(opts.isShared === undefined ? {} : { is_shared: opts.isShared }),
+    };
+
+    const { fsEntryStore, userStore } = opts;
+    const [isEmpty, ownerUsername, thumbnail] = await Promise.all([
+        // `is_empty` — only meaningful for directories.
+        entry.isDir && fsEntryStore
+            ? (async () => {
+                  try {
+                      return !(await fsEntryStore.hasChildrenByParentUid(
+                          entry.uuid,
+                      ));
+                  } catch {
+                      return false;
+                  }
+              })()
+            : undefined,
+        // `owner` — username-only. Matches the legacy safe-entry contract.
+        userStore
+            ? (async () => {
+                  try {
+                      const owner = await userStore.getById(entry.userId);
+                      return owner && typeof owner.username === 'string'
+                          ? owner.username
+                          : undefined;
+                  } catch {
+                      return undefined; // best-effort
+                  }
+              })()
+            : undefined,
+        // Let the thumbnail extension swap an s3:// key for a signed URL.
+        signEntryThumbnail(
+            eventClient,
+            entry.uuid,
+            response.thumbnail as string | null,
+        ),
+    ]);
+
+    if (isEmpty !== undefined) response.is_empty = isEmpty;
+    else if (!entry.isDir) response.is_empty = false;
+    if (ownerUsername !== undefined)
+        response.owner = { username: ownerUsername };
+    response.thumbnail = thumbnail;
+
+    return response;
+}
+
+// -- GUI item events --------------------------------------------------
+
+export type GuiItemEventName =
+    | 'outer.gui.item.added'
+    | 'outer.gui.item.updated'
+    | 'outer.gui.item.moved'
+    | 'outer.gui.item.removed';
+
+/**
+ * Tell the entry's owner's open clients about a change. The desktop reads the
+ * legacy entry shape plus per-event `extra` fields: `old_path` on moves,
+ * `descendants_only` on removes.
+ *
+ * `replaced` is what an overwriting copy or move took the place of. Its
+ * `removed` goes out first: the desktop hides rows by path, so arriving second
+ * it would hide the new row too.
+ */
+export async function emitGuiItemEvent(
+    eventClient: EventClient,
+    eventName: GuiItemEventName,
+    entry: FSEntry,
+    extra?: Record<string, unknown>,
+    replaced?: FSEntry | null,
+): Promise<void> {
+    // Moving an entry onto its own path replaces nothing.
+    if (replaced && replaced.uuid !== entry.uuid) {
+        await emitGuiItemEvent(eventClient, 'outer.gui.item.removed', replaced);
+    }
+    // `forOwner`: the audience is the owner, who can't read the actor's mask.
+    const response = {
+        ...(await toLegacyEntry(eventClient, entry, { forOwner: true })),
+        ...extra,
+        from_new_service: true,
+    };
+    eventClient.emit(eventName, { user_id_list: [entry.userId], response }, {});
+}
+
+/**
+ * The entry at `name` under `destinationParent`. An overwriting copy or move
+ * deletes it, so callers look it up first to announce its removal.
+ */
+export async function findOverwriteTarget(
+    fsEntryStore: FSEntryStore,
+    destinationParent: FSEntry,
+    name: string,
+): Promise<FSEntry | null> {
+    return fsEntryStore.getEntryByPath(
+        destinationParent.path === '/'
+            ? `/${name}`
+            : `${destinationParent.path}/${name}`,
+    );
+}
+
+/**
+ * `target` if the overwriting move kept the name it was looked up by, so took
+ * its place. A move into someone else's Trash renames instead and leaves it.
+ */
+export function replacedByMove(
+    target: FSEntry | null,
+    moved: FSEntry,
+    name: string,
+): FSEntry | null {
+    return target && moved.name === name ? target : null;
+}
+
+export { normalizeAbsolutePath };
+
+// -- Signing ---------------------------------------------------------
+
+/**
+ * Pull the signing config off the app config. Throws if either value is missing
+ * — these are required for signed URL routes to function.
+ */
+export function signingConfigFromAppConfig(config: IConfig): SigningConfig {
+    const secret = config.url_signature_secret;
+    const apiBaseUrl = config.api_base_url;
+    if (typeof secret !== 'string' || secret.length === 0) {
+        throw new HttpError(
+            500,
+            'Server misconfiguration: url_signature_secret not set',
+            { legacyCode: 'internal_error' },
+        );
+    }
+    if (typeof apiBaseUrl !== 'string' || apiBaseUrl.length === 0) {
+        throw new HttpError(
+            500,
+            'Server misconfiguration: api_base_url not set',
+            { legacyCode: 'internal_error' },
+        );
+    }
+    return {
+        secret,
+        apiBaseUrl,
+        allowLegacySignatures: config.legacy_file_signatures !== false,
+    };
+}
+
+/**
+ * Convenience wrapper: turn an FSEntry into a signed-file response object.
+ *
+ * Pass `actorUserId` so a signature over someone else's entry — a shared file —
+ * expires rather than outliving the share (see
+ * NON_OWNER_SIGNATURE_TTL_SECONDS). The signature is bound to `entry.userId`.
+ */
+export function signEntry(
+    entry: {
+        uuid: string;
+        name: string;
+        isDir: boolean;
+        size: number | null;
+        accessed: number | null;
+        modified: number;
+        created: number | null;
+        userId: number;
+    },
+    config: SigningConfig,
+    opts: { actorUserId?: number; ttlSeconds?: number } = {},
+): SignedFile {
+    const isForeign =
+        typeof opts.actorUserId === 'number' &&
+        typeof entry.userId === 'number' &&
+        entry.userId !== opts.actorUserId;
+    const ttlSeconds =
+        opts.ttlSeconds ??
+        (isForeign ? NON_OWNER_SIGNATURE_TTL_SECONDS : undefined);
+    return signFile(entry as Parameters<typeof signFile>[0], config, {
+        ...(ttlSeconds === undefined ? {} : { ttlSeconds }),
+    });
+}

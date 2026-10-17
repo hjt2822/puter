@@ -1,0 +1,294 @@
+/*
+ * Copyright (C) 2024-present Puter Technologies Inc.
+ *
+ * This file is part of Puter.
+ *
+ * Puter is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published
+ * by the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+import UIWindowChangePassword from '../UIWindowChangePassword.js';
+import UIWindowChangeEmail from '../Settings/UIWindowChangeEmail.js';
+import UIWindowChangeUsername from '../UIWindowChangeUsername.js';
+import UIWindowConfirmUserDeletion from '../Settings/UIWindowConfirmUserDeletion.js';
+import UIWindowCopyToken from '../UIWindowCopyToken.js';
+import UIWindow from '../UIWindow.js';
+import UIProfilePictureCropModal from './UIProfilePictureCropModal.js';
+import { isOrgSeat, orgSeatTeamName } from './orgSeat.js';
+
+const TabAccount = {
+    id: 'account',
+    label: i18n('account'),
+    icon: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>',
+
+    html () {
+        let h = '';
+        h += '<div class="dashboard-tab-content">';
+
+        // Profile section header
+        h += '<div class="dashboard-section-header">';
+        h += `<h2>${ i18n('account') }</h2>`;
+        h += '<p>Manage your account settings and profile</p>';
+        h += '</div>';
+
+        // Profile picture card
+        h += '<div class="dashboard-card dashboard-profile-card">';
+        h += '<div class="dashboard-profile-picture-section">';
+        h += `<div class="profile-picture change-profile-picture dashboard-profile-avatar profile-pic" role="button" tabindex="0" aria-label="${i18n('change_profile_picture')}" style="background-image: url('${html_encode(window.user?.profile?.picture ?? window.icons['profile.svg'])}');">`;
+        h += '</div>';
+        h += '<div class="dashboard-profile-info">';
+        h += `<h3>${html_encode(window.user?.username || 'User')}</h3>`;
+        h += `<p>${html_encode(window.user?.email || '')}</p>`;
+        h += `<span class="dashboard-profile-hint">${i18n('profile_picture_hint')}</span>`;
+        // Shown only while there is a picture to remove.
+        h += `<button type="button" class="dashboard-profile-remove-picture" ${window.user?.profile?.picture ? '' : 'hidden'}>${i18n('remove_profile_picture')}</button>`;
+        h += '</div>';
+        h += '</div>';
+        h += '</div>';
+
+        // Account settings cards
+        h += '<div class="dashboard-settings-grid">';
+
+        // Username card
+        h += '<div class="dashboard-card dashboard-settings-card">';
+        h += '<div class="dashboard-settings-card-content">';
+        h += '<div class="dashboard-settings-card-icon">';
+        h += '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>';
+        h += '</div>';
+        h += '<div class="dashboard-settings-card-info">';
+        h += `<strong>${i18n('username')}</strong>`;
+        h += `<span class="username">${html_encode(window.user.username)}</span>`;
+        h += '</div>';
+        h += '</div>';
+        // A seat's name is the team's; the console and audit log key on it.
+        if ( isOrgSeat(window.user) ) {
+            const team = orgSeatTeamName(window.user);
+            h += `<span class="dashboard-settings-card-note">${
+                team
+                    ? i18n('username_set_by_team', { team })
+                    : i18n('username_set_by_team_generic')
+            }</span>`;
+        } else {
+            h += `<button class="button change-username">${i18n('change_username')}</button>`;
+        }
+        h += '</div>';
+
+        // Password card (only for non-temp users)
+        if ( ! window.user.is_temp ) {
+            h += '<div class="dashboard-card dashboard-settings-card">';
+            h += '<div class="dashboard-settings-card-content">';
+            h += '<div class="dashboard-settings-card-icon">';
+            h += '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>';
+            h += '</div>';
+            h += '<div class="dashboard-settings-card-info">';
+            h += `<strong>${i18n('password')}</strong>`;
+            h += '<span>••••••••</span>';
+            h += '</div>';
+            h += '</div>';
+            h += `<button class="button change-password">${i18n('change_password')}</button>`;
+            h += '</div>';
+        }
+
+        // Email card (only if email exists)
+        if ( window.user.email ) {
+            h += '<div class="dashboard-card dashboard-settings-card">';
+            h += '<div class="dashboard-settings-card-content">';
+            h += '<div class="dashboard-settings-card-icon">';
+            h += '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/><polyline points="22,6 12,13 2,6"/></svg>';
+            h += '</div>';
+            h += '<div class="dashboard-settings-card-info">';
+            h += `<strong>${i18n('email')}</strong>`;
+            h += `<span class="user-email">${html_encode(window.user.email)}</span>`;
+            h += '</div>';
+            h += '</div>';
+            h += `<button class="button change-email">${i18n('change_email')}</button>`;
+            h += '</div>';
+        }
+
+        // API token card
+        h += '<div class="dashboard-card dashboard-settings-card">';
+        h += '<div class="dashboard-settings-card-content">';
+        h += '<div class="dashboard-settings-card-icon">';
+        h += '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4"/></svg>';
+        h += '</div>';
+        h += '<div class="dashboard-settings-card-info">';
+        h += `<strong>${i18n('api_token')}</strong>`;
+        h += `<span>${i18n('api_token_description')}</span>`;
+        h += '</div>';
+        h += '</div>';
+        if ( window.user?.email_confirmed ) {
+            h += `<button class="button copy-auth-token">${i18n('create_token')}</button>`;
+        } else {
+            // "Verify your email" is a dead end for an account with none.
+            const tokenHint = window.user?.email
+                ? i18n('verify_email_to_create_token')
+                : i18n('email_needed_to_create_token');
+            // Disabled buttons have `pointer-events: none`, so the tooltip
+            // lives on a wrapping span that still receives hover.
+            h += `<span title="${html_encode(tokenHint)}" style="cursor: not-allowed;">`;
+            h += `<button class="button copy-auth-token" disabled>${i18n('create_token')}</button>`;
+            h += '</span>';
+        }
+        h += '</div>';
+
+        // Danger zone. A seat has none: the team owns the account.
+        if ( ! isOrgSeat(window.user) ) {
+            h += '<div class="dashboard-danger-zone">';
+            h += '<div class="dashboard-card dashboard-danger-card">';
+            h += '<div class="dashboard-danger-card-content">';
+            h += '<div class="dashboard-danger-card-info">';
+            h += `<strong>${i18n('delete_account')}</strong>`;
+            h += '<span>Permanently delete your account and all associated data. This action cannot be undone.</span>';
+            h += '</div>';
+            h += '</div>';
+            h += `<button class="button button-danger delete-account">${i18n('delete_account')}</button>`;
+            h += '</div>';
+            h += '</div>';
+        }
+
+        h += '</div>'; // end settings-grid
+
+        h += '</div>'; // end dashboard-tab-content
+        return h;
+    },
+
+    init ($el_window) {
+        $el_window.find('.dashboard-section-account .change-password').on('click', function (e) {
+            UIWindowChangePassword({
+                window_options: {
+                    parent_uuid: $el_window.attr('data-element_uuid'),
+                    backdrop: true,
+                    close_on_backdrop_click: true,
+                    parent_center: true,
+                    stay_on_top: true,
+                    has_head: false,
+                },
+            });
+        });
+        $el_window.find('.dashboard-section-account .change-username').on('click', function (e) {
+            UIWindowChangeUsername({
+                window_options: {
+                    parent_uuid: $el_window.attr('data-element_uuid'),
+                    backdrop: true,
+                    close_on_backdrop_click: true,
+                    parent_center: true,
+                    stay_on_top: true,
+                    has_head: false,
+                },
+            });
+        });
+        $el_window.find('.dashboard-section-account .change-email').on('click', function (e) {
+            UIWindowChangeEmail({
+                window_options: {
+                    parent_uuid: $el_window.attr('data-element_uuid'),
+                    backdrop: true,
+                    close_on_backdrop_click: true,
+                    parent_center: true,
+                    stay_on_top: true,
+                    has_head: false,
+                },
+            });
+        });
+        $el_window.find('.dashboard-section-account .copy-auth-token').on('click', function (e) {
+            UIWindowCopyToken({
+                show_close_button: true,
+                show_header: true,
+                window_options: {
+                    parent_uuid: $el_window.attr('data-element_uuid'),
+                    backdrop: true,
+                    close_on_backdrop_click: true,
+                    parent_center: true,
+                    stay_on_top: true,
+                    has_head: false,
+                    is_draggable: false,
+                    draggable_body: false,
+                },
+            });
+        });
+        $el_window.find('.dashboard-section-account .delete-account').on('click', function (e) {
+            UIWindowConfirmUserDeletion({
+                window_options: {
+                    parent_uuid: $el_window.attr('data-element_uuid'),
+                    backdrop: true,
+                    close_on_backdrop_click: true,
+                    parent_center: true,
+                    stay_on_top: true,
+                    has_head: false,
+                },
+            });
+        });
+        $el_window.find('.dashboard-section-account .change-profile-picture').on('keydown', function (e) {
+            if ( e.key !== 'Enter' && e.key !== ' ' ) return;
+            e.preventDefault();
+            $(this).trigger('click');
+        });
+        $el_window.find('.dashboard-section-account .change-profile-picture').on('click', async function (e) {
+            // open dialog
+            UIWindow({
+                path: `/${ window.user.username }/Desktop`,
+                // this is the uuid of the window to which this dialog will return
+                parent_uuid: $el_window.attr('data-element_uuid'),
+                allowed_file_types: ['.png', '.jpg', '.jpeg'],
+                show_maximize_button: false,
+                show_minimize_button: false,
+                title: 'Open',
+                is_dir: true,
+                is_openFileDialog: true,
+                selectable_body: false,
+                backdrop: true,
+                close_on_backdrop_click: true,
+                parent_center: true,
+                stay_on_top: true,
+            });
+        });
+        $el_window.on('file_opened', function (e) {
+            const selectedFile = Array.isArray(e.detail) ? e.detail[0] : e.detail;
+            // Let the user frame the photo before it becomes the avatar.
+            UIProfilePictureCropModal({
+                picture: puter.fs.read(selectedFile.path),
+                $container: $el_window,
+                returnFocusTo: $el_window.find('.dashboard-section-account .change-profile-picture').get(0),
+                onSave: (dataUrl) => {
+                    // update profile picture everywhere (matches helpers.js session refresh)
+                    $('.profile-pic').css('background-image', `url(${ html_encode(dataUrl) })`);
+                    $('.profile-image').css('background-image', `url(${ html_encode(dataUrl) })`);
+                    $('.profile-image').addClass('profile-image-has-picture');
+                    $el_window.find('.dashboard-profile-remove-picture').prop('hidden', false);
+                    update_profile(window.user.username, { picture: dataUrl });
+                },
+            });
+        });
+        $el_window.find('.dashboard-section-account .dashboard-profile-remove-picture').on('click', async function () {
+            const $btn = $(this);
+            const $hint = $el_window.find('.dashboard-section-account .dashboard-profile-hint');
+            $btn.prop('disabled', true);
+            // update_profile resolves with no profile when the request failed.
+            const profile = await update_profile(window.user.username, { picture: null });
+            $btn.prop('disabled', false);
+            if ( ! profile ) {
+                $hint.text(i18n('profile_picture_remove_failed', [], false));
+                return;
+            }
+            $hint.text(i18n('profile_picture_hint', [], false));
+            // fall back to the default avatar everywhere the picture was shown
+            const defaultPicture = window.icons['profile.svg'];
+            $('.profile-pic').css('background-image', `url(${ html_encode(defaultPicture) })`);
+            $('.profile-image').css('background-image', `url(${ html_encode(defaultPicture) })`);
+            $('.profile-image').removeClass('profile-image-has-picture');
+            $btn.prop('hidden', true);
+            $el_window.find('.dashboard-section-account .change-profile-picture').trigger('focus');
+        });
+    },
+};
+
+export default TabAccount;

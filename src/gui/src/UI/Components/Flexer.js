@@ -1,5 +1,5 @@
-/**
- * Copyright (C) 2024 Puter Technologies Inc.
+/*
+ * Copyright (C) 2024-present Puter Technologies Inc.
  *
  * This file is part of Puter.
  *
@@ -17,7 +17,6 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-
 const Component = use('util.Component');
 
 /**
@@ -30,10 +29,11 @@ export default def(class Flexer extends Component {
     static PROPERTIES = {
         children: {},
         gap: { value: '20pt' },
-    }
+    };
 
     static CSS = `
         :host > div {
+            height: 100%;
             display: flex;
             flex-direction: column;
             justify-content: center;

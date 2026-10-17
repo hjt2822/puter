@@ -17,13 +17,9 @@
     ·
     <a href="https://discord.com/invite/PQcx7Teh8u">Discord</a>
     ·
-    <a href="https://www.youtube.com/@EricsPuterVideos">YouTube</a>
-    ·
     <a href="https://reddit.com/r/puter">Reddit</a>
     ·
     <a href="https://twitter.com/HeyPuter">X (Twitter)</a>
-    ·
-    <a href="https://hackerone.com/puter_h1b">漏洞报告</a>
 </p>
 
 <h3 align="center"><img width="800" style="border-radius:5px;" alt="screenshot" src="https://assets.puter.site/puter.com-screenshot-3.webp"></h3>
@@ -92,6 +88,15 @@ Invoke-WebRequest -Uri "https://raw.githubusercontent.com/HeyPuter/puter/main/do
 docker compose up
 ```
 <br/>
+
+## 宝塔面板Docker一键部署（推荐）
+
+1. 安装宝塔面板9.2.0及以上版本，前往 [宝塔面板](https://www.bt.cn/new/download.html?r=dk_puter) 官网，选择正式版的脚本下载安装
+
+2. 安装后登录宝塔面板，在左侧菜单栏中点击 `Docker`，首次进入会提示安装`Docker`服务，点击立即安装，按提示完成安装
+
+3. 安装完成后在应用商店中搜索`puter`，点击安装，配置域名等基本信息即可完成安装
+   
 
 ### ☁️ Puter.com
 

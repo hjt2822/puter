@@ -1,0 +1,1759 @@
+/*
+ * Copyright (C) 2024-present Puter Technologies Inc.
+ *
+ * This file is part of Puter.
+ *
+ * Puter is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published
+ * by the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+import { PuterStore } from '../types';
+import type { LayerInstances } from '../../types';
+import type { puterStores } from '../index';
+import { PermissionUtil } from '../../services/permission/permissionUtil';
+import {
+    PERM_KEY_PREFIX,
+    PERMISSION_CACHE_GENERATION_LOCAL_TTL_SECONDS,
+    PERMISSION_CACHE_GENERATION_TTL_SECONDS,
+    PERMISSION_SCAN_CACHE_TTL_SECONDS,
+} from '../../services/permission/consts';
+import { kv } from '../../util/kvSingleton';
+import { keysetPage, openIdCursor } from '../../util/pagination';
+import { bumpGeneration } from '../../util/redisGeneration';
+import { escapeLike } from '../../util/sqlLike';
+import type { UserRow } from '../user/UserStore';
+
+// Short TTLs: FK CASCADE on user/app delete + PermissionService rewriters
+// can touch rows this store's mutators never see.
+const U2A_CACHE_TTL_SECONDS = 5 * 60;
+const U2U_CACHE_TTL_SECONDS = 5 * 60;
+const TOKEN_CACHE_TTL_SECONDS = 10 * 60;
+// Rows per INSERT; five parameters each stays under SQLite's 999 limit.
+const ACCESS_TOKEN_PERM_INSERT_CHUNK = 100;
+
+const AUDIT_PAGE_SIZE = 50;
+const MAX_AUDIT_PAGE_SIZE = 200;
+
+/** The user-to-app grant a user's first sign-in to an app records. */
+export const APP_AUTHENTICATED_FLAG = 'flag:app-is-authenticated';
+
+const INSTALLED_APPS_ORDER_COLUMNS = {
+    id: 'apps.id',
+    name: 'apps.name',
+    uid: 'apps.uid',
+    title: 'apps.title',
+    installed_at: 'installed_at',
+} as const;
+export type InstalledAppsOrder = keyof typeof INSTALLED_APPS_ORDER_COLUMNS;
+export const INSTALLED_APPS_ORDERS = Object.keys(
+    INSTALLED_APPS_ORDER_COLUMNS,
+) as InstalledAppsOrder[];
+
+// Re-export for back-compat — PermissionService et al. import `UserRow` from here.
+// The canonical definition lives in `UserStore`, which owns the user table.
+export type { UserRow };
+
+// -- Types ------------------------------------------------------------
+
+export interface FlatPermValue {
+    permission?: string;
+    issuer_user_id?: number;
+    deleted?: boolean;
+    [k: string]: unknown;
+}
+
+export interface LinkedUserUserPermRow {
+    holder_user_id: number;
+    issuer_user_id: number;
+    permission: string;
+    extra: Record<string, unknown>;
+    [k: string]: unknown;
+}
+
+export interface LinkedUserAppPermRow {
+    user_id: number;
+    app_id: number;
+    permission: string;
+    extra: Record<string, unknown>;
+    [k: string]: unknown;
+}
+
+export interface LinkedUserGroupPermRow {
+    user_id: number;
+    group_id: number;
+    permission: string;
+    extra: Record<string, unknown>;
+    [k: string]: unknown;
+}
+
+export interface AccessTokenPermRow {
+    token_uid: string;
+    permission: string;
+    [k: string]: unknown;
+}
+
+export interface AuditEntry {
+    action: 'grant' | 'revoke';
+    reason: string;
+    /** Recorded on the row, and read back by whoever reads the trail. */
+    extra?: Record<string, unknown> | null;
+    [k: string]: unknown;
+}
+
+/** One user-to-user audit row, as read back. */
+export interface UserUserAuditRow {
+    id: number;
+    /** Null once that account is deleted; the FK columns are ON DELETE SET NULL. */
+    issuer_user_id: number | null;
+    holder_user_id: number | null;
+    permission: string;
+    action: string | null;
+    extra: Record<string, unknown> | null;
+    created_at: unknown;
+}
+
+/** What a read of the user-to-user audit trail may be narrowed to. */
+export interface UserUserAuditFilter {
+    issuerUserId?: number;
+    holderUserId?: number;
+    permissions?: string[];
+}
+
+/** One entry in the flat KV view, as addressed by a delete. */
+export interface FlatPermRef {
+    holderUserId: number;
+    permission: string;
+}
+
+/**
+ * A prefix as `subtreeClause` wants it. A caller may write the delimiter it is
+ * matching under (`fs:`) or leave it off (`fs:<uuid>`); both mean the same
+ * subtree, and the clause supplies the delimiter itself.
+ */
+const subtreeRoot = (prefix: string): string =>
+    prefix.endsWith(':') ? prefix.slice(0, -1) : prefix;
+
+/** Match a permission and everything beneath it. */
+const subtreeClause = (
+    permissions: string[],
+): { where: string; params: string[] } => ({
+    where: permissions
+        .map(() => "(`permission` = ? OR `permission` LIKE ? ESCAPE '!')")
+        .join(' OR '),
+    params: permissions.flatMap((permission) => [
+        permission,
+        `${escapeLike(permission)}:%`,
+    ]),
+});
+
+/**
+ * PermissionStore owns the _persistence_ side of permissions:
+ *
+ * - SQL CRUD + audit inserts for all permission tables
+ * - Flat KV reads/writes under `PERM_KEY_PREFIX` (system namespace)
+ * - Redis scan-cache get/set/invalidate
+ *
+ * It does NOT own semantics — rewriters, implicators, exploders, and the
+ * `scan()` algorithm all live on PermissionService. This store is just I/O.
+ */
+export class PermissionStore extends PuterStore {
+    declare protected stores: LayerInstances<typeof puterStores>;
+
+    override onServerStart(): void {
+        this.#subscribeRemoteGenerationBumps();
+        this.#subscribeRemoteFlatInvalidations();
+    }
+
+    /**
+     * Apply a peer region's flat-permission deletes. Independent of whether the
+     * KV table replicates: a redundant delete is a no-op, a needed one is the
+     * only thing that makes the revoke real there.
+     */
+    #subscribeRemoteFlatInvalidations(): void {
+        this.clients.event.on(
+            'outer.permission.flatInvalidated',
+            (_key, data, meta) => {
+                if (!(meta as { from_outside?: boolean })?.from_outside) return;
+                const raw = (data as { entries?: unknown })?.entries;
+                if (!Array.isArray(raw)) return;
+                const entries = raw.filter(
+                    (entry): entry is FlatPermRef =>
+                        typeof (entry as FlatPermRef)?.holderUserId ===
+                            'number' &&
+                        typeof (entry as FlatPermRef)?.permission ===
+                            'string' &&
+                        (entry as FlatPermRef).permission !== '',
+                );
+                if (entries.length === 0) return;
+                // Guarded: a transient KV error applying a peer's delete must
+                // not become an unhandled rejection. The entry stays until the
+                // next invalidation or its TTL — same as a lost event.
+                this.#applyFlatUserPermDeletes(entries).catch((err) => {
+                    console.warn(
+                        '[PermissionStore] failed to apply remote flat-perm deletes:',
+                        err,
+                    );
+                });
+            },
+        );
+    }
+
+    /**
+     * Apply a peer region's cache-generation bumps. Our own emit reaches local
+     * listeners too, and that half already ran before it went out.
+     */
+    #subscribeRemoteGenerationBumps(): void {
+        this.clients.event.on(
+            'outer.permission.generationBumped',
+            (_key, data, meta) => {
+                if (!(meta as { from_outside?: boolean })?.from_outside) return;
+                const raw = (data as { actorUids?: unknown })?.actorUids;
+                if (!Array.isArray(raw)) return;
+                const actorUids = raw.filter(
+                    (uid): uid is string =>
+                        typeof uid === 'string' && uid !== '',
+                );
+                if (actorUids.length === 0) return;
+                void Promise.all(
+                    actorUids.map((uid) => this.#applyCacheGenerationBump(uid)),
+                );
+            },
+        );
+    }
+
+    // -- Flat view (KV under system namespace) ------------------------
+
+    /**
+     * Read the flat user-to-user permissions for a holder across a set of
+     * permission strings. Returns the KV values that exist; missing keys are
+     * filtered out.
+     */
+    async getFlatUserPerms(
+        holderUserId: number,
+        permissions: string[],
+    ): Promise<FlatPermValue[]> {
+        if (permissions.length === 0) return [];
+        const keys = [
+            ...new Set(
+                permissions.map((p) =>
+                    PermissionUtil.join(
+                        PERM_KEY_PREFIX,
+                        String(holderUserId),
+                        p,
+                    ),
+                ),
+            ),
+        ];
+        const { res } = await this.stores.kv.get({ key: keys });
+        const values = Array.isArray(res) ? res : [res];
+        return values.filter(
+            (v): v is FlatPermValue => v !== null && typeof v === 'object',
+        );
+    }
+
+    /**
+     * Write a single flat user-to-user permission entry to KV.
+     *
+     * `opts.expireAt` (epoch seconds) marks the entry as a derived cache warm
+     * rather than an authoritative grant: warms self-expire so a warm that
+     * raced a concurrent revoke cannot re-materialize the grant indefinitely.
+     * Grant-path writes omit it and are permanent.
+     */
+    async setFlatUserPerm(
+        holderUserId: number,
+        permission: string,
+        value: FlatPermValue,
+        opts: { expireAt?: number } = {},
+    ): Promise<void> {
+        const key = PermissionUtil.join(
+            PERM_KEY_PREFIX,
+            String(holderUserId),
+            permission,
+        );
+        await this.stores.kv.set({ key, value, expireAt: opts.expireAt });
+    }
+
+    /** Delete a single flat user-to-user permission entry from KV. */
+    async delFlatUserPerm(
+        holderUserId: number,
+        permission: string,
+    ): Promise<void> {
+        await this.delFlatUserPerms([{ holderUserId, permission }]);
+    }
+
+    /**
+     * Delete many flat entries and tell peer regions once. Retiring a shared
+     * directory can touch hundreds of grants; one event per grant would put
+     * that whole fan-out on the cross-region path.
+     */
+    async delFlatUserPerms(entries: FlatPermRef[]): Promise<void> {
+        if (entries.length === 0) return;
+        await this.#applyFlatUserPermDeletes(entries);
+        try {
+            this.clients.event.emit(
+                'outer.permission.flatInvalidated',
+                { entries },
+                {},
+            );
+        } catch {
+            // Peer regions keep the entries until their KV replicates.
+        }
+    }
+
+    /** Local half of a flat delete. Never emits, so a remote one can't loop. */
+    async #applyFlatUserPermDeletes(entries: FlatPermRef[]): Promise<void> {
+        await this.stores.kv.batchDel({
+            keys: entries.map(({ holderUserId, permission }) =>
+                PermissionUtil.join(
+                    PERM_KEY_PREFIX,
+                    String(holderUserId),
+                    permission,
+                ),
+            ),
+        });
+    }
+
+    // -- SQL: user-to-user permissions -------------------------------
+
+    async readLinkedUserUserPerms(
+        holderUserId: number,
+        permissions: string[],
+    ): Promise<LinkedUserUserPermRow[]> {
+        if (permissions.length === 0) return [];
+        const all = await this.#readAllUserUserPermsForHolder(holderUserId);
+        const wanted = new Set(permissions);
+        return all.filter((row) => wanted.has(row.permission));
+    }
+
+    /**
+     * Read-after-write variant of {@link readLinkedUserUserPerms}: skips the row
+     * cache and queries the primary, so a check that immediately follows a
+     * write on this holder cannot be misled by replica lag or by a stale cached
+     * row set. Re-warms the cache with what the primary returned — the plain
+     * read path would otherwise re-cache the replica's stale view.
+     */
+    async readLinkedUserUserPermsFromPrimary(
+        holderUserId: number,
+        permissions: string[],
+    ): Promise<LinkedUserUserPermRow[]> {
+        if (permissions.length === 0) return [];
+        const rows = await this.clients.db.pread(
+            'SELECT * FROM `user_to_user_permissions` WHERE `holder_user_id` = ?',
+            [holderUserId],
+        );
+        const decoded = rows.map((row) =>
+            this.#decodeExtra<LinkedUserUserPermRow>(row),
+        );
+        this.clients.redis
+            .set(
+                this.#u2uCacheKey(holderUserId),
+                JSON.stringify(decoded),
+                'EX',
+                U2U_CACHE_TTL_SECONDS,
+            )
+            .catch(() => {});
+        const wanted = new Set(permissions);
+        return decoded.filter((row) => wanted.has(row.permission));
+    }
+
+    /**
+     * Batched {@link readLinkedUserUserPerms} across holders: an indexed `holder
+     * IN … AND permission IN …` read instead of one row-set per holder, which
+     * on a cold cache fans a listing page out into that many queries. Chunked
+     * to stay under the dialects' placeholder limits.
+     */
+    async readLinkedUserUserPermsForHolders(
+        holderUserIds: number[],
+        permissions: string[],
+    ): Promise<LinkedUserUserPermRow[]> {
+        const holders = [...new Set(holderUserIds)].filter((id) =>
+            Number.isFinite(id),
+        );
+        const perms = [...new Set(permissions)];
+        if (holders.length === 0 || perms.length === 0) return [];
+
+        const rows: LinkedUserUserPermRow[] = [];
+        for (let h = 0; h < holders.length; h += 200) {
+            const holderChunk = holders.slice(h, h + 200);
+            for (let p = 0; p < perms.length; p += 700) {
+                const permChunk = perms.slice(p, p + 700);
+                const found = await this.clients.db.read(
+                    'SELECT * FROM `user_to_user_permissions` WHERE ' +
+                        `\`holder_user_id\` IN (${holderChunk.map(() => '?').join(', ')}) ` +
+                        `AND \`permission\` IN (${permChunk.map(() => '?').join(', ')})`,
+                    [...holderChunk, ...permChunk],
+                );
+                for (const row of found) {
+                    rows.push(this.#decodeExtra<LinkedUserUserPermRow>(row));
+                }
+            }
+        }
+        return rows;
+    }
+
+    /**
+     * Batched {@link getFlatUserPerms} across holders — one multi-get for all of
+     * a listing page's (holder, permission) pairs. Entries come back paired
+     * with the ref they answer, because a flat value doesn't name its holder.
+     */
+    async getFlatUserPermsForRefs(
+        refs: FlatPermRef[],
+    ): Promise<Array<{ ref: FlatPermRef; value: FlatPermValue }>> {
+        if (refs.length === 0) return [];
+        const keys = refs.map(({ holderUserId, permission }) =>
+            PermissionUtil.join(
+                PERM_KEY_PREFIX,
+                String(holderUserId),
+                permission,
+            ),
+        );
+        const { res } = await this.stores.kv.get({ key: keys });
+        const values = Array.isArray(res) ? res : [res];
+        const out: Array<{ ref: FlatPermRef; value: FlatPermValue }> = [];
+        for (let i = 0; i < refs.length; i++) {
+            const value = values[i];
+            if (value !== null && typeof value === 'object') {
+                out.push({ ref: refs[i], value: value as FlatPermValue });
+            }
+        }
+        return out;
+    }
+
+    async upsertUserUserPerm(
+        holderUserId: number,
+        issuerUserId: number,
+        permission: string,
+        extra: Record<string, unknown>,
+    ): Promise<void> {
+        const upsertClause = this.clients.db.upsertClause(
+            ['holder_user_id', 'issuer_user_id', 'permission'],
+            ['extra'],
+        );
+        await this.clients.db.write(
+            'INSERT INTO `user_to_user_permissions` (`holder_user_id`, `issuer_user_id`, `permission`, `extra`) ' +
+                `VALUES (?, ?, ?, ?) ${upsertClause}`,
+            [
+                holderUserId,
+                issuerUserId,
+                permission,
+                JSON.stringify(extra),
+                JSON.stringify(extra),
+            ],
+        );
+        await this.publishCacheKeys({
+            keys: [this.#u2uCacheKey(holderUserId)],
+            broadcast: true,
+        });
+    }
+
+    /**
+     * Remove one issuer's grant. Scoped to the issuer because grants are keyed
+     * on (holder, issuer, permission) — two people can grant the same access
+     * independently, and one withdrawing must not take the other's with it.
+     *
+     * Returns whether a row was actually deleted.
+     */
+    async deleteUserUserPermByHolder(
+        holderUserId: number,
+        permission: string,
+        issuerUserId: number,
+    ): Promise<boolean> {
+        const result = await this.clients.db.write(
+            'DELETE FROM `user_to_user_permissions` WHERE `holder_user_id` = ? ' +
+                'AND `permission` = ? AND `issuer_user_id` = ?',
+            [holderUserId, permission, issuerUserId],
+        );
+        if (!result.anyRowsAffected) return false;
+        await this.publishCacheKeys({
+            keys: [this.#u2uCacheKey(holderUserId)],
+            broadcast: true,
+        });
+        return true;
+    }
+
+    /**
+     * The grants an account issued, as flat-view refs. Read before the account
+     * row goes: the SQL rows cascade with it, the holders' flat entries do
+     * not.
+     */
+    async listUserUserPermRefsIssuedBy(
+        issuerUserId: number,
+    ): Promise<FlatPermRef[]> {
+        const rows = (await this.clients.db.read(
+            'SELECT `holder_user_id`, `permission` FROM `user_to_user_permissions` ' +
+                'WHERE `issuer_user_id` = ?',
+            [issuerUserId],
+        )) as Array<{ holder_user_id: number; permission: string }>;
+        return rows.map((row) => ({
+            holderUserId: row.holder_user_id,
+            permission: row.permission,
+        }));
+    }
+
+    /** The group analogue: a deleted node's group grants must go with it. */
+    async deleteUserGroupPermsByPermissionPrefixes(
+        permissions: string[],
+    ): Promise<Array<{ group_id: number; permission: string }>> {
+        if (permissions.length === 0) return [];
+        const { where, params } = subtreeClause(permissions);
+
+        const rows = (await this.clients.db.read(
+            'SELECT `group_id`, `permission` FROM `user_to_group_permissions` ' +
+                `WHERE ${where}`,
+            params,
+        )) as Array<{ group_id: number; permission: string }>;
+        if (rows.length === 0) return [];
+
+        await this.clients.db.write(
+            `DELETE FROM \`user_to_group_permissions\` WHERE ${where}`,
+            params,
+        );
+        return rows;
+    }
+
+    /**
+     * Delete every user-to-user grant at or beneath any of `permissions`, in
+     * one scan, clearing the flat KV view too, and return the rows removed so
+     * the caller can audit them and bust caches.
+     *
+     * The subject lives in the permission text rather than a column, so no
+     * foreign key can cascade it — this is how a deleted fsentry's grants get
+     * withdrawn. `permission` has no index, so this is a table scan: fine on
+     * deletion, never on a hot path.
+     */
+    async deleteUserUserPermsByPermissionPrefixes(
+        permissions: string[],
+    ): Promise<
+        Array<{
+            holder_user_id: number;
+            issuer_user_id: number;
+            permission: string;
+        }>
+    > {
+        if (permissions.length === 0) return [];
+        const { where, params } = subtreeClause(permissions);
+
+        const rows = (await this.clients.db.read(
+            'SELECT `holder_user_id`, `issuer_user_id`, `permission` FROM `user_to_user_permissions` ' +
+                `WHERE ${where}`,
+            params,
+        )) as Array<{
+            holder_user_id: number;
+            issuer_user_id: number;
+            permission: string;
+        }>;
+        if (rows.length === 0) return [];
+
+        await this.clients.db.write(
+            `DELETE FROM \`user_to_user_permissions\` WHERE ${where}`,
+            params,
+        );
+
+        // One batched invalidation, so retiring a busy directory doesn't put a
+        // row-sized fan-out on the cross-region path.
+        await this.delFlatUserPerms(
+            rows.map((row) => ({
+                holderUserId: row.holder_user_id,
+                permission: row.permission,
+            })),
+        );
+
+        const keys = [
+            ...new Set(rows.map((r) => this.#u2uCacheKey(r.holder_user_id))),
+        ];
+        if (keys.length > 0)
+            await this.publishCacheKeys({ keys, broadcast: true });
+
+        return rows;
+    }
+
+    /**
+     * The same subtree delete, narrowed to one issuer's grants to one holder.
+     *
+     * Withdrawing a share names a person, not a region: two people granted on
+     * the same prefix hold two independent grants, and taking one back must not
+     * take the other's with it. Returns the permissions removed, so the caller
+     * can audit them and announce each one.
+     */
+    async deleteUserUserPermSubtreeForHolder(
+        holderUserId: number,
+        issuerUserId: number,
+        permission: string,
+    ): Promise<string[]> {
+        const { where, params } = subtreeClause([permission]);
+        const scope = '`holder_user_id` = ? AND `issuer_user_id` = ?';
+        const scoped = [holderUserId, issuerUserId, ...params];
+
+        const rows = (await this.clients.db.read(
+            'SELECT `permission` FROM `user_to_user_permissions` ' +
+                `WHERE ${scope} AND (${where})`,
+            scoped,
+        )) as Array<{ permission: string }>;
+        if (rows.length === 0) return [];
+
+        await this.clients.db.write(
+            `DELETE FROM \`user_to_user_permissions\` WHERE ${scope} AND (${where})`,
+            scoped,
+        );
+
+        const removed = rows.map((row) => String(row.permission));
+        await this.delFlatUserPerms(
+            removed.map((perm) => ({ holderUserId, permission: perm })),
+        );
+        await this.publishCacheKeys({
+            keys: [this.#u2uCacheKey(holderUserId)],
+            broadcast: true,
+        });
+        return removed;
+    }
+
+    async auditUserUserPerm(
+        entry: AuditEntry & {
+            holder_user_id: number;
+            issuer_user_id: number;
+            permission: string;
+        },
+    ): Promise<void> {
+        await this.clients.db.write(
+            'INSERT INTO `audit_user_to_user_permissions` (' +
+                '`holder_user_id`, `holder_user_id_keep`, `issuer_user_id`, `issuer_user_id_keep`, ' +
+                '`permission`, `extra`, `action`, `reason`) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+            [
+                entry.holder_user_id,
+                entry.holder_user_id,
+                entry.issuer_user_id,
+                entry.issuer_user_id,
+                entry.permission,
+                entry.extra ? JSON.stringify(entry.extra) : null,
+                entry.action,
+                entry.reason,
+            ],
+        );
+    }
+
+    /**
+     * The user-to-user audit trail, newest first, keyset-paginated on `id`.
+     *
+     * Rows are never deleted with the grant they describe, so this answers when
+     * something was granted long after it was withdrawn. The caller decides who
+     * may see which rows and narrows `filter` accordingly — this applies it, it
+     * does not authorize it.
+     */
+    async listUserUserAudit(
+        filter: UserUserAuditFilter,
+        opts: { limit?: number; cursor?: string } = {},
+    ): Promise<{ items: UserUserAuditRow[]; cursor?: string }> {
+        const size = Math.min(
+            Math.max(1, Math.floor(Number(opts.limit) || AUDIT_PAGE_SIZE)),
+            MAX_AUDIT_PAGE_SIZE,
+        );
+        const beforeId =
+            openIdCursor(opts.cursor, this.config.jwt_secret_v2, {
+                label: 'audit cursor',
+            }) || null;
+        const { sql, params } = this.#auditWhere(filter);
+
+        const rows = await this.clients.db.read(
+            'SELECT * FROM `audit_user_to_user_permissions` WHERE ' +
+                sql +
+                (beforeId === null ? '' : ' AND `id` < ?') +
+                ' ORDER BY `id` DESC LIMIT ?',
+            [...params, ...(beforeId === null ? [] : [beforeId]), size + 1],
+        );
+
+        const page = keysetPage(rows, size, this.config.jwt_secret_v2);
+        return {
+            items: page.rows.map((row) => this.#auditRow(row)),
+            cursor: page.cursor,
+        };
+    }
+
+    /** How many rows `listUserUserAudit` walks under the same filter. */
+    async countUserUserAudit(filter: UserUserAuditFilter): Promise<number> {
+        const { sql, params } = this.#auditWhere(filter);
+        const rows = await this.clients.db.read(
+            'SELECT COUNT(*) AS `count` FROM `audit_user_to_user_permissions` ' +
+                `WHERE ${sql}`,
+            params,
+        );
+        return Number(rows[0]?.count ?? 0);
+    }
+
+    /**
+     * The filter as SQL. An empty filter would read the whole table, so it is
+     * refused rather than quietly returning everyone's trail.
+     */
+    #auditWhere(filter: UserUserAuditFilter): {
+        sql: string;
+        params: unknown[];
+    } {
+        const clauses: string[] = [];
+        const params: unknown[] = [];
+        if (filter.issuerUserId !== undefined) {
+            clauses.push('`issuer_user_id` = ?');
+            params.push(filter.issuerUserId);
+        }
+        if (filter.holderUserId !== undefined) {
+            clauses.push('`holder_user_id` = ?');
+            params.push(filter.holderUserId);
+        }
+        if (filter.permissions !== undefined) {
+            if (filter.permissions.length === 0) {
+                return { sql: '1 = 0', params: [] };
+            }
+            clauses.push(
+                `\`permission\` IN (${filter.permissions.map(() => '?').join(', ')})`,
+            );
+            params.push(...filter.permissions);
+        }
+        if (clauses.length === 0) {
+            throw new Error('listUserUserAudit requires a filter');
+        }
+        return { sql: clauses.join(' AND '), params };
+    }
+
+    #auditRow(row: Record<string, unknown>): UserUserAuditRow {
+        let extra = row.extra;
+        if (typeof extra === 'string') {
+            try {
+                extra = JSON.parse(extra);
+            } catch {
+                extra = null;
+            }
+        }
+        const userId = (value: unknown) =>
+            value === null || value === undefined ? null : Number(value);
+        return {
+            id: Number(row.id),
+            issuer_user_id: userId(row.issuer_user_id),
+            holder_user_id: userId(row.holder_user_id),
+            permission: String(row.permission),
+            action: (row.action as string | null) ?? null,
+            extra: (extra as Record<string, unknown> | null) ?? null,
+            created_at: row.created_at,
+        };
+    }
+
+    // -- SQL: user-to-app permissions --------------------------------
+
+    async readUserAppPerms(
+        userId: number,
+        appId: number,
+        permissions: string[],
+    ): Promise<LinkedUserAppPermRow[]> {
+        if (permissions.length === 0) return [];
+        const all = await this.#readAllUserAppPerms(userId, appId);
+        const wanted = new Set(permissions);
+        return all.filter((row) => wanted.has(row.permission));
+    }
+
+    async hasUserAppPerm(
+        userId: number,
+        appId: number,
+        permission: string,
+    ): Promise<boolean> {
+        const all = await this.#readAllUserAppPerms(userId, appId);
+        return all.some((row) => row.permission === permission);
+    }
+
+    /**
+     * Every row this user granted this app, read from the primary past the row
+     * cache — for a write that must see a grant made moments before.
+     */
+    async listUserAppPermsFromPrimary(
+        userId: number,
+        appId: number,
+    ): Promise<LinkedUserAppPermRow[]> {
+        const rows = await this.clients.db.pread(
+            'SELECT * FROM `user_to_app_permissions` WHERE `user_id` = ? AND `app_id` = ?',
+            [userId, appId],
+        );
+        return rows.map((row) => this.#decodeExtra<LinkedUserAppPermRow>(row));
+    }
+
+    /** Re-fill from the primary; a miss on a replica re-caches a stale row. */
+    async warmUserAppPermsFromPrimary(
+        userId: number,
+        appId: number,
+    ): Promise<void> {
+        try {
+            const rows = await this.listUserAppPermsFromPrimary(userId, appId);
+            await this.clients.redis.set(
+                this.#u2aCacheKey(userId, appId),
+                JSON.stringify(rows),
+                'EX',
+                U2A_CACHE_TTL_SECONDS,
+            );
+        } catch (e) {
+            // A key left absent is the safe miss: the next read goes to the DB.
+            console.warn('[permission] u2a cache re-fill failed:', e);
+        }
+    }
+
+    /**
+     * The apps a user has granted anything to, each with when it first was
+     * (`installed_at`), one page at a time.
+     */
+    async listAppsGrantedByUser(
+        userId: number,
+        {
+            orderBy,
+            descending,
+            limit,
+            offset,
+        }: {
+            orderBy: InstalledAppsOrder;
+            descending: boolean;
+            limit: number;
+            offset: number;
+        },
+    ): Promise<Array<Record<string, unknown>>> {
+        const orderColumn = INSTALLED_APPS_ORDER_COLUMNS[orderBy];
+        return this.clients.db.read(
+            `SELECT
+                apps.name,
+                apps.uid,
+                apps.title,
+                apps.description,
+                apps.icon,
+                apps.index_url,
+                apps.owner_user_id,
+                MIN(perm.dt) AS installed_at
+            FROM apps
+            LEFT JOIN user_to_app_permissions AS perm ON apps.id = perm.app_id
+            WHERE perm.user_id = ?
+            GROUP BY apps.id, apps.name, apps.uid, apps.title, apps.description
+            ORDER BY ${orderColumn} ${descending ? 'DESC' : 'ASC'}
+            LIMIT ?
+            OFFSET ?`,
+            [userId, limit, offset],
+        );
+    }
+
+    /**
+     * Users who have authenticated into an app, oldest first, with whether each
+     * one shared their email with it (`user:<uuid>:email:read`).
+     */
+    async listAppAuthenticatedUsers(
+        appId: number,
+        { limit, offset }: { limit: number; offset: number },
+    ): Promise<
+        Array<{
+            id: number;
+            username: string;
+            uuid: string;
+            email: string | null;
+            emailShared: boolean;
+        }>
+    > {
+        const users = (await this.clients.db.read(
+            `SELECT u.id, u.username, u.uuid, u.email FROM user_to_app_permissions p
+             INNER JOIN ${this.clients.db.quoteIdentifier('user')} u ON p.user_id = u.id
+             WHERE p.permission = ? AND p.app_id = ?
+             ORDER BY (p.dt IS NOT NULL), p.dt, p.user_id
+             LIMIT ? OFFSET ?`,
+            [APP_AUTHENTICATED_FLAG, appId, limit, offset],
+        )) as Array<{
+            id: number;
+            username: string;
+            uuid: string;
+            email: string | null;
+        }>;
+        if (users.length === 0) return [];
+
+        const emailGrants = users.map((u) => `user:${u.uuid}:email:read`);
+        const grants = (await this.clients.db.read(
+            `SELECT user_id FROM user_to_app_permissions
+             WHERE app_id = ? AND permission IN (${emailGrants.map(() => '?').join(', ')})`,
+            [appId, ...emailGrants],
+        )) as Array<{ user_id: number }>;
+        const shared = new Set(grants.map((g) => Number(g.user_id)));
+        return users.map((u) => ({ ...u, emailShared: shared.has(u.id) }));
+    }
+
+    /** How many users have authenticated into an app. */
+    async countAppUsers(appId: number): Promise<number> {
+        const [row] = (await this.clients.db.read(
+            `SELECT COUNT(*) AS n FROM user_to_app_permissions
+             WHERE permission = ? AND app_id = ?`,
+            [APP_AUTHENTICATED_FLAG, appId],
+        )) as Array<{ n: number | string }>;
+        return Number(row?.n ?? 0);
+    }
+
+    async upsertUserAppPerm(
+        userId: number,
+        appId: number,
+        permission: string,
+        extra: Record<string, unknown>,
+    ): Promise<void> {
+        const upsertClause = this.clients.db.upsertClause(
+            ['user_id', 'app_id', 'permission'],
+            ['extra'],
+        );
+        await this.clients.db.write(
+            'INSERT INTO `user_to_app_permissions` (`user_id`, `app_id`, `permission`, `extra`) ' +
+                `VALUES (?, ?, ?, ?) ${upsertClause}`,
+            [
+                userId,
+                appId,
+                permission,
+                JSON.stringify(extra),
+                JSON.stringify(extra),
+            ],
+        );
+        await this.publishCacheKeys({
+            keys: [this.#u2aCacheKey(userId, appId)],
+            broadcast: true,
+        });
+    }
+
+    async deleteUserAppPerm(
+        userId: number,
+        appId: number,
+        permission: string,
+    ): Promise<void> {
+        await this.clients.db.write(
+            'DELETE FROM `user_to_app_permissions` WHERE `user_id` = ? AND `app_id` = ? AND `permission` = ?',
+            [userId, appId, permission],
+        );
+        await this.publishCacheKeys({
+            keys: [this.#u2aCacheKey(userId, appId)],
+            broadcast: true,
+        });
+        await this.warmUserAppPermsFromPrimary(userId, appId);
+    }
+
+    async deleteUserAppAll(userId: number, appId: number): Promise<void> {
+        await this.clients.db.write(
+            'DELETE FROM `user_to_app_permissions` WHERE `user_id` = ? AND `app_id` = ?',
+            [userId, appId],
+        );
+        await this.publishCacheKeys({
+            keys: [this.#u2aCacheKey(userId, appId)],
+            broadcast: true,
+        });
+        await this.warmUserAppPermsFromPrimary(userId, appId);
+    }
+
+    /**
+     * Delete every app grant whose permission is exactly `permission` or sits
+     * beneath it, across both the user-to-app and dev-to-app tables, returning
+     * the rows removed so the caller can audit them and bust their caches.
+     *
+     * Kept generic — the caller owns what the prefix means. Used to withdraw
+     * cross-app data grants when their _target_ app goes away: the target lives
+     * in the permission text rather than a column, so no foreign key can
+     * cascade it. `permission` has no index, making this a table scan —
+     * acceptable on app deletion, never on a hot path.
+     */
+    async deleteAppGrantsByPermissionPrefix(permission: string): Promise<
+        Array<{
+            table: 'user_to_app_permissions' | 'dev_to_app_permissions';
+            user_id: number;
+            app_id: number;
+            permission: string;
+        }>
+    > {
+        const { where, params } = subtreeClause([permission]);
+
+        const removed: Array<{
+            table: 'user_to_app_permissions' | 'dev_to_app_permissions';
+            user_id: number;
+            app_id: number;
+            permission: string;
+        }> = [];
+
+        for (const table of [
+            'user_to_app_permissions',
+            'dev_to_app_permissions',
+        ] as const) {
+            const rows = (await this.clients.db.read(
+                `SELECT \`user_id\`, \`app_id\`, \`permission\` FROM \`${table}\` ` +
+                    `WHERE ${where}`,
+                params,
+            )) as Array<{
+                user_id: number;
+                app_id: number;
+                permission: string;
+            }>;
+            if (rows.length === 0) continue;
+
+            await this.clients.db.write(
+                `DELETE FROM \`${table}\` WHERE ${where}`,
+                params,
+            );
+            for (const row of rows) removed.push({ table, ...row });
+        }
+
+        const keys = [
+            ...new Set(
+                removed
+                    .filter((r) => r.table === 'user_to_app_permissions')
+                    .map((r) => this.#u2aCacheKey(r.user_id, r.app_id)),
+            ),
+        ];
+        if (keys.length > 0)
+            await this.publishCacheKeys({ keys, broadcast: true });
+
+        return removed;
+    }
+
+    async auditUserAppPerm(
+        entry: AuditEntry & {
+            user_id: number;
+            app_id: number;
+            permission: string;
+        },
+    ): Promise<void> {
+        await this.clients.db.write(
+            'INSERT INTO `audit_user_to_app_permissions` (' +
+                '`user_id`, `user_id_keep`, `app_id`, `app_id_keep`, ' +
+                '`permission`, `action`, `reason`) VALUES (?, ?, ?, ?, ?, ?, ?)',
+            [
+                entry.user_id,
+                entry.user_id,
+                entry.app_id,
+                entry.app_id,
+                entry.permission,
+                entry.action,
+                entry.reason,
+            ],
+        );
+    }
+
+    // -- SQL: dev-to-app permissions ---------------------------------
+
+    async readDevAppPerms(
+        appId: number,
+        permissions: string[],
+    ): Promise<LinkedUserAppPermRow[]> {
+        if (permissions.length === 0) return [];
+        let permClause = permissions.map(() => '`permission` = ?').join(' OR ');
+        if (permissions.length > 1) permClause = `(${permClause})`;
+        const rows = await this.clients.db.read(
+            'SELECT * FROM `dev_to_app_permissions` ' +
+                `WHERE \`app_id\` = ? AND ${permClause}`,
+            [appId, ...permissions],
+        );
+        return rows.map((row) => this.#decodeExtra<LinkedUserAppPermRow>(row));
+    }
+
+    async upsertDevAppPerm(
+        userId: number,
+        appId: number,
+        permission: string,
+        extra: Record<string, unknown>,
+    ): Promise<void> {
+        const upsertClause = this.clients.db.upsertClause(
+            ['user_id', 'app_id', 'permission'],
+            ['extra'],
+        );
+        await this.clients.db.write(
+            'INSERT INTO `dev_to_app_permissions` (`user_id`, `app_id`, `permission`, `extra`) ' +
+                `VALUES (?, ?, ?, ?) ${upsertClause}`,
+            [
+                userId,
+                appId,
+                permission,
+                JSON.stringify(extra),
+                JSON.stringify(extra),
+            ],
+        );
+    }
+
+    async deleteDevAppPerm(
+        userId: number,
+        appId: number,
+        permission: string,
+    ): Promise<void> {
+        await this.clients.db.write(
+            'DELETE FROM `dev_to_app_permissions` WHERE `user_id` = ? AND `app_id` = ? AND `permission` = ?',
+            [userId, appId, permission],
+        );
+    }
+
+    async deleteDevAppAll(userId: number, appId: number): Promise<void> {
+        await this.clients.db.write(
+            'DELETE FROM `dev_to_app_permissions` WHERE `user_id` = ? AND `app_id` = ?',
+            [userId, appId],
+        );
+    }
+
+    async auditDevAppPerm(
+        entry: AuditEntry & {
+            user_id: number;
+            app_id: number;
+            permission: string;
+        },
+    ): Promise<void> {
+        await this.clients.db.write(
+            'INSERT INTO `audit_dev_to_app_permissions` (' +
+                '`user_id`, `user_id_keep`, `app_id`, `app_id_keep`, ' +
+                '`permission`, `action`, `reason`) VALUES (?, ?, ?, ?, ?, ?, ?)',
+            [
+                entry.user_id,
+                entry.user_id,
+                entry.app_id,
+                entry.app_id,
+                entry.permission,
+                entry.action,
+                entry.reason,
+            ],
+        );
+    }
+
+    // -- SQL: user-to-group permissions ------------------------------
+    //
+    // Read-only. Group grants are seeded by migration (the admin group's
+    // unrestricted `driver` access); nothing writes them at runtime.
+
+    /**
+     * Reads group permissions granted to groups the user is a member of, for a
+     * given set of permission strings. Result already joined against
+     * `jct_user_group` so callers don't need group membership resolution.
+     * Deliberately blind to the block list: this reading also answers authority
+     * checks that gate permanent revocations, and a block only suspends
+     * delivery (which the share listings and fan-out filter themselves).
+     */
+    async readUserGroupPerms(
+        userId: number,
+        permissions: string[],
+    ): Promise<LinkedUserGroupPermRow[]> {
+        if (permissions.length === 0) return [];
+        let permClause = permissions.map(() => 'p.permission = ?').join(' OR ');
+        if (permissions.length > 1) permClause = `(${permClause})`;
+        // Deletion leaves memberships and grants, so a deleted team would
+        // otherwise keep resolving access nothing can withdraw.
+        const rows = await this.clients.db.read(
+            'SELECT p.permission, p.user_id, p.group_id, p.extra FROM `user_to_group_permissions` p ' +
+                'JOIN `jct_user_group` ug ON p.group_id = ug.group_id ' +
+                'JOIN `group` g ON g.`id` = ug.group_id ' +
+                `WHERE ug.user_id = ? AND g.\`deleted_at\` IS NULL AND ${permClause}`,
+            [userId, ...permissions],
+        );
+        return rows.map((row) =>
+            this.#decodeExtra<LinkedUserGroupPermRow>(row),
+        );
+    }
+
+    /** Any group, seeded or team: a grant does not care which kind it is. */
+    async resolveGroupId(groupUid: string): Promise<number | null> {
+        const rows = (await this.clients.db.read(
+            'SELECT `id` FROM `group` WHERE `uid` = ? LIMIT 1',
+            [groupUid],
+        )) as { id: number }[];
+        return rows[0]?.id ?? null;
+    }
+
+    /** Whose cached readings a grant to this group invalidates. */
+    async listGroupMemberUuids(groupId: number): Promise<string[]> {
+        const rows = (await this.clients.db.read(
+            'SELECT u.`uuid` FROM `jct_user_group` ug ' +
+                'JOIN `user` u ON u.`id` = ug.`user_id` ' +
+                'WHERE ug.`group_id` = ?',
+            [groupId],
+        )) as { uuid: string | null }[];
+        return rows
+            .map((r) => r.uuid)
+            .filter((uuid): uuid is string => Boolean(uuid));
+    }
+
+    /** Whose standing access a grant to this group settles. */
+    async listGroupMemberIds(groupId: number): Promise<number[]> {
+        const rows = (await this.clients.db.read(
+            'SELECT `user_id` FROM `jct_user_group` WHERE `group_id` = ?',
+            [groupId],
+        )) as { user_id: number }[];
+        return rows.map((r) => Number(r.user_id));
+    }
+
+    /** Batched `readUserGroupPerms`, tagged with the user each row reached. */
+    async readUserGroupPermsForHolders(
+        userIds: number[],
+        permissions: string[],
+    ): Promise<
+        Array<{ holder_user_id: number; permission: string; user_id: number }>
+    > {
+        const holders = [...new Set(userIds)];
+        const perms = [...new Set(permissions)];
+        if (holders.length === 0 || perms.length === 0) return [];
+        const rows = await this.clients.db.read(
+            'SELECT ug.`user_id` AS `holder_user_id`, p.`permission`, p.`user_id` ' +
+                'FROM `user_to_group_permissions` p ' +
+                'JOIN `jct_user_group` ug ON p.`group_id` = ug.`group_id` ' +
+                'JOIN `group` g ON g.`id` = ug.`group_id` ' +
+                `WHERE ug.\`user_id\` IN (${holders.map(() => '?').join(', ')}) ` +
+                'AND g.`deleted_at` IS NULL ' +
+                `AND p.\`permission\` IN (${perms.map(() => '?').join(', ')})`,
+            [...holders, ...perms],
+        );
+        return rows as unknown as Array<{
+            holder_user_id: number;
+            permission: string;
+            user_id: number;
+        }>;
+    }
+
+    /** What this issuer already granted this group under a prefix. */
+    async queryIssuerGroupPermsByPrefix(
+        issuerUserId: number,
+        groupId: number,
+        prefix: string,
+    ): Promise<string[]> {
+        const rows = await this.queryIssuerGroupPermsByPrefixes(
+            [{ issuerUserId, groupId }],
+            [prefix],
+        );
+        return rows.map((row) => row.permission);
+    }
+
+    /** The grants under any of `prefixes` that any issuer/group pair made. */
+    async queryIssuerGroupPermsByPrefixes(
+        pairs: Array<{ issuerUserId: number; groupId: number }>,
+        prefixes: string[],
+    ): Promise<
+        Array<{ issuerUserId: number; groupId: number; permission: string }>
+    > {
+        if (pairs.length === 0 || prefixes.length === 0) return [];
+        const subtree = subtreeClause([...new Set(prefixes)].map(subtreeRoot));
+        const who = pairs
+            .map(() => '(`user_id` = ? AND `group_id` = ?)')
+            .join(' OR ');
+        const rows = await this.clients.db.read(
+            'SELECT `user_id`, `group_id`, `permission` FROM ' +
+                `\`user_to_group_permissions\` WHERE (${who}) AND (${subtree.where})`,
+            [
+                ...pairs.flatMap((pair) => [pair.issuerUserId, pair.groupId]),
+                ...subtree.params,
+            ],
+        );
+        return rows.map((row) => ({
+            issuerUserId: Number(row.user_id),
+            groupId: Number(row.group_id),
+            permission: String(row.permission),
+        }));
+    }
+
+    /** `user_id` is the issuer; `group_id` is who receives it. */
+    async upsertUserGroupPerm(
+        groupId: number,
+        issuerUserId: number,
+        permission: string,
+        extra: Record<string, unknown>,
+    ): Promise<void> {
+        const upsertClause = this.clients.db.upsertClause(
+            ['user_id', 'group_id', 'permission'],
+            ['extra'],
+        );
+        await this.clients.db.write(
+            'INSERT INTO `user_to_group_permissions` (`user_id`, `group_id`, `permission`, `extra`) ' +
+                `VALUES (?, ?, ?, ?) ${upsertClause}`,
+            [
+                issuerUserId,
+                groupId,
+                permission,
+                JSON.stringify(extra),
+                JSON.stringify(extra),
+            ],
+        );
+    }
+
+    /** Scoped to the issuer: one issuer's revoke must not drop another's. */
+    async deleteUserGroupPerm(
+        groupId: number,
+        issuerUserId: number,
+        permission: string,
+    ): Promise<boolean> {
+        const result = await this.clients.db.write(
+            'DELETE FROM `user_to_group_permissions` ' +
+                'WHERE `group_id` = ? AND `user_id` = ? AND `permission` = ?',
+            [groupId, issuerUserId, permission],
+        );
+        return result.anyRowsAffected;
+    }
+
+    async auditUserGroupPerm(
+        entry: AuditEntry & {
+            group_id: number;
+            issuer_user_id: number;
+            permission: string;
+        },
+    ): Promise<void> {
+        await this.clients.db.write(
+            'INSERT INTO `audit_user_to_group_permissions` (' +
+                '`user_id`, `user_id_keep`, `group_id`, `group_id_keep`, ' +
+                '`permission`, `extra`, `action`, `reason`) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+            [
+                entry.issuer_user_id,
+                entry.issuer_user_id,
+                entry.group_id,
+                entry.group_id,
+                entry.permission,
+                entry.extra ? JSON.stringify(entry.extra) : null,
+                entry.action,
+                entry.reason,
+            ],
+        );
+    }
+
+    // -- SQL: access token permissions -------------------------------
+
+    /** The token's whole grant list, so a check reads it once. */
+    async listAccessTokenPerms(tokenUid: string): Promise<string[]> {
+        const cacheKey = this.#tokenCacheKey(tokenUid);
+        try {
+            const raw = await this.clients.redis.get(cacheKey);
+            if (raw) {
+                const parsed = JSON.parse(raw);
+                if (Array.isArray(parsed)) return parsed;
+            }
+        } catch {
+            // Fall through to DB.
+        }
+
+        const rows = await this.clients.db.read(
+            'SELECT `permission` FROM `access_token_permissions` WHERE `token_uid` = ?',
+            [tokenUid],
+        );
+        const perms = rows.map((r) => String(r.permission));
+
+        this.clients.redis
+            .set(cacheKey, JSON.stringify(perms), 'EX', TOKEN_CACHE_TTL_SECONDS)
+            .catch(() => {});
+        return perms;
+    }
+
+    /** Whether the token holds any of `permissions`, from one read. */
+    async hasAnyAccessTokenPerm(
+        tokenUid: string,
+        permissions: readonly string[],
+    ): Promise<boolean> {
+        const all = await this.listAccessTokenPerms(tokenUid);
+        return permissions.some((permission) => all.includes(permission));
+    }
+
+    /** Record a new token's grants, chunked multi-row inserts. */
+    async insertAccessTokenPerms(
+        tokenUid: string,
+        authorizer: { userId: number | null; appId: number | null },
+        grants: ReadonlyArray<{
+            permission: string;
+            extra?: Record<string, unknown>;
+        }>,
+    ): Promise<void> {
+        for (
+            let offset = 0;
+            offset < grants.length;
+            offset += ACCESS_TOKEN_PERM_INSERT_CHUNK
+        ) {
+            const chunk = grants.slice(
+                offset,
+                offset + ACCESS_TOKEN_PERM_INSERT_CHUNK,
+            );
+            await this.clients.db.write(
+                'INSERT INTO `access_token_permissions` (`token_uid`, `authorizer_user_id`, `authorizer_app_id`, `permission`, `extra`) VALUES ' +
+                    chunk.map(() => '(?, ?, ?, ?, ?)').join(', '),
+                chunk.flatMap(({ permission, extra }) => [
+                    tokenUid,
+                    authorizer.userId,
+                    authorizer.appId,
+                    permission,
+                    extra ? JSON.stringify(extra) : '{}',
+                ]),
+            );
+        }
+        await this.#invalidateAccessTokenPerms(tokenUid);
+    }
+
+    /** Drop a token's grant manifest. */
+    async deleteAccessTokenPerms(tokenUid: string): Promise<void> {
+        await this.clients.db.write(
+            'DELETE FROM `access_token_permissions` WHERE `token_uid` = ?',
+            [tokenUid],
+        );
+        await this.#invalidateAccessTokenPerms(tokenUid);
+    }
+
+    /**
+     * The user recorded as authorizing a token's grants. Null for a token with
+     * none, which every full-access token is.
+     */
+    async getAccessTokenAuthorizerId(tokenUid: string): Promise<number | null> {
+        const rows = (await this.clients.db.read(
+            'SELECT `authorizer_user_id` FROM `access_token_permissions` WHERE `token_uid` = ? LIMIT 1',
+            [tokenUid],
+        )) as Array<{ authorizer_user_id?: number | null }>;
+        return rows[0]?.authorizer_user_id ?? null;
+    }
+
+    async #invalidateAccessTokenPerms(tokenUid: string): Promise<void> {
+        await this.publishCacheKeys({
+            keys: [this.#tokenCacheKey(tokenUid)],
+            broadcast: true,
+        });
+    }
+
+    // -- SQL: issuer-prefix queries (share discovery, etc.) ----------
+    //
+    // All of these go through `subtreeClause`: a prefix is a permission and
+    // everything under it, so `fs:abc` must not reach `fs:abcdef`, and a `%`
+    // or `_` in one must not widen the match.
+
+    async queryIssuerUserPermsByPrefix(
+        issuerUserId: number,
+        prefix: string,
+    ): Promise<Array<{ holder_user_id: number; permission: string }>> {
+        const subtree = subtreeClause([subtreeRoot(prefix)]);
+        const rows = await this.clients.db.read(
+            'SELECT DISTINCT holder_user_id, permission FROM `user_to_user_permissions` ' +
+                `WHERE issuer_user_id = ? AND (${subtree.where})`,
+            [issuerUserId, ...subtree.params],
+        );
+        return rows.map((r) => ({
+            holder_user_id: Number(r.holder_user_id),
+            permission: String(r.permission),
+        }));
+    }
+
+    async queryIssuerAppPermsByPrefix(
+        issuerUserId: number,
+        prefix: string,
+    ): Promise<Array<{ app_id: number; permission: string }>> {
+        const subtree = subtreeClause([subtreeRoot(prefix)]);
+        const rows = await this.clients.db.read(
+            'SELECT DISTINCT app_id, permission FROM `user_to_app_permissions` ' +
+                `WHERE user_id = ? AND (${subtree.where})`,
+            [issuerUserId, ...subtree.params],
+        );
+        return rows.map((r) => ({
+            app_id: Number(r.app_id),
+            permission: String(r.permission),
+        }));
+    }
+
+    async queryIssuerHolderPermsByPrefix(
+        issuerUserId: number,
+        holderUserId: number,
+        prefix: string,
+    ): Promise<string[]> {
+        const subtree = subtreeClause([subtreeRoot(prefix)]);
+        const rows = await this.clients.db.read(
+            'SELECT permission FROM `user_to_user_permissions` ' +
+                `WHERE issuer_user_id = ? AND holder_user_id = ? AND (${subtree.where})`,
+            [issuerUserId, holderUserId, ...subtree.params],
+        );
+        return rows.map((r) => String(r.permission));
+    }
+
+    // -- Cache generation (per-actor invalidation) -------------------
+    //
+    // A monotonically increasing counter per actor, folded into the scan
+    // and check cache keys. Bumping it (a single-key INCR — cluster-safe,
+    // no CROSSSLOT pattern scan) instantly orphans every cached reading for
+    // that actor: subsequent lookups compute a new key and miss.
+    //
+    // Derived actors (app-under-user, access-token) fold the generations of
+    // every actor they act through into their cache keys — see
+    // PermissionService's cacheGenerationTag — so a bump of `user:<uuid>`
+    // also orphans that user's app and token actors' readings.
+    //
+    // The authoritative counter lives in shared Redis. Permission checks are
+    // extremely hot, so each node keeps a tiny in-process cache (the kv.js
+    // singleton, ~2s TTL) in front of the Redis read — this collapses the
+    // per-check round-trip and the `checkMany`/recursive-scan fan-out to
+    // in-memory lookups. A bump on any node updates that node's local copy
+    // immediately and propagates to other nodes within the local TTL, which
+    // is therefore the cross-node revocation lag. Old-generation cache keys
+    // expire via their own short TTL.
+    #cacheGenerationKey(actorUid: string): string {
+        return PermissionUtil.join('permission-cachegen', actorUid);
+    }
+
+    #localCacheGenerationKey(actorUid: string): string {
+        return `permgen-local:${actorUid}`;
+    }
+
+    async getCacheGeneration(actorUid: string): Promise<number> {
+        const localKey = this.#localCacheGenerationKey(actorUid);
+        const local = kv.get(localKey);
+        if (typeof local === 'number') return local;
+        try {
+            const raw = await this.clients.redis.get(
+                this.#cacheGenerationKey(actorUid),
+            );
+            const n = raw === null ? 0 : Number.parseInt(raw, 10);
+            const generation = Number.isFinite(n) && n >= 0 ? n : 0;
+            kv.set(localKey, generation, {
+                EX: PERMISSION_CACHE_GENERATION_LOCAL_TTL_SECONDS,
+            });
+            return generation;
+        } catch {
+            // On a cache read failure, fall back to generation 0 — the worst
+            // case is a stale reading bounded by the scan-cache TTL.
+            return 0;
+        }
+    }
+
+    async bumpCacheGeneration(actorUid: string): Promise<void> {
+        await this.bumpCacheGenerations([actorUid]);
+    }
+
+    /** Bump several actors and tell peer regions once. */
+    async bumpCacheGenerations(actorUids: string[]): Promise<void> {
+        const unique = [...new Set(actorUids.filter(Boolean))];
+        if (unique.length === 0) return;
+        await Promise.all(
+            unique.map((uid) => this.#applyCacheGenerationBump(uid)),
+        );
+        try {
+            this.clients.event.emit(
+                'outer.permission.generationBumped',
+                { actorUids: unique },
+                {},
+            );
+        } catch {
+            // Peer regions fall back to their scan-cache TTL.
+        }
+    }
+
+    /** Local half of a bump. Never emits, so a remote bump can't ping-pong. */
+    async #applyCacheGenerationBump(actorUid: string): Promise<void> {
+        const key = this.#cacheGenerationKey(actorUid);
+        try {
+            // Keep the counter alive well past the cache TTL so it can't
+            // reset to 0 and revive same-generation stale entries.
+            const next = await bumpGeneration(
+                this.clients.redis,
+                key,
+                PERMISSION_CACHE_GENERATION_TTL_SECONDS,
+            );
+            // Make this node consistent immediately; other nodes pick up the
+            // new value when their local copy expires (≤ local TTL).
+            if (Number.isFinite(next)) {
+                kv.set(this.#localCacheGenerationKey(actorUid), next, {
+                    EX: PERMISSION_CACHE_GENERATION_LOCAL_TTL_SECONDS,
+                });
+            } else {
+                kv.del(this.#localCacheGenerationKey(actorUid));
+            }
+        } catch {
+            // Best-effort: if the bump fails, the scan-cache TTL still
+            // bounds how long a revoked grant can linger. Drop the local
+            // copy so we re-read from Redis rather than serve a stale gen.
+            kv.del(this.#localCacheGenerationKey(actorUid));
+        }
+    }
+
+    // -- Scan cache (redis) ------------------------------------------
+
+    buildScanCacheKey(
+        actorUid: string,
+        permissionOptions: string[],
+        generation: number | string = 0,
+    ): string {
+        return PermissionUtil.join(
+            'permission-scan',
+            actorUid,
+            `g${generation}`,
+            'options-list',
+            ...permissionOptions,
+        );
+    }
+
+    async getScanCache(cacheKey: string): Promise<unknown | null> {
+        const raw = await this.clients.redis.get(cacheKey);
+        if (!raw) return null;
+        try {
+            return JSON.parse(raw);
+        } catch {
+            return null;
+        }
+    }
+
+    async setScanCache(
+        cacheKey: string,
+        value: unknown,
+        ttlSeconds: number = PERMISSION_SCAN_CACHE_TTL_SECONDS,
+    ): Promise<void> {
+        await this.clients.redis.set(
+            cacheKey,
+            JSON.stringify(value),
+            'EX',
+            ttlSeconds,
+        );
+    }
+
+    // -- Per-permission check cache (for `checkMany`) -----------------
+    //
+    // Cached as `1`/`0` per (actor, permission) pair so a batch lookup
+    // reduces to a single MGET. Same TTL as the scan cache. The cache
+    // generation (see above) is folded into the key, so a grant/revoke
+    // bump invalidates these entries immediately rather than waiting for
+    // the TTL to lapse.
+    #checkCacheKey(
+        actorUid: string,
+        permission: string,
+        generation: number | string = 0,
+    ): string {
+        return PermissionUtil.join(
+            'permission-check',
+            actorUid,
+            `g${generation}`,
+            'p',
+            permission,
+        );
+    }
+
+    async getMultiCheckCache(
+        actorUid: string,
+        permissions: string[],
+        generation: number | string = 0,
+    ): Promise<Map<string, boolean>> {
+        const out = new Map<string, boolean>();
+        if (permissions.length === 0) return out;
+        const keys = permissions.map((p) =>
+            this.#checkCacheKey(actorUid, p, generation),
+        );
+        let raw: Array<string | null> = [];
+        try {
+            raw = (await this.clients.redis.mget(...keys)) as Array<
+                string | null
+            >;
+        } catch {
+            return out;
+        }
+        for (let i = 0; i < permissions.length; i++) {
+            const v = raw[i];
+            if (v === '1') out.set(permissions[i], true);
+            else if (v === '0') out.set(permissions[i], false);
+        }
+        return out;
+    }
+
+    async setMultiCheckCache(
+        actorUid: string,
+        entries: Array<{ permission: string; granted: boolean }>,
+        generation: number | string = 0,
+        ttlSeconds: number = PERMISSION_SCAN_CACHE_TTL_SECONDS,
+    ): Promise<void> {
+        if (entries.length === 0) return;
+        const pipeline = this.clients.redis.pipeline();
+        for (const { permission, granted } of entries) {
+            pipeline.set(
+                this.#checkCacheKey(actorUid, permission, generation),
+                granted ? '1' : '0',
+                'EX',
+                ttlSeconds,
+            );
+        }
+        try {
+            await pipeline.exec();
+        } catch {
+            // Best-effort cache write.
+        }
+    }
+
+    // -- Internals ---------------------------------------------------
+
+    #u2uCacheKey(holderUserId: number): string {
+        return `perms:u2u:holder:${holderUserId}`;
+    }
+
+    #u2aCacheKey(userId: number, appId: number): string {
+        return `perms:u2a:${userId}:${appId}`;
+    }
+
+    #tokenCacheKey(tokenUid: string): string {
+        return `perms:token:${tokenUid}`;
+    }
+
+    async #readAllUserUserPermsForHolder(
+        holderUserId: number,
+    ): Promise<LinkedUserUserPermRow[]> {
+        const cacheKey = this.#u2uCacheKey(holderUserId);
+        try {
+            const raw = await this.clients.redis.get(cacheKey);
+            if (raw) {
+                const parsed = JSON.parse(raw);
+                if (Array.isArray(parsed)) return parsed;
+            }
+        } catch {
+            // Fall through to DB.
+        }
+
+        const rows = await this.clients.db.read(
+            'SELECT * FROM `user_to_user_permissions` WHERE `holder_user_id` = ?',
+            [holderUserId],
+        );
+        const decoded = rows.map((row) =>
+            this.#decodeExtra<LinkedUserUserPermRow>(row),
+        );
+
+        this.clients.redis
+            .set(cacheKey, JSON.stringify(decoded), 'EX', U2U_CACHE_TTL_SECONDS)
+            .catch(() => {});
+        return decoded;
+    }
+
+    async #readAllUserAppPerms(
+        userId: number,
+        appId: number,
+    ): Promise<LinkedUserAppPermRow[]> {
+        const cacheKey = this.#u2aCacheKey(userId, appId);
+        try {
+            const raw = await this.clients.redis.get(cacheKey);
+            if (raw) {
+                const parsed = JSON.parse(raw);
+                if (Array.isArray(parsed)) return parsed;
+            }
+        } catch {
+            // Fall through to DB.
+        }
+
+        const rows = await this.clients.db.read(
+            'SELECT * FROM `user_to_app_permissions` WHERE `user_id` = ? AND `app_id` = ?',
+            [userId, appId],
+        );
+        const decoded = rows.map((row) =>
+            this.#decodeExtra<LinkedUserAppPermRow>(row),
+        );
+
+        this.clients.redis
+            .set(cacheKey, JSON.stringify(decoded), 'EX', U2A_CACHE_TTL_SECONDS)
+            .catch(() => {});
+        return decoded;
+    }
+
+    /** Parse the JSON `extra` column into an object. */
+    #decodeExtra<T extends Record<string, unknown>>(
+        row: Record<string, unknown>,
+    ): T {
+        const extra = this.clients.db.case<() => unknown>({
+            mysql: () => row.extra,
+            otherwise: () => {
+                if (row.extra == null) return {};
+                if (typeof row.extra === 'object') return row.extra;
+                try {
+                    return JSON.parse(String(row.extra));
+                } catch {
+                    return {};
+                }
+            },
+        })();
+        return {
+            ...row,
+            extra: (extra ?? {}) as Record<string, unknown>,
+        } as unknown as T;
+    }
+}

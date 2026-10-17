@@ -1,0 +1,859 @@
+/*
+ * Copyright (C) 2024-present Puter Technologies Inc.
+ *
+ * This file is part of Puter.
+ *
+ * Puter is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published
+ * by the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+import {
+    AbortMultipartUploadCommand,
+    CompleteMultipartUploadCommand,
+    CopyObjectCommand,
+    CreateMultipartUploadCommand,
+    DeleteObjectCommand,
+    DeleteObjectsCommand,
+    GetObjectCommand,
+    HeadObjectCommand,
+    PutObjectCommand,
+    type S3Client,
+    UploadPartCommand,
+    UploadPartCopyCommand,
+} from '@aws-sdk/client-s3';
+import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
+import { Readable } from 'node:stream';
+import type {
+    CopyObjectInput,
+    DeleteObjectsInput,
+    GetObjectInput,
+    GetObjectResult,
+    MultipartCompleteInput,
+    ServerUploadInput,
+    SignedMultipartPartUrlsInput,
+    SignedUploadInput,
+    SignedUploadPart,
+    SignedUploadResult,
+} from './s3Types.js';
+import { recordStorageOps } from '../../core/storageOps.js';
+import { Span } from '../../util/span.js';
+import { PuterStore } from '../types.js';
+
+/**
+ * Clamp a requested presign lifetime to 1 minute–1 hour; a bad value gets the
+ * max.
+ */
+export function clampSignedUploadExpirySeconds(requested: unknown): number {
+    const seconds = Number(requested);
+    if (!Number.isFinite(seconds)) return 60 * 60;
+    return Math.max(60, Math.min(60 * 60, seconds));
+}
+
+/**
+ * True when an object request failed because the store says the key isn't
+ * there. A HEAD has no error body, so a missing key arrives as a bare
+ * `NotFound`; throttling, network, access and server errors return false.
+ */
+export function isMissingObjectError(err: unknown): boolean {
+    if (!err || typeof err !== 'object') return false;
+    const e = err as { name?: unknown; Code?: unknown };
+    return (
+        e.name === 'NotFound' ||
+        e.name === 'NoSuchKey' ||
+        e.Code === 'NoSuchKey'
+    );
+}
+
+/**
+ * True when the store rejected an upload because the body ended before the
+ * length it was sent with.
+ */
+export function isIncompleteBodyError(err: unknown): boolean {
+    if (!err || typeof err !== 'object') return false;
+    const e = err as { name?: unknown; Code?: unknown };
+    return e.name === 'IncompleteBody' || e.Code === 'IncompleteBody';
+}
+
+/**
+ * Store that owns S3 object I/O for fsentries: signed-URL minting, multipart
+ * lifecycle, server-driven uploads, and object reads/copies/deletes. Wraps the
+ * regional `S3Client` pool exposed by `clients.s3`.
+ */
+export class S3ObjectStore extends PuterStore {
+    #getClientForRegion(region: string): S3Client {
+        return this.clients.s3.get(region);
+    }
+
+    /**
+     * Client to use when minting presigned URLs handed back to the browser.
+     * Same instance as `#getClientForRegion` unless `s3Config.publicEndpoint`
+     * is set — see `clients/s3/S3Client.ts`.
+     */
+    #getPresignClientForRegion(region: string): S3Client {
+        return this.clients.s3.getForPresign(region);
+    }
+
+    // Older entries (migrated from v1) can have a null bucketRegion; callers
+    // use this to fall back to the configured default instead of erroring.
+    resolveRegion(region?: string | null): string {
+        return (
+            region || this.config.s3_region || this.config.region || 'us-west-2'
+        );
+    }
+
+    // Same story for `bucket`: older rows may be null. Fall back to the
+    // configured default bucket.
+    resolveBucket(bucket?: string | null): string {
+        return bucket || this.config.s3_bucket || 'puter-local';
+    }
+
+    getMaxSingleUploadSize(): number {
+        return this.clients.s3.maxSingleUploadSize;
+    }
+
+    getMultipartPartSize(): number {
+        return this.clients.s3.partSize;
+    }
+
+    #resolveMultipartPartSize(requestedPartSize?: number): number {
+        return Math.max(
+            this.getMaxSingleUploadSize(),
+            requestedPartSize ?? this.getMultipartPartSize(),
+        );
+    }
+
+    async createSignedUploadUrl(
+        fileMetadata: SignedUploadInput,
+        region: string,
+    ): Promise<SignedUploadResult> {
+        const [result] = await this.batchCreateSignedUploadUrls(
+            [fileMetadata],
+            region,
+        );
+        if (!result) {
+            throw new Error('Failed to create signed upload url');
+        }
+        return result;
+    }
+
+    // Presigning is local crypto — no network call, so no aws-sdk auto
+    // span. These s3.* spans are the only visibility into it.
+    @Span('s3.batchCreateSignedUploadUrls', (files: unknown[]) => ({
+        'db.batch_size': files.length,
+    }))
+    async batchCreateSignedUploadUrls(
+        filesMetadata: SignedUploadInput[],
+        region: string,
+    ): Promise<SignedUploadResult[]> {
+        const client = this.#getClientForRegion(region);
+        const presignClient = this.#getPresignClientForRegion(region);
+        const now = Date.now();
+        const settledResults = await Promise.allSettled(
+            filesMetadata.map(async (fileMetadata) => {
+                const expiresInSeconds = clampSignedUploadExpirySeconds(
+                    fileMetadata.expiresInSeconds,
+                );
+                const expiresAt = now + expiresInSeconds * 1000;
+                const maxSingleUploadSize = this.getMaxSingleUploadSize();
+                const shouldUseSingleUpload =
+                    fileMetadata.uploadMode === 'single' &&
+                    fileMetadata.size <= maxSingleUploadSize;
+
+                if (shouldUseSingleUpload) {
+                    const command = new PutObjectCommand({
+                        Bucket: fileMetadata.bucket,
+                        Key: fileMetadata.objectKey,
+                        ContentType: fileMetadata.contentType,
+                        // Binds the URL to the declared size, which is what
+                        // the start-write quota check ran against. Without it
+                        // the client can declare 0 and PUT gigabytes: signing
+                        // covers `content-length`, so any other body length
+                        // fails the signature instead of landing.
+                        ContentLength: fileMetadata.size,
+                    });
+                    const url = await getSignedUrl(presignClient, command, {
+                        expiresIn: expiresInSeconds,
+                    });
+                    // Signing costs nothing; the upload it authorizes is a
+                    // request against the object store that we never see,
+                    // because the client makes it directly. Counted here
+                    // because here is where we know it is going to happen.
+                    recordStorageOps('write');
+                    return {
+                        uploadMode: 'single' as const,
+                        expiresAt,
+                        url,
+                    };
+                }
+
+                const multipartPartSize = this.#resolveMultipartPartSize(
+                    fileMetadata.multipartPartSize,
+                );
+                const multipartPartCount = Math.max(
+                    1,
+                    Math.ceil(fileMetadata.size / multipartPartSize),
+                );
+                let multipartUploadId: string | undefined;
+
+                try {
+                    recordStorageOps('write');
+                    const multipartResult = await client.send(
+                        new CreateMultipartUploadCommand({
+                            Bucket: fileMetadata.bucket,
+                            Key: fileMetadata.objectKey,
+                            ContentType: fileMetadata.contentType,
+                        }),
+                    );
+
+                    if (!multipartResult.UploadId) {
+                        throw new Error(
+                            'Failed to initialize multipart upload',
+                        );
+                    }
+
+                    multipartUploadId = multipartResult.UploadId;
+                    const partUrls = await this.createSignedMultipartPartUrls(
+                        {
+                            bucket: fileMetadata.bucket,
+                            objectKey: fileMetadata.objectKey,
+                            multipartUploadId,
+                            partNumbers: Array.from(
+                                { length: multipartPartCount },
+                                (_, index) => index + 1,
+                            ),
+                            expiresInSeconds,
+                            declaredTotalSize: fileMetadata.size,
+                            multipartPartSize,
+                        },
+                        region,
+                    );
+
+                    return {
+                        uploadMode: 'multipart' as const,
+                        expiresAt,
+                        multipartUploadId,
+                        multipartPartSize,
+                        multipartPartCount,
+                        multipartPartUrls: partUrls,
+                    };
+                } catch (error) {
+                    if (multipartUploadId) {
+                        try {
+                            await this.abortMutipartUpload(
+                                multipartUploadId,
+                                region,
+                                fileMetadata.bucket,
+                                fileMetadata.objectKey,
+                            );
+                        } catch {
+                            // Best effort cleanup for partially initialized multipart uploads.
+                        }
+                    }
+                    throw error;
+                }
+            }),
+        );
+
+        const failedResults = settledResults.filter(
+            (result) => result.status === 'rejected',
+        );
+        if (failedResults.length > 0) {
+            await Promise.allSettled(
+                settledResults.map((result, index) => {
+                    if (result.status !== 'fulfilled') {
+                        return Promise.resolve();
+                    }
+                    if (
+                        result.value.uploadMode !== 'multipart' ||
+                        !result.value.multipartUploadId
+                    ) {
+                        return Promise.resolve();
+                    }
+                    const fileMetadata = filesMetadata[index];
+                    if (!fileMetadata) {
+                        return Promise.resolve();
+                    }
+                    return this.abortMutipartUpload(
+                        result.value.multipartUploadId,
+                        region,
+                        fileMetadata.bucket,
+                        fileMetadata.objectKey,
+                    );
+                }),
+            );
+
+            const firstFailure = failedResults[0]?.reason;
+            if (firstFailure instanceof Error) {
+                throw firstFailure;
+            }
+            throw new Error('Failed to create signed upload urls');
+        }
+
+        return settledResults.map((result) => {
+            if (result.status !== 'fulfilled') {
+                throw new Error('Failed to create signed upload urls');
+            }
+            return result.value;
+        });
+    }
+
+    @Span('s3.createSignedMultipartPartUrls')
+    async createSignedMultipartPartUrls(
+        input: SignedMultipartPartUrlsInput,
+        region: string,
+    ): Promise<SignedUploadPart[]> {
+        const presignClient = this.#getPresignClientForRegion(region);
+        const expiresInSeconds = clampSignedUploadExpirySeconds(
+            input.expiresInSeconds,
+        );
+
+        // One upload request per part, made by the client against the URLs
+        // handed back below.
+        recordStorageOps('write', input.partNumbers.length);
+
+        // Same binding as the single-PUT path: every part carries `partSize`
+        // bytes except the last, which carries the remainder.
+        const { declaredTotalSize, multipartPartSize } = input;
+        const partContentLength = (partNumber: number): number | undefined => {
+            if (
+                declaredTotalSize === undefined ||
+                multipartPartSize === undefined ||
+                !Number.isFinite(declaredTotalSize) ||
+                !Number.isFinite(multipartPartSize) ||
+                multipartPartSize <= 0
+            ) {
+                return undefined;
+            }
+            const offset = (partNumber - 1) * multipartPartSize;
+            const remaining = declaredTotalSize - offset;
+            // Zero, not `undefined`: a declared size of 0 leaves nothing for
+            // the part to carry, and an omitted binding is an unbounded URL
+            // rather than a small one.
+            if (remaining <= 0) return 0;
+            return Math.min(multipartPartSize, remaining);
+        };
+
+        return Promise.all(
+            input.partNumbers.map(async (partNumber) => {
+                const contentLength = partContentLength(partNumber);
+                const command = new UploadPartCommand({
+                    Bucket: input.bucket,
+                    Key: input.objectKey,
+                    UploadId: input.multipartUploadId,
+                    PartNumber: partNumber,
+                    ...(contentLength !== undefined
+                        ? { ContentLength: contentLength }
+                        : {}),
+                });
+                const url = await getSignedUrl(presignClient, command, {
+                    expiresIn: expiresInSeconds,
+                });
+                return {
+                    partNumber,
+                    url,
+                };
+            }),
+        );
+    }
+
+    @Span('s3.completeMultipartUpload')
+    async completeMultipartUpload(
+        input: MultipartCompleteInput,
+        region: string,
+    ): Promise<void> {
+        const client = this.#getClientForRegion(region);
+        recordStorageOps('write');
+        await client.send(
+            new CompleteMultipartUploadCommand({
+                Bucket: input.bucket,
+                Key: input.objectKey,
+                UploadId: input.multipartUploadId,
+                MultipartUpload: {
+                    Parts: [...input.parts]
+                        .sort(
+                            (partA, partB) =>
+                                partA.partNumber - partB.partNumber,
+                        )
+                        .map((part) => ({
+                            PartNumber: part.partNumber,
+                            ETag: part.etag,
+                        })),
+                },
+            }),
+        );
+    }
+
+    @Span('s3.abortMutipartUpload')
+    async abortMutipartUpload(
+        uploadId: string,
+        region: string,
+        bucket: string,
+        objectKey: string,
+    ): Promise<void> {
+        const client = this.#getClientForRegion(region);
+        recordStorageOps('delete');
+        await client.send(
+            new AbortMultipartUploadCommand({
+                Bucket: bucket,
+                Key: objectKey,
+                UploadId: uploadId,
+            }),
+        );
+    }
+
+    @Span('s3.uploadFromServer')
+    async uploadFromServer(
+        input: ServerUploadInput,
+        region: string,
+    ): Promise<void> {
+        const client = this.#getClientForRegion(region);
+        const maxSingleUploadSize = this.getMaxSingleUploadSize();
+        const resolvedContentLength = this.#resolveContentLength(input);
+        const shouldUseMultipart =
+            input.body instanceof Readable
+                ? resolvedContentLength === undefined ||
+                  resolvedContentLength > maxSingleUploadSize
+                : resolvedContentLength !== undefined &&
+                  resolvedContentLength > maxSingleUploadSize;
+
+        if (!shouldUseMultipart) {
+            recordStorageOps('write');
+            await client.send(
+                new PutObjectCommand({
+                    Bucket: input.bucket,
+                    Key: input.objectKey,
+                    ContentType: input.contentType,
+                    Body: input.body,
+                    // Use the *resolved* length (input.contentLength → sizeHint →
+                    // Buffer.byteLength). Without this, a Readable body whose
+                    // length we know only via `sizeHint` falls into the SDK's
+                    // chunked-streaming path and emits
+                    // `x-amz-decoded-content-length: undefined`, which the HTTP
+                    // layer rejects as an invalid header value.
+                    ...(resolvedContentLength !== undefined
+                        ? { ContentLength: resolvedContentLength }
+                        : {}),
+                }),
+            );
+            return;
+        }
+
+        await this.#uploadFromServerMultipart(
+            input,
+            region,
+            this.#resolveMultipartPartSize(),
+        );
+    }
+
+    /**
+     * Return the actual byte size of a stored object via a HEAD request, or
+     * null if S3 doesn't report a content length. Used to reconcile the
+     * authoritative size of a direct-to-S3 (signed-URL) upload against the
+     * client-declared size, which is otherwise untrusted.
+     */
+    @Span('s3.headObjectSize')
+    async headObjectSize(
+        bucket: string,
+        objectKey: string,
+        region: string,
+    ): Promise<number | null> {
+        const client = this.#getClientForRegion(region);
+        recordStorageOps('read');
+        const response = await client.send(
+            new HeadObjectCommand({
+                Bucket: bucket,
+                Key: objectKey,
+            }),
+        );
+        return typeof response.ContentLength === 'number'
+            ? response.ContentLength
+            : null;
+    }
+
+    @Span('s3.deleteObject')
+    async deleteObject(
+        bucket: string,
+        objectKey: string,
+        region: string,
+    ): Promise<void> {
+        const client = this.#getClientForRegion(region);
+        recordStorageOps('delete');
+        await client.send(
+            new DeleteObjectCommand({
+                Bucket: bucket,
+                Key: objectKey,
+            }),
+        );
+    }
+
+    // Batch delete up to 1000 objects per S3 API limit; callers chunk if needed.
+    @Span('s3.deleteObjects')
+    async deleteObjects(
+        input: DeleteObjectsInput,
+        region: string,
+    ): Promise<void> {
+        if (input.objectKeys.length === 0) return;
+        const client = this.#getClientForRegion(region);
+        const MAX_BATCH = 1000;
+        for (
+            let offset = 0;
+            offset < input.objectKeys.length;
+            offset += MAX_BATCH
+        ) {
+            const chunk = input.objectKeys.slice(offset, offset + MAX_BATCH);
+            recordStorageOps('delete');
+            await client.send(
+                new DeleteObjectsCommand({
+                    Bucket: input.bucket,
+                    Delete: {
+                        Objects: chunk.map((key) => ({ Key: key })),
+                        Quiet: true,
+                    },
+                }),
+            );
+        }
+    }
+
+    // Server-side copy. Avoids downloading/re-uploading bytes.
+    @Span('s3.copyObject')
+    async copyObject(input: CopyObjectInput, region: string): Promise<void> {
+        const client = this.#getClientForRegion(region);
+        recordStorageOps('write');
+        await client.send(
+            new CopyObjectCommand({
+                Bucket: input.destinationBucket,
+                Key: input.destinationKey,
+                CopySource: `${input.sourceBucket}/${encodeURIComponent(input.sourceKey)}`,
+                ...(input.contentType
+                    ? { ContentType: input.contentType }
+                    : {}),
+                ...(input.metadataDirective
+                    ? { MetadataDirective: input.metadataDirective }
+                    : {}),
+            }),
+        );
+    }
+
+    /** Most S3 implementations refuse a single-request copy beyond this. */
+    static readonly MAX_SINGLE_COPY_BYTES = 5 * 1024 * 1024 * 1024;
+
+    /** Server-side copy of any size: one request, or part by part past the cap. */
+    @Span('s3.copyObjectOfAnySize')
+    async copyObjectOfAnySize(
+        input: CopyObjectInput,
+        region: string,
+        size: number,
+    ): Promise<void> {
+        if (size <= S3ObjectStore.MAX_SINGLE_COPY_BYTES) {
+            await this.copyObject(input, region);
+            return;
+        }
+
+        const client = this.#getClientForRegion(region);
+        const partSize = Math.max(
+            this.getMultipartPartSize(),
+            // Ten thousand parts is the ceiling, so the floor follows the size.
+            Math.ceil(size / 10_000),
+        );
+        const created = await client.send(
+            new CreateMultipartUploadCommand({
+                Bucket: input.destinationBucket,
+                Key: input.destinationKey,
+                ...(input.contentType
+                    ? { ContentType: input.contentType }
+                    : {}),
+            }),
+        );
+        const uploadId = created.UploadId;
+        if (!uploadId) {
+            throw new Error('Copy could not start a multipart upload');
+        }
+
+        try {
+            const parts: Array<{ partNumber: number; etag: string }> = [];
+            for (let offset = 0, partNumber = 1; offset < size; partNumber++) {
+                const end = Math.min(offset + partSize, size) - 1;
+                recordStorageOps('write');
+                const copied = await client.send(
+                    new UploadPartCopyCommand({
+                        Bucket: input.destinationBucket,
+                        Key: input.destinationKey,
+                        UploadId: uploadId,
+                        PartNumber: partNumber,
+                        CopySource: `${input.sourceBucket}/${encodeURIComponent(input.sourceKey)}`,
+                        CopySourceRange: `bytes=${offset}-${end}`,
+                    }),
+                );
+                const etag = copied.CopyPartResult?.ETag;
+                if (!etag) {
+                    throw new Error(
+                        `Copy returned no ETag for part ${partNumber}`,
+                    );
+                }
+                parts.push({ partNumber, etag });
+                offset = end + 1;
+            }
+            await this.completeMultipartUpload(
+                {
+                    bucket: input.destinationBucket,
+                    objectKey: input.destinationKey,
+                    multipartUploadId: uploadId,
+                    parts,
+                },
+                region,
+            );
+        } catch (error) {
+            await this.abortMutipartUpload(
+                uploadId,
+                region,
+                input.destinationBucket,
+                input.destinationKey,
+            ).catch(() => {});
+            throw error;
+        }
+    }
+
+    @Span('s3.getObjectStream')
+    async getObjectStream(
+        input: GetObjectInput,
+        region: string,
+    ): Promise<GetObjectResult> {
+        const client = this.#getClientForRegion(region);
+        recordStorageOps('read');
+        const response = await client.send(
+            new GetObjectCommand({
+                Bucket: input.bucket,
+                Key: input.objectKey,
+                ...(input.range ? { Range: input.range } : {}),
+            }),
+        );
+
+        const body = response.Body;
+        if (!body) {
+            throw new Error('S3 getObject returned no body');
+        }
+        // AWS SDK v3 returns body as Readable in Node.js; other runtimes return a web stream.
+        const stream =
+            body instanceof Readable
+                ? body
+                : Readable.fromWeb(
+                      body as unknown as import('node:stream/web').ReadableStream,
+                  );
+        // The body can fail before its consumer attaches (the connection drops
+        // while the caller is still awaiting something else), and an 'error'
+        // with no listener exits the process. Consumers still get the error
+        // through their own listener, pipeline or iterator.
+        stream.on('error', (err) => {
+            if (stream.listenerCount('error') === 1) {
+                console.warn('[s3] object stream failed with no reader', err);
+            }
+        });
+
+        return {
+            body: stream,
+            contentLength: response.ContentLength ?? null,
+            contentType: response.ContentType ?? null,
+            contentRange: response.ContentRange ?? null,
+            etag: response.ETag ?? null,
+            lastModified: response.LastModified ?? null,
+        };
+    }
+
+    #resolveContentLength(input: ServerUploadInput): number | undefined {
+        if (
+            Number.isFinite(input.contentLength) &&
+            Number(input.contentLength) >= 0
+        ) {
+            return Number(input.contentLength);
+        }
+        // A 0 hint is the "length unknown" placeholder streamed writes pass
+        // (legacy signed write, chunked WebDAV PUT); taking it literally
+        // declares an empty body.
+        if (Number.isFinite(input.sizeHint) && Number(input.sizeHint) > 0) {
+            return Number(input.sizeHint);
+        }
+        if (Buffer.isBuffer(input.body) || input.body instanceof Uint8Array) {
+            return input.body.byteLength;
+        }
+        if (typeof input.body === 'string') {
+            return Buffer.byteLength(input.body);
+        }
+        return undefined;
+    }
+
+    #toBuffer(chunk: unknown): Buffer {
+        if (Buffer.isBuffer(chunk)) {
+            return chunk;
+        }
+        if (chunk instanceof Uint8Array) {
+            return Buffer.from(
+                chunk.buffer,
+                chunk.byteOffset,
+                chunk.byteLength,
+            );
+        }
+        if (typeof chunk === 'string') {
+            return Buffer.from(chunk);
+        }
+        throw new Error('Unsupported chunk type for multipart upload');
+    }
+
+    async #uploadFromServerMultipart(
+        input: ServerUploadInput,
+        region: string,
+        partSize: number,
+    ): Promise<void> {
+        const client = this.#getClientForRegion(region);
+        recordStorageOps('write');
+        const createResult = await client.send(
+            new CreateMultipartUploadCommand({
+                Bucket: input.bucket,
+                Key: input.objectKey,
+                ContentType: input.contentType,
+            }),
+        );
+
+        const uploadId = createResult.UploadId;
+        if (!uploadId) {
+            throw new Error('Failed to initialize multipart upload');
+        }
+
+        const completedParts: Array<{ ETag: string; PartNumber: number }> = [];
+        let partNumber = 1;
+
+        const uploadPart = async (partBody: Buffer) => {
+            recordStorageOps('write');
+            const uploadPartResult = await client.send(
+                new UploadPartCommand({
+                    Bucket: input.bucket,
+                    Key: input.objectKey,
+                    UploadId: uploadId,
+                    PartNumber: partNumber,
+                    Body: partBody,
+                    ContentLength: partBody.byteLength,
+                }),
+            );
+            if (!uploadPartResult.ETag) {
+                throw new Error(
+                    `Multipart upload returned no ETag for part ${partNumber}`,
+                );
+            }
+            completedParts.push({
+                ETag: uploadPartResult.ETag,
+                PartNumber: partNumber,
+            });
+            partNumber++;
+        };
+
+        try {
+            if (
+                Buffer.isBuffer(input.body) ||
+                input.body instanceof Uint8Array
+            ) {
+                const bufferBody = this.#toBuffer(input.body);
+                for (
+                    let offset = 0;
+                    offset < bufferBody.byteLength;
+                    offset += partSize
+                ) {
+                    const partBody = bufferBody.subarray(
+                        offset,
+                        offset + partSize,
+                    );
+                    await uploadPart(partBody);
+                }
+            } else if (typeof input.body === 'string') {
+                const bufferBody = Buffer.from(input.body);
+                for (
+                    let offset = 0;
+                    offset < bufferBody.byteLength;
+                    offset += partSize
+                ) {
+                    const partBody = bufferBody.subarray(
+                        offset,
+                        offset + partSize,
+                    );
+                    await uploadPart(partBody);
+                }
+            } else if (input.body instanceof Readable) {
+                let pendingChunk: Buffer = Buffer.alloc(0);
+                for await (const chunk of input.body) {
+                    const chunkBuffer = this.#toBuffer(chunk);
+                    if (chunkBuffer.byteLength === 0) {
+                        continue;
+                    }
+                    pendingChunk =
+                        pendingChunk.byteLength === 0
+                            ? chunkBuffer
+                            : Buffer.concat([pendingChunk, chunkBuffer]);
+                    while (pendingChunk.byteLength >= partSize) {
+                        const partBody = pendingChunk.subarray(0, partSize);
+                        await uploadPart(partBody);
+                        pendingChunk = pendingChunk.subarray(partSize);
+                    }
+                }
+                if (pendingChunk.byteLength > 0) {
+                    await uploadPart(pendingChunk);
+                }
+            } else {
+                throw new Error('Unsupported body type for multipart upload');
+            }
+
+            if (completedParts.length === 0) {
+                recordStorageOps('delete');
+                await client.send(
+                    new AbortMultipartUploadCommand({
+                        Bucket: input.bucket,
+                        Key: input.objectKey,
+                        UploadId: uploadId,
+                    }),
+                );
+                recordStorageOps('write');
+                await client.send(
+                    new PutObjectCommand({
+                        Bucket: input.bucket,
+                        Key: input.objectKey,
+                        ContentType: input.contentType,
+                        Body: Buffer.alloc(0),
+                        ContentLength: 0,
+                    }),
+                );
+                return;
+            }
+
+            recordStorageOps('write');
+            await client.send(
+                new CompleteMultipartUploadCommand({
+                    Bucket: input.bucket,
+                    Key: input.objectKey,
+                    UploadId: uploadId,
+                    MultipartUpload: {
+                        Parts: completedParts,
+                    },
+                }),
+            );
+        } catch (error) {
+            recordStorageOps('delete');
+            await client
+                .send(
+                    new AbortMultipartUploadCommand({
+                        Bucket: input.bucket,
+                        Key: input.objectKey,
+                        UploadId: uploadId,
+                    }),
+                )
+                .catch(() => undefined);
+            throw error;
+        }
+    }
+}

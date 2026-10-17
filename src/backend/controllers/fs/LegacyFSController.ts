@@ -1,0 +1,2917 @@
+/*
+ * Copyright (C) 2024-present Puter Technologies Inc.
+ *
+ * This file is part of Puter.
+ *
+ * Puter is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published
+ * by the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+import Busboy from 'busboy';
+import type { NextFunction, Request, RequestHandler, Response } from 'express';
+import { contentType as contentTypeFromMime } from 'mime-types';
+import { posix as pathPosix } from 'node:path';
+import {
+    assertResolvedActor,
+    isAccessTokenActor,
+    isAppActor,
+    makeActor,
+} from '../../core/actor.js';
+import { Context } from '../../core/context.js';
+import { HttpError } from '../../core/http/HttpError.js';
+import { RouteOptions } from '../../core/http/index.js';
+import { pipeToResponse } from '../../core/http/pipeToResponse.js';
+import {
+    assertNotSuspended,
+    assertTeam2fa,
+    assertVerifiedAccount,
+} from '../../core/http/middleware/gates.js';
+import type { PuterRouter } from '../../core/http/PuterRouter.js';
+import type { ACLService } from '../../services/acl/ACLService.js';
+import { assertActorHasCredits } from '../../services/metering/enforcement.js';
+import type { FSEntry } from '../../stores/fs/FSEntry.js';
+import type {
+    SignAction,
+    SignedFile,
+    SigningConfig,
+} from '../../util/fileSigning.js';
+import {
+    NON_OWNER_SIGNATURE_TTL_SECONDS,
+    parseSignedQuery,
+    verifySignature,
+} from '../../util/fileSigning.js';
+import { APP_ICON_SIZES } from '../../util/appIcon.js';
+import { toAppSummary } from '../../util/appView.js';
+import { awaitLater } from '../../util/concurrency.js';
+import {
+    joinChildPath,
+    normalizeAbsolutePath,
+    splitParentAndName,
+} from '../../services/fs/resolveNode.js';
+import { maskEntryPath } from '../../services/fs/sharePathMask.js';
+import { clientParentUid } from '../../services/fs/rootListing.js';
+import {
+    buildHostedBackingDenial,
+    hostedIndexUrlBackingsAreUnavailable,
+} from '../../util/hostedAppBacking.js';
+import { applyInlineContentSecurity } from '../../util/inlineContentSecurity.js';
+import { listClientShares } from '../share/clientShare.js';
+import { SHARE_LIST_LIMIT } from '../share/limits.js';
+import { consumeRouteRateLimit } from '../../core/http/middleware/rateLimit.js';
+import { PuterController } from '../types.js';
+import {
+    FS_BATCH_CONCURRENT,
+    FS_BATCH_LIMIT,
+    FS_BATCH_WRITE_MAX_ITEMS,
+    FS_DF_LIMIT,
+    FS_HELPER_LIMIT,
+    FS_MUTATE_LIMIT,
+    FS_POLL_LIMIT,
+    FS_READ_CONCURRENT,
+    FS_READ_LIMIT,
+    FS_READDIR_LIMIT,
+    FS_SEARCH_CONCURRENT,
+    FS_SEARCH_LIMIT,
+    FS_SIGN_LIMIT,
+    FS_SIGN_MAX_ITEMS,
+    FS_SIGNED_CONCURRENT,
+    FS_SIGNED_READ_LIMIT,
+    FS_SIGNED_WRITE_LIMIT,
+    FS_STAT_LIMIT,
+} from './limits.js';
+import {
+    asRecord,
+    assertAccess,
+    assertCanCreate,
+    assertCanMoveInto,
+    emitGuiItemEvent,
+    expandClientPath,
+    findOverwriteTarget,
+    getBoolean,
+    getString,
+    type GuiItemEventName,
+    loadLegacyAssociatedApps,
+    replacedByMove,
+    resolveV1Selector,
+    signEntry,
+    signingConfigFromAppConfig,
+    toLegacyEntry,
+} from './legacyFsHelpers.js';
+
+type RouterCache = Map<string, RequestHandler | null>;
+
+const additionalRoutePaths: Record<string, string> = {};
+
+// Shape only: version and variant nibbles aren't checked, so a row whose uuid
+// wasn't minted by an RFC-conforming generator still resolves.
+const UUID_SHAPE =
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+// Legacy `/batch` multipart upload caps. Each file is buffered fully into
+// memory before any quota / storage check runs, so without these limits an
+// authenticated caller could grow the process heap proportional to whatever
+// they sent. Streaming uploads go through `/writeFile`; this path is for
+// pre-v2 clients only.
+const BATCH_MAX_FILE_SIZE = 100 * 1024 * 1024; // 100 MiB per file
+const BATCH_MAX_TOTAL_SIZE = 256 * 1024 * 1024; // 256 MiB buffered per request
+const BATCH_MAX_FILES = 64;
+const BATCH_MAX_PARTS = 256;
+const BATCH_MAX_FIELD_SIZE = 1 * 1024 * 1024; // 1 MiB per operation/fileinfo JSON
+// Multipart carries at most one op per part, so JSON mode gets the same bound.
+const BATCH_MAX_OPS = BATCH_MAX_PARTS;
+const BATCH_MUTATING_OPS = new Set(['mkdir', 'shortcut', 'move', 'delete']);
+
+/** Rows per `readdir-subdomains` read; the response pages until done. */
+const SUBDOMAIN_PAGE_SIZE = 500;
+
+// An op's `as` names the path it produced; later ops in the same batch refer
+// to it as `$name` or `$name/rest`, since a deduped mkdir can land elsewhere.
+function resolveBatchRef(raw: string, refs: Map<string, string>): string {
+    if (!raw.startsWith('$')) return raw;
+    const slashIdx = raw.indexOf('/');
+    const name = slashIdx === -1 ? raw.slice(1) : raw.slice(1, slashIdx);
+    const rest = slashIdx === -1 ? '' : raw.slice(slashIdx);
+    if (!name) {
+        throw new HttpError(400, 'Invalid batch reference', {
+            legacyCode: 'bad_request',
+        });
+    }
+    const base = refs.get(name);
+    if (base === undefined) {
+        throw new HttpError(400, `Unknown batch reference: $${name}`, {
+            legacyCode: 'bad_request',
+        });
+    }
+    // Rejects non-normalized results, so `$ref/../x` can't escape.
+    return normalizeAbsolutePath(base + rest);
+}
+
+const malformedMultipart = (err: unknown): HttpError =>
+    err instanceof HttpError
+        ? err
+        : new HttpError(
+              400,
+              `Malformed multipart body${err instanceof Error ? `: ${err.message}` : ''}`,
+              { legacyCode: 'bad_request' },
+          );
+
+async function loadAdditionalRouter(
+    key: string,
+): Promise<RequestHandler | null> {
+    const path = additionalRoutePaths[key];
+    if (!path) return null;
+    try {
+        const mod = await import(path);
+        return (mod.default ?? mod) as RequestHandler;
+    } catch (err) {
+        console.error(
+            `[legacy-fs] failed to load additional route module '${key}':`,
+            err,
+        );
+        return null;
+    }
+}
+
+// -- Controller ------------------------------------------------------
+
+export class LegacyFSController extends PuterController {
+    #additionalCache: RouterCache = new Map();
+
+    registerRoutes(router: PuterRouter): void {
+        const apiOptions = {
+            subdomain: 'api',
+            requireVerified: true,
+        } as RouteOptions;
+        // Operations that move file content or make object-store requests on
+        // the caller's behalf, and so are refused to an account with nothing
+        // left of its budget. The metadata routes above deliberately aren't:
+        // an account that has run out still has to be able to look at what it
+        // has and delete it. The signature-authorised routes aren't either —
+        // they carry no session to answer for, and `/sign` (which does) is
+        // where the URL that reaches them is minted.
+        const spends = { ...apiOptions, requireCredits: true } as RouteOptions;
+        // Signed-URL routes: the handler validates the URL signature itself,
+        // so no auth gate is applied (matches v1, which mounted these routers
+        // with no middleware).
+        const signedOptions = {
+            subdomain: 'api',
+        } as RouteOptions;
+
+        // Core filesystem_api routes — direct handlers over the FS service.
+        // Limits come from `./limits` and carry an explicit `scope`, so these
+        // draw from the same per-user budget as their v2 counterparts rather
+        // than handing a caller a second allowance for the same operation.
+        const mutate = { ...apiOptions, rateLimit: FS_MUTATE_LIMIT };
+        // Read-side routes admit scoped access tokens: the ACL check each
+        // handler runs already intersects a token's grant with its issuer's,
+        // so the token reaches exactly what it was minted for. That is what a
+        // background events handler acts through — its `user` is a token
+        // scoped to the subscription's grant.
+        const reads = { ...apiOptions, allowAccessToken: true } as RouteOptions;
+        router.post('/stat', { ...reads, rateLimit: FS_STAT_LIMIT }, this.stat);
+        router.post(
+            '/readdir',
+            { ...reads, rateLimit: FS_READDIR_LIMIT },
+            this.readdir,
+        );
+        router.post('/mkdir', mutate, this.mkdir);
+        router.post('/copy', { ...mutate, requireCredits: true }, this.copy);
+        router.post('/move', mutate, this.move);
+        router.post('/delete', mutate, this.delete);
+        router.post('/rename', mutate, this.rename);
+        router.post('/touch', mutate, this.touch);
+        router.post(
+            '/search',
+            {
+                ...apiOptions,
+                rateLimit: FS_SEARCH_LIMIT,
+                concurrent: FS_SEARCH_CONCURRENT,
+            },
+            this.search,
+        );
+        router.get(
+            '/read',
+            {
+                ...spends,
+                allowAccessToken: true,
+                rateLimit: FS_READ_LIMIT,
+                concurrent: FS_READ_CONCURRENT,
+            },
+            this.read,
+        );
+        router.get(
+            '/token-read',
+            {
+                subdomain: 'api',
+                requireVerified: false,
+                allowAccessToken: true,
+                // An access token may or may not carry a user, so this shares
+                // the network-keyed budget the other signed routes use.
+                rateLimit: FS_SIGNED_READ_LIMIT,
+            },
+            this.tokenRead,
+        );
+
+        router.post(
+            '/batch',
+            {
+                ...spends,
+                rateLimit: FS_BATCH_LIMIT,
+                concurrent: FS_BATCH_CONCURRENT,
+            },
+            this.batch,
+        );
+
+        // Signed-URL + meta routes.
+        router.post(
+            '/sign',
+            // Gated even though it moves nothing itself: the URL it returns
+            // outlives the request and is served by a route with no session to
+            // check, so this is the last point at which the account is known.
+            { ...spends, rateLimit: FS_SIGN_LIMIT },
+            this.sign,
+        );
+        router.post(
+            '/writeFile',
+            {
+                ...signedOptions,
+                rateLimit: FS_SIGNED_WRITE_LIMIT,
+                concurrent: FS_SIGNED_CONCURRENT,
+            },
+            this.writeFile,
+        );
+        router.get(
+            '/file',
+            {
+                ...signedOptions,
+                rateLimit: FS_SIGNED_READ_LIMIT,
+                concurrent: FS_SIGNED_CONCURRENT,
+            },
+            this.file,
+        );
+        router.all('/df', { ...apiOptions, rateLimit: FS_DF_LIMIT }, this.df);
+        router.post(
+            '/open_item',
+            {
+                ...apiOptions,
+                // Opening an item grants an app access to a file on the user's
+                // behalf, so only the user's own credential may drive it — an
+                // app calling it for itself would be widening its own ACL.
+                // Session-only: the user-app token it returns is a session mint.
+                requireUserActor: true,
+                rateLimit: FS_HELPER_LIMIT,
+            },
+            this.openItem,
+        );
+        router.post(
+            '/auth/request-app-root-dir',
+            { ...apiOptions, rateLimit: FS_SIGN_LIMIT },
+            this.requestAppRootDir,
+        );
+        router.post(
+            '/auth/check-app-acl',
+            { ...apiOptions, rateLimit: FS_SIGN_LIMIT },
+            this.checkAppAcl,
+        );
+
+        // `/down` — session-auth'd file download. Unlike `/file` (signed URL)
+        // this accepts a path on the user's behalf and streams as attachment.
+        // Matches v1 semantics: mounted on both root and api subdomains
+        // because the GUI triggers it from `window.origin`, not the api host.
+        router.post(
+            '/down',
+            {
+                subdomain: ['api', ''],
+                requireUserActor: true,
+                // The user's own credential may download their files; apps and
+                // scoped tokens stay blocked. antiCsrf still protects the
+                // cookie-authed GUI path — a bearer-token PAT is exempt below
+                // (CSRF can't forge a header-credentialed request).
+                allowFullAccessToken: true,
+                requireVerified: true,
+                requireCredits: true,
+                antiCsrf: true,
+                rateLimit: FS_READ_LIMIT,
+                concurrent: FS_READ_CONCURRENT,
+            },
+            this.down,
+        );
+        // /itemMetadata is deprecated; not called by puter-js. Return 410 Gone.
+        router.get('/itemMetadata', apiOptions, (_req, res) => {
+            res.status(410).json({
+                error: 'itemMetadata is deprecated; use /fs/stat',
+            });
+        });
+
+        router.get(
+            '/get-launch-apps',
+            { ...apiOptions, rateLimit: FS_HELPER_LIMIT },
+            async (req, res) => {
+                const recommended =
+                    await this.services.recommendedApps.getRecommendedApps();
+
+                // The direct icon URL names a size; honour the one the
+                // caller asked for so the client isn't handed a 256px PNG for
+                // a 64px slot. `icon` keeps the raw column either way.
+                const requestedIconSize = Number(req.query.icon_size);
+                const iconSize = APP_ICON_SIZES.includes(requestedIconSize)
+                    ? requestedIconSize
+                    : undefined;
+
+                let recent: unknown[] = [];
+                const userId = req.actor?.user?.id;
+                if (userId) {
+                    const recentUids = await this.stores.app.getRecentAppOpens(
+                        userId,
+                        { limit: 10 },
+                    );
+                    const appsByUid =
+                        await this.stores.app.getByUids(recentUids);
+
+                    // `recentUids` is ordered most-recent-first; preserve it.
+                    const orderedApps: Array<Record<string, unknown>> =
+                        recentUids
+                            .map((uid: string) => appsByUid.get(uid))
+                            .filter(Boolean);
+
+                    // Don't hand out an index_url whose puter-hosted backing is
+                    // gone or reclaimed. The taskbar launches recents by name (so
+                    // AppDriver's guard applies), but this list is a
+                    // launch-metadata producer like any other — a future consumer
+                    // reading index_url straight off it shouldn't inherit a stale
+                    // origin.
+                    let backingGoneFlags: boolean[];
+                    try {
+                        backingGoneFlags =
+                            await hostedIndexUrlBackingsAreUnavailable({
+                                apps: orderedApps,
+                                subdomainStore: this.stores.subdomain,
+                                config: this.config,
+                            });
+                    } catch {
+                        backingGoneFlags = orderedApps.map(() => true);
+                    }
+
+                    recent = orderedApps.map((app, index) => {
+                        const backingGone = backingGoneFlags[index];
+                        return {
+                            ...toAppSummary(app, {
+                                config: this.config,
+                                iconSize,
+                            }),
+                            icon: app.icon ?? null,
+                            index_url: backingGone ? null : app.index_url,
+                            ...(backingGone
+                                ? { privateAccess: buildHostedBackingDenial() }
+                                : {}),
+                        };
+                    });
+                }
+
+                res.json({ recommended, recent });
+            },
+        );
+
+        router.post(
+            '/suggest_apps',
+            { ...apiOptions, rateLimit: FS_HELPER_LIMIT },
+            this.suggestApps,
+        );
+
+        // puter-js polls this to decide whether to purge its in-memory FS
+        // cache. SocketService bumps a per-user Redis key on every
+        // `outer.gui.item.*` mutation — read it back here.
+        router.get(
+            '/cache/last-change-timestamp',
+            { ...apiOptions, rateLimit: FS_POLL_LIMIT },
+            async (req, res) => {
+                const userId = req.actor?.user?.id;
+                if (!userId) {
+                    res.json({ timestamp: 0 });
+                    return;
+                }
+                const socket = this.services.socket as unknown as
+                    | {
+                          getLastChangeTimestamp?: (
+                              id: number,
+                          ) => Promise<number>;
+                      }
+                    | undefined;
+                const timestamp = socket?.getLastChangeTimestamp
+                    ? await socket.getLastChangeTimestamp(userId)
+                    : 0;
+                res.json({ timestamp });
+            },
+        );
+
+        router.post(
+            '/readdir-subdomains',
+            { ...apiOptions, rateLimit: FS_HELPER_LIMIT },
+            this.readdirSubdomains,
+        );
+        router.post(
+            '/update-fsentry-thumbnail',
+            { ...apiOptions, rateLimit: FS_HELPER_LIMIT },
+            this.updateFsentryThumbnail,
+        );
+
+        for (const key of Object.keys(additionalRoutePaths)) {
+            router.use(
+                this.#createLazyHandler(
+                    key,
+                    this.#additionalCache,
+                    loadAdditionalRouter,
+                ),
+            );
+        }
+    }
+
+    // -- Route implementations -------------------------------------------
+    //
+    // Handlers are public arrow class fields so they auto-bind `this` and can
+    // be passed directly to `router.post(...)` without `.bind(this)`. Express
+    // 5 catches their async rejections and routes them to the error handler.
+
+    stat = async (req: Request, res: Response): Promise<void> => {
+        const actor = this.#requireActor(req);
+        const userId = this.#getActorUserId(req);
+        const body = asRecord(req.body);
+
+        const entry = await resolveV1Selector(this.stores.fsEntry, body);
+        await assertAccess(
+            this.services.acl,
+            this.services.fs,
+            actor,
+            entry.path,
+            'see',
+        );
+
+        // Started early but awaited where it used to run, so its error still
+        // surfaces after the ones below. awaitLater covers the early exits
+        // that never reach that await.
+        const subtreeSize =
+            entry.isDir && getBoolean(body, 'return_size')
+                ? awaitLater(
+                      this.services.fs.getSubtreeSize(userId, entry.path),
+                  )
+                : null;
+
+        const [suggestedApps, appsById, shareFlags, parentUid] =
+            await Promise.all([
+                this.services.suggestedApps.getSuggestedApps(entry),
+                loadLegacyAssociatedApps(this.stores.app, [entry]),
+                this.services.share.shareFlags(actor, [entry]),
+                clientParentUid(
+                    actor,
+                    entry,
+                    this.services.acl,
+                    this.stores.permission,
+                ),
+            ]);
+        entry.suggestedApps = suggestedApps;
+
+        const shaped = await toLegacyEntry(this.clients.event, entry, {
+            fsEntryStore: this.stores.fsEntry,
+            userStore: this.stores.user as unknown as {
+                getById: (
+                    id: number,
+                ) => Promise<Record<string, unknown> | null>;
+            },
+            appsById,
+            isShared: shareFlags.get(entry.uuid) ?? null,
+            parentUid,
+        });
+
+        // Optional hydrations:
+        if (subtreeSize) shaped.size = await subtreeSize;
+        // `return_versions` has no parity yet; the empty array keeps `forEach`
+        // callers working. `return_owner` is a no-op — `owner` is always set.
+        if (getBoolean(body, 'return_versions')) shaped.versions = [];
+        if (getBoolean(body, 'return_shares')) {
+            // Share-listing work spends the share-listing budget, not just
+            // `fs:stat`'s.
+            if (!(await consumeRouteRateLimit(req, SHARE_LIST_LIMIT))) {
+                throw new HttpError(429, 'Too many requests.', {
+                    legacyCode: 'too_many_requests',
+                });
+            }
+            shaped.shares = await listClientShares(
+                this.services.share,
+                this.clients.event,
+                actor,
+                entry.uuid,
+            );
+        }
+
+        res.json(shaped);
+    };
+
+    readdir = async (req: Request, res: Response): Promise<void> => {
+        const actor = this.#requireActor(req);
+        const body = asRecord(req.body);
+
+        // Presence of `cursor` (null means "first page") or `includeTotal`
+        // opts into the paginated `{items, cursor?, total?}` envelope.
+        // Requests without pagination params keep the bare-array response.
+        const paginated =
+            Object.prototype.hasOwnProperty.call(body, 'cursor') ||
+            body.includeTotal === true;
+
+        if (this.#isRootPathRef(body)) {
+            const { listRootEntries } =
+                await import('../../services/fs/rootListing.js');
+            const rootChildren = await listRootEntries(
+                actor,
+                this.stores.fsEntry,
+                this.services.acl,
+                this.stores.permission,
+            );
+            const rootSuggestions =
+                await this.services.suggestedApps.getSuggestedAppsForEntries(
+                    rootChildren,
+                );
+            for (let index = 0; index < rootChildren.length; index++) {
+                const child = rootChildren[index];
+                if (child) {
+                    child.suggestedApps = rootSuggestions[index] ?? [];
+                }
+            }
+            const [rootAppsById, rootShareFlags] = await Promise.all([
+                loadLegacyAssociatedApps(this.stores.app, rootChildren),
+                this.services.share.shareFlags(actor, rootChildren),
+            ]);
+            const shaped = await Promise.all(
+                rootChildren.map((c) =>
+                    toLegacyEntry(this.clients.event, c, {
+                        appsById: rootAppsById,
+                        isShared: rootShareFlags.get(c.uuid) ?? null,
+                    }),
+                ),
+            );
+            if (paginated) {
+                res.json({
+                    items: shaped,
+                    ...(body.includeTotal === true
+                        ? { total: shaped.length }
+                        : {}),
+                });
+                return;
+            }
+            res.json(shaped);
+            return;
+        }
+
+        const parent = await resolveV1Selector(this.stores.fsEntry, body);
+        if (!parent.isDir) {
+            throw new HttpError(400, 'Target is not a directory', {
+                legacyCode: 'dest_is_not_a_directory',
+            });
+        }
+        await assertAccess(
+            this.services.acl,
+            this.services.fs,
+            actor,
+            parent.path,
+            'list',
+        );
+
+        const sortBy = this.#parseSortBy(body);
+        const sortOrder = this.#parseSortOrder(body);
+        const limit =
+            typeof body.limit === 'number' || typeof body.limit === 'string'
+                ? Number(body.limit)
+                : undefined;
+        const offset =
+            typeof body.offset === 'number' || typeof body.offset === 'string'
+                ? Number(body.offset)
+                : undefined;
+
+        let children;
+        let cursor: string | undefined;
+        if (paginated) {
+            const page = await this.services.fs.listDirectoryPage(parent.uuid, {
+                limit,
+                cursor:
+                    typeof body.cursor === 'string' ? body.cursor : undefined,
+                sortBy,
+                sortOrder,
+            });
+            children = page.entries;
+            cursor = page.cursor;
+        } else {
+            children = await this.services.fs.listDirectory(parent.uuid, {
+                limit: Number.isFinite(limit) ? limit : undefined,
+                offset: Number.isFinite(offset) ? offset : undefined,
+                sortBy,
+                sortOrder,
+            });
+        }
+
+        const suggestions =
+            await this.services.suggestedApps.getSuggestedAppsForEntries(
+                children,
+            );
+        for (let index = 0; index < children.length; index++) {
+            const child = children[index];
+            if (child) {
+                child.suggestedApps = suggestions[index] ?? [];
+            }
+        }
+
+        const [appsById, shareFlags] = await Promise.all([
+            loadLegacyAssociatedApps(this.stores.app, children),
+            this.services.share.shareFlags(actor, children),
+        ]);
+
+        const shaped = await Promise.all(
+            children.map((c) =>
+                toLegacyEntry(this.clients.event, c, {
+                    appsById,
+                    isShared: shareFlags.get(c.uuid) ?? null,
+                }),
+            ),
+        );
+
+        if (paginated) {
+            const total =
+                body.includeTotal === true
+                    ? await this.services.fs.countDirectory(parent.uuid)
+                    : undefined;
+            res.json({
+                items: shaped,
+                ...(cursor ? { cursor } : {}),
+                ...(total !== undefined ? { total } : {}),
+            });
+            return;
+        }
+        res.json(shaped);
+    };
+
+    mkdir = async (req: Request, res: Response): Promise<void> => {
+        const actor = this.#requireActor(req);
+        const userId = this.#getActorUserId(req);
+        const body = asRecord(req.body);
+        const rawPath = getString(body, 'path');
+        if (!rawPath)
+            throw new HttpError(400, '`path` is required', {
+                legacyCode: 'bad_request',
+            });
+
+        // Supports `{ parent, path }` where `path` is a relative suffix.
+        // When `parent` is a path string, use it directly without requiring
+        // the entry to exist — `services.fs.mkdir` honors `create_missing_parents`
+        // and will materialize any missing intermediate directories.
+        const username = actor.user?.username;
+        let targetPath = rawPath.startsWith('/')
+            ? await expandClientPath(this.stores.fsEntry, rawPath, username)
+            : rawPath;
+        if (body.parent !== undefined && !rawPath.startsWith('/')) {
+            let parentPath: string;
+            if (
+                typeof body.parent === 'string' &&
+                (body.parent.startsWith('/') || body.parent.startsWith('~'))
+            ) {
+                parentPath = await expandClientPath(
+                    this.stores.fsEntry,
+                    body.parent,
+                    username,
+                );
+            } else {
+                const parent = await resolveV1Selector(
+                    this.stores.fsEntry,
+                    body.parent,
+                );
+                parentPath = parent.path;
+            }
+            targetPath =
+                parentPath === '/'
+                    ? `/${rawPath}`
+                    : `${parentPath.replace(/\/+$/, '')}/${rawPath}`;
+        }
+
+        const normalizedTarget = targetPath.startsWith('/')
+            ? targetPath
+            : `/${targetPath}`;
+        const dedupeName =
+            getBoolean(body, 'dedupe_name', 'change_name') ?? false;
+        await assertCanCreate(
+            this.services.acl,
+            this.services.fs,
+            actor,
+            normalizedTarget,
+        );
+        if (dedupeName) {
+            const existing =
+                await this.stores.fsEntry.getEntryByPath(normalizedTarget);
+            if (existing) {
+                const parent = pathPosix.dirname(normalizedTarget);
+                await assertAccess(
+                    this.services.acl,
+                    this.services.fs,
+                    actor,
+                    parent === '/' ? normalizedTarget : parent,
+                    'write',
+                );
+            }
+        }
+
+        const entry = await this.services.fs.mkdir(userId, {
+            path: targetPath,
+            overwrite: getBoolean(body, 'overwrite') ?? false,
+            dedupeName,
+            createMissingParents:
+                getBoolean(
+                    body,
+                    'create_missing_parents',
+                    'create_missing_ancestors',
+                ) ?? false,
+        });
+        await this.#emitGuiEvent('outer.gui.item.added', entry);
+
+        res.json(await toLegacyEntry(this.clients.event, entry));
+    };
+
+    copy = async (req: Request, res: Response): Promise<void> => {
+        const actor = this.#requireActor(req);
+        const userId = this.#getActorUserId(req);
+        const body = asRecord(req.body);
+
+        const source = await resolveV1Selector(
+            this.stores.fsEntry,
+            body.source,
+        );
+        const destinationParent = await resolveV1Selector(
+            this.stores.fsEntry,
+            body.destination,
+        );
+
+        await assertAccess(
+            this.services.acl,
+            this.services.fs,
+            actor,
+            source.path,
+            'read',
+        );
+        await assertAccess(
+            this.services.acl,
+            this.services.fs,
+            actor,
+            destinationParent.path,
+            'write',
+        );
+
+        // The v1 wire contract reports the entry an overwrite replaced
+        // (`overwritten`) so clients can drop its stale row/icon. The copy
+        // deletes that entry, so resolve it beforehand.
+        const overwriteRequested = getBoolean(body, 'overwrite') ?? false;
+        const overwrittenEntry = overwriteRequested
+            ? await findOverwriteTarget(
+                  this.stores.fsEntry,
+                  destinationParent,
+                  getString(body, 'new_name') ?? source.name,
+              )
+            : null;
+
+        const copy = await this.services.fs.copy(userId, {
+            source,
+            destinationParent,
+            newName: getString(body, 'new_name'),
+            overwrite: overwriteRequested,
+            dedupeName: getBoolean(body, 'dedupe_name', 'change_name') ?? false,
+        });
+        // Announcing the replaced entry's removal keeps other clients from
+        // showing a ghost row for it until the directory is re-listed.
+        await this.#emitGuiEvent(
+            'outer.gui.item.added',
+            copy,
+            undefined,
+            overwrittenEntry,
+        );
+
+        // Legacy response shape: `[{copied: fsentry, overwritten?}]`.
+        // Array is historical — originally supported bulk copy.
+        const legacyEntryOpts = {
+            fsEntryStore: this.stores.fsEntry,
+            userStore: this.stores.user as unknown as {
+                getById: (
+                    id: number,
+                ) => Promise<Record<string, unknown> | null>;
+            },
+        };
+        const copied = await toLegacyEntry(
+            this.clients.event,
+            copy,
+            legacyEntryOpts,
+        );
+        const overwritten = overwrittenEntry
+            ? await toLegacyEntry(
+                  this.clients.event,
+                  overwrittenEntry,
+                  legacyEntryOpts,
+              )
+            : undefined;
+        res.json([{ copied, ...(overwritten ? { overwritten } : {}) }]);
+    };
+
+    move = async (req: Request, res: Response): Promise<void> => {
+        const actor = this.#requireActor(req);
+        const userId = this.#getActorUserId(req);
+        const body = asRecord(req.body);
+
+        const source = await resolveV1Selector(
+            this.stores.fsEntry,
+            body.source,
+        );
+        const destinationParent = await resolveV1Selector(
+            this.stores.fsEntry,
+            body.destination,
+        );
+
+        await assertAccess(
+            this.services.acl,
+            this.services.fs,
+            actor,
+            source.path,
+            'write',
+        );
+        await assertCanMoveInto(
+            this.services.acl,
+            this.services.fs,
+            actor,
+            source,
+            destinationParent,
+        );
+
+        // The v1 wire contract reports the entry an overwrite replaced
+        // (`overwritten`) so clients can drop its stale row/icon. The move
+        // deletes that entry, so resolve it beforehand.
+        const overwriteRequested = getBoolean(body, 'overwrite') ?? false;
+        const name = getString(body, 'new_name') ?? source.name;
+        let overwriteTarget = null;
+        if (overwriteRequested) {
+            const existing = await findOverwriteTarget(
+                this.stores.fsEntry,
+                destinationParent,
+                name,
+            );
+            // Moving an entry onto its own path is not an overwrite.
+            if (existing && existing.uuid !== source.uuid) {
+                overwriteTarget = existing;
+            }
+        }
+
+        const moved = await this.services.fs.move(userId, {
+            source,
+            destinationParent,
+            newName: getString(body, 'new_name'),
+            overwrite: overwriteRequested,
+            dedupeName: getBoolean(body, 'dedupe_name', 'change_name') ?? false,
+            // Trash/restore rides on this: GUI sends
+            // `{ original_name, original_path, trashed_ts }` when moving into
+            // Trash, and `null`/`{}` when restoring. See
+            // `src/gui/src/helpers.js` → `window.move_items`.
+            newMetadata: (body.new_metadata ?? undefined) as
+                | Record<string, unknown>
+                | null
+                | undefined,
+        });
+        const overwrittenEntry = replacedByMove(overwriteTarget, moved, name);
+        const oldPath = source.path;
+        // Announcing the replaced entry's removal keeps other clients from
+        // showing a ghost row for it until the directory is re-listed.
+        await this.#emitGuiEvent(
+            'outer.gui.item.moved',
+            moved,
+            { old_path: oldPath },
+            overwrittenEntry,
+        );
+
+        // Legacy response shape: `{moved: fsentry, old_path, overwritten?}`.
+        const legacyEntryOpts = {
+            fsEntryStore: this.stores.fsEntry,
+            userStore: this.stores.user as unknown as {
+                getById: (
+                    id: number,
+                ) => Promise<Record<string, unknown> | null>;
+            },
+        };
+        const movedEntry = await toLegacyEntry(
+            this.clients.event,
+            moved,
+            legacyEntryOpts,
+        );
+        const overwritten = overwrittenEntry
+            ? await toLegacyEntry(
+                  this.clients.event,
+                  overwrittenEntry,
+                  legacyEntryOpts,
+              )
+            : undefined;
+        res.json({
+            moved: movedEntry,
+            old_path: oldPath,
+            ...(overwritten ? { overwritten } : {}),
+        });
+    };
+
+    delete = async (req: Request, res: Response): Promise<void> => {
+        const actor = this.#requireActor(req);
+        const userId = this.#getActorUserId(req);
+        const body = asRecord(req.body);
+
+        // /delete can take `paths: []` for bulk delete, or a single selector.
+        const descendantsOnly = getBoolean(body, 'descendants_only') ?? false;
+        const pathsArray = Array.isArray(body.paths) ? body.paths : null;
+        if (pathsArray) {
+            if (pathsArray.length > FS_BATCH_WRITE_MAX_ITEMS) {
+                throw new HttpError(
+                    400,
+                    `Too many items in one request (max ${FS_BATCH_WRITE_MAX_ITEMS})`,
+                    { legacyCode: 'bad_request' },
+                );
+            }
+            const removedEntries: unknown[] = [];
+            for (const raw of pathsArray) {
+                const entry = await resolveV1Selector(this.stores.fsEntry, raw);
+                await assertAccess(
+                    this.services.acl,
+                    this.services.fs,
+                    actor,
+                    entry.path,
+                    'write',
+                );
+                await this.services.fs.remove(userId, {
+                    entry,
+                    recursive: getBoolean(body, 'recursive') ?? true,
+                    descendantsOnly,
+                });
+                await this.#emitGuiEvent('outer.gui.item.removed', entry, {
+                    descendants_only: descendantsOnly,
+                });
+                removedEntries.push(
+                    await toLegacyEntry(this.clients.event, entry),
+                );
+            }
+            res.json(removedEntries);
+            return;
+        }
+
+        const entry = await resolveV1Selector(this.stores.fsEntry, body);
+        await assertAccess(
+            this.services.acl,
+            this.services.fs,
+            actor,
+            entry.path,
+            'write',
+        );
+        await this.services.fs.remove(userId, {
+            entry,
+            recursive: getBoolean(body, 'recursive') ?? true,
+            descendantsOnly,
+        });
+        await this.#emitGuiEvent('outer.gui.item.removed', entry, {
+            descendants_only: descendantsOnly,
+        });
+        res.json({ ok: true, uid: entry.uuid });
+    };
+
+    rename = async (req: Request, res: Response): Promise<void> => {
+        const actor = this.#requireActor(req);
+        const body = asRecord(req.body);
+
+        const newName = getString(body, 'new_name');
+        if (!newName)
+            throw new HttpError(400, '`new_name` is required', {
+                legacyCode: 'bad_request',
+            });
+
+        const entry = await resolveV1Selector(this.stores.fsEntry, body);
+        await assertAccess(
+            this.services.acl,
+            this.services.fs,
+            actor,
+            entry.path,
+            'write',
+        );
+
+        const userId = this.#getActorUserId(req);
+        const renamed = await this.services.fs.rename(userId, entry, newName);
+        await this.#emitGuiEvent('outer.gui.item.updated', renamed);
+        res.json(await toLegacyEntry(this.clients.event, renamed));
+    };
+
+    touch = async (req: Request, res: Response): Promise<void> => {
+        const actor = this.#requireActor(req);
+        const userId = this.#getActorUserId(req);
+        const body = asRecord(req.body);
+
+        const rawPath = getString(body, 'path');
+        if (!rawPath)
+            throw new HttpError(400, '`path` is required', {
+                legacyCode: 'bad_request',
+            });
+
+        const expanded = await expandClientPath(
+            this.stores.fsEntry,
+            rawPath,
+            actor.user?.username,
+        );
+        const targetPath = expanded.startsWith('/') ? expanded : `/${expanded}`;
+        const parentPath = pathPosix.dirname(targetPath);
+        if (parentPath === '/') {
+            throw new HttpError(400, 'Cannot touch in root', {
+                legacyCode: 'bad_request',
+            });
+        }
+        await assertAccess(
+            this.services.acl,
+            this.services.fs,
+            actor,
+            parentPath,
+            'write',
+        );
+
+        await this.services.fs.touch(userId, {
+            path: targetPath,
+            setAccessed: getBoolean(body, 'set_accessed_to_now') ?? false,
+            setModified: getBoolean(body, 'set_modified_to_now') ?? false,
+            setCreated: getBoolean(body, 'set_created_to_now') ?? false,
+            createMissingParents:
+                getBoolean(body, 'create_missing_parents') ?? false,
+        });
+        // /touch historically returns an empty body.
+        res.send('');
+    };
+
+    suggestApps = async (req: Request, res: Response): Promise<void> => {
+        const suggestSvc = this.services.suggestedApps;
+        if (!suggestSvc?.getSuggestedApps) {
+            res.json([]);
+            return;
+        }
+        const actor = this.#requireActor(req);
+        const body = asRecord(req.body);
+        let entryName: string | undefined;
+        let entryPath: string | undefined;
+        if (body.uid || body.path) {
+            try {
+                const entry = await resolveV1Selector(
+                    this.stores.fsEntry,
+                    body,
+                );
+                // Suggestions leak the entry's extension and existence;
+                // gate on `see` so app actors can't probe outside scope.
+                if (entry?.path) {
+                    await assertAccess(
+                        this.services.acl,
+                        this.services.fs,
+                        actor,
+                        entry.path,
+                        'see',
+                    );
+                }
+                entryName = entry?.name;
+                entryPath = entry?.path;
+            } catch {
+                // Unresolvable or ACL-denied → empty suggestions.
+            }
+        }
+        const suggestions = await suggestSvc.getSuggestedApps({
+            name: entryName,
+            path: entryPath,
+        });
+        res.json(suggestions);
+    };
+
+    readdirSubdomains = async (req: Request, res: Response): Promise<void> => {
+        const actor = this.#requireActor(req);
+        // Subdomain enumeration is a user-level concern; app actors would
+        // otherwise see root_dir uids pointing outside their AppData scope.
+        if (actor.effectiveApp) {
+            res.json([]);
+            return;
+        }
+        const userId = this.#getActorUserId(req);
+        const sites: Array<Record<string, unknown>> = [];
+        let afterId: number | undefined;
+        for (;;) {
+            const page = (await this.stores.subdomain.listByUserId(userId, {
+                afterId,
+                limit: SUBDOMAIN_PAGE_SIZE,
+            })) as Array<Record<string, unknown>>;
+            for (const row of page) {
+                sites.push({
+                    subdomain: row.subdomain,
+                    root_dir_id: row.root_dir_id,
+                    uuid: row.uuid,
+                    ts: row.ts,
+                });
+            }
+            if (page.length < SUBDOMAIN_PAGE_SIZE) break;
+            afterId = Number(page[page.length - 1]!.id);
+        }
+        res.json(sites);
+    };
+
+    updateFsentryThumbnail = async (
+        req: Request,
+        res: Response,
+    ): Promise<void> => {
+        const actor = this.#requireActor(req);
+        const { uid, thumbnail } = asRecord(req.body) as {
+            uid?: string;
+            thumbnail?: string;
+        };
+        if (!uid)
+            throw new HttpError(400, 'Missing `uid`', {
+                legacyCode: 'bad_request',
+            });
+        if (!thumbnail)
+            throw new HttpError(400, 'Missing `thumbnail`', {
+                legacyCode: 'bad_request',
+            });
+        // Only inline image data. Clients generate the thumbnail themselves
+        // and the thumbnails extension is what turns it into a storage
+        // pointer; accepting a pointer here would let a caller name an object
+        // the server would then sign reads of, and delete, on their behalf.
+        if (!thumbnail.startsWith('data:'))
+            throw new HttpError(400, '`thumbnail` must be a data: URL', {
+                legacyCode: 'bad_request',
+            });
+
+        const entry = await this.stores.fsEntry.getEntryByUuid(uid);
+        if (!entry || !entry.path)
+            throw new HttpError(404, `Entry not found: uid=${uid}`, {
+                legacyCode: 'subject_does_not_exist',
+            });
+        await assertAccess(
+            this.services.acl,
+            this.services.fs,
+            actor,
+            entry.path,
+            'write',
+        );
+
+        // emitAndWait is required: the thumbnails extension rewrites
+        // `event.url` from a data URL to an `s3://` pointer, and the DB
+        // write below needs to see that rewrite.
+        const event = { url: thumbnail, uuid: entry.uuid };
+        await this.clients.event.emitAndWait('thumbnail.created', event, {});
+
+        // Not the owner-scoped update: a shared writer passed the check above.
+        await this.stores.fsEntry.updateEntryThumbnailByUuid(
+            entry.uuid,
+            event.url,
+        );
+        res.json({ thumbnail: event.url });
+    };
+
+    search = async (req: Request, res: Response): Promise<void> => {
+        const actor = this.#requireActor(req);
+        const userId = this.#getActorUserId(req);
+        const body = asRecord(req.body);
+        const query = getString(body, 'query', 'text') ?? '';
+        if (query.trim().length === 0)
+            throw new HttpError(400, '`query` is required', {
+                legacyCode: 'bad_request',
+            });
+
+        // App-under-user actors only see entries within their AppData root;
+        // user actors are unscoped. Mirrors the ACL short-circuit in
+        // ACLService.check.
+        const app = actor.effectiveApp;
+        const username = actor.user?.username;
+        const pathScope =
+            app && typeof username === 'string' && username.length > 0
+                ? `/${username}/AppData/${app.uid}`
+                : undefined;
+        const results = await this.services.fs.searchByName(
+            userId,
+            query,
+            200,
+            pathScope,
+        );
+        const shaped = await Promise.all(
+            results.map((r) => toLegacyEntry(this.clients.event, r)),
+        );
+        res.json(shaped);
+    };
+
+    read = async (
+        req: Request,
+        res: Response,
+        _next?: NextFunction,
+        options: { realMime?: boolean } = {},
+    ) => {
+        const actor = this.#requireActor(req);
+        const query = asRecord(req.query);
+
+        // Legacy v1 /read aliased `file` onto either path or uid depending on
+        // whether the value starts with `/`. resolveV1Selector does the same
+        // dispatch when handed a raw string.
+        const selector =
+            typeof query.file === 'string' && query.file.length > 0
+                ? query.file
+                : query;
+        const entry = await resolveV1Selector(this.stores.fsEntry, selector);
+        await assertAccess(
+            this.services.acl,
+            this.services.fs,
+            actor,
+            entry.path,
+            'read',
+        );
+
+        if (entry.isDir) {
+            throw new HttpError(400, 'Cannot read a directory', {
+                legacyCode: 'cannot_read_a_directory',
+            });
+        }
+
+        const range =
+            typeof req.headers.range === 'string'
+                ? req.headers.range
+                : undefined;
+        const download = await this.services.fs.readContent(entry, {
+            range,
+        });
+
+        // Force `application/octet-stream` on this endpoint for wire parity
+        // with v1. puter-js's `parseResponse` branches on Content-Type —
+        // `application/octet-stream` returns the raw Blob while other
+        // types wrap in `{success, result: Blob}`. Clients (including the
+        // GUI) expect the raw-Blob shape. Use `/fs/read` for type-aware
+        // streaming.
+        if (options.realMime) {
+            res.setHeader(
+                'Content-Type',
+                contentTypeFromMime(entry.name) as string,
+            );
+        } else {
+            res.setHeader('Content-Type', 'application/octet-stream');
+        }
+
+        if (download.contentLength !== null)
+            res.setHeader('Content-Length', String(download.contentLength));
+        if (download.contentRange)
+            res.setHeader('Content-Range', download.contentRange);
+        if (download.etag) res.setHeader('ETag', download.etag);
+        if (download.lastModified)
+            res.setHeader('Last-Modified', download.lastModified.toUTCString());
+        res.setHeader(
+            'Content-Disposition',
+            `inline; filename="${encodeURIComponent(entry.name)}"`,
+        );
+        res.status(range ? 206 : 200);
+
+        void pipeToResponse(download.body, res);
+    };
+
+    tokenRead = async (req: Request, res: Response): Promise<void> => {
+        const query = asRecord(req.query);
+        const accessToken = getString(query, 'token');
+        if (!accessToken) {
+            throw new HttpError(401, 'Token authentication failed', {
+                legacyCode: 'token_auth_failed',
+            });
+        }
+
+        const actor =
+            await this.services.auth.authenticateFromToken(accessToken);
+        if (!isAccessTokenActor(actor)) {
+            throw new HttpError(401, 'Token authentication failed', {
+                legacyCode: 'token_auth_failed',
+            });
+        }
+
+        // This endpoint authenticates the token by hand and never runs the
+        // route gate chain, so the suspension and pending-verification checks
+        // that guard every other authenticated FS route have to run here.
+        assertNotSuspended(actor!.user);
+        assertVerifiedAccount(actor!.user);
+        await assertTeam2fa(actor!.user, this.stores.team);
+
+        req.actor = assertResolvedActor(actor!);
+        Context.set('actor', actor);
+
+        // And the budget gate the other read routes declare with
+        // `requireCredits`. The global auth probe only looks for `auth_token`,
+        // so `?token=` leaves `req.actor` unset for the whole gate chain and
+        // the declarative form would wave every request through — this streams
+        // file content like `/read` does, so it is refused on the same terms.
+        await assertActorHasCredits(
+            this.services.metering,
+            req.actor,
+            this.config,
+        );
+
+        // Forward back to regular read after setting actor
+        return this.read(req, res, undefined, { realMime: true });
+    };
+
+    // -- Signed-URL + meta routes ----------------------------------------
+
+    /**
+     * POST /sign Body: `{ items: [{ uid?, path?, action }], app_uid? }`.
+     * Returns `{ signatures: [...], token? }`. Apps may only sign files under
+     * their own AppData subtree.
+     */
+    sign = async (req: Request, res: Response): Promise<void> => {
+        const actor = this.#requireActor(req);
+        const body = asRecord(req.body);
+        const items = Array.isArray(body.items) ? body.items : [];
+        if (items.length === 0)
+            throw new HttpError(400, '`items` is required', {
+                legacyCode: 'bad_request',
+            });
+        if (items.length > FS_SIGN_MAX_ITEMS)
+            throw new HttpError(
+                400,
+                `Too many items in one request (max ${FS_SIGN_MAX_ITEMS})`,
+                { legacyCode: 'bad_request' },
+            );
+
+        const actingApp = actor.effectiveApp;
+        const signingCfg = signingConfigFromAppConfig(this.config);
+
+        // Apps can only sign inside their AppData root.
+        let appDataRoot: string | null = null;
+        if (actingApp) {
+            const username = actor.user?.username;
+            const appUid = actingApp.uid;
+            if (!username || !appUid)
+                throw new HttpError(403, 'Forbidden', {
+                    legacyCode: 'forbidden',
+                });
+            appDataRoot = `/${username}/AppData/${appUid}`;
+        }
+
+        type SignedOrEmpty =
+            | (SignedFile & { path?: string })
+            | Record<string, never>;
+        const result: { signatures: SignedOrEmpty[]; token?: string } = {
+            signatures: [],
+        };
+
+        // Optional app grant: provide app_uid to grant permissions + token.
+        let grantApp: { uid: string } | null = null;
+        if (typeof body.app_uid === 'string' && body.app_uid.length > 0) {
+            const app = await this.stores.app.getByUid(body.app_uid);
+            if (!app)
+                throw new HttpError(404, 'App not found', {
+                    legacyCode: 'not_found',
+                });
+            grantApp = { uid: app.uid };
+            result.token = await this.services.auth.getUserAppToken(
+                actor,
+                app.uid,
+            );
+        }
+
+        for (const rawItem of items) {
+            const item = asRecord(rawItem);
+            const uid = typeof item.uid === 'string' ? item.uid : undefined;
+            const path = typeof item.path === 'string' ? item.path : undefined;
+            const action =
+                typeof item.action === 'string' ? item.action : 'read';
+            if (!uid && !path) {
+                result.signatures.push({});
+                continue;
+            }
+            try {
+                const entry = await resolveV1Selector(this.stores.fsEntry, {
+                    uid,
+                    path,
+                });
+
+                // App-sandbox check.
+                const withinAppRoot = appDataRoot
+                    ? entry.path === appDataRoot ||
+                      entry.path.startsWith(`${appDataRoot}/`)
+                    : true;
+                if (!withinAppRoot) {
+                    throw new HttpError(403, 'Forbidden', {
+                        legacyCode: 'forbidden',
+                    });
+                }
+
+                // ACL: always require read; downgrade write→read silently.
+                // One descriptor for both modes reads the chain at most once.
+                const descriptor = this.services.acl.fsDescriptor(entry.path);
+                await assertAccess(
+                    this.services.acl,
+                    this.services.fs,
+                    actor,
+                    descriptor,
+                    'read',
+                );
+                let finalAction: 'read' | 'write' = 'read';
+                if (action === 'write') {
+                    // The real path, not the masked one: ACL reads the path
+                    // string itself for its short-circuits (own home, an app's
+                    // AppData under another user), and a mask hides the
+                    // `AppData/<appUid>` shape those match on. Nothing here
+                    // publishes the descriptor, so there is nothing to hide.
+                    const writeOk = await this.services.acl.check(
+                        actor,
+                        descriptor,
+                        'write',
+                    );
+                    finalAction = writeOk ? 'write' : 'read';
+                }
+
+                if (grantApp) {
+                    // Grant the app the permission the user is signing for.
+                    await this.services.permission.grantUserAppPermission(
+                        actor,
+                        grantApp.uid,
+                        `fs:${entry.uuid}:${finalAction}`,
+                        {},
+                        { reason: 'endpoint:sign' },
+                    );
+                }
+
+                const signed = signEntry(entry, signingCfg, {
+                    actorUserId: actor.user?.id,
+                });
+                if (finalAction !== 'write') {
+                    const { write_url: _, ...rest } = signed;
+                    result.signatures.push({
+                        ...rest,
+                        path: maskEntryPath(entry),
+                    });
+                } else {
+                    result.signatures.push({
+                        ...signed,
+                        path: maskEntryPath(entry),
+                    });
+                }
+            } catch {
+                // Silently skip unresolvable items.
+                result.signatures.push({});
+            }
+        }
+
+        res.json(result);
+    };
+
+    /**
+     * POST /writeFile?uid=<uid>&operation=<op> Signature-authenticated
+     * multipart upload. `operation` dispatches to one of
+     * write/copy/move/mkdir/delete/rename/trash. Signature must be valid for
+     * `write` action on `uid`.
+     */
+    writeFile = async (req: Request, res: Response): Promise<void> => {
+        const query = asRecord(req.query);
+        const signingCfg = signingConfigFromAppConfig(this.config);
+        const targetEntry = await this.#resolveSignedEntry(
+            query,
+            'write',
+            signingCfg,
+        );
+
+        // Owner suspension check.
+        const owner = await this.stores.user.getById(targetEntry.userId);
+        if (!owner)
+            throw new HttpError(500, 'Owner not found', {
+                legacyCode: 'internal_error',
+            });
+        if ((owner as { suspended?: unknown }).suspended)
+            throw new HttpError(401, 'Account suspended', {
+                legacyCode: 'account_suspended',
+            });
+
+        const userId = targetEntry.userId;
+        const operation =
+            typeof query.operation === 'string' ? query.operation : 'write';
+
+        // A valid write signature authorises overwriting the file's bytes,
+        // not structural changes. Restrict copy/move/mkdir/rename/delete/trash
+        // to a caller authenticated as the owner — otherwise a recipient of a
+        // write-share could relocate or destroy the source via this endpoint.
+        if (operation !== 'write' && req.actor?.user?.id !== userId) {
+            throw new HttpError(
+                403,
+                `'${operation}' via signed URL requires owner authentication`,
+                { legacyCode: 'forbidden' },
+            );
+        }
+
+        const callerActor = this.#requireActor(req);
+        if (operation === 'write') {
+            const body = asRecord(req.body);
+            let targetPath: string;
+            if (targetEntry.isDir) {
+                const name =
+                    typeof body.name === 'string'
+                        ? body.name
+                        : `upload-${Date.now()}`;
+                targetPath =
+                    targetEntry.path === '/'
+                        ? `/${name}`
+                        : `${targetEntry.path}/${name}`;
+                await assertCanCreate(
+                    this.services.acl,
+                    this.services.fs,
+                    callerActor,
+                    targetPath,
+                );
+            } else {
+                targetPath = targetEntry.path;
+                await assertAccess(
+                    this.services.acl,
+                    this.services.fs,
+                    callerActor,
+                    targetPath,
+                    'write',
+                );
+            }
+
+            // Parse multipart and pipe the first `file` part into fsService.write.
+            const uploadResult = await this.#multipartWrite(
+                req,
+                userId,
+                targetPath,
+            );
+            await this.#emitGuiEvent(
+                'outer.gui.item.added',
+                uploadResult.fsEntry,
+            );
+            const signed = signEntry(uploadResult.fsEntry, signingCfg, {
+                actorUserId: callerActor.user?.id,
+            });
+            res.json({ ...signed, path: maskEntryPath(uploadResult.fsEntry) });
+            return;
+        }
+
+        // Non-write operations: route to existing service methods and sign the result.
+        // The signature alone authorises only byte writes to `targetEntry`. Structural
+        // ops (mkdir/rename/copy/move/delete) require a caller actor with explicit
+        // ACL on the affected paths — mirroring the unsigned counterparts above.
+        const record = asRecord(req.body);
+        if (operation === 'mkdir') {
+            await assertAccess(
+                this.services.acl,
+                this.services.fs,
+                callerActor,
+                targetEntry.path,
+                'write',
+            );
+            const folderName =
+                typeof record.name === 'string'
+                    ? record.name
+                    : `folder-${Date.now()}`;
+            const entry = await this.services.fs.mkdir(userId, {
+                path: targetEntry.isDir
+                    ? `${targetEntry.path === '/' ? '' : targetEntry.path}/${folderName}`
+                    : targetEntry.path,
+                dedupeName: true,
+            });
+            await this.#emitGuiEvent('outer.gui.item.added', entry);
+            res.json({
+                ...signEntry(entry, signingCfg, {
+                    actorUserId: callerActor.user?.id,
+                }),
+                path: maskEntryPath(entry),
+            });
+            return;
+        }
+        if (operation === 'rename') {
+            const newName =
+                typeof record.new_name === 'string' ? record.new_name : '';
+            if (!newName)
+                throw new HttpError(400, '`new_name` required', {
+                    legacyCode: 'bad_request',
+                });
+            await assertAccess(
+                this.services.acl,
+                this.services.fs,
+                callerActor,
+                targetEntry.path,
+                'write',
+            );
+            const renamed = await this.services.fs.rename(
+                userId,
+                targetEntry,
+                newName,
+            );
+            await this.#emitGuiEvent('outer.gui.item.updated', renamed);
+            res.json({
+                ...signEntry(renamed, signingCfg, {
+                    actorUserId: callerActor.user?.id,
+                }),
+                path: maskEntryPath(renamed),
+            });
+            return;
+        }
+        if (operation === 'delete' || operation === 'trash') {
+            await assertAccess(
+                this.services.acl,
+                this.services.fs,
+                callerActor,
+                targetEntry.path,
+                'write',
+            );
+            // Treat trash == delete (recursive). Most clients just call delete
+            // directly; if a trash folder becomes important we can revisit.
+            await this.services.fs.remove(userId, {
+                entry: targetEntry,
+                recursive: true,
+            });
+            await this.#emitGuiEvent('outer.gui.item.removed', targetEntry);
+            res.json({ ok: true, uid: targetEntry.uuid });
+            return;
+        }
+        if (operation === 'copy' || operation === 'move') {
+            const destRef =
+                record.destination ??
+                record.destination_uid ??
+                record.dest_path;
+            if (!destRef)
+                throw new HttpError(400, '`destination` required', {
+                    legacyCode: 'bad_request',
+                });
+            const destinationParent = await resolveV1Selector(
+                this.stores.fsEntry,
+                destRef,
+            );
+            await assertAccess(
+                this.services.acl,
+                this.services.fs,
+                callerActor,
+                targetEntry.path,
+                operation === 'copy' ? 'read' : 'write',
+            );
+            await assertAccess(
+                this.services.acl,
+                this.services.fs,
+                callerActor,
+                destinationParent.path,
+                'write',
+            );
+            const method = operation === 'copy' ? 'copy' : 'move';
+            const result = await this.services.fs[method](userId, {
+                source: targetEntry,
+                destinationParent,
+                newName:
+                    typeof record.new_name === 'string'
+                        ? record.new_name
+                        : undefined,
+                overwrite: getBoolean(record, 'overwrite') ?? false,
+                dedupeName: getBoolean(record, 'dedupe_name') ?? false,
+            });
+            await this.#emitGuiEvent(
+                operation === 'copy'
+                    ? 'outer.gui.item.added'
+                    : 'outer.gui.item.moved',
+                result,
+                operation === 'move'
+                    ? { old_path: targetEntry.path }
+                    : undefined,
+            );
+            res.json({
+                ...signEntry(result, signingCfg, {
+                    actorUserId: callerActor.user?.id,
+                }),
+                path: maskEntryPath(result),
+            });
+            return;
+        }
+
+        throw new HttpError(
+            400,
+            `Unsupported writeFile operation: '${operation}'`,
+            { legacyCode: 'bad_request' },
+        );
+    };
+
+    /**
+     * GET /file?uid=<uid>&signature=...&expires=... Signature-authenticated
+     * file read. Directories return a signed listing of children; files stream
+     * bytes (with Range support when `download` isn't requested).
+     */
+    file = async (req: Request, res: Response): Promise<void> => {
+        const query = asRecord(req.query);
+        const signingCfg = signingConfigFromAppConfig(this.config);
+        const entry = await this.#resolveSignedEntry(query, 'read', signingCfg);
+
+        // Owner-suspension guard — matches v1's /file. A signed URL stays
+        // valid forever by default, so a signature minted before a suspension
+        // would otherwise keep leaking content.
+        const owner = await this.stores.user.getById(entry.userId);
+        if ((owner as { suspended?: unknown } | null)?.suspended) {
+            throw new HttpError(401, 'Account suspended', {
+                legacyCode: 'account_suspended',
+            });
+        }
+
+        // Name who this response's bytes are billed to. A signature authorises
+        // access to a file; it says nothing about who is asking, so an
+        // unidentified caller is billed to the account whose file it is —
+        // otherwise a signed URL is a way to serve content for free. A caller
+        // who did identify themselves pays for what they fetch, as on a hosted
+        // site.
+        if (owner?.uuid) {
+            req.egressActor = req.actor ?? {
+                user: {
+                    uuid: owner.uuid,
+                    id: owner.id,
+                    username: owner.username,
+                    email: owner.email ?? null,
+                    suspended: !!(owner as { suspended?: unknown }).suspended,
+                },
+            };
+        }
+
+        // Directory: return a signed listing of direct children.
+        // The caller only proved read access, so strip write_url from
+        // each child to prevent privilege escalation via /writeFile.
+        //
+        // Child paths are the owner's real ones — there is no actor here to
+        // mask for. Accepted: a signature is minted and handed out by the
+        // owner, so the layout it reveals is theirs to reveal, and the child
+        // signatures expire; the paths are the only part that outlives them.
+        if (entry.isDir) {
+            const children = await this.services.fs.listDirectory(entry.uuid);
+            const signedChildren = children.map((child) => {
+                const { write_url: _, ...rest } = signEntry(child, signingCfg, {
+                    ttlSeconds: NON_OWNER_SIGNATURE_TTL_SECONDS,
+                });
+                return { ...rest, path: maskEntryPath(child) };
+            });
+            res.json(signedChildren);
+            return;
+        }
+
+        // File: stream bytes with Range support.
+        const range =
+            typeof req.headers.range === 'string'
+                ? req.headers.range
+                : undefined;
+        const download = await this.services.fs.readContent(entry, {
+            range,
+        });
+        const wantsAttachment =
+            query.download === 'true' ||
+            query.download === '1' ||
+            query.download === true;
+
+        if (download.contentType) {
+            res.setHeader('Content-Type', download.contentType);
+            // Uploader-controlled type served inline on the file origin —
+            // sandbox active-document types so an uploaded HTML/SVG can't
+            // execute scripts here. Mirrors FSController /fs/read.
+            if (!wantsAttachment) {
+                applyInlineContentSecurity(res, download.contentType);
+            }
+        }
+        if (download.contentLength !== null)
+            res.setHeader('Content-Length', String(download.contentLength));
+        if (download.contentRange)
+            res.setHeader('Content-Range', download.contentRange);
+        if (download.etag) res.setHeader('ETag', download.etag);
+        if (download.lastModified)
+            res.setHeader('Last-Modified', download.lastModified.toUTCString());
+        res.setHeader(
+            'Content-Disposition',
+            `${wantsAttachment ? 'attachment' : 'inline'}; filename="${encodeURIComponent(entry.name)}"`,
+        );
+        res.status(range ? 206 : 200);
+
+        void pipeToResponse(download.body, res);
+    };
+
+    /** GET|POST /df — user storage allowance. */
+    df = async (req: Request, res: Response): Promise<void> => {
+        this.#requireActor(req);
+        const userId = this.#getActorUserId(req);
+        const allowance =
+            await this.services.fs.getUsersStorageAllowance(userId);
+        res.json({
+            used: allowance.curr,
+            capacity: allowance.max,
+        });
+    };
+
+    /**
+     * POST /open_item — resolve an entry, grant the default suggested app
+     * access to it, and return a signed URL + user-app token so the launched
+     * app can read/write the file via its app-under-user token.
+     *
+     * This is a user-authority action: it writes a user→app ACL row. Two things
+     * keep an app from opening an item to widen its own access — the caller
+     * must be the user themselves (the route gate, re-checked here because
+     * extensions can reach handlers directly), and the grant is capped at the
+     * access the caller actually proved on the entry.
+     */
+    openItem = async (req: Request, res: Response): Promise<void> => {
+        const actor = this.#requireActor(req);
+        // Refused before the grant, so a token never leaves an orphaned ACL row.
+        if (actor.effectiveApp || actor.accessToken) {
+            throw new HttpError(
+                403,
+                'This endpoint is only available to user sessions',
+                { legacyCode: 'forbidden' },
+            );
+        }
+        const body = asRecord(req.body);
+        const entry = await resolveV1Selector(this.stores.fsEntry, body);
+
+        await assertAccess(
+            this.services.acl,
+            this.services.fs,
+            actor,
+            entry.path,
+            'read',
+        );
+
+        // Downgrade the envelope and the grant when the caller only proved
+        // read. `/writeFile`'s ACL re-check would still block the write, but
+        // returning `write_url` to a read-only caller is the same
+        // privilege-leak shape that `/sign` and `/readdir` strip.
+        // Real path — see the note on the other `acl.check` above.
+        const writeOk = await this.services.acl.check(
+            actor,
+            this.services.acl.fsDescriptor(entry.path),
+            'write',
+        );
+
+        const suggested =
+            (await this.services.suggestedApps?.getSuggestedApps({
+                name: entry.name,
+                path: maskEntryPath(entry),
+            })) ?? [];
+
+        let token: string | null = null;
+        const defaultAppUid =
+            typeof suggested[0]?.uuid === 'string'
+                ? (suggested[0].uuid as string)
+                : undefined;
+        if (defaultAppUid) {
+            await this.services.permission.grantUserAppPermission(
+                actor,
+                defaultAppUid,
+                `fs:${entry.uuid}:${writeOk ? 'write' : 'read'}`,
+                {},
+                { reason: 'open_item' },
+            );
+            token = await this.services.auth.getUserAppToken(
+                actor,
+                defaultAppUid,
+            );
+        }
+
+        const signingCfg = signingConfigFromAppConfig(this.config);
+        const signed = signEntry(entry, signingCfg, {
+            actorUserId: actor.user?.id,
+        });
+        const signature = writeOk
+            ? { ...signed, path: maskEntryPath(entry) }
+            : (() => {
+                  const { write_url: _, ...rest } = signed;
+                  return { ...rest, path: maskEntryPath(entry) };
+              })();
+        res.json({
+            signature,
+            token,
+            suggested_apps: suggested,
+        });
+    };
+
+    /**
+     * POST /auth/request-app-root-dir — an app-under-user requests stat on its
+     * own app root directory. The app must own itself.
+     *
+     * `check: true` answers whether the caller may claim it and stops there,
+     * for callers asking the question rather than acting on the answer —
+     * otherwise `puter.perms.check('appRootDir', …)` would provision a
+     * directory just by being asked. Answering is the whole response: a caller
+     * that may not claim it gets the 403 below either way.
+     */
+    requestAppRootDir = async (req: Request, res: Response): Promise<void> => {
+        const actor = this.#requireActor(req);
+        const body = asRecord(req.body);
+        const appUid = getString(body, 'app_uid');
+        if (!appUid)
+            throw new HttpError(400, '`app_uid` is required', {
+                legacyCode: 'bad_request',
+            });
+
+        // The app acting directly, not one that merely issued the credential:
+        // claiming a root dir is the app itself asking, and a token is not it.
+        const callerApp = isAppActor(actor) ? actor.effectiveApp : null;
+        if (callerApp?.uid !== appUid) {
+            // `reason` separates this from a refusal a grant could lift, so a
+            // client does not spend a consent prompt on a grant that cannot work.
+            throw new HttpError(
+                403,
+                'Only the app itself may request its root dir',
+                { legacyCode: 'forbidden', fields: { reason: 'app_mismatch' } },
+            );
+        }
+        const userId = this.#getActorUserId(req);
+        const username = (actor as { user?: { username?: string } }).user
+            ?.username;
+        if (!username)
+            throw new HttpError(401, 'Unauthorized', {
+                legacyCode: 'unauthorized',
+            });
+
+        if (getBoolean(body, 'check')) {
+            res.json({ allowed: true });
+            return;
+        }
+
+        const rootPath = `/${username}/AppData/${appUid}`;
+        // Auto-create the AppData/<uid> tree on first call.
+        const entry = await this.services.fs.mkdir(userId, {
+            path: rootPath,
+            createMissingParents: true,
+        });
+        res.json(await toLegacyEntry(this.clients.event, entry));
+    };
+
+    /**
+     * POST /auth/check-app-acl — check whether an app has a given mode of
+     * access to a subject FS entry.
+     */
+    checkAppAcl = async (req: Request, res: Response): Promise<void> => {
+        const actor = this.#requireActor(req);
+        const body = asRecord(req.body);
+
+        const subjectRef = body.subject;
+        const appRef = body.app;
+        const mode = (getString(body, 'mode') ?? 'read') as
+            | 'see'
+            | 'list'
+            | 'read'
+            | 'write';
+        if (!subjectRef || !appRef)
+            throw new HttpError(400, '`subject` and `app` are required', {
+                legacyCode: 'bad_request',
+            });
+
+        // A missing subject and one the caller can't see get the same 404,
+        // so this can't be used to probe for other users' entries.
+        let subject: import('../../stores/fs/FSEntry.js').FSEntry | null = null;
+        try {
+            subject = await resolveV1Selector(this.stores.fsEntry, subjectRef);
+        } catch (err) {
+            if (!(err instanceof HttpError && err.statusCode === 404))
+                throw err;
+        }
+        const acl = this.services.acl as ACLService;
+        const descriptor = subject && acl.fsDescriptor(subject.path);
+        if (!descriptor || !(await acl.check(actor, descriptor, 'see')))
+            throw new HttpError(404, 'Subject does not exist', {
+                legacyCode: 'subject_does_not_exist',
+            });
+
+        let app: { uid: string } | null = null;
+        if (typeof appRef === 'string') {
+            app =
+                (await this.stores.app.getByUid(appRef)) ??
+                (await this.stores.app.getByName(appRef));
+        }
+        if (!app)
+            throw new HttpError(404, 'App not found', {
+                legacyCode: 'not_found',
+            });
+
+        // Build an actor-under-user shape for the check.
+        const actorForApp = makeActor({
+            user: actor.user,
+            app: { uid: (app as { uid: string }).uid },
+        });
+        const allowed = await acl.check(actorForApp, descriptor, mode);
+        res.json({ allowed });
+    };
+
+    /**
+     * POST /down?path=/absolute/path — session-auth'd, path-based file
+     * download. Keeps v1's wire contract: path query param, anti-CSRF body
+     * token, attachment response. No signed URL involved — /file (signature
+     * based) and /down (session based) are the two download paths.
+     */
+    down = async (req: Request, res: Response): Promise<void> => {
+        const actor = this.#requireActor(req);
+
+        const rawPath =
+            typeof req.query.path === 'string' ? req.query.path.trim() : '';
+        if (!rawPath)
+            throw new HttpError(400, '`path` is required', {
+                legacyCode: 'bad_request',
+            });
+        if (rawPath === '/')
+            throw new HttpError(400, 'Cannot download a directory', {
+                legacyCode: 'bad_request',
+            });
+
+        const entry = await resolveV1Selector(this.stores.fsEntry, {
+            path: rawPath,
+        });
+        if (entry.isDir)
+            throw new HttpError(400, 'Cannot download a directory', {
+                legacyCode: 'bad_request',
+            });
+
+        // Same ACL gate that /read uses — owners hit the is-owner implicator;
+        // shared-file readers get through the permission scan.
+        await assertAccess(
+            this.services.acl,
+            this.services.fs,
+            actor,
+            entry.path,
+            'read',
+        );
+
+        // The GUI calls this on the root origin, which egress metering skips
+        // by default, so opt in by naming the downloader as who pays.
+        req.egressActor = actor;
+
+        const range =
+            typeof req.headers.range === 'string'
+                ? req.headers.range
+                : undefined;
+        const download = await this.services.fs.readContent(entry, {
+            range,
+        });
+
+        res.setHeader('Content-Type', 'application/octet-stream');
+        if (download.contentLength !== null)
+            res.setHeader('Content-Length', String(download.contentLength));
+        if (download.contentRange)
+            res.setHeader('Content-Range', download.contentRange);
+        if (download.etag) res.setHeader('ETag', download.etag);
+        if (download.lastModified)
+            res.setHeader('Last-Modified', download.lastModified.toUTCString());
+        res.setHeader(
+            'Content-Disposition',
+            `attachment; filename="${encodeURIComponent(entry.name)}"`,
+        );
+        res.status(range ? 206 : 200);
+
+        void pipeToResponse(download.body, res);
+    };
+
+    async #emitGuiEvent(
+        eventName: GuiItemEventName,
+        entry: import('../../stores/fs/FSEntry.js').FSEntry,
+        extra?: Record<string, unknown>,
+        replaced?: import('../../stores/fs/FSEntry.js').FSEntry | null,
+    ): Promise<void> {
+        try {
+            await emitGuiItemEvent(
+                this.clients.event,
+                eventName,
+                entry,
+                extra,
+                replaced,
+            );
+        } catch {
+            // Non-critical — GUI event failure must never break the HTTP response.
+        }
+    }
+
+    async #multipartWrite(
+        req: Request,
+        userId: number,
+        targetPath: string,
+    ): Promise<{ fsEntry: import('../../stores/fs/FSEntry.js').FSEntry }> {
+        // Parse the first `file` part via busboy and stream it into write.
+        const { Readable: NodeReadable } = await import('node:stream');
+        return new Promise((resolve, reject) => {
+            const bb = Busboy({ headers: req.headers });
+            let dispatched = false;
+            let writePromise: Promise<unknown> | null = null;
+            let size = 0;
+
+            bb.on('field', () => {
+                // Fields are ignored — only the file stream matters here.
+            });
+            bb.on('file', (_fieldName, fileStream, info) => {
+                if (dispatched) {
+                    fileStream.resume();
+                    return;
+                }
+                dispatched = true;
+                const passthrough = new NodeReadable({
+                    read() {
+                        // no-op; data pushed from the busboy file stream.
+                    },
+                });
+                fileStream.on('data', (chunk: Buffer) => {
+                    size += chunk.length;
+                    passthrough.push(chunk);
+                });
+                fileStream.on('end', () => passthrough.push(null));
+                fileStream.on('error', (err: Error) =>
+                    passthrough.destroy(err),
+                );
+
+                const contentType =
+                    info && typeof info.mimeType === 'string'
+                        ? info.mimeType
+                        : undefined;
+                writePromise = this.services.fs
+                    .write(userId, {
+                        fileMetadata: {
+                            path: targetPath,
+                            size: 0, // real size accumulates as stream drains
+                            ...(contentType ? { contentType } : {}),
+                            overwrite: true,
+                        },
+                        fileContent: passthrough,
+                    })
+                    .then((response) => {
+                        resolve({ fsEntry: response.fsEntry });
+                    })
+                    .catch(reject);
+            });
+            bb.on('close', () => {
+                if (!dispatched) {
+                    reject(
+                        new HttpError(400, 'No file uploaded', {
+                            legacyCode: 'bad_request',
+                        }),
+                    );
+                    return;
+                }
+                if (!writePromise) {
+                    reject(
+                        new HttpError(500, 'Write did not dispatch', {
+                            legacyCode: 'internal_error',
+                        }),
+                    );
+                }
+                // size is logged only; fsService.write handles quota/size.
+                void size;
+            });
+            bb.on('error', (err) => reject(err));
+            req.pipe(bb);
+        });
+    }
+
+    // -- Batch route -----------------------------------------------------
+    //
+    // `/batch` interleaves multipart JSON operations with optional file
+    // uploads. puter-js uses it for `write`, `shortcut`, `mkdir`, `move`,
+    // `delete`, and `symlink` — `write` ops are paired with `file` blob
+    // parts (by `item_upload_id`, then fallback position) and matching
+    // `fileinfo` JSON.
+    //
+    // File bodies are buffered in memory per op; large uploads should go
+    // through the signed `/writeFile` endpoint instead, which streams.
+    // The wire shape (multipart/form-data) is preserved for client
+    // compatibility. Unknown op-types are rejected per-op.
+
+    batch = async (req: Request, res: Response): Promise<void> => {
+        this.#requireActor(req);
+        const userId = this.#getActorUserId(req);
+        const actor = req.actor!;
+        const username = actor.user?.username;
+        const contentType =
+            typeof req.headers['content-type'] === 'string'
+                ? req.headers['content-type']
+                : '';
+
+        // Parse the request. We support both multipart/form-data (the
+        // canonical client shape) and JSON bodies (handy for ad-hoc
+        // callers / tests).
+        const parsed = contentType.includes('multipart/form-data')
+            ? await this.#parseMultipartBatch(req)
+            : { ops: this.#parseJsonBatch(req), files: [], fileinfos: [] };
+        const { ops: operationSpecs, files, fileinfos } = parsed;
+
+        const results: unknown[] = [];
+        let hasError = false;
+        let sequentialFileIdx = 0;
+        const pathRefs = new Map<string, string>();
+
+        for (const spec of operationSpecs) {
+            try {
+                const record = asRecord(spec);
+                const op = typeof record.op === 'string' ? record.op : '';
+                let shaped: unknown;
+
+                // Non-write ops draw the same budget as the standalone routes.
+                if (
+                    BATCH_MUTATING_OPS.has(op) &&
+                    !(await consumeRouteRateLimit(req, FS_MUTATE_LIMIT))
+                ) {
+                    throw new HttpError(429, 'Too many requests.', {
+                        legacyCode: 'too_many_requests',
+                    });
+                }
+
+                if (op === 'write') {
+                    // Pair with a file part — prefer `item_upload_id`
+                    // index (what puter-js sets), fall back to the op's
+                    // order among write ops for safety.
+                    const uploadIdRaw = record.item_upload_id;
+                    let fileIdx =
+                        typeof uploadIdRaw === 'number'
+                            ? uploadIdRaw
+                            : typeof uploadIdRaw === 'string' &&
+                                /^\d+$/.test(uploadIdRaw)
+                              ? Number(uploadIdRaw)
+                              : sequentialFileIdx;
+                    if (fileIdx >= files.length) fileIdx = sequentialFileIdx;
+                    sequentialFileIdx += 1;
+                    const filePart = files[fileIdx];
+                    if (!filePart) {
+                        throw new HttpError(
+                            400,
+                            `write op has no paired file (item_upload_id=${uploadIdRaw})`,
+                            { legacyCode: 'bad_request' },
+                        );
+                    }
+                    const fileInfo = fileinfos[fileIdx] ?? {};
+                    const name =
+                        getString(record, 'name') ??
+                        (typeof fileInfo.name === 'string'
+                            ? fileInfo.name
+                            : undefined);
+                    if (!name) {
+                        throw new HttpError(400, 'write op missing `name`', {
+                            legacyCode: 'bad_request',
+                        });
+                    }
+                    const parentPath = resolveBatchRef(
+                        getString(record, 'path') ?? '',
+                        pathRefs,
+                    );
+                    const expandedParent = await expandClientPath(
+                        this.stores.fsEntry,
+                        parentPath,
+                        username,
+                    );
+                    // joinChildPath rejects a `name` carrying a slash or a
+                    // `.`/`..` segment, so it can't reach outside the parent
+                    // the ACL check below actually authorized.
+                    const targetPath = joinChildPath(
+                        expandedParent || '/',
+                        name,
+                    );
+                    // Mirrors the per-op /write|/mkdir routes: assert write
+                    // on the parent dir, but when the parent resolves to `/`
+                    // fall back to the target path so the ACL check rides
+                    // the ancestor chain instead of bouncing on root.
+                    const writeAclPath =
+                        expandedParent && expandedParent !== '/'
+                            ? expandedParent.replace(/\/+$/, '')
+                            : targetPath;
+                    await assertAccess(
+                        this.services.acl,
+                        this.services.fs,
+                        actor,
+                        writeAclPath,
+                        'write',
+                    );
+                    const dedupeName =
+                        getBoolean(record, 'dedupe_name') ?? true;
+                    const overwrite = getBoolean(record, 'overwrite') ?? false;
+                    const createMissingParents =
+                        getBoolean(
+                            record,
+                            'create_missing_ancestors',
+                            'create_missing_parents',
+                        ) ?? false;
+                    const writeContentType =
+                        typeof fileInfo.type === 'string'
+                            ? fileInfo.type
+                            : filePart.mimeType;
+                    const response = await this.services.fs.write(userId, {
+                        fileMetadata: {
+                            path: targetPath,
+                            size: filePart.content.length,
+                            ...(writeContentType
+                                ? { contentType: writeContentType }
+                                : {}),
+                            overwrite,
+                            dedupeName,
+                            createMissingParents,
+                        },
+                        fileContent: filePart.content,
+                    });
+                    await this.#emitGuiEvent(
+                        'outer.gui.item.added',
+                        response.fsEntry,
+                    );
+                    shaped = await toLegacyEntry(
+                        this.clients.event,
+                        response.fsEntry,
+                    );
+                } else if (op === 'mkdir') {
+                    const { targetPath, writeAclPath } =
+                        await this.#resolveBatchMkdirTarget(
+                            record,
+                            username,
+                            pathRefs,
+                        );
+                    await assertAccess(
+                        this.services.acl,
+                        this.services.fs,
+                        actor,
+                        writeAclPath,
+                        'write',
+                    );
+                    const entry = await this.services.fs.mkdir(userId, {
+                        path: targetPath,
+                        dedupeName: getBoolean(record, 'dedupe_name') ?? true,
+                        createMissingParents:
+                            getBoolean(
+                                record,
+                                'create_missing_ancestors',
+                                'create_missing_parents',
+                            ) ?? false,
+                    });
+                    this.#registerBatchRef(record, pathRefs, entry.path);
+                    await this.#emitGuiEvent('outer.gui.item.added', entry);
+                    shaped = await toLegacyEntry(this.clients.event, entry);
+                } else if (op === 'shortcut') {
+                    const parentPath = getString(record, 'path') ?? '';
+                    const name = getString(record, 'name');
+                    const shortcutToRaw =
+                        getString(record, 'shortcut_to_uid') ??
+                        getString(record, 'shortcut_to');
+                    if (!name) {
+                        throw new HttpError(400, 'shortcut op missing `name`', {
+                            legacyCode: 'shortcut_target_not_found',
+                        });
+                    }
+                    if (!shortcutToRaw) {
+                        throw new HttpError(
+                            400,
+                            'shortcut op missing `shortcut_to_uid`',
+                            { legacyCode: 'shortcut_target_not_found' },
+                        );
+                    }
+                    // A path or a uid; the desktop sends a path.
+                    const target = await resolveV1Selector(
+                        this.stores.fsEntry,
+                        resolveBatchRef(shortcutToRaw, pathRefs),
+                    );
+                    const expandedParent = await expandClientPath(
+                        this.stores.fsEntry,
+                        resolveBatchRef(parentPath, pathRefs),
+                        username,
+                    );
+                    const parent = await resolveV1Selector(
+                        this.stores.fsEntry,
+                        { path: expandedParent || '/' },
+                    );
+                    await assertAccess(
+                        this.services.acl,
+                        this.services.fs,
+                        actor,
+                        target.path,
+                        'read',
+                    );
+                    await assertAccess(
+                        this.services.acl,
+                        this.services.fs,
+                        actor,
+                        parent.path,
+                        'write',
+                    );
+                    const link = await this.services.fs.mkshortcut(userId, {
+                        parent,
+                        name,
+                        target,
+                        dedupeName: getBoolean(record, 'dedupe_name') ?? true,
+                    });
+                    await this.#emitGuiEvent('outer.gui.item.added', link);
+                    shaped = await toLegacyEntry(this.clients.event, link);
+                } else if (op === 'move') {
+                    const sourceRef =
+                        typeof record.source === 'string'
+                            ? resolveBatchRef(record.source, pathRefs)
+                            : record.source;
+                    const destinationRef =
+                        typeof record.destination === 'string'
+                            ? resolveBatchRef(record.destination, pathRefs)
+                            : record.destination;
+                    const source = await resolveV1Selector(
+                        this.stores.fsEntry,
+                        sourceRef,
+                    );
+                    const destinationParent = await resolveV1Selector(
+                        this.stores.fsEntry,
+                        destinationRef,
+                    );
+                    await assertAccess(
+                        this.services.acl,
+                        this.services.fs,
+                        actor,
+                        source.path,
+                        'write',
+                    );
+                    await assertCanMoveInto(
+                        this.services.acl,
+                        this.services.fs,
+                        actor,
+                        source,
+                        destinationParent,
+                    );
+                    const moved = await this.services.fs.move(userId, {
+                        source,
+                        destinationParent,
+                        newName: getString(record, 'new_name'),
+                        overwrite: getBoolean(record, 'overwrite') ?? false,
+                        dedupeName: getBoolean(record, 'dedupe_name') ?? false,
+                    });
+                    this.#registerBatchRef(record, pathRefs, moved.path);
+                    await this.#emitGuiEvent('outer.gui.item.moved', moved, {
+                        old_path: source.path,
+                    });
+                    shaped = await toLegacyEntry(this.clients.event, moved);
+                } else if (op === 'delete') {
+                    const pathField = getString(record, 'path');
+                    const selectorRef =
+                        pathField !== undefined
+                            ? resolveBatchRef(pathField, pathRefs)
+                            : record;
+                    const entry = await resolveV1Selector(
+                        this.stores.fsEntry,
+                        selectorRef,
+                    );
+                    await assertAccess(
+                        this.services.acl,
+                        this.services.fs,
+                        actor,
+                        entry.path,
+                        'write',
+                    );
+                    const descendantsOnly =
+                        getBoolean(record, 'descendants_only') ?? false;
+                    await this.services.fs.remove(userId, {
+                        entry,
+                        recursive: getBoolean(record, 'recursive') ?? true,
+                        descendantsOnly,
+                    });
+                    await this.#emitGuiEvent('outer.gui.item.removed', entry, {
+                        descendants_only: descendantsOnly,
+                    });
+                    shaped = { ok: true, uid: entry.uuid };
+                } else {
+                    throw new HttpError(400, `Unsupported batch op: '${op}'`, {
+                        legacyCode: 'bad_request',
+                    });
+                }
+                results.push(shaped);
+            } catch (err) {
+                hasError = true;
+                results.push(this.#serializeBatchError(err));
+            }
+        }
+
+        res.status(hasError ? 218 : 200).json({ results });
+    };
+
+    async #parseMultipartBatch(req: Request): Promise<{
+        ops: unknown[];
+        files: Array<{ content: Buffer; mimeType?: string; filename?: string }>;
+        fileinfos: Array<Record<string, unknown>>;
+    }> {
+        return new Promise((resolve, reject) => {
+            const ops: unknown[] = [];
+            const files: Array<{
+                content: Buffer;
+                mimeType?: string;
+                filename?: string;
+            }> = [];
+            const fileinfos: Array<Record<string, unknown>> = [];
+            let parseError: Error | null = null;
+            let totalBufferedBytes = 0;
+            // First error wins. Buffered files are dropped right away rather
+            // than held while the rest of the body drains.
+            const fail = (err: Error) => {
+                if (parseError) return;
+                parseError = err;
+                files.length = 0;
+            };
+            const tooLarge = (message: string) =>
+                new HttpError(413, message, {
+                    legacyCode: 'too_large' as never,
+                });
+            const reserve = (bytes: number): boolean => {
+                totalBufferedBytes += bytes;
+                if (totalBufferedBytes <= BATCH_MAX_TOTAL_SIZE) return true;
+                fail(
+                    tooLarge(
+                        `Batch exceeds ${BATCH_MAX_TOTAL_SIZE} bytes in total`,
+                    ),
+                );
+                return false;
+            };
+            let bb: ReturnType<typeof Busboy>;
+            try {
+                bb = Busboy({
+                    headers: req.headers,
+                    limits: {
+                        fileSize: BATCH_MAX_FILE_SIZE,
+                        files: BATCH_MAX_FILES,
+                        parts: BATCH_MAX_PARTS,
+                        fieldSize: BATCH_MAX_FIELD_SIZE,
+                    },
+                });
+            } catch (err) {
+                // Missing boundary or unparseable content-type.
+                reject(malformedMultipart(err));
+                return;
+            }
+
+            bb.on('filesLimit', () =>
+                fail(
+                    tooLarge(
+                        `Too many files in batch (max ${BATCH_MAX_FILES})`,
+                    ),
+                ),
+            );
+            bb.on('partsLimit', () =>
+                fail(
+                    tooLarge(
+                        `Too many parts in batch (max ${BATCH_MAX_PARTS})`,
+                    ),
+                ),
+            );
+            bb.on('fieldsLimit', () =>
+                fail(tooLarge('Too many fields in batch')),
+            );
+
+            bb.on('field', (fieldName, value, info) => {
+                if (parseError) return;
+                if (info?.valueTruncated) {
+                    fail(
+                        tooLarge(
+                            `\`${fieldName}\` field exceeds ${BATCH_MAX_FIELD_SIZE} bytes`,
+                        ),
+                    );
+                    return;
+                }
+                if (!reserve(Buffer.byteLength(value))) return;
+                // Ignore operation_id / socket_id / misc fields — not
+                // needed for v2 batch semantics.
+                if (fieldName !== 'operation' && fieldName !== 'fileinfo') {
+                    return;
+                }
+                let parsed: unknown;
+                try {
+                    parsed = JSON.parse(value);
+                } catch {
+                    fail(
+                        new HttpError(
+                            400,
+                            `\`${fieldName}\` field is not valid JSON`,
+                            { legacyCode: 'bad_request' },
+                        ),
+                    );
+                    return;
+                }
+                if (fieldName === 'operation') {
+                    ops.push(parsed);
+                } else {
+                    fileinfos.push(
+                        parsed && typeof parsed === 'object'
+                            ? (parsed as Record<string, unknown>)
+                            : {},
+                    );
+                }
+            });
+
+            // Buffer file parts into memory so batched writes can be
+            // processed in any order relative to the operation specs.
+            // For streaming uploads use the signed `/writeFile` endpoint.
+            bb.on('file', (_fieldName, stream, info) => {
+                const chunks: Buffer[] = [];
+                // After a failure the stream keeps draining so the multipart
+                // parser reaches `close`, but nothing more is held.
+                stream.on('data', (chunk: Buffer) => {
+                    if (parseError || !reserve(chunk.length)) {
+                        chunks.length = 0;
+                        return;
+                    }
+                    chunks.push(chunk);
+                });
+                // Busboy emits `limit` after the first byte past `fileSize`.
+                stream.on('limit', () => {
+                    chunks.length = 0;
+                    fail(
+                        tooLarge(
+                            `File in batch exceeds ${BATCH_MAX_FILE_SIZE} bytes`,
+                        ),
+                    );
+                });
+                stream.on('end', () => {
+                    if (parseError) return;
+                    files.push({
+                        content: Buffer.concat(chunks),
+                        mimeType:
+                            info && typeof info.mimeType === 'string'
+                                ? info.mimeType
+                                : undefined,
+                        filename:
+                            info && typeof info.filename === 'string'
+                                ? info.filename
+                                : undefined,
+                    });
+                });
+                stream.on('error', (err: Error) => fail(err));
+            });
+
+            bb.on('close', () => {
+                if (parseError) reject(malformedMultipart(parseError));
+                else resolve({ ops, files, fileinfos });
+            });
+            bb.on('error', (err) => reject(malformedMultipart(err)));
+            // A client that disconnects mid-body never lets busboy close.
+            req.on('error', (err) => reject(malformedMultipart(err)));
+            req.on('aborted', () =>
+                reject(malformedMultipart(new Error('Request aborted'))),
+            );
+
+            req.pipe(bb);
+        });
+    }
+
+    #parseJsonBatch(req: Request): unknown[] {
+        const body = asRecord(req.body);
+        const ops = Array.isArray(body.operations)
+            ? body.operations
+            : Array.isArray(body.ops)
+              ? body.ops
+              : [];
+        if (ops.length > BATCH_MAX_OPS) {
+            throw new HttpError(
+                413,
+                `Too many operations in batch (max ${BATCH_MAX_OPS})`,
+                { legacyCode: 'too_large' as never },
+            );
+        }
+        return ops;
+    }
+
+    /**
+     * Batch `mkdir` shapes: `{ parent, path }` with `path` relative to
+     * `parent`, `{ path, name }` with `path` as the parent, or an absolute `{
+     * path }`.
+     */
+    async #resolveBatchMkdirTarget(
+        record: Record<string, unknown>,
+        username: string | undefined,
+        pathRefs: Map<string, string>,
+    ): Promise<{ targetPath: string; writeAclPath: string }> {
+        // Write is checked on the immediate parent: a multi-segment relative
+        // path must not be authorized by a grant on the target itself. Under
+        // `/` there is no parent to check, so the target stands in.
+        const withAclPath = (targetPath: string) => {
+            const parentPath = pathPosix.dirname(targetPath);
+            return {
+                targetPath,
+                writeAclPath: parentPath === '/' ? targetPath : parentPath,
+            };
+        };
+
+        const name = getString(record, 'name');
+
+        if (typeof record.parent === 'string' && !name) {
+            const parentPath = await expandClientPath(
+                this.stores.fsEntry,
+                resolveBatchRef(record.parent, pathRefs),
+                username,
+            );
+            const segments = (getString(record, 'path') ?? '')
+                .split('/')
+                .filter((s) => s.length > 0);
+            if (segments.length === 0) {
+                throw new HttpError(400, 'mkdir op missing `name`', {
+                    legacyCode: 'bad_request',
+                });
+            }
+            let targetPath = parentPath || '/';
+            for (const segment of segments) {
+                targetPath = joinChildPath(targetPath, segment);
+            }
+            return withAclPath(targetPath);
+        }
+
+        if (name) {
+            const parentPath = await expandClientPath(
+                this.stores.fsEntry,
+                resolveBatchRef(getString(record, 'path') ?? '', pathRefs),
+                username,
+            );
+            return withAclPath(joinChildPath(parentPath || '/', name));
+        }
+
+        const rawPath = getString(record, 'path');
+        if (!rawPath) {
+            throw new HttpError(400, 'mkdir op missing `name`', {
+                legacyCode: 'bad_request',
+            });
+        }
+        const { parentPath, name: derivedName } = splitParentAndName(
+            await expandClientPath(
+                this.stores.fsEntry,
+                resolveBatchRef(rawPath, pathRefs),
+                username,
+            ),
+        );
+        return withAclPath(joinChildPath(parentPath, derivedName));
+    }
+
+    /** Record an op's `as` (a bare name, no slash) for later `$name` refs. */
+    #registerBatchRef(
+        record: Record<string, unknown>,
+        pathRefs: Map<string, string>,
+        path: string,
+    ): void {
+        const as = record.as;
+        if (typeof as === 'string' && as.length > 0 && !as.includes('/')) {
+            pathRefs.set(as, path);
+        }
+    }
+
+    #serializeBatchError(err: unknown): Record<string, unknown> {
+        if (err instanceof HttpError) {
+            const payload: Record<string, unknown> = {
+                error: true,
+                status: err.statusCode,
+                message: err.message,
+                code: err.legacyCode ?? err.code,
+            };
+            // Same as the terminal errorHandler: extra fields (e.g.
+            // `entry_name` on item_with_same_name_exists) ride along
+            // without clobbering the canonical slots.
+            if (err.fields) {
+                for (const [k, v] of Object.entries(err.fields)) {
+                    if (!(k in payload)) payload[k] = v;
+                }
+            }
+            return payload;
+        }
+        if (err instanceof Error) {
+            return { error: true, status: 500, message: err.message };
+        }
+        return { error: true, status: 500, message: 'Unknown batch error' };
+    }
+
+    // -- Helpers ---------------------------------------------------------
+
+    /**
+     * Resolve the entry a signed URL names and verify the signature against its
+     * current owner. Malformed or expired params fail before the lookup.
+     */
+    async #resolveSignedEntry(
+        query: Record<string, unknown>,
+        action: SignAction,
+        signingCfg: SigningConfig,
+    ): Promise<FSEntry> {
+        const signed = {
+            uid: query.uid as string,
+            expires: query.expires as string,
+            signature: query.signature as string,
+        };
+        const { uid } = parseSignedQuery(signed);
+        // A non-UUID uid can never match a real entry — skip the cache/DB
+        // round trip a forged request would otherwise pay for on every hit.
+        const entry = UUID_SHAPE.test(uid)
+            ? await this.stores.fsEntry.getEntryByUuid(uid)
+            : null;
+        verifySignature(signed, action, signingCfg, entry?.userId ?? null);
+        // Only a signature from before owner binding verifies without an entry.
+        if (!entry)
+            throw new HttpError(404, 'Subject does not exist', {
+                legacyCode: 'subject_does_not_exist',
+            });
+        return entry;
+    }
+
+    #requireActor(req: Request) {
+        const actor = req.actor;
+        if (!actor) {
+            throw new HttpError(401, 'Unauthorized', {
+                legacyCode: 'unauthorized',
+            });
+        }
+        return actor;
+    }
+
+    #getActorUserId(req: Request): number {
+        const requestUser = (req as Request & { user?: { id?: unknown } }).user;
+        const actorUser = req.actor?.user;
+        const candidate = requestUser?.id ?? actorUser?.id;
+        if (candidate === undefined || candidate === null) {
+            throw new HttpError(401, 'Unauthorized', {
+                legacyCode: 'unauthorized',
+            });
+        }
+        const numeric = Number(candidate);
+        if (Number.isNaN(numeric))
+            throw new HttpError(401, 'Unauthorized', {
+                legacyCode: 'unauthorized',
+            });
+        return numeric;
+    }
+
+    #isRootPathRef(body: Record<string, unknown>): boolean {
+        if (body.uid !== undefined || body.uuid !== undefined) return false;
+        if (body.id !== undefined) return false;
+        if (body.parent !== undefined) return false;
+        const path = body.path;
+        if (typeof path !== 'string') return false;
+        return path.trim() === '/';
+    }
+
+    #parseSortBy(
+        body: Record<string, unknown>,
+    ): 'name' | 'modified' | 'type' | 'size' | null {
+        const raw = getString(body, 'sortBy') || getString(body, 'sort_by');
+        if (!raw) return null;
+        const normalized = raw.toLowerCase();
+        return (
+            (['name', 'modified', 'type', 'size'] as const).find(
+                (v) => v === normalized,
+            ) ?? null
+        );
+    }
+
+    #parseSortOrder(body: Record<string, unknown>): 'asc' | 'desc' | null {
+        const raw =
+            getString(body, 'sortOrder') || getString(body, 'sort_order');
+        if (!raw) return null;
+        const normalized = raw.toLowerCase();
+        return (['asc', 'desc'] as const).find((v) => v === normalized) ?? null;
+    }
+
+    // Reserved escape hatch for lazy-loading auxiliary route handlers.
+    #createLazyHandler(
+        key: string,
+        cache: RouterCache,
+        loader: (key: string) => Promise<RequestHandler | null>,
+    ): RequestHandler {
+        return async (req, res, next) => {
+            let handler = cache.get(key);
+            if (handler === undefined) {
+                handler = await loader(key);
+                cache.set(key, handler);
+            }
+            if (!handler) {
+                next();
+                return;
+            }
+            handler(req, res, next);
+        };
+    }
+}

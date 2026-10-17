@@ -1,0 +1,811 @@
+/*
+ * Copyright (C) 2024-present Puter Technologies Inc.
+ *
+ * This file is part of Puter.
+ *
+ * Puter is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published
+ * by the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+import type { RequestHandler } from 'express';
+import { contentType as contentTypeFromMime } from 'mime-types';
+import { posix as pathPosix } from 'node:path';
+import type { puterClients } from '../../../clients';
+import type { puterServices } from '../../../services';
+import { HOSTED_ASSET_COOKIES } from '../../../services/auth/AuthService';
+import { MANAGE_PERM_PREFIX } from '../../../services/permission/consts';
+import type { puterStores } from '../../../stores';
+import type { IConfig, LayerInstances } from '../../../types';
+import { awaitLater } from '../../../util/concurrency';
+import { makeActor } from '../../actor';
+import {
+    buildAppCenterFallback,
+    buildHostingConfig,
+    buildPrivateHostRedirect,
+    buildPublicHostRedirect,
+    hostMatchesPrivateDomain,
+    isTopLevelNavigation,
+    pathWithoutQueryParam,
+    renderLoginBootstrapHtml,
+    resolveOwnedAppForHostedSite,
+    resolvePrivateIdentity,
+    resolvePublicHostedIdentity,
+} from './privateAppGate';
+import {
+    isSiteConfigPath,
+    loadSiteConfig,
+    resolveErrorTarget,
+    type SiteConfig,
+} from './puterSiteConfig';
+
+/**
+ * Serves user-hosted static sites on the hosting domains (`*.puter.site`,
+ * `*.puter.app`, and their alt variants). Must run after the auth probe so
+ * `req.actor` is populated for the private-app gate, but before controller
+ * routes so site hosts don't accidentally hit the API/GUI routers.
+ *
+ * Scope:
+ *
+ * - Subdomain → site row (SubdomainStore) → file under site root
+ * - 404 for unknown subdomain / missing file / suspended owner
+ * - Private-app gate via `app.privateAccess.check` — marketplace extension
+ *   decides; default is denied + redirect to `app-center`
+ * - Range / ETag / Last-Modified passthrough via `fsEntry.readContent`
+ *
+ * Deferred (not yet implemented):
+ *
+ * - `.at` username-based sites (UUIDv5-keyed `/user/Public`).
+ * - Custom domains (subdomains table `domain` column) — requires host validation
+ *   to allow arbitrary hostnames first.
+ *
+ * Site config:
+ *
+ * - `.puter_site_config` at the site root (see `puterSiteConfig.ts`) supplies
+ *   custom error pages. On a file 404, the matching rule's `file` is served
+ *   with the rule's `status` — supports the SPA fallback pattern of `404 →
+ *   /index.html with status 200`. The config file itself is hidden from public
+ *   serving.
+ */
+
+/**
+ * Reserved folder at a site root holding server-side worker source
+ * (`__workers/<name>.worker.js`). Its contents are backend code — users' trade
+ * secrets live there — so nothing under it is ever served: not directly, not
+ * via the folder→index.html fallback, and not as a custom error page target.
+ * Matched on the decoded, normalized path, and case-insensitively, so no
+ * alternate spelling of the same entry can reach the bytes.
+ *
+ * Matched at ANY depth, not just the site root: site roots can nest, and a site
+ * rooted above another site would otherwise serve the inner site's `__workers/`
+ * as ordinary content under `/inner/__workers/...`.
+ */
+const WORKERS_FOLDER = '__workers';
+const isWorkersSourcePath = (urlPath: string): boolean =>
+    urlPath
+        .split('/')
+        .some((segment) => segment.toLowerCase() === WORKERS_FOLDER);
+
+/**
+ * Checks the stored path of a looked-up entry. The URL-level guards are not
+ * enough on MySQL: `fsentries.path` is utf8mb4_unicode_ci, so `__wörkers`,
+ * fullwidth or zero-width spellings resolve to the real `__workers` row.
+ */
+const isServableEntryPath = (
+    entryPath: string | null | undefined,
+    rootPath: string,
+): boolean => {
+    if (!entryPath?.startsWith(`${rootPath}/`)) return false;
+    const relPath = entryPath.slice(rootPath.length);
+    return !isWorkersSourcePath(relPath) && !isSiteConfigPath(relPath);
+};
+
+/** Inside some owner's top-level Trash, which is where Delete puts things. */
+const isTrashedPath = (path: string): boolean =>
+    /^\/[^/]+\/Trash(\/|$)/u.test(path);
+
+/**
+ * Suggested value for `config.hosting_csp`. Not applied unless configured.
+ *
+ * Sources stay wide open because hosted sites legitimately pull from anywhere,
+ * and `'unsafe-inline'` stays because most hosted apps use inline script. What
+ * it withholds is `'unsafe-eval'` — the capability a stale library needs to
+ * reach `new Function`, which is how CVE-2024-4367 turns a crafted PDF into
+ * script execution in the viewer app's own origin.
+ *
+ * Apps that genuinely need eval (some wasm glue, some template engines) will
+ * break under this, which is why it ships as a suggestion rather than a
+ * default. Roll it out with `hosting_csp_report_only` first and read the
+ * violation reports before enforcing.
+ */
+export const RECOMMENDED_HOSTING_CSP = [
+    'default-src * data: blob:',
+    "script-src * data: blob: 'unsafe-inline'",
+    "style-src * data: blob: 'unsafe-inline'",
+    "object-src 'none'",
+    "base-uri 'self'",
+].join('; ');
+
+const SUBDOMAIN_404 = `<div style="font-size: 20px;
+        text-align: center;
+        height: calc(100vh);
+        display: flex;
+        justify-content: center;
+        flex-direction: column;"><h1 style="margin:0; color:#727272;">404</h1><p style="margin-top:10px;">Subdomain or site is not pointing to a directory.</p></div>`;
+interface SubdomainRow {
+    id: number;
+    uuid: string;
+    subdomain: string;
+    user_id: number | null;
+    root_dir_id: number | null;
+    associated_app_id: number | null;
+    domain?: string | null;
+    protected?: number | null;
+}
+
+interface AppRow {
+    id: number;
+    uid: string;
+    name?: string;
+    is_private?: number | null;
+    owner_user_id?: number;
+}
+
+interface UserRow {
+    id: number;
+    uuid: string;
+    username: string;
+    email?: string | null;
+    suspended?: number | null;
+}
+
+interface Layers {
+    clients: LayerInstances<typeof puterClients>;
+    stores: LayerInstances<typeof puterStores>;
+    services: LayerInstances<typeof puterServices>;
+}
+
+function normalizeHost(value: string | undefined | null): string | null {
+    if (typeof value !== 'string') return null;
+    const trimmed = value.trim().toLowerCase().replace(/^\./, '');
+    if (!trimmed) return null;
+    return trimmed.split(':')[0] || null;
+}
+
+export const createPuterSiteMiddleware = (
+    config: IConfig,
+    layers: Layers,
+): RequestHandler => {
+    const domain = normalizeHost(config.domain);
+    const hostingDomains = [
+        normalizeHost(config.static_hosting_domain),
+        normalizeHost(config.static_hosting_domain_alt),
+        normalizeHost(config.private_app_hosting_domain),
+        normalizeHost(config.private_app_hosting_domain_alt),
+    ].filter((d): d is string => !!d);
+
+    // The private-app hosting domains are the only ones where unowned,
+    // unentitled access should be rejected outright — used below to
+    // default-deny when a subdomain row on these hosts has no associated
+    // app (or the app lookup fails).
+    const privateHostingDomains = new Set(
+        [
+            normalizeHost(config.private_app_hosting_domain),
+            normalizeHost(config.private_app_hosting_domain_alt),
+        ].filter((d): d is string => !!d),
+    );
+
+    if (hostingDomains.length === 0) {
+        return (_req, _res, next) => next();
+    }
+    const hostingCfg = buildHostingConfig(config);
+
+    // Longest-first so `foo.bar.puter.site` matches `bar.puter.site` before
+    // falling back to `puter.site`.
+    const sortedHostingDomains = [...hostingDomains].sort(
+        (a, b) => b.length - a.length,
+    );
+
+    const matchHostingDomain = (host: string): string | null => {
+        for (const d of sortedHostingDomains) {
+            if (host === d) return d;
+            if (host.endsWith(`.${d}`)) return d;
+        }
+        return null;
+    };
+
+    return async (req, res, next) => {
+        const host = normalizeHost(req.hostname);
+        if (!host) return next();
+
+        const matched = matchHostingDomain(host);
+        if (!matched) return next();
+
+        // Bare hosting domain (e.g. `puter.site`) → redirect to the main site.
+        if (host === matched) {
+            if (domain) {
+                res.redirect(302, `${req.protocol}://${domain}`);
+                return;
+            }
+            res.status(404).type('text/plain').send('Subdomain not found');
+            return;
+        }
+
+        // `host` is `<prefix>.<matched>`; subdomain is the left-most label.
+        const prefix = host.slice(0, host.length - matched.length - 1);
+        const subdomain = prefix.split('.')[0] || '';
+
+        if (!subdomain || subdomain === 'www') {
+            if (domain) {
+                res.redirect(302, `${req.protocol}://${domain}`);
+                return;
+            }
+            res.status(404).type('text/plain').send('Subdomain not found');
+            return;
+        }
+
+        const site = (await layers.stores.subdomain.getBySubdomain(
+            subdomain,
+        )) as unknown as SubdomainRow | null;
+        if (!site || site.user_id === null || site.user_id === undefined) {
+            res.status(404).type('text/plain').send('Subdomain not found');
+            return;
+        }
+
+        // Suspended owner 404s — don't leak the suspension reason.
+        const owner = (await layers.stores.user.getById(
+            site.user_id,
+        )) as unknown as UserRow | null;
+        if (!owner || owner.suspended) {
+            res.status(404).type('text/plain').send('Subdomain not found');
+            return;
+        }
+
+        // The hosted app and the site root depend only on the site row, so
+        // both lookups run together. Each is awaited where it is read, so an
+        // early return drops the other and errors surface in the same order.
+        //
+        // The subdomain row's `associated_app_id` column is intentionally
+        // not consulted — it was previously user-writable without an
+        // ownership check (so any value there is either legacy or planted).
+        // Resolve "what app does this subdomain host?" directly from
+        // `apps.owner_user_id = site.user_id` + `index_url` match against
+        // the request host.
+        const appLookup = awaitLater(
+            resolveOwnedAppForHostedSite({
+                req,
+                site: { user_id: site.user_id },
+                appStore: layers.stores.app,
+                config: hostingCfg,
+            }),
+        );
+        const rootLookup =
+            site.root_dir_id === null || site.root_dir_id === undefined
+                ? null
+                : awaitLater(
+                      layers.stores.fsEntry.getEntryById(site.root_dir_id),
+                  );
+
+        const associatedApp = (await appLookup) as AppRow | null;
+
+        const isPrivateApp = Boolean(associatedApp?.is_private);
+        const privateApp = isPrivateApp ? associatedApp : null;
+
+        if (isPrivateApp) {
+            // Private apps must run on the private hosting domain. If a
+            // visitor arrives via the public domain (puter.site), redirect
+            // them to the equivalent private-host URL so the cookie scope
+            // and gate run on the right origin.
+            if (!hostMatchesPrivateDomain(host, hostingCfg.privateDomains)) {
+                const redirectUrl = buildPrivateHostRedirect(
+                    req,
+                    privateApp as never,
+                    hostingCfg,
+                );
+                if (redirectUrl) {
+                    res.redirect(302, redirectUrl);
+                    return;
+                }
+                // No private host configured — refuse rather than leak.
+                res.status(403)
+                    .type('text/plain')
+                    .send('Private app host mismatch');
+                return;
+            }
+
+            // Resolve identity. Lookup order: sticky private-asset
+            // cookie → req.actor → session cookie → bootstrap token.
+            const identity = await resolvePrivateIdentity({
+                req,
+                authService: layers.services.auth,
+                sessionCookieName:
+                    typeof config.cookie_name === 'string'
+                        ? config.cookie_name
+                        : undefined,
+                expectedAppUid: privateApp!.uid,
+                expectedSubdomain: subdomain,
+                expectedPrivateHost: host,
+            });
+
+            if (!identity.userUid) {
+                // No identity yet — render the sign-in bootstrap so the
+                // browser can call `puter.auth.signIn()` and retry with a
+                // token in the query string.
+                res.status(200)
+                    .set('Cache-Control', 'no-store')
+                    .set('X-Robots-Tag', 'noindex, nofollow')
+                    .set('Referrer-Policy', 'no-referrer')
+                    .type('text/html; charset=UTF-8')
+                    .send(
+                        renderLoginBootstrapHtml(
+                            privateApp as unknown as {
+                                uid?: string;
+                                name?: string;
+                                title?: string;
+                            },
+                        ),
+                    );
+                return;
+            }
+
+            // Entitlement check runs on every request — matching v1. The
+            // sticky cookie is an identity shortcut, not an access cache;
+            // the marketplace extension already caches access decisions
+            // in Redis so repeat checks are cheap. This guarantees that
+            // if entitlement is revoked (refund, grant removed) the very
+            // next request stops serving content.
+            const checkEvent = {
+                appUid: privateApp!.uid,
+                userUid: identity.userUid,
+                requestHost: host,
+                requestPath: req.path,
+                result: {
+                    allowed: false,
+                } as {
+                    allowed: boolean;
+                    reason?: string;
+                    redirectUrl?: string;
+                    checkedBy?: string;
+                },
+            };
+            try {
+                await layers.clients.event.emitAndWait(
+                    'app.privateAccess.check',
+                    checkEvent,
+                    {},
+                );
+            } catch (e) {
+                console.error('[puter-site] privateAccess.check threw', e);
+            }
+            if (!checkEvent.result.allowed) {
+                const fallback = buildAppCenterFallback(
+                    privateApp as unknown as {
+                        name?: string;
+                        uid?: string;
+                    },
+                    hostingCfg,
+                );
+                res.redirect(302, checkEvent.result.redirectUrl || fallback);
+                return;
+            }
+
+            // Mint the sticky cookie only when we don't already have a
+            // valid one — keeps Set-Cookie off of the hot path for repeat
+            // visitors but still refreshes after rotation/expiry.
+            let hasStickyCookie = !!identity.hasValidPrivateCookie;
+            if (!hasStickyCookie) {
+                try {
+                    const token =
+                        await layers.services.auth.createHostedAssetToken(
+                            'private',
+                            {
+                                appUid: privateApp!.uid,
+                                userUid: identity.userUid,
+                                sessionUuid: identity.sessionUuid,
+                                subdomain,
+                                host,
+                            },
+                        );
+                    res.cookie(
+                        HOSTED_ASSET_COOKIES.private.name,
+                        token,
+                        layers.services.auth.getHostedAssetCookieOptions({
+                            requestHostname: host,
+                        }),
+                    );
+                    hasStickyCookie = true;
+                } catch (e) {
+                    console.warn(
+                        '[puter-site] failed to mint private asset cookie',
+                        e,
+                    );
+                }
+            }
+
+            // Referrer-policy hardening — don't leak private-host URLs to
+            // third-party resources loaded from the app.
+            res.setHeader('Referrer-Policy', 'no-referrer');
+
+            // A tab opened straight on the app carries the sign-in token in
+            // its URL. Once the cookie stands in for it, reload without it so
+            // it doesn't stay in the address bar. Framed launches keep it:
+            // the SDK inside reads it from there.
+            const cleanPath =
+                hasStickyCookie && isTopLevelNavigation(req)
+                    ? pathWithoutQueryParam(req.originalUrl, 'puter.auth.token')
+                    : null;
+            if (cleanPath) {
+                res.set('Cache-Control', 'no-store');
+                res.redirect(302, cleanPath);
+                return;
+            }
+        } else if (privateHostingDomains.has(matched)) {
+            // Non-private content landed on the private hosting domain —
+            // mirror of the private redirect above. Covers two cases:
+            //   - a paid app that just flipped to free (is_private 1→0)
+            //     whose old `puter.app` URL is still bookmarked/shared;
+            //   - a plain hosted site that has no associated app.
+            // Redirect to the equivalent `puter.site` URL so the content
+            // resolves on the correct origin instead of 404ing.
+            const redirectUrl = buildPublicHostRedirect(req, hostingCfg);
+            if (redirectUrl) {
+                res.redirect(302, redirectUrl);
+                return;
+            }
+            // No public hosting domain configured — fall back to refusing
+            // rather than leaking via the private host.
+            res.status(404).type('text/plain').send('Subdomain not found');
+            return;
+        } else {
+            // Public hosted site. Mint the public hosted-actor cookie if
+            // we can identify the visitor — lets the hosted page make
+            // cross-origin requests as the actor without needing a
+            // host-scoped main session cookie. No-op for anonymous
+            // visitors.
+            try {
+                const identity = await resolvePublicHostedIdentity({
+                    req,
+                    authService: layers.services.auth,
+                    sessionCookieName:
+                        typeof config.cookie_name === 'string'
+                            ? config.cookie_name
+                            : undefined,
+                    expectedAppUid: associatedApp?.uid,
+                    expectedSubdomain: subdomain,
+                    expectedHost: host,
+                });
+                if (
+                    identity.userUid &&
+                    !(identity as { hasValidPublicCookie?: boolean })
+                        .hasValidPublicCookie &&
+                    associatedApp?.uid
+                ) {
+                    const token =
+                        await layers.services.auth.createHostedAssetToken(
+                            'public',
+                            {
+                                appUid: associatedApp.uid,
+                                userUid: identity.userUid,
+                                sessionUuid: identity.sessionUuid,
+                                subdomain,
+                                host,
+                            },
+                        );
+                    res.cookie(
+                        HOSTED_ASSET_COOKIES.public.name,
+                        token,
+                        layers.services.auth.getHostedAssetCookieOptions({
+                            requestHostname: host,
+                        }),
+                    );
+                }
+            } catch (e) {
+                // Best-effort — don't block the public file serve.
+                console.warn(
+                    '[puter-site] public hosted actor resolve failed',
+                    e,
+                );
+            }
+        }
+
+        if (site.root_dir_id === null || site.root_dir_id === undefined) {
+            res.status(404)
+                .type('text/html; charset=UTF-8')
+                .send(SUBDOMAIN_404);
+            return;
+        }
+
+        const rootEntry = await rootLookup;
+        if (!rootEntry) {
+            res.status(404)
+                .type('text/html; charset=UTF-8')
+                .send(SUBDOMAIN_404);
+            return;
+        }
+        if (!rootEntry.isDir) {
+            res.status(404)
+                .type('text/html; charset=UTF-8')
+                .send(SUBDOMAIN_404);
+            return;
+        }
+
+        // A site rooted in someone else's directory stands on the `manage`
+        // grant that authorized publishing it, and serves that whole subtree
+        // with the ACL bypassed — so the grant is re-read on every request.
+        // Trash is its own check: a grant is keyed on the node, not its
+        // location, so it survives the owner deleting the directory. Sites
+        // rooted in their publisher's own tree skip all of this.
+        if (rootEntry.userId !== site.user_id) {
+            let stillPublishable = false;
+            if (!isTrashedPath(rootEntry.path)) {
+                try {
+                    stillPublishable = await layers.services.acl.check(
+                        makeActor({
+                            user: {
+                                id: owner.id,
+                                uuid: owner.uuid,
+                                username: owner.username,
+                            },
+                        }),
+                        {
+                            path: rootEntry.path,
+                            resolveAncestors: () =>
+                                layers.services.fs.getAncestorChain(
+                                    rootEntry.path,
+                                ),
+                        },
+                        MANAGE_PERM_PREFIX,
+                    );
+                } catch (e) {
+                    // Fail closed — an unreadable grant is not a held one.
+                    console.warn(
+                        '[puter-site] publish grant recheck failed',
+                        e,
+                    );
+                }
+            }
+            if (!stillPublishable) {
+                res.status(404)
+                    .type('text/html; charset=UTF-8')
+                    .send(SUBDOMAIN_404);
+                return;
+            }
+        }
+
+        // Resolve URL path → absolute FS path under the site root.
+        let urlPath = req.path || '/';
+        if (urlPath.endsWith('/')) urlPath += 'index.html';
+        let decoded: string;
+        try {
+            decoded = decodeURIComponent(urlPath);
+        } catch {
+            // Malformed `%xx` escape — treat as a missing path, not a 500.
+            res.status(404)
+                .type('text/html; charset=UTF-8')
+                .send('<h1>404</h1><p>Not Found</p>');
+            return;
+        }
+        // pathPosix.normalize strips `..` segments; the join with '/' anchors
+        // it so traversal can't escape the site root.
+        const resolvedUrlPath = pathPosix.normalize(
+            pathPosix.join('/', decoded),
+        );
+        const rootPath = rootEntry.path.replace(/\/+$/, '');
+        if (!rootPath || rootPath === '/') {
+            res.status(403).type('text/plain').send('Forbidden');
+            return;
+        }
+        const filePath = rootPath + resolvedUrlPath;
+
+        // Hide the config file from public serving — visitors should
+        // see the same 404 as for any other missing path so the
+        // deployment shape isn't leaked.
+        const isConfigRequest = isSiteConfigPath(resolvedUrlPath);
+
+        // Subdomain hosting bypasses ACL by design: anything the owner placed
+        // under the registered root_dir is treated as public. Path traversal
+        // is blocked above by `pathPosix.normalize` anchoring at `/`.
+        // `__workers/` is carved out of that bypass: worker source is the one
+        // thing under a site root that is NOT public. Treated exactly like the
+        // config file — no lookup at all, so the folder→index.html fallback
+        // below can't resolve into it either.
+        let entry =
+            isConfigRequest || isWorkersSourcePath(resolvedUrlPath)
+                ? null
+                : await layers.stores.fsEntry.getEntryByPath(filePath);
+        if (entry?.isDir) {
+            // Folder request → fall back to <folder>/index.html, the same
+            // way `/` is rewritten to `/index.html` at the site root above.
+            entry = await layers.stores.fsEntry.getEntryByPath(
+                pathPosix.join(filePath, 'index.html'),
+            );
+        }
+        if (entry && !isServableEntryPath(entry.path, rootPath)) {
+            entry = null;
+        }
+
+        // Custom error page fallback. On a 404 we consult the site config
+        // for a rule and, if one resolves to an existing file, serve that
+        // instead. Critical: we do this exactly once — the error page
+        // itself never re-enters error handling, so a misconfigured
+        // `errors.404.file` that doesn't exist falls through to the
+        // default 404 page rather than looping.
+        let statusOverride: number | undefined;
+        if (!entry || entry.isDir) {
+            // Best-effort site config load, only needed on a 404. A missing /
+            // malformed config never blocks the request — `loadSiteConfig`
+            // returns null on any failure, and caches by `rootDirId`.
+            let siteConfig: SiteConfig | null = null;
+            try {
+                siteConfig = await loadSiteConfig({
+                    rootPath,
+                    rootDirId: rootEntry.id,
+                    fsEntryStore: layers.stores.fsEntry,
+                    fsService: layers.services.fs,
+                    cache: layers.clients.redis,
+                });
+            } catch (e) {
+                console.warn('[puter-site] loadSiteConfig threw', e);
+            }
+            const errorTarget = resolveErrorTarget(siteConfig, 404, rootPath);
+            // A config pointing `errors.404.file` into `__workers/` would
+            // publish worker source through the error page — refuse it the
+            // same way a nonexistent target is refused.
+            if (
+                errorTarget &&
+                !isWorkersSourcePath(errorTarget.absPath.slice(rootPath.length))
+            ) {
+                const candidate = await layers.stores.fsEntry.getEntryByPath(
+                    errorTarget.absPath,
+                );
+                if (
+                    candidate &&
+                    !candidate.isDir &&
+                    isServableEntryPath(candidate.path, rootPath)
+                ) {
+                    entry = candidate;
+                    statusOverride = errorTarget.status;
+                }
+            }
+        }
+
+        if (!entry || entry.isDir) {
+            res.status(404)
+                .type('text/html; charset=UTF-8')
+                .send('<h1>404</h1><p>Not Found</p>');
+            return;
+        }
+
+        // A listener owning the site may withhold this entry (a system site
+        // that publishes per-user files conditionally). Denied looks exactly
+        // like missing, and a listener failure denies rather than serves.
+        const accessCheck = {
+            subdomain,
+            host,
+            requestPath: req.path,
+            entry,
+            result: { allowed: true },
+        };
+        try {
+            await layers.clients.event.emitAndWait(
+                'site.access.check',
+                accessCheck,
+                {},
+            );
+        } catch (e) {
+            console.error('[puter-site] site.access.check threw', e);
+            accessCheck.result.allowed = false;
+        }
+        if (!accessCheck.result.allowed) {
+            res.status(404)
+                .type('text/html; charset=UTF-8')
+                .send('<h1>404</h1><p>Not Found</p>');
+            return;
+        }
+
+        // Stream the file. `fsEntry.readContent` honours Range + emits
+        // ETag/Last-Modified when the S3 layer returns them. Range
+        // requests are suppressed when serving a custom error page so
+        // the visitor always receives the full document with the
+        // configured status code (no 206 with a stale `bytes=...`
+        // header from the original request).
+        const range =
+            statusOverride === undefined &&
+            typeof req.headers.range === 'string'
+                ? req.headers.range
+                : undefined;
+        let download;
+        try {
+            download = await layers.services.fs.readContent(entry, {
+                range,
+            });
+        } catch (e) {
+            console.error('[puter-site] readContent failed', e);
+            return next(e);
+        }
+
+        const mime =
+            contentTypeFromMime(entry.name) || 'application/octet-stream';
+        res.setHeader('Content-Type', mime);
+
+        // Fire-and-forget signal for downstream extensions
+        const mimeBase = mime.split(';', 1)[0].trim().toLowerCase();
+        const isActiveDocument =
+            mimeBase === 'text/html' || mimeBase === 'application/xhtml+xml';
+
+        // Only active documents carry a CSP — it does nothing for an image or
+        // a stylesheet, and every header we set here ships to third-party apps
+        // we don't control. Off unless `hosting_csp` is configured; see
+        // RECOMMENDED_HOSTING_CSP.
+        if (config.hosting_csp && isActiveDocument) {
+            res.setHeader(
+                config.hosting_csp_report_only
+                    ? 'Content-Security-Policy-Report-Only'
+                    : 'Content-Security-Policy',
+                config.hosting_csp,
+            );
+        }
+
+        if (isActiveDocument) {
+            try {
+                const requestUrl = (req.originalUrl || '/').startsWith('/')
+                    ? req.originalUrl || '/'
+                    : `/${req.originalUrl}`;
+                layers.clients.event.emit(
+                    'site.htmlServed',
+                    {
+                        subdomain,
+                        entry,
+                        host,
+                        requestPath: req.path,
+                        requestUrl,
+                        mime: mimeBase,
+                    },
+                    {},
+                );
+            } catch (e) {
+                console.warn('[puter-site] site.htmlServed emit failed', e);
+            }
+        }
+        if (download.contentLength !== null) {
+            res.setHeader('Content-Length', String(download.contentLength));
+        }
+        if (download.contentRange)
+            res.setHeader('Content-Range', download.contentRange);
+        if (download.etag) res.setHeader('ETag', download.etag);
+        if (download.lastModified)
+            res.setHeader('Last-Modified', download.lastModified.toUTCString());
+        res.setHeader('Accept-Ranges', 'bytes');
+        res.setHeader('Access-Control-Allow-Origin', '*');
+        res.status(statusOverride ?? (range ? 206 : 200));
+
+        // Name who this response's bytes are billed to; the egress middleware
+        // does the metering. A visitor carrying a token pays for what they
+        // fetch, and the account hosting the site covers everyone else —
+        // hosting is unauthenticated by design, so most visitors are nobody in
+        // particular. Set unconditionally because hosting subdomains are not
+        // metered by default: this is what opts the response in.
+        req.egressActor = req.actor ?? {
+            user: {
+                uuid: owner.uuid,
+                id: owner.id,
+                username: owner.username,
+                email: owner.email ?? null,
+                suspended: !!owner.suspended,
+            },
+        };
+
+        req.on('close', () => download.body.destroy());
+        download.body.on('error', (err) => res.destroy(err));
+        download.body.pipe(res);
+    };
+};

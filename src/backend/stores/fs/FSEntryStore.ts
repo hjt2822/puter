@@ -1,0 +1,4026 @@
+/*
+ * Copyright (C) 2024-present Puter Technologies Inc.
+ *
+ * This file is part of Puter.
+ *
+ * Puter is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published
+ * by the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+import { statfs } from 'node:fs/promises';
+import { posix as pathPosix } from 'node:path';
+import { assertNormalized } from '../../services/fs/resolveNode.js';
+import { v4 as uuidv4 } from 'uuid';
+import type { WriteResult } from '../../clients/database/DatabaseClient.js';
+import { HttpError } from '../../core/http/HttpError.js';
+import type { LayerInstances } from '../../types.js';
+import {
+    runWithConcurrencyLimit,
+    runWithConcurrencyLimitSettled,
+} from '../../util/concurrency.js';
+import { escapeLike } from '../../util/sqlLike.js';
+import {
+    keysetPage,
+    normalizeLimit,
+    openCursor,
+} from '../../util/pagination.js';
+import type { puterStores } from '../index.js';
+import { PuterStore, readCacheValues } from '../types.js';
+import {
+    AncestorChain,
+    FSEntry,
+    FSEntryCreateInput,
+    FSEntrySubdomain,
+    PendingUploadCreateInput,
+    PendingUploadSession,
+} from './FSEntry.js';
+import {
+    groupByPendingUploadSessionPartition,
+    normalizePendingUploadSession,
+    PendingUploadSessionStatus,
+    toPendingUploadSession,
+    toPendingUploadSessionExpiresAtSeconds,
+    toPendingUploadSessionKey,
+    withPendingUploadSessionStatus,
+} from './pendingUploadSessionHelpers.js';
+import type {
+    FSEntryRow,
+    NormalizedEntryWrite,
+    ReadEntriesByPathsOptions,
+} from './types.js';
+
+// Sort fields a recursive listing accepts, mapped to the SQL expression they
+// order by. `name` orders by full path: across depths, bare names interleave
+// subtrees, while path keeps every child next to its parent. NULLs drop out of
+// keyset comparisons, so nullable columns are coalesced here and in the seek.
+const DESCENDANT_SORT_EXPRESSIONS = {
+    name: 'path',
+    modified: 'COALESCE(modified, 0)',
+    size: 'COALESCE(size, -1)',
+    type: 'is_dir',
+} as const;
+
+type DescendantSortField = keyof typeof DESCENDANT_SORT_EXPRESSIONS;
+
+// One directory's children sort by bare name; otherwise as above. Anything
+// unrecognised sorts by name.
+const CHILD_SORT_EXPRESSIONS: Record<DescendantSortField, string> = {
+    ...DESCENDANT_SORT_EXPRESSIONS,
+    name: 'name',
+};
+const childSortExpression = (sortBy: unknown): string =>
+    typeof sortBy === 'string' &&
+    Object.prototype.hasOwnProperty.call(CHILD_SORT_EXPRESSIONS, sortBy)
+        ? CHILD_SORT_EXPRESSIONS[sortBy as DescendantSortField]
+        : CHILD_SORT_EXPRESSIONS.name;
+
+// Cursors are opaque to callers but arrive from the wire, so the sort they pin
+// is validated rather than trusted.
+const toDescendantSortField = (value: unknown): DescendantSortField => {
+    if (
+        typeof value === 'string' &&
+        Object.prototype.hasOwnProperty.call(DESCENDANT_SORT_EXPRESSIONS, value)
+    ) {
+        return value as DescendantSortField;
+    }
+    throw new HttpError(400, 'unsupported sort field', {
+        legacyCode: 'bad_request',
+    });
+};
+
+// The value the next page seeks from — must match the sort expressions above.
+const sortValue = (
+    row: FSEntryRow,
+    sortBy: DescendantSortField,
+    names: 'name' | 'path',
+) => {
+    switch (sortBy) {
+        case 'modified':
+            return row.modified ?? 0;
+        case 'size':
+            return row.size ?? -1;
+        case 'type':
+            return row.is_dir;
+        case 'name':
+        default:
+            return row[names];
+    }
+};
+
+const thumbnailEntryNotFound = () =>
+    new HttpError(404, 'File entry was not found for thumbnail update', {
+        legacyCode: 'not_found',
+    });
+
+const ENTRY_CACHE_TTL_SECONDS = 60;
+const entryCacheKey = (
+    by: 'id' | 'uuid' | 'path',
+    value: string | number,
+): string => `prodfsv2:fsentry:${by === 'path' ? 'path:any' : by}:${value}`;
+// A renamed home's descendants can stay cached under the old path until their
+// TTL (past the invalidation caps, or behind a lagging replica), and ACL grants
+// a home by path prefix, so no other account may take the vacated name until
+// well after that.
+const VACATED_HOME_HOLD_SECONDS = 60 * 60;
+const vacatedHomeKey = (username: string) =>
+    `prodfsv2:vacated-home:${username.toLowerCase()}`;
+const BULK_QUERY_CHUNK_SIZE = 200;
+// MySQL abandons a statement's index ranges for a full scan once they outgrow
+// `range_optimizer_max_mem_size`, about 1,300 on the path key.
+const SUBTREE_PATTERNS_PER_STATEMENT = 500;
+const SUBTREE_PATTERNS_MAX = 5000;
+const DEFAULT_DB_CHUNK_CONCURRENCY = 4;
+// Two replica batcher flushes' worth of lineage lookups in flight.
+const LINEAGE_LOOKUP_CONCURRENCY = 10;
+// Cache refreshes after a batched update; each is a cache read and write.
+const ENTRY_PATCH_CONCURRENCY = 32;
+// Thumbnail text one batched UPDATE carries; inline data URLs run to
+// megabytes, and the statement must stay under the server's packet limit.
+const THUMBNAIL_BATCH_CHARS = 4 * 1024 * 1024;
+// Most entries whose invalidations one node broadcasts per broadcast flush
+// window (~200 bytes an entry); past the cap, invalidations stay local and
+// peers wait out ENTRY_CACHE_TTL_SECONDS.
+export const ENTRY_BROADCAST_CAP = 10_000;
+// BroadcastService's default `broadcast.outbound_flush_ms`.
+const DEFAULT_BROADCAST_FLUSH_MS = 2_000;
+// Most moved descendants a prefix rewrite invalidates by key; past it, the
+// rest wait out ENTRY_CACHE_TTL_SECONDS.
+const REBASED_INVALIDATION_MAX = 100_000;
+
+/**
+ * Store backing the `fsentries` table. Owns DB CRUD over filesystem entries,
+ * Redis caching keyed by uuid/path/id, and pending-upload-session state in the
+ * system KV store. Constructed by the store registry; depends on `kv`.
+ */
+export class FSEntryStore extends PuterStore {
+    declare protected stores: LayerInstances<typeof puterStores>;
+
+    #broadcastWindowStart = 0;
+    #broadcastedInWindow = 0;
+    #broadcastCapLogged = false;
+
+    #insertIgnoreIntoFsentriesSql(): string {
+        return this.clients.db.insertIgnoreInto('fsentries');
+    }
+
+    // JSON aggregation of associated subdomain rows, keyed on fsentries.id.
+    // SQLite uses `json_group_array` + `json_object`; MySQL/MariaDB use
+    // `JSON_ARRAYAGG` + `JSON_OBJECT`. Correlated subquery keeps the row
+    // count 1:1 with fsentries and avoids a GROUP BY on the outer query.
+    #subdomainsAggSql(): string {
+        return this.clients.db.case({
+            sqlite: `(
+                SELECT json_group_array(
+                    json_object('uuid', sd.uuid, 'subdomain', sd.subdomain)
+                )
+                FROM subdomains sd
+                WHERE sd.root_dir_id = fsentries.id
+            )`,
+            otherwise: `(
+                SELECT JSON_ARRAYAGG(
+                    JSON_OBJECT('uuid', sd.uuid, 'subdomain', sd.subdomain)
+                )
+                FROM subdomains sd
+                WHERE sd.root_dir_id = fsentries.id
+            )`,
+            postgres: `(
+                SELECT COALESCE(
+                    json_agg(
+                        json_build_object('uuid', sd.uuid, 'subdomain', sd.subdomain)
+                    ),
+                    '[]'::json
+                )
+                FROM subdomains sd
+                WHERE sd.root_dir_id = fsentries.id
+            )`,
+        });
+    }
+
+    // Projection shared by every read path: all fsentries columns plus the
+    // aggregated subdomains JSON aliased to `subdomains_agg`. Callers append
+    // their own `FROM fsentries ...` tail.
+    #selectFsentriesColumns(): string {
+        return `fsentries.*, ${this.#subdomainsAggSql()} AS subdomains_agg`;
+    }
+
+    #parseSubdomainsAgg(
+        raw: unknown,
+    ): Array<{ uuid: string; subdomain: string }> {
+        if (raw === null || raw === undefined) {
+            return [];
+        }
+        let parsed: unknown = raw;
+        if (typeof raw === 'string') {
+            if (raw.length === 0) {
+                return [];
+            }
+            try {
+                parsed = JSON.parse(raw);
+            } catch {
+                return [];
+            }
+        }
+        if (!Array.isArray(parsed)) {
+            return [];
+        }
+        const result: Array<{ uuid: string; subdomain: string }> = [];
+        for (const item of parsed) {
+            if (item === null || typeof item !== 'object') {
+                continue;
+            }
+            const record = item as Record<string, unknown>;
+            if (
+                typeof record.uuid !== 'string' ||
+                typeof record.subdomain !== 'string'
+            ) {
+                continue;
+            }
+            result.push({ uuid: record.uuid, subdomain: record.subdomain });
+        }
+        return result;
+    }
+
+    // Static hosting for user sites lives at `*.{static_hosting_domain}`
+    // (typically `puter.site`). Workers deploy as subdomain rows prefixed
+    // `workers.puter.<name>` and are exposed at `<name>.puter.work` — that
+    // mapping is hardcoded in `WorkerDriver`, mirrored here so the URL we
+    // return matches the deployment domain.
+    #buildFsEntrySubdomains(rows: Array<{ uuid: string; subdomain: string }>): {
+        subdomains: FSEntrySubdomain[];
+        workers: FSEntrySubdomain[];
+    } {
+        const protocol = this.config.protocol ?? 'https';
+        const siteDomain = this.config.static_hosting_domain ?? 'puter.site';
+        const workerPrefix = 'workers.puter.';
+        const workerDomain = 'puter.work';
+
+        const subdomains: FSEntrySubdomain[] = [];
+        const workers: FSEntrySubdomain[] = [];
+        for (const row of rows) {
+            if (row.subdomain.startsWith(workerPrefix)) {
+                const workerName = row.subdomain.slice(workerPrefix.length);
+                workers.push({
+                    uuid: row.uuid,
+                    subdomain: row.subdomain,
+                    address: `${protocol}://${workerName}.${workerDomain}`,
+                });
+                continue;
+            }
+            subdomains.push({
+                uuid: row.uuid,
+                subdomain: row.subdomain,
+                address: `${protocol}://${row.subdomain}.${siteDomain}`,
+            });
+        }
+        return { subdomains, workers };
+    }
+
+    #normalizePath(path: string): string {
+        const trimmed = path.trim();
+        if (trimmed.length === 0) {
+            throw new HttpError(400, 'Path cannot be empty', {
+                legacyCode: 'bad_request',
+            });
+        }
+
+        assertNormalized(trimmed);
+        let normalized = trimmed;
+        if (!normalized.startsWith('/')) {
+            normalized = `/${normalized}`;
+        }
+        if (normalized.length > 1 && normalized.endsWith('/')) {
+            normalized = normalized.slice(0, -1);
+        }
+
+        return normalized;
+    }
+
+    #toBoolean(value: number | boolean | null | undefined): boolean {
+        if (typeof value === 'boolean') {
+            return value;
+        }
+        return Number(value ?? 0) === 1;
+    }
+
+    #toNullableBoolean(
+        value: number | boolean | null | undefined,
+    ): boolean | null {
+        if (value === null || value === undefined) {
+            return null;
+        }
+        return this.#toBoolean(value);
+    }
+
+    #mapFSEntryRow(row: FSEntryRow): FSEntry {
+        const { subdomains, workers } = this.#buildFsEntrySubdomains(
+            this.#parseSubdomainsAgg(row.subdomains_agg),
+        );
+        // Legacy NULL-path rows surface here with `path: null`. Async lineage
+        // heal happens at the call site via `#healEntriesWithMissingPathsInPlace`
+        // — this mapper stays sync because mapping fans out from many places
+        // that batch their DB reads (per-chunk).
+        return {
+            id: Number(row.id),
+            uuid: row.uuid,
+            uid: row.uuid,
+            userId: Number(row.user_id),
+            parentId: row.parent_id === null ? null : Number(row.parent_id),
+            parentUid: row.parent_uid,
+            path: row.path,
+            name: row.name,
+            isDir: this.#toBoolean(row.is_dir),
+            bucket: row.bucket,
+            bucketRegion: row.bucket_region,
+            publicToken: row.public_token,
+            fileRequestToken: row.file_request_token,
+            isShortcut: this.#toBoolean(row.is_shortcut),
+            shortcutTo: row.shortcut_to,
+            associatedAppId: row.associated_app_id,
+            layout: row.layout,
+            sortBy: row.sort_by,
+            sortOrder: row.sort_order,
+            isPublic: this.#toNullableBoolean(row.is_public),
+            thumbnail: row.thumbnail,
+            immutable: this.#toBoolean(row.immutable),
+            metadata: row.metadata,
+            modified: Number(row.modified),
+            created: row.created === null ? null : Number(row.created),
+            accessed: row.accessed === null ? null : Number(row.accessed),
+            size: row.size === null ? null : Number(row.size),
+            symlinkPath: row.symlink_path,
+            isSymlink: this.#toBoolean(row.is_symlink),
+            subdomains,
+            workers,
+            hasWebsite: subdomains.length > 0,
+            // Populated by `SuggestedAppsService` in the request path — kept
+            // empty here so the field is always present on the type.
+            suggestedApps: [],
+        };
+    }
+
+    #entryCacheKeys(entry: Pick<FSEntry, 'id' | 'uuid' | 'path'>): string[] {
+        return [
+            entryCacheKey('id', entry.id),
+            entryCacheKey('uuid', entry.uuid),
+            entryCacheKey('path', entry.path),
+        ];
+    }
+
+    async #readEntryFromCache(cacheKey: string): Promise<FSEntry | null> {
+        try {
+            return this.#parseCachedEntry(
+                await this.clients.redis.get(cacheKey),
+            );
+        } catch {
+            return null;
+        }
+    }
+
+    /** `#readEntryFromCache` for many keys, in one pipelined round trip. */
+    async #readEntriesFromCache(
+        keys: string[],
+    ): Promise<Array<FSEntry | null>> {
+        const values = await readCacheValues(this.clients.redis, keys);
+        return values.map((raw) => this.#parseCachedEntry(raw));
+    }
+
+    #parseCachedEntry(raw: string | null): FSEntry | null {
+        if (!raw) return null;
+        try {
+            return JSON.parse(raw) as FSEntry;
+        } catch {
+            return null;
+        }
+    }
+
+    async #writeEntryToCache(entry: FSEntry): Promise<void> {
+        try {
+            const serialized = JSON.stringify(entry);
+            await Promise.all(
+                this.#entryCacheKeys(entry).map((cacheKey) => {
+                    return this.clients.redis.setex(
+                        cacheKey,
+                        ENTRY_CACHE_TTL_SECONDS,
+                        serialized,
+                    );
+                }),
+            );
+        } catch {
+            // Best effort cache write.
+        }
+    }
+
+    /** `#writeEntryToCache` for many entries, in one round trip. */
+    async #writeEntriesToCache(entries: FSEntry[]): Promise<void> {
+        if (entries.length === 0) return;
+        try {
+            const pipeline = this.clients.redis.pipeline();
+            for (const entry of entries) {
+                const serialized = JSON.stringify(entry);
+                for (const cacheKey of this.#entryCacheKeys(entry)) {
+                    pipeline.setex(
+                        cacheKey,
+                        ENTRY_CACHE_TTL_SECONDS,
+                        serialized,
+                    );
+                }
+            }
+            await pipeline.exec();
+        } catch {
+            // Best effort cache write.
+        }
+    }
+
+    async #invalidateEntryCache(entry: FSEntry): Promise<void> {
+        await this.#invalidateEntriesCache([entry]);
+    }
+
+    /**
+     * Drops here and, within the window's broadcast budget, in peer regions as
+     * one event for the batch. The read-path `#writeEntryToCache` stays local
+     * so backfills don't fan out.
+     */
+    async #invalidateEntriesCache(
+        entries: Array<Pick<FSEntry, 'id' | 'uuid' | 'path'>>,
+    ): Promise<void> {
+        const keysOf = (batch: typeof entries) =>
+            batch.flatMap((entry) => this.#entryCacheKeys(entry));
+        const broadcastCount = this.#takeBroadcastBudget(entries.length);
+        await this.publishCacheKeys({
+            keys: keysOf(entries.slice(0, broadcastCount)),
+            broadcast: true,
+        });
+        await this.publishCacheKeys({
+            keys: keysOf(entries.slice(broadcastCount)),
+        });
+    }
+
+    /** How many of `count` entries may still broadcast this window. */
+    #takeBroadcastBudget(count: number): number {
+        const flushMs = Number(this.config.broadcast?.outbound_flush_ms);
+        const windowMs =
+            Number.isFinite(flushMs) && flushMs > 0
+                ? flushMs
+                : DEFAULT_BROADCAST_FLUSH_MS;
+        const now = Date.now();
+        if (now - this.#broadcastWindowStart >= windowMs) {
+            this.#broadcastWindowStart = now;
+            this.#broadcastedInWindow = 0;
+            this.#broadcastCapLogged = false;
+        }
+        const allowed = Math.min(
+            count,
+            ENTRY_BROADCAST_CAP - this.#broadcastedInWindow,
+        );
+        this.#broadcastedInWindow += allowed;
+        if (allowed < count && !this.#broadcastCapLogged) {
+            this.#broadcastCapLogged = true;
+            console.warn(
+                `[FSEntryStore] broadcast cap (${ENTRY_BROADCAST_CAP} entries per ${windowMs} ms) reached; invalidating the rest locally only`,
+            );
+        }
+        return allowed;
+    }
+
+    async invalidateEntryCacheByPathForUser(
+        _userId: number,
+        path: string,
+    ): Promise<void> {
+        const normalizedPath = this.#normalizePath(path);
+        const cacheKeys: string[] = [entryCacheKey('path', normalizedPath)];
+
+        const rows = (await this.clients.db.read(
+            `SELECT ${this.#selectFsentriesColumns()} FROM fsentries WHERE path = ? LIMIT 1`,
+            [normalizedPath],
+        )) as unknown as FSEntryRow[];
+        const row = rows[0];
+
+        if (row) {
+            const entry = this.#mapFSEntryRow(row);
+            await this.#invalidateEntryCache(entry);
+            return;
+        }
+
+        await this.publishCacheKeys({
+            keys: cacheKeys,
+            broadcast: this.#takeBroadcastBudget(1) > 0,
+        });
+    }
+
+    async invalidateEntryCacheByUuid(uuid: string): Promise<void> {
+        if (typeof uuid !== 'string' || uuid.length === 0) {
+            return;
+        }
+
+        const rows = (await this.clients.db.read(
+            `SELECT ${this.#selectFsentriesColumns()} FROM fsentries WHERE uuid = ? LIMIT 1`,
+            [uuid],
+        )) as unknown as FSEntryRow[];
+        const row = rows[0];
+
+        if (row) {
+            const entry = this.#mapFSEntryRow(row);
+            await this.#invalidateEntryCache(entry);
+            return;
+        }
+
+        const cached = await this.#readEntryFromCache(
+            entryCacheKey('uuid', uuid),
+        );
+        if (cached) {
+            await this.#invalidateEntryCache(cached);
+            return;
+        }
+
+        await this.publishCacheKeys({
+            keys: [`prodfsv2:fsentry:uuid:${uuid}`],
+            broadcast: this.#takeBroadcastBudget(1) > 0,
+        });
+    }
+
+    async invalidateEntryCacheById(id: number): Promise<void> {
+        if (typeof id !== 'number' || !Number.isFinite(id)) {
+            return;
+        }
+
+        const rows = (await this.clients.db.read(
+            `SELECT ${this.#selectFsentriesColumns()} FROM fsentries WHERE id = ? LIMIT 1`,
+            [id],
+        )) as unknown as FSEntryRow[];
+        const row = rows[0];
+
+        if (row) {
+            const entry = this.#mapFSEntryRow(row);
+            await this.#invalidateEntryCache(entry);
+            return;
+        }
+
+        const cached = await this.#readEntryFromCache(entryCacheKey('id', id));
+        if (cached) {
+            await this.#invalidateEntryCache(cached);
+            return;
+        }
+
+        await this.publishCacheKeys({
+            keys: [`prodfsv2:fsentry:id:${id}`],
+            broadcast: this.#takeBroadcastBudget(1) > 0,
+        });
+    }
+
+    #chunk<T>(values: T[], size: number): T[][] {
+        if (values.length === 0) {
+            return [];
+        }
+        const chunks: T[][] = [];
+        for (let index = 0; index < values.length; index += size) {
+            chunks.push(values.slice(index, index + size));
+        }
+        return chunks;
+    }
+
+    async #writePendingUploadSessions(
+        sessions: PendingUploadSession[],
+        operationName: string,
+    ): Promise<void> {
+        if (sessions.length === 0) {
+            return;
+        }
+
+        try {
+            await runWithConcurrencyLimit(
+                groupByPendingUploadSessionPartition(
+                    sessions,
+                    (session) => session.sessionId,
+                ),
+                DEFAULT_DB_CHUNK_CONCURRENCY,
+                ([systemPartition, group]) =>
+                    this.stores.kv.batchPut(
+                        {
+                            items: group.map((session) => ({
+                                key: toPendingUploadSessionKey(
+                                    session.sessionId,
+                                ),
+                                value: session,
+                                expireAt:
+                                    toPendingUploadSessionExpiresAtSeconds(
+                                        session.expiresAt,
+                                    ),
+                            })),
+                        },
+                        { systemPartition },
+                    ),
+            );
+        } catch (error) {
+            if (error instanceof Error) {
+                throw error;
+            }
+            throw new Error(`Failed to ${operationName}`);
+        }
+    }
+
+    async #getPendingUploadSessionsBySessionIds(
+        sessionIds: string[],
+    ): Promise<Map<string, PendingUploadSession>> {
+        const uniqueSessionIds = Array.from(new Set(sessionIds));
+        const sessionsById = new Map<string, PendingUploadSession>();
+        if (uniqueSessionIds.length === 0) {
+            return sessionsById;
+        }
+
+        const readSessions = async (
+            ids: string[],
+            systemPartition?: string,
+        ): Promise<void> => {
+            // SystemKVStore returns `{ res, usage }`; only `res` is the value.
+            const { res: rawValues } = await this.stores.kv.get(
+                {
+                    key: ids.map((sessionId) =>
+                        toPendingUploadSessionKey(sessionId),
+                    ),
+                },
+                { systemPartition },
+            );
+            if (!Array.isArray(rawValues)) {
+                return;
+            }
+
+            for (let index = 0; index < ids.length; index++) {
+                const sessionId = ids[index];
+                if (!sessionId) {
+                    continue;
+                }
+
+                const normalizedSession = normalizePendingUploadSession(
+                    rawValues[index],
+                    sessionId,
+                );
+                if (normalizedSession) {
+                    sessionsById.set(sessionId, normalizedSession);
+                }
+            }
+        };
+
+        await runWithConcurrencyLimit(
+            groupByPendingUploadSessionPartition(
+                uniqueSessionIds,
+                (sessionId) => sessionId,
+            ),
+            DEFAULT_DB_CHUNK_CONCURRENCY,
+            ([systemPartition, ids]) => readSessions(ids, systemPartition),
+        );
+
+        // Sessions written before partitioning sit in the unpartitioned system
+        // namespace. A session lives at most an hour (the presign clamp), so
+        // this fallback can go once partitioned writes have been deployed
+        // everywhere for longer than that.
+        const unpartitionedIds = uniqueSessionIds.filter(
+            (sessionId) => !sessionsById.has(sessionId),
+        );
+        if (unpartitionedIds.length > 0) {
+            await readSessions(unpartitionedIds);
+        }
+
+        return sessionsById;
+    }
+
+    async #markPendingSessionsWithStatus(
+        sessionIds: string[],
+        status: PendingUploadSessionStatus,
+        reason: string | null,
+    ): Promise<void> {
+        if (sessionIds.length === 0) {
+            return;
+        }
+
+        const sessionsById =
+            await this.#getPendingUploadSessionsBySessionIds(sessionIds);
+        const now = Date.now();
+        const updatedSessions = Array.from(new Set(sessionIds))
+            .map((sessionId) => {
+                const session = sessionsById.get(sessionId);
+                if (!session) {
+                    return null;
+                }
+
+                return withPendingUploadSessionStatus(
+                    session,
+                    status,
+                    reason,
+                    now,
+                );
+            })
+            .filter((session): session is PendingUploadSession =>
+                Boolean(session),
+            );
+
+        await this.#writePendingUploadSessions(
+            updatedSessions,
+            `mark pending upload sessions as ${status}`,
+        );
+    }
+
+    // Paths are globally unique because they're prefixed with the owner's
+    // username (`/<username>/...`); the SQL `WHERE` clause can't filter by
+    // user_id — doing so breaks older accounts where the stored `user_id`
+    // doesn't line up with the current id. Matches v1, which only ever
+    // queried `WHERE path = ?`. The userId param is accepted for call-site
+    // clarity but intentionally unused.
+    async #readEntriesByPathsForUser(
+        _userId: number,
+        paths: string[],
+        options: ReadEntriesByPathsOptions = {},
+    ): Promise<Map<string, FSEntry>> {
+        const useTryHardRead = Boolean(options.useTryHardRead);
+        const skipCache = Boolean(options.skipCache);
+        const normalizedPaths = Array.from(
+            new Set(
+                paths
+                    .map((path) => this.#normalizePath(path))
+                    .filter((path) => path.length > 0),
+            ),
+        );
+        const entriesByPath = new Map<string, FSEntry>();
+        if (normalizedPaths.length === 0) {
+            return entriesByPath;
+        }
+
+        const missingPaths: string[] = [];
+        if (skipCache) {
+            missingPaths.push(...normalizedPaths);
+        } else {
+            const cached = await this.#readEntriesFromCache(
+                normalizedPaths.map((path) => entryCacheKey('path', path)),
+            );
+            normalizedPaths.forEach((path, i) => {
+                const entry = cached[i];
+                if (entry) entriesByPath.set(path, entry);
+                else missingPaths.push(path);
+            });
+        }
+
+        const chunks = this.#chunk(missingPaths, BULK_QUERY_CHUNK_SIZE);
+        const chunkResults = await runWithConcurrencyLimit(
+            chunks,
+            DEFAULT_DB_CHUNK_CONCURRENCY,
+            async (chunk) => {
+                if (chunk.length === 0) {
+                    return [];
+                }
+
+                const placeholders = chunk.map(() => '?').join(', ');
+                const selectSql = `SELECT ${this.#selectFsentriesColumns()} FROM fsentries WHERE path IN (${placeholders})`;
+                const rows = (useTryHardRead
+                    ? await this.clients.db.tryHardRead(selectSql, chunk)
+                    : await this.clients.db.read(
+                          selectSql,
+                          chunk,
+                      )) as unknown as FSEntryRow[];
+
+                const entries = rows.map((row) => this.#mapFSEntryRow(row));
+                if (entries.length > 0) {
+                    await Promise.all(
+                        entries.map((entry) => this.#writeEntryToCache(entry)),
+                    );
+                }
+                return entries;
+            },
+        );
+        for (const chunkEntries of chunkResults) {
+            for (const entry of chunkEntries) {
+                entriesByPath.set(entry.path, entry);
+            }
+        }
+
+        // Per-path lineage fallback for entries the bulk SELECT missed —
+        // legacy rows with a NULL `path` column (see #resolveEntryByPathLineage).
+        // Every path of a fresh upload lands here, so the lookups run
+        // concurrently and share batcher flushes; the first failure in path
+        // order is the one surfaced.
+        const stillMissing =
+            options.lineage === false
+                ? []
+                : normalizedPaths.filter((path) => !entriesByPath.has(path));
+        const lineageResults = await runWithConcurrencyLimitSettled(
+            stillMissing,
+            LINEAGE_LOOKUP_CONCURRENCY,
+            async (path) => ({
+                path,
+                entry: await this.#resolveEntryByPathLineage(path),
+            }),
+        );
+        for (const result of lineageResults) {
+            if (result.status === 'rejected') throw result.reason;
+            const { path, entry } = result.value;
+            if (entry) entriesByPath.set(path, entry);
+        }
+
+        return entriesByPath;
+    }
+
+    #pathDepth(path: string): number {
+        return path.split('/').filter(Boolean).length;
+    }
+
+    async #ensureDirectoryPathsForUser(
+        userId: number,
+        requiredPaths: string[],
+    ): Promise<{
+        requiredEntryMap: Map<string, FSEntry>;
+        createdEntryMap: Map<string, FSEntry>;
+    }> {
+        const normalizedRequiredPaths = Array.from(
+            new Set(
+                requiredPaths
+                    .map((path) => this.#normalizePath(path))
+                    .filter((path) => path !== '/'),
+            ),
+        );
+        const requiredEntryMap = new Map<string, FSEntry>();
+        const createdEntryMap = new Map<string, FSEntry>();
+        if (normalizedRequiredPaths.length === 0) {
+            return {
+                requiredEntryMap,
+                createdEntryMap,
+            };
+        }
+
+        const candidateDirSet = new Set<string>();
+        for (const requiredPath of normalizedRequiredPaths) {
+            let cursor = requiredPath;
+            while (cursor !== '/') {
+                candidateDirSet.add(cursor);
+                cursor = pathPosix.dirname(cursor);
+            }
+        }
+
+        const candidatePaths = Array.from(candidateDirSet);
+        const allEntries = await this.#readEntriesByPathsForUser(
+            userId,
+            candidatePaths,
+        );
+        for (const path of candidatePaths) {
+            const entry = allEntries.get(path);
+            if (entry && !entry.isDir) {
+                throw new HttpError(
+                    409,
+                    `Path is not a directory: ${pathPosix.basename(path)}`,
+                    { legacyCode: 'conflict' },
+                );
+            }
+        }
+
+        const missingPaths = candidatePaths
+            .filter((path) => !allEntries.has(path))
+            .sort(
+                (pathA, pathB) =>
+                    this.#pathDepth(pathA) - this.#pathDepth(pathB),
+            );
+        if (missingPaths.length > 0) {
+            const uniqueDepths = Array.from(
+                new Set(missingPaths.map((path) => this.#pathDepth(path))),
+            ).sort((depthA, depthB) => depthA - depthB);
+
+            for (const depth of uniqueDepths) {
+                const pathsAtDepth = missingPaths.filter(
+                    (path) => this.#pathDepth(path) === depth,
+                );
+                if (pathsAtDepth.length === 0) {
+                    continue;
+                }
+
+                const now = Math.floor(Date.now() / 1000);
+                const insertRows: unknown[] = [];
+                const valuePlaceholders: string[] = [];
+                const expectedUuidByPath = new Map<string, string>();
+                const trueLiteral = this.clients.db.booleanLiteral(true);
+                const falseLiteral = this.clients.db.booleanLiteral(false);
+                for (const dirPath of pathsAtDepth) {
+                    const parentPath = pathPosix.dirname(dirPath);
+                    const parentEntry =
+                        parentPath === '/' ? null : allEntries.get(parentPath);
+                    if (parentPath !== '/' && !parentEntry) {
+                        throw new Error(
+                            `Parent directory not resolved while creating ${dirPath}`,
+                        );
+                    }
+                    if (parentEntry && !parentEntry.isDir) {
+                        throw new HttpError(
+                            409,
+                            `Path is not a directory: ${pathPosix.basename(parentPath)}`,
+                            { legacyCode: 'conflict' },
+                        );
+                    }
+
+                    const expectedUuid = uuidv4();
+                    expectedUuidByPath.set(dirPath, expectedUuid);
+                    valuePlaceholders.push(
+                        `(?, ?, ?, ?, ?, ?, ${trueLiteral}, ?, ?, ?, ${falseLiteral}, 0)`,
+                    );
+                    insertRows.push(
+                        expectedUuid,
+                        parentEntry ? parentEntry.userId : userId,
+                        parentEntry ? parentEntry.id : null,
+                        parentEntry ? parentEntry.uuid : null,
+                        pathPosix.basename(dirPath),
+                        dirPath,
+                        now,
+                        now,
+                        now,
+                    );
+                }
+
+                try {
+                    await this.clients.db.write(
+                        `${this.#insertIgnoreIntoFsentriesSql()} (
+                            uuid,
+                            user_id,
+                            parent_id,
+                            parent_uid,
+                            name,
+                            path,
+                            is_dir,
+                            created,
+                            modified,
+                            accessed,
+                            immutable,
+                            size
+                        ) VALUES ${valuePlaceholders.join(', ')}${this.clients.db.insertIgnoreSuffix()}`,
+                        insertRows,
+                    );
+                } catch {
+                    // Concurrent create may have already inserted some/all rows.
+                }
+
+                const insertedEntries = await this.#readEntriesByPathsForUser(
+                    userId,
+                    pathsAtDepth,
+                    { useTryHardRead: true },
+                );
+                for (const path of pathsAtDepth) {
+                    let insertedEntry = insertedEntries.get(path);
+                    if (!insertedEntry) {
+                        insertedEntry = await this.#ensureDirectoryPath(
+                            path,
+                            userId,
+                            true,
+                        );
+                    }
+                    if (!insertedEntry.isDir) {
+                        throw new HttpError(
+                            409,
+                            `Path is not a directory: ${pathPosix.basename(path)}`,
+                            { legacyCode: 'conflict' },
+                        );
+                    }
+                    if (expectedUuidByPath.get(path) === insertedEntry.uuid) {
+                        createdEntryMap.set(path, insertedEntry);
+                    }
+                    allEntries.set(path, insertedEntry);
+                }
+            }
+        }
+
+        for (const requiredPath of normalizedRequiredPaths) {
+            const entry = allEntries.get(requiredPath);
+            if (!entry) {
+                // INSERT IGNORE silently dropped the row (see sibling
+                // path in #ensureDirectoryPath). Surface as 404.
+                throw new HttpError(
+                    404,
+                    `Parent path does not exist: ${pathPosix.basename(requiredPath)}`,
+                    { legacyCode: 'not_found' },
+                );
+            }
+            if (!entry.isDir) {
+                throw new HttpError(
+                    409,
+                    `Path is not a directory: ${pathPosix.basename(requiredPath)}`,
+                    { legacyCode: 'conflict' },
+                );
+            }
+            requiredEntryMap.set(requiredPath, entry);
+        }
+
+        return {
+            requiredEntryMap,
+            createdEntryMap,
+        };
+    }
+
+    async #ensureDirectoryPath(
+        path: string,
+        userId: number,
+        createPaths: boolean,
+    ): Promise<FSEntry> {
+        const normalizedPath = this.#normalizePath(path);
+
+        const existingEntry = await this.getEntryByPath(normalizedPath);
+        if (existingEntry) {
+            if (!existingEntry.isDir) {
+                throw new HttpError(
+                    409,
+                    `Path is not a directory: ${pathPosix.basename(normalizedPath)}`,
+                    { legacyCode: 'conflict' },
+                );
+            }
+            return existingEntry;
+        }
+
+        if (!createPaths) {
+            throw new HttpError(
+                404,
+                `Parent path does not exist: ${pathPosix.basename(normalizedPath)}`,
+                { legacyCode: 'not_found' },
+            );
+        }
+
+        if (normalizedPath === '/') {
+            throw new HttpError(400, 'Cannot create root directory', {
+                legacyCode: 'bad_request',
+            });
+        }
+
+        const parentPath = pathPosix.dirname(normalizedPath);
+        const parentEntry =
+            parentPath === '/'
+                ? null
+                : await this.#ensureDirectoryPath(parentPath, userId, true);
+        const dirName = pathPosix.basename(normalizedPath);
+        const now = Math.floor(Date.now() / 1000);
+        const trueLiteral = this.clients.db.booleanLiteral(true);
+        const falseLiteral = this.clients.db.booleanLiteral(false);
+
+        let insertError: unknown = null;
+        try {
+            await this.clients.db.write(
+                `${this.#insertIgnoreIntoFsentriesSql()} (
+                    uuid,
+                    user_id,
+                    parent_id,
+                    parent_uid,
+                    name,
+                    path,
+                    is_dir,
+                    created,
+                    modified,
+                    accessed,
+                    immutable,
+                    size
+                ) VALUES (?, ?, ?, ?, ?, ?, ${trueLiteral}, ?, ?, ?, ${falseLiteral}, 0)${this.clients.db.insertIgnoreSuffix()}`,
+                [
+                    uuidv4(),
+                    parentEntry ? parentEntry.userId : userId,
+                    parentEntry ? parentEntry.id : null,
+                    parentEntry ? parentEntry.uuid : null,
+                    dirName,
+                    normalizedPath,
+                    now,
+                    now,
+                    now,
+                ],
+            );
+        } catch (err) {
+            // Most often a concurrent create raced us — the SELECT below
+            // will pick up the row the other request inserted. If the
+            // SELECT then comes back empty, surface this error so we can
+            // tell a real INSERT failure apart from the race.
+            insertError = err;
+        }
+
+        const resolvedEntries = await this.#readEntriesByPathsForUser(
+            userId,
+            [normalizedPath],
+            { useTryHardRead: true },
+        );
+        const resolvedEntry = resolvedEntries.get(normalizedPath) ?? null;
+        if (!resolvedEntry) {
+            if (insertError) {
+                throw new Error(
+                    `Failed to create directory ${normalizedPath}: ${
+                        insertError instanceof Error
+                            ? insertError.message
+                            : String(insertError)
+                    }`,
+                );
+            }
+            // INSERT IGNORE silently dropped the row (typical cause:
+            // FK violation on parent_id/user_id — e.g. the user namespace
+            // doesn't exist). The path is unreachable from the client's
+            // perspective; surface as 404 rather than letting a generic
+            // Error become a 500 + page on-call.
+            throw new HttpError(
+                404,
+                `Parent path does not exist: ${pathPosix.basename(normalizedPath)}`,
+                { legacyCode: 'not_found' },
+            );
+        }
+        if (!resolvedEntry.isDir) {
+            throw new HttpError(
+                409,
+                `Path is not a directory: ${pathPosix.basename(normalizedPath)}`,
+                { legacyCode: 'conflict' },
+            );
+        }
+
+        return resolvedEntry;
+    }
+
+    #serializeMetadata(input: FSEntryCreateInput): string | null {
+        if (typeof input.metadata === 'string') {
+            return input.metadata;
+        }
+
+        const metadataObject: Record<string, unknown> =
+            input.metadata && typeof input.metadata === 'object'
+                ? { ...input.metadata }
+                : {};
+
+        if (input.contentType) {
+            metadataObject.contentType = input.contentType;
+        }
+        if (input.checksumSha256) {
+            metadataObject.checksumSha256 = input.checksumSha256;
+        }
+
+        if (Object.keys(metadataObject).length === 0) {
+            return null;
+        }
+
+        return JSON.stringify(metadataObject);
+    }
+
+    async getEntryByPath(
+        path: string,
+        options: ReadEntriesByPathsOptions = {},
+    ): Promise<FSEntry | null> {
+        if (options.useTryHardRead || options.skipCache) {
+            const normalizedPath = this.#normalizePath(path);
+            const entriesByPath = await this.#readEntriesByPathsForUser(
+                0,
+                [normalizedPath],
+                options,
+            );
+            return entriesByPath.get(normalizedPath) ?? null;
+        }
+
+        const normalizedPath = this.#normalizePath(path);
+        const cacheKey = entryCacheKey('path', normalizedPath);
+        const cached = await this.#readEntryFromCache(cacheKey);
+        if (cached) {
+            return cached;
+        }
+
+        const rows = (await this.clients.db.read(
+            `SELECT ${this.#selectFsentriesColumns()} FROM fsentries WHERE path = ? LIMIT 1`,
+            [normalizedPath],
+        )) as unknown as FSEntryRow[];
+        const row = rows[0];
+        if (row) {
+            const entry = this.#mapFSEntryRow(row);
+            await this.#writeEntryToCache(entry);
+            return entry;
+        }
+
+        // Fallback for legacy rows whose `path` column was never populated
+        // (very old accounts pre-date the path-cache write). Mirrors v1's
+        // `convert_path_to_fsentry` lineage walk: split the path into
+        // segments, anchor at `parent_uid IS NULL` matching the first
+        // segment, then walk down via `parent_uid` chains. Backfills the
+        // `path` column on every resolved row so subsequent calls take
+        // the fast `WHERE path = ?` branch above.
+        if (options.lineage === false) return null;
+        return this.#resolveEntryByPathLineage(normalizedPath);
+    }
+
+    /**
+     * Recursive-CTE lineage resolver. Returns the entry at `path`, or null if
+     * any segment is unresolvable. On success, backfills the `path` column on
+     * every row in the lineage (one UPDATE per row, gated on `path IS NULL OR
+     * path != expected` so we don't write the same value back on warm rows).
+     */
+    async #resolveEntryByPathLineage(
+        normalizedPath: string,
+    ): Promise<FSEntry | null> {
+        if (normalizedPath === '/') return null;
+        const segments = normalizedPath.split('/').filter(Boolean);
+        if (segments.length === 0) return null;
+
+        // Build the segments CTE as an UNION ALL chain of literal SELECTs.
+        // Both SQLite and MySQL support recursive CTEs of this shape.
+        const segmentRows = segments
+            .map((_, i) =>
+                i === 0
+                    ? 'SELECT 1 AS depth, ? AS name'
+                    : `UNION ALL SELECT ${i + 1}, ?`,
+            )
+            .join(' ');
+        const sql = `
+            WITH RECURSIVE
+              segments(depth, name) AS (
+                ${segmentRows}
+              ),
+              lineage(id, uuid, depth) AS (
+                SELECT f.id, f.uuid, 1
+                FROM fsentries f
+                INNER JOIN segments s ON s.depth = 1
+                WHERE f.parent_uid IS NULL AND f.name = s.name
+
+                UNION ALL
+
+                SELECT f.id, f.uuid, l.depth + 1
+                FROM fsentries f
+                INNER JOIN lineage l ON f.parent_uid = l.uuid
+                INNER JOIN segments s ON s.depth = l.depth + 1
+                WHERE f.name = s.name
+              )
+            SELECT id, uuid, depth FROM lineage ORDER BY depth ASC, id ASC
+        `;
+
+        const rows = (await this.clients.db.read(sql, segments)) as {
+            id: number | string;
+            uuid: string;
+            depth: number | string;
+        }[];
+
+        // Take the lowest-id row at each depth (deterministic pick that
+        // matches v1's `LIMIT 1` per-segment behaviour).
+        const byDepth = new Map<number, { id: number; uuid: string }>();
+        for (const r of rows) {
+            const depth = Number(r.depth);
+            if (!byDepth.has(depth)) {
+                byDepth.set(depth, { id: Number(r.id), uuid: r.uuid });
+            }
+        }
+        if (byDepth.size !== segments.length) {
+            return null;
+        }
+
+        await this.#backfillLineagePaths(byDepth, segments);
+
+        const target = byDepth.get(segments.length);
+        if (!target) return null;
+        return this.getEntryByUuid(target.uuid);
+    }
+
+    async #backfillLineagePaths(
+        byDepth: Map<number, { id: number; uuid: string }>,
+        segments: string[],
+    ): Promise<void> {
+        for (let depth = 1; depth <= segments.length; depth++) {
+            const row = byDepth.get(depth);
+            if (!row) continue;
+            const expected = '/' + segments.slice(0, depth).join('/');
+            await this.clients.db.write(
+                `UPDATE fsentries SET path = ?
+                 WHERE id = ? AND (path IS NULL OR path <> ?)`,
+                [expected, row.id, expected],
+            );
+            await this.invalidateEntryCacheByUuid(row.uuid);
+        }
+    }
+
+    /**
+     * Upward-walk variant of the lineage resolver. Used by uuid/id lookups
+     * where we already have the row but its `path` column is NULL — same legacy
+     * state the path-based resolver heals from the other direction.
+     *
+     * Walks `parent_uid` chains from the entry up to the home row (`parent_uid
+     * IS NULL`), then reuses `#backfillLineagePaths` to write the correct
+     * `path` on every ancestor + the entry itself. Returns the re-fetched
+     * target entry so the caller doesn't need a second query.
+     *
+     * Returns null if the chain is broken (an intermediate `parent_uid` doesn't
+     * resolve to a row) — those rows are unrecoverable from this direction and
+     * the caller should fall back to whatever degraded behaviour it had
+     * before.
+     *
+     * Same security posture as `#resolveEntryByPathLineage`: this method only
+     * resolves + heals data, it does not authorize access. Callers still gate
+     * via ACL on the returned entry.
+     */
+    async #healEntryPathByLineageUp(
+        targetUuid: string,
+    ): Promise<FSEntry | null> {
+        const sql = `
+            WITH RECURSIVE
+              ancestors(id, uuid, parent_uid, name, depth) AS (
+                SELECT id, uuid, parent_uid, name, 0
+                FROM fsentries
+                WHERE uuid = ?
+
+                UNION ALL
+
+                SELECT f.id, f.uuid, f.parent_uid, f.name, a.depth + 1
+                FROM fsentries f
+                INNER JOIN ancestors a ON f.uuid = a.parent_uid
+              )
+            SELECT id, uuid, parent_uid, name, depth
+            FROM ancestors
+            ORDER BY depth ASC
+        `;
+        const rows = (await this.clients.db.read(sql, [targetUuid])) as Array<{
+            id: number | string;
+            uuid: string;
+            parent_uid: string | null;
+            name: string;
+            depth: number | string;
+        }>;
+        if (rows.length === 0) return null;
+
+        // Highest-depth row should be the home (parent_uid IS NULL). If it
+        // isn't, the chain dead-ends mid-walk — bail rather than write a
+        // bogus path.
+        const root = rows[rows.length - 1];
+        if (root.parent_uid !== null) return null;
+
+        // Reverse to root → target order so segments[0] is the home name
+        // and segments[N-1] is the target name. Then map into the
+        // (depth → row) shape `#backfillLineagePaths` expects (depth=1 is
+        // home, depth=N is target).
+        const ordered = [...rows].reverse();
+        const segments = ordered.map((r) => r.name);
+        const byDepth = new Map<number, { id: number; uuid: string }>();
+        for (let i = 0; i < ordered.length; i++) {
+            byDepth.set(i + 1, {
+                id: Number(ordered[i].id),
+                uuid: ordered[i].uuid,
+            });
+        }
+
+        await this.#backfillLineagePaths(byDepth, segments);
+
+        // Re-fetch the target so the caller gets an entry with the now
+        // populated `path` column (and the full column projection).
+        const refreshed = (await this.clients.db.read(
+            `SELECT ${this.#selectFsentriesColumns()} FROM fsentries WHERE uuid = ? LIMIT 1`,
+            [targetUuid],
+        )) as unknown as FSEntryRow[];
+        if (!refreshed[0]) return null;
+        return this.#mapFSEntryRow(refreshed[0]);
+    }
+
+    /**
+     * Heal in place: for every entry in `entries` whose `path` column is NULL
+     * (legacy rows that pre-date the path-cache write), run the lineage-up
+     * resolver and replace the slot with the healed entry. Heals run in
+     * parallel — typical workloads have zero such rows so the loop is a no-op;
+     * rare bursts (a freshly migrated account) only pay one recursive-CTE
+     * round-trip per row instead of N sequential.
+     *
+     * Mutates the array in place.
+     */
+    async #healEntriesWithMissingPathsInPlace(
+        entries: FSEntry[],
+    ): Promise<void> {
+        const healJobs: Promise<void>[] = [];
+        for (let index = 0; index < entries.length; index++) {
+            if (entries[index].path) continue;
+            const slot = index;
+            healJobs.push(
+                this.#healEntryPathByLineageUp(entries[slot].uuid).then(
+                    (healed) => {
+                        if (healed) entries[slot] = healed;
+                    },
+                ),
+            );
+        }
+        if (healJobs.length === 0) return;
+        await Promise.all(healJobs);
+    }
+
+    async getEntriesByPaths(paths: string[]): Promise<Map<string, FSEntry>> {
+        const normalizedPaths = Array.from(
+            new Set(
+                paths
+                    .map((path) => this.#normalizePath(path))
+                    .filter((path) => path.length > 0),
+            ),
+        );
+        const entriesByPath = new Map<string, FSEntry>();
+        if (normalizedPaths.length === 0) {
+            return entriesByPath;
+        }
+
+        const missingPaths: string[] = [];
+        const cached = await this.#readEntriesFromCache(
+            normalizedPaths.map((path) => entryCacheKey('path', path)),
+        );
+        normalizedPaths.forEach((path, i) => {
+            const entry = cached[i];
+            if (entry) entriesByPath.set(path, entry);
+            else missingPaths.push(path);
+        });
+
+        if (missingPaths.length > 0) {
+            const chunks = this.#chunk(missingPaths, BULK_QUERY_CHUNK_SIZE);
+            const chunkResults = await runWithConcurrencyLimit(
+                chunks,
+                DEFAULT_DB_CHUNK_CONCURRENCY,
+                async (chunk) => {
+                    if (chunk.length === 0) {
+                        return [];
+                    }
+                    const placeholders = chunk.map(() => '?').join(', ');
+                    const rows = (await this.clients.db.read(
+                        `SELECT ${this.#selectFsentriesColumns()} FROM fsentries WHERE path IN (${placeholders})`,
+                        chunk,
+                    )) as unknown as FSEntryRow[];
+                    const entries = rows.map((row) => this.#mapFSEntryRow(row));
+                    await Promise.all(
+                        entries.map((entry) => this.#writeEntryToCache(entry)),
+                    );
+                    return entries;
+                },
+            );
+            for (const chunkEntries of chunkResults) {
+                for (const entry of chunkEntries) {
+                    entriesByPath.set(entry.path, entry);
+                }
+            }
+        }
+
+        return entriesByPath;
+    }
+
+    /**
+     * The entry at `path` and every directory above it that exists, deepest
+     * first, in one batched read off the per-path cache.
+     */
+    async getAncestors(path: string): Promise<FSEntry[]> {
+        const paths: string[] = [];
+        for (
+            let cursor = this.#normalizePath(path);
+            cursor !== '/';
+            cursor = pathPosix.dirname(cursor)
+        ) {
+            paths.push(cursor);
+        }
+        const byPath = await this.getEntriesByPaths(paths);
+        return paths.flatMap((p): FSEntry[] => {
+            const entry = byPath.get(p);
+            return entry ? [entry] : [];
+        });
+    }
+
+    /** `getAncestors` as the `{ uid, path }` chain ACL descriptors walk. */
+    async getAncestorChain(path: string): Promise<AncestorChain> {
+        return (await this.getAncestors(path)).map((entry) => ({
+            uid: entry.uid,
+            path: entry.path,
+        }));
+    }
+
+    /**
+     * The entry as it stands after a patch this store just wrote. The writer
+     * already knows every column it set, so all it needs is a base, and a
+     * cache-first read supplies that without the cross-region round trip a
+     * primary read costs.
+     *
+     * Only for patches that leave `id`, `uuid` and `path` alone — the cache
+     * keys derive from those. A writer changing other columns in the same
+     * instant can have one field served stale until the entry's TTL lapses;
+     * reading the primary on every mutation is the alternative.
+     */
+    async #entryAfterPatch(
+        uuid: string,
+        patch: Partial<FSEntry>,
+    ): Promise<FSEntry | null> {
+        const base = await this.getEntryByUuid(uuid);
+        if (!base) return null;
+        const entry = { ...base, ...patch };
+        // Broadcast the new value rather than a hole: peers would otherwise
+        // serve their own cached copy of the pre-patch row until its TTL.
+        await this.publishCacheKeys({
+            keys: this.#entryCacheKeys(entry),
+            serializedData: JSON.stringify(entry),
+            ttlSeconds: ENTRY_CACHE_TTL_SECONDS,
+            broadcast: this.#takeBroadcastBudget(1) > 0,
+        });
+        return entry;
+    }
+
+    async getEntryByUuid(uuid: string): Promise<FSEntry | null> {
+        return this.#getEntryBy('uuid', uuid);
+    }
+
+    /** Uncached primary read, for decisions a stale row must not make. */
+    async getEntryByUuidFromPrimary(uuid: string): Promise<FSEntry | null> {
+        const rows = (await this.clients.db.pread(
+            `SELECT ${this.#selectFsentriesColumns()} FROM fsentries WHERE uuid = ? LIMIT 1`,
+            [uuid],
+        )) as unknown as FSEntryRow[];
+        return rows[0] ? this.#mapFSEntryRow(rows[0]) : null;
+    }
+
+    async getEntryById(id: number): Promise<FSEntry | null> {
+        return this.#getEntryBy('id', id);
+    }
+
+    async #getEntryBy(
+        column: 'id' | 'uuid',
+        value: number | string,
+    ): Promise<FSEntry | null> {
+        const cached = await this.#readEntryFromCache(
+            entryCacheKey(column, value),
+        );
+        // Treat a cached row with no `path` as a miss — the cache may
+        // have captured a legacy NULL-path row pre-heal. Falling through
+        // to the DB read + heal lets the next caller hit the warm cache.
+        if (cached?.path) return cached;
+
+        const rows = (await this.clients.db.read(
+            `SELECT ${this.#selectFsentriesColumns()} FROM fsentries WHERE ${column} = ? LIMIT 1`,
+            [value],
+        )) as unknown as FSEntryRow[];
+        const row = rows[0];
+        if (!row) {
+            return null;
+        }
+        let entry = this.#mapFSEntryRow(row);
+        if (!entry.path) {
+            const healed = await this.#healEntryPathByLineageUp(entry.uuid);
+            if (healed) entry = healed;
+        }
+        await this.#writeEntryToCache(entry);
+        return entry;
+    }
+
+    /**
+     * Batched lookup by id. Dedupes input ids, reads cache in one pipeline, and
+     * resolves remaining misses with a single `SELECT … WHERE id IN (…)` per
+     * chunk. Use this in place of `Promise.all(ids.map(getEntryById))` to avoid
+     * one connection per row on large id sets.
+     *
+     * Missing ids (no DB row) are simply absent from the returned map.
+     */
+    async getEntriesByIds(ids: number[]): Promise<Map<number, FSEntry>> {
+        const result = new Map<number, FSEntry>();
+        const uniqueIds = [
+            ...new Set(
+                (Array.isArray(ids) ? ids : []).filter(
+                    (id): id is number => typeof id === 'number',
+                ),
+            ),
+        ];
+        if (uniqueIds.length === 0) return result;
+
+        const missingIds: number[] = [];
+        const cached = await this.#readEntriesFromCache(
+            uniqueIds.map((id) => entryCacheKey('id', id)),
+        );
+        uniqueIds.forEach((id, i) => {
+            const entry = cached[i];
+            // Same NULL-path-cache fallthrough as getEntryById/Uuid.
+            if (entry?.path) result.set(id, entry);
+            else missingIds.push(id);
+        });
+
+        if (missingIds.length === 0) return result;
+
+        const chunks = this.#chunk(missingIds, BULK_QUERY_CHUNK_SIZE);
+        const chunkResults = await runWithConcurrencyLimit(
+            chunks,
+            DEFAULT_DB_CHUNK_CONCURRENCY,
+            async (chunk) => {
+                if (chunk.length === 0) return [];
+                const placeholders = chunk.map(() => '?').join(', ');
+                const rows = (await this.clients.db.read(
+                    `SELECT ${this.#selectFsentriesColumns()} FROM fsentries WHERE id IN (${placeholders})`,
+                    chunk,
+                )) as unknown as FSEntryRow[];
+                const entries = rows.map((row) => this.#mapFSEntryRow(row));
+                // Heal any legacy NULL-path rows in this chunk before caching.
+                await this.#healEntriesWithMissingPathsInPlace(entries);
+                await Promise.all(
+                    entries.map((entry) => this.#writeEntryToCache(entry)),
+                );
+                return entries;
+            },
+        );
+        for (const chunkEntries of chunkResults) {
+            for (const entry of chunkEntries) {
+                result.set(entry.id, entry);
+            }
+        }
+
+        return result;
+    }
+
+    /**
+     * Set an entry's thumbnail with no owner check; the caller authorizes. With
+     * `expectedThumbnail`, only a row still holding it changes. Whether a row
+     * changed, whatever the cache refresh after it finds.
+     */
+    async updateEntryThumbnailByUuid(
+        uuid: string,
+        thumbnail: string | null,
+        expectedThumbnail?: string,
+    ): Promise<boolean> {
+        const compare = expectedThumbnail !== undefined;
+        const writeResult = await this.clients.db.write(
+            `UPDATE fsentries SET thumbnail = ? WHERE uuid = ?${
+                compare ? ' AND thumbnail = ?' : ''
+            }`,
+            compare ? [thumbnail, uuid, expectedThumbnail] : [thumbnail, uuid],
+        );
+        if (this.#affectedRows(writeResult) === 0) return false;
+        await this.#entryAfterPatch(uuid, { thumbnail });
+        return true;
+    }
+
+    async updateEntryThumbnailByUuidForUser(
+        userId: number,
+        uuid: string,
+        thumbnail: string | null,
+    ): Promise<FSEntry> {
+        const [result] = await this.updateEntryThumbnailsByUuidForUser(userId, [
+            { uuid, thumbnail },
+        ]);
+        if (result?.status !== 'fulfilled') {
+            throw result?.reason ?? thumbnailEntryNotFound();
+        }
+        return result.value;
+    }
+
+    /**
+     * Set the thumbnails of entries `userId` owns with one UPDATE per chunk,
+     * each result in input order: the entry as patched, or why that one failed.
+     * A chunk the UPDATE fails or only partly matches is redone one entry at a
+     * time, which tells the misses apart.
+     */
+    async updateEntryThumbnailsByUuidForUser(
+        userId: number,
+        updates: Array<{ uuid: string; thumbnail: string | null }>,
+    ): Promise<PromiseSettledResult<FSEntry>[]> {
+        const chunks: Array<typeof updates> = [];
+        let chunk: typeof updates = [];
+        let chars = 0;
+        for (const update of updates) {
+            const size = update.thumbnail?.length ?? 0;
+            if (
+                chunk.length >= BULK_QUERY_CHUNK_SIZE ||
+                (chunk.length > 0 && chars + size > THUMBNAIL_BATCH_CHARS)
+            ) {
+                chunks.push(chunk);
+                chunk = [];
+                chars = 0;
+            }
+            chunk.push(update);
+            chars += size;
+        }
+        if (chunk.length > 0) chunks.push(chunk);
+
+        const results: PromiseSettledResult<FSEntry>[] = [];
+        for (const rows of chunks) {
+            results.push(...(await this.#updateThumbnailChunk(userId, rows)));
+        }
+        return results;
+    }
+
+    async #updateThumbnailChunk(
+        userId: number,
+        chunk: Array<{ uuid: string; thumbnail: string | null }>,
+    ): Promise<PromiseSettledResult<FSEntry>[]> {
+        const now = Math.floor(Date.now() / 1000);
+        const oneByOne = () =>
+            runWithConcurrencyLimitSettled(
+                chunk,
+                DEFAULT_DB_CHUNK_CONCURRENCY,
+                ({ uuid, thumbnail }) =>
+                    this.updateEntryThumbnailByUuidForUser(
+                        userId,
+                        uuid,
+                        thumbnail,
+                    ),
+            );
+        let matched: number;
+        try {
+            const writeResult = await this.clients.db.write(
+                `UPDATE fsentries
+                 SET thumbnail = CASE uuid ${chunk.map(() => 'WHEN ? THEN ?').join(' ')} END,
+                     modified = ?,
+                     accessed = ?
+                 WHERE user_id = ? AND uuid IN (${chunk.map(() => '?').join(', ')})`,
+                [
+                    ...chunk.flatMap(({ uuid, thumbnail }) => [
+                        uuid,
+                        thumbnail,
+                    ]),
+                    now,
+                    now,
+                    userId,
+                    ...chunk.map(({ uuid }) => uuid),
+                ],
+            );
+            matched = this.#affectedRows(writeResult);
+        } catch (error) {
+            if (chunk.length > 1) return oneByOne();
+            return [{ status: 'rejected', reason: error }];
+        }
+        if (matched !== chunk.length) {
+            if (chunk.length > 1) return oneByOne();
+            return [{ status: 'rejected', reason: thumbnailEntryNotFound() }];
+        }
+
+        // The UPDATE proved each row exists and belongs to this user, and
+        // named every column that moved, so no row needs reading back.
+        return runWithConcurrencyLimitSettled(
+            chunk,
+            ENTRY_PATCH_CONCURRENCY,
+            async ({ uuid, thumbnail }) => {
+                const updatedEntry = await this.#entryAfterPatch(uuid, {
+                    thumbnail,
+                    modified: now,
+                    accessed: now,
+                });
+                if (!updatedEntry || updatedEntry.userId !== userId) {
+                    throw thumbnailEntryNotFound();
+                }
+                return updatedEntry;
+            },
+        );
+    }
+
+    async resolveParentDirectory(
+        userId: number,
+        parentPath: string,
+        createPaths: boolean,
+    ): Promise<FSEntry> {
+        return this.#ensureDirectoryPath(parentPath, userId, createPaths);
+    }
+
+    async getEntriesByPathsForUser(
+        userId: number,
+        paths: string[],
+        options: ReadEntriesByPathsOptions = {},
+    ): Promise<(FSEntry | null)[]> {
+        const username = options.crossNamespace
+            ? null
+            : ((await this.stores.user.getById(userId))?.username ?? null);
+        const entriesByPath = await this.#readEntriesByPathsForUser(
+            userId,
+            paths,
+            options,
+        );
+        return paths.map((path) => {
+            const normalizedPath = this.#normalizePath(path);
+            // Namespace check applied per-path so a single batch can mix
+            // in/out-of-namespace inputs without leaking out-of-namespace hits.
+            if (
+                !options.crossNamespace &&
+                !this.#pathInUserNamespace(normalizedPath, username)
+            ) {
+                return null;
+            }
+            return entriesByPath.get(normalizedPath) ?? null;
+        });
+    }
+
+    #pathInUserNamespace(path: string, username: string | null): boolean {
+        if (!username) return false;
+        const normalized = this.#normalizePath(path);
+        const root = `/${username}`;
+        return normalized === root || normalized.startsWith(`${root}/`);
+    }
+
+    async resolveParentDirectoriesBatch(
+        userId: number,
+        requests: { parentPath: string; createPaths: boolean }[],
+    ): Promise<FSEntry[]> {
+        const { parentEntries } =
+            await this.resolveParentDirectoriesBatchWithCreated(
+                userId,
+                requests,
+            );
+        return parentEntries;
+    }
+
+    async resolveParentDirectoriesBatchWithCreated(
+        userId: number,
+        requests: { parentPath: string; createPaths: boolean }[],
+    ): Promise<{
+        parentEntries: FSEntry[];
+        createdDirectoryEntries: FSEntry[];
+    }> {
+        if (requests.length === 0) {
+            return {
+                parentEntries: [],
+                createdDirectoryEntries: [],
+            };
+        }
+
+        const parentPathsToEnsure = requests
+            .filter((request) => request.createPaths)
+            .map((request) => request.parentPath);
+        const { createdEntryMap } = await this.#ensureDirectoryPathsForUser(
+            userId,
+            parentPathsToEnsure,
+        );
+
+        const allParentPaths = requests.map((request) => request.parentPath);
+        const parentEntriesByPath = await this.#readEntriesByPathsForUser(
+            userId,
+            allParentPaths,
+        );
+        const parentEntries = allParentPaths.map((path) => {
+            const normalizedPath = this.#normalizePath(path);
+            const parentEntry = parentEntriesByPath.get(normalizedPath);
+            if (!parentEntry) {
+                throw new HttpError(
+                    404,
+                    `Parent path does not exist: ${pathPosix.basename(normalizedPath)}`,
+                    { legacyCode: 'not_found' },
+                );
+            }
+            if (!parentEntry.isDir) {
+                throw new HttpError(
+                    409,
+                    `Path is not a directory: ${pathPosix.basename(normalizedPath)}`,
+                    { legacyCode: 'conflict' },
+                );
+            }
+            return parentEntry;
+        });
+
+        return {
+            parentEntries,
+            createdDirectoryEntries: Array.from(createdEntryMap.values()),
+        };
+    }
+
+    async ensureDirectoriesForUserWithCreated(
+        userId: number,
+        requests: { path: string; createPaths: boolean }[],
+    ): Promise<{
+        entries: FSEntry[];
+        createdDirectoryEntries: FSEntry[];
+    }> {
+        if (requests.length === 0) {
+            return {
+                entries: [],
+                createdDirectoryEntries: [],
+            };
+        }
+
+        const normalizedRequests = requests.map((request) => {
+            const normalizedPath = this.#normalizePath(request.path);
+            if (normalizedPath === '/') {
+                throw new HttpError(400, 'Cannot create root directory', {
+                    legacyCode: 'bad_request',
+                });
+            }
+            return {
+                path: normalizedPath,
+                createPaths: request.createPaths,
+            };
+        });
+
+        const pathsToEnsure = normalizedRequests
+            .filter((request) => request.createPaths)
+            .map((request) => request.path);
+        const { createdEntryMap } = await this.#ensureDirectoryPathsForUser(
+            userId,
+            pathsToEnsure,
+        );
+
+        const allPaths = normalizedRequests.map((request) => request.path);
+        const entriesByPath = await this.#readEntriesByPathsForUser(
+            userId,
+            allPaths,
+        );
+
+        const entries = normalizedRequests.map((request) => {
+            const entry = entriesByPath.get(request.path);
+            if (!entry) {
+                throw new HttpError(
+                    404,
+                    `Directory path does not exist: ${pathPosix.basename(request.path)}`,
+                    { legacyCode: 'not_found' },
+                );
+            }
+            if (!entry.isDir) {
+                throw new HttpError(
+                    409,
+                    `Path is not a directory: ${pathPosix.basename(request.path)}`,
+                    { legacyCode: 'conflict' },
+                );
+            }
+            return entry;
+        });
+
+        return {
+            entries,
+            createdDirectoryEntries: Array.from(createdEntryMap.values()),
+        };
+    }
+
+    async createEntry(
+        fsEntry: FSEntryCreateInput,
+        createPaths = true,
+    ): Promise<FSEntry> {
+        const [entry] = await this.batchCreateEntries([fsEntry], createPaths);
+        if (!entry) {
+            throw new Error('Failed to create entry');
+        }
+        return entry;
+    }
+
+    async batchCreateEntries(
+        entries: FSEntryCreateInput[],
+        createPaths = true,
+    ): Promise<FSEntry[]> {
+        if (entries.length === 0) {
+            return [];
+        }
+
+        const normalizedEntries: NormalizedEntryWrite[] = entries.map(
+            (entryInput, index) => {
+                const targetPath = this.#normalizePath(entryInput.path);
+                if (targetPath === '/') {
+                    throw new HttpError(400, 'Cannot write to root path', {
+                        legacyCode: 'cannot_write_to_root',
+                    });
+                }
+
+                const parentPath = this.#normalizePath(
+                    pathPosix.dirname(targetPath),
+                );
+                if (parentPath === '/') {
+                    throw new HttpError(
+                        400,
+                        'Cannot write directly under root path',
+                        { legacyCode: 'bad_request' },
+                    );
+                }
+
+                const size = Number(entryInput.size);
+                if (Number.isNaN(size) || size < 0) {
+                    throw new HttpError(
+                        400,
+                        `Invalid size for ${pathPosix.basename(targetPath)}`,
+                        { legacyCode: 'bad_request' },
+                    );
+                }
+
+                return {
+                    index,
+                    input: entryInput,
+                    userId: entryInput.userId,
+                    targetPath,
+                    parentPath,
+                    fileName: pathPosix.basename(targetPath),
+                    metadataJson: this.#serializeMetadata(entryInput),
+                    bucket: entryInput.bucket ?? null,
+                    bucketRegion: entryInput.bucketRegion ?? null,
+                    size,
+                    createPaths: entryInput.createMissingParents ?? createPaths,
+                };
+            },
+        );
+
+        const duplicatePathSet = new Set<string>();
+        for (const normalizedEntry of normalizedEntries) {
+            const dedupeKey = `${normalizedEntry.userId}:${normalizedEntry.targetPath}`;
+            if (duplicatePathSet.has(dedupeKey)) {
+                throw new HttpError(
+                    409,
+                    `Batch contains duplicate target path: ${pathPosix.basename(normalizedEntry.targetPath)}`,
+                    { legacyCode: 'conflict' },
+                );
+            }
+            duplicatePathSet.add(dedupeKey);
+        }
+
+        const entriesByUser = new Map<number, NormalizedEntryWrite[]>();
+        for (const normalizedEntry of normalizedEntries) {
+            const userEntries = entriesByUser.get(normalizedEntry.userId) ?? [];
+            userEntries.push(normalizedEntry);
+            entriesByUser.set(normalizedEntry.userId, userEntries);
+        }
+
+        const resultsByIndex = new Map<number, FSEntry>();
+        for (const [userId, userEntries] of entriesByUser) {
+            const parentEntries = await this.resolveParentDirectoriesBatch(
+                userId,
+                userEntries.map((entry) => ({
+                    parentPath: entry.parentPath,
+                    createPaths: entry.createPaths,
+                })),
+            );
+            const parentByPath = new Map<string, FSEntry>();
+            for (const parentEntry of parentEntries) {
+                parentByPath.set(parentEntry.path, parentEntry);
+            }
+
+            const existingEntriesByPath = await this.#readEntriesByPathsForUser(
+                userId,
+                userEntries.map((entry) => entry.targetPath),
+                {
+                    useTryHardRead: true,
+                    skipCache: true,
+                },
+            );
+
+            const now = Math.floor(Date.now() / 1000);
+            const updateOperations: Array<{
+                existingEntry: FSEntry;
+                updatedEntry: FSEntry;
+                promise: Promise<unknown>;
+            }> = [];
+            const updatedResultsByIndex = new Map<number, FSEntry>();
+            const insertCandidates: NormalizedEntryWrite[] = [];
+
+            for (const entry of userEntries) {
+                const parentEntry = parentByPath.get(entry.parentPath);
+                if (!parentEntry) {
+                    throw new HttpError(
+                        404,
+                        `Parent directory not found for ${pathPosix.basename(entry.targetPath)}`,
+                        { legacyCode: 'dest_does_not_exist' },
+                    );
+                }
+
+                const existingEntry = existingEntriesByPath.get(
+                    entry.targetPath,
+                );
+                if (existingEntry) {
+                    if (!entry.input.overwrite) {
+                        throw new HttpError(
+                            409,
+                            `An entry named \`${pathPosix.basename(entry.targetPath)}\` already exists`,
+                            { legacyCode: 'conflict' },
+                        );
+                    }
+                    if (existingEntry.isDir) {
+                        throw new HttpError(
+                            409,
+                            `Cannot overwrite a directory: ${pathPosix.basename(entry.targetPath)}`,
+                            { legacyCode: 'cannot_overwrite_a_directory' },
+                        );
+                    }
+
+                    const updatedEntry = {
+                        ...existingEntry,
+                        bucket: entry.bucket,
+                        bucketRegion: entry.bucketRegion,
+                        parentId: parentEntry.id,
+                        parentUid: parentEntry.uuid,
+                        associatedAppId: entry.input.associatedAppId ?? null,
+                        isPublic:
+                            entry.input.isPublic === undefined
+                                ? null
+                                : Boolean(entry.input.isPublic),
+                        thumbnail: entry.input.thumbnail ?? null,
+                        immutable: Boolean(entry.input.immutable),
+                        name: entry.fileName,
+                        path: entry.targetPath,
+                        metadata: entry.metadataJson,
+                        modified: now,
+                        accessed: now,
+                        size: entry.size,
+                    };
+                    updateOperations.push({
+                        existingEntry,
+                        updatedEntry,
+                        promise: this.clients.db.write(
+                            `UPDATE fsentries
+                             SET bucket = ?,
+                                 bucket_region = ?,
+                                 parent_id = ?,
+                                 parent_uid = ?,
+                                 associated_app_id = ?,
+                                 is_public = ?,
+                                 thumbnail = ?,
+                                 immutable = ?,
+                                 name = ?,
+                                 path = ?,
+                                 metadata = ?,
+                                 modified = ?,
+                                 accessed = ?,
+                                 size = ?
+                             WHERE id = ?`,
+                            [
+                                entry.bucket,
+                                entry.bucketRegion,
+                                parentEntry.id,
+                                parentEntry.uuid,
+                                entry.input.associatedAppId ?? null,
+                                entry.input.isPublic === undefined
+                                    ? null
+                                    : this.clients.db.booleanValue(
+                                          entry.input.isPublic,
+                                      ),
+                                entry.input.thumbnail ?? null,
+                                this.clients.db.booleanValue(
+                                    Boolean(entry.input.immutable),
+                                ),
+                                entry.fileName,
+                                entry.targetPath,
+                                entry.metadataJson,
+                                now,
+                                now,
+                                entry.size,
+                                existingEntry.id,
+                            ],
+                        ),
+                    });
+                    updatedResultsByIndex.set(entry.index, updatedEntry);
+                    continue;
+                }
+
+                insertCandidates.push(entry);
+            }
+
+            if (updateOperations.length > 0) {
+                const updateResults = await Promise.allSettled(
+                    updateOperations.map((operation) => operation.promise),
+                );
+                const successfulUpdateOperations = updateResults.flatMap(
+                    (result, index) => {
+                        if (result.status !== 'fulfilled') {
+                            return [];
+                        }
+                        const operation = updateOperations[index];
+                        return operation ? [operation] : [];
+                    },
+                );
+                if (successfulUpdateOperations.length > 0) {
+                    await this.#invalidateEntriesCache(
+                        successfulUpdateOperations.map(
+                            (operation) => operation.existingEntry,
+                        ),
+                    );
+                    await Promise.all(
+                        successfulUpdateOperations.map((operation) => {
+                            return this.#writeEntryToCache(
+                                operation.updatedEntry,
+                            );
+                        }),
+                    );
+                }
+
+                const failedUpdate = updateResults.find(
+                    (result) => result.status === 'rejected',
+                );
+                if (failedUpdate?.status === 'rejected') {
+                    throw failedUpdate.reason instanceof Error
+                        ? failedUpdate.reason
+                        : new Error('Failed to update fsentries batch');
+                }
+            }
+
+            const insertChunks = this.#chunk(
+                insertCandidates,
+                BULK_QUERY_CHUNK_SIZE,
+            );
+            const insertedEntriesByUuid = new Map<string, FSEntry>();
+            await runWithConcurrencyLimit(
+                insertChunks,
+                DEFAULT_DB_CHUNK_CONCURRENCY,
+                async (insertChunk) => {
+                    if (insertChunk.length === 0) {
+                        return;
+                    }
+
+                    const valuePlaceholders: string[] = [];
+                    const values: unknown[] = [];
+                    const rows: FSEntryRow[] = [];
+                    for (const entry of insertChunk) {
+                        const parentEntry = parentByPath.get(entry.parentPath);
+                        if (!parentEntry) {
+                            throw new HttpError(
+                                404,
+                                `Parent directory not found for ${pathPosix.basename(entry.targetPath)}`,
+                                { legacyCode: 'dest_does_not_exist' },
+                            );
+                        }
+
+                        const row = this.#fileInsertRow(
+                            entry,
+                            parentEntry,
+                            now,
+                        );
+                        rows.push(row);
+                        valuePlaceholders.push(
+                            `(?, ?, ?, ?, ?, ?, ?, ${this.clients.db.booleanLiteral(false)}, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                        );
+                        values.push(
+                            row.uuid,
+                            row.bucket,
+                            row.bucket_region,
+                            row.user_id,
+                            row.parent_id,
+                            row.parent_uid,
+                            row.associated_app_id,
+                            row.is_public,
+                            row.thumbnail,
+                            row.immutable,
+                            row.name,
+                            row.path,
+                            row.metadata,
+                            row.modified,
+                            row.created,
+                            row.accessed,
+                            row.size,
+                        );
+                    }
+
+                    // Use INSERT IGNORE so a row that lost the (parent_id,
+                    // name) race against another writer doesn't take down
+                    // the whole chunk. Skipped rows are recovered below by
+                    // detecting uuids missing from the post-INSERT SELECT
+                    // and running the same overwrite-or-409 logic the
+                    // upfront existence check uses.
+                    const written = await this.clients.db.write(
+                        `${this.#insertIgnoreIntoFsentriesSql()} (
+                            uuid,
+                            bucket,
+                            bucket_region,
+                            user_id,
+                            parent_id,
+                            parent_uid,
+                            associated_app_id,
+                            is_dir,
+                            is_public,
+                            thumbnail,
+                            immutable,
+                            name,
+                            path,
+                            metadata,
+                            modified,
+                            created,
+                            accessed,
+                            size
+                        ) VALUES ${valuePlaceholders.join(', ')}${this.clients.db.insertIgnoreSuffix()}`,
+                        values,
+                    );
+
+                    const [onlyRow] = rows;
+                    if (rows.length === 1 && onlyRow) {
+                        const stored = this.#storedAsWritten(onlyRow, written);
+                        if (stored) {
+                            insertedEntriesByUuid.set(
+                                stored.uuid,
+                                this.#mapFSEntryRow(stored),
+                            );
+                        }
+                    }
+                },
+            );
+
+            if (insertedEntriesByUuid.size > 0) {
+                await Promise.all(
+                    [...insertedEntriesByUuid.values()].map((entry) =>
+                        this.#writeEntryToCache(entry),
+                    ),
+                );
+            }
+
+            const unreadCandidates = insertCandidates.filter(
+                (entry) => !insertedEntriesByUuid.has(entry.input.uuid),
+            );
+            if (unreadCandidates.length > 0) {
+                const insertUuidChunks = this.#chunk(
+                    unreadCandidates.map((entry) => entry.input.uuid),
+                    BULK_QUERY_CHUNK_SIZE,
+                );
+
+                const insertedChunkResults = await runWithConcurrencyLimit(
+                    insertUuidChunks,
+                    DEFAULT_DB_CHUNK_CONCURRENCY,
+                    async (insertUuidChunk) => {
+                        if (insertUuidChunk.length === 0) {
+                            return [];
+                        }
+
+                        const placeholders = insertUuidChunk
+                            .map(() => '?')
+                            .join(', ');
+                        // By uuid alone — the rows just written belong to the
+                        // parent's owner, not necessarily the acting user.
+                        const rows = (await this.clients.db.pread(
+                            `SELECT ${this.#selectFsentriesColumns()} FROM fsentries WHERE uuid IN (${placeholders})`,
+                            insertUuidChunk,
+                        )) as unknown as FSEntryRow[];
+
+                        const insertedEntries = rows.map((row) =>
+                            this.#mapFSEntryRow(row),
+                        );
+                        if (insertedEntries.length > 0) {
+                            await Promise.all(
+                                insertedEntries.map((entry) =>
+                                    this.#writeEntryToCache(entry),
+                                ),
+                            );
+                        }
+                        return insertedEntries;
+                    },
+                );
+                for (const insertedEntries of insertedChunkResults) {
+                    for (const insertedEntry of insertedEntries) {
+                        insertedEntriesByUuid.set(
+                            insertedEntry.uuid,
+                            insertedEntry,
+                        );
+                    }
+                }
+            }
+
+            // Recovery for INSERT IGNORE skips. An insertCandidate whose
+            // uuid is missing from the post-INSERT SELECT lost the
+            // (parent_id, name) race against a concurrent writer. Re-check
+            // primary-aware and either UPDATE (overwrite=true) or surface
+            // a clear 409. Other rows in the batch already persisted.
+            const racedCandidates = insertCandidates.filter(
+                (entry) => !insertedEntriesByUuid.has(entry.input.uuid),
+            );
+            const insertConflictErrors: Error[] = [];
+            if (racedCandidates.length > 0) {
+                const racedExistingByPath =
+                    await this.#readEntriesByPathsForUser(
+                        userId,
+                        racedCandidates.map((entry) => entry.targetPath),
+                        { useTryHardRead: true, skipCache: true },
+                    );
+                for (const entry of racedCandidates) {
+                    const parentEntry = parentByPath.get(entry.parentPath);
+                    if (!parentEntry) {
+                        throw new HttpError(
+                            404,
+                            `Parent directory not found for ${pathPosix.basename(entry.targetPath)}`,
+                            { legacyCode: 'dest_does_not_exist' },
+                        );
+                    }
+                    const existing = racedExistingByPath.get(entry.targetPath);
+                    if (!existing) {
+                        insertConflictErrors.push(
+                            new HttpError(
+                                409,
+                                `An entry named \`${pathPosix.basename(entry.targetPath)}\` already exists`,
+                                { legacyCode: 'conflict' },
+                            ),
+                        );
+                        continue;
+                    }
+                    if (existing.isDir) {
+                        insertConflictErrors.push(
+                            new HttpError(
+                                409,
+                                `Cannot overwrite a directory: ${pathPosix.basename(entry.targetPath)}`,
+                                { legacyCode: 'cannot_overwrite_a_directory' },
+                            ),
+                        );
+                        continue;
+                    }
+                    if (!entry.input.overwrite) {
+                        insertConflictErrors.push(
+                            new HttpError(
+                                409,
+                                `An entry named \`${pathPosix.basename(entry.targetPath)}\` already exists`,
+                                { legacyCode: 'conflict' },
+                            ),
+                        );
+                        continue;
+                    }
+
+                    const updatedEntry: FSEntry = {
+                        ...existing,
+                        bucket: entry.bucket,
+                        bucketRegion: entry.bucketRegion,
+                        parentId: parentEntry.id,
+                        parentUid: parentEntry.uuid,
+                        associatedAppId: entry.input.associatedAppId ?? null,
+                        isPublic:
+                            entry.input.isPublic === undefined
+                                ? null
+                                : Boolean(entry.input.isPublic),
+                        thumbnail: entry.input.thumbnail ?? null,
+                        immutable: Boolean(entry.input.immutable),
+                        name: entry.fileName,
+                        path: entry.targetPath,
+                        metadata: entry.metadataJson,
+                        modified: now,
+                        accessed: now,
+                        size: entry.size,
+                    };
+                    await this.clients.db.write(
+                        `UPDATE fsentries
+                         SET bucket = ?,
+                             bucket_region = ?,
+                             parent_id = ?,
+                             parent_uid = ?,
+                             associated_app_id = ?,
+                             is_public = ?,
+                             thumbnail = ?,
+                             immutable = ?,
+                             name = ?,
+                             path = ?,
+                             metadata = ?,
+                             modified = ?,
+                             accessed = ?,
+                             size = ?
+                         WHERE id = ?`,
+                        [
+                            entry.bucket,
+                            entry.bucketRegion,
+                            parentEntry.id,
+                            parentEntry.uuid,
+                            entry.input.associatedAppId ?? null,
+                            entry.input.isPublic === undefined
+                                ? null
+                                : this.clients.db.booleanValue(
+                                      entry.input.isPublic,
+                                  ),
+                            entry.input.thumbnail ?? null,
+                            this.clients.db.booleanValue(
+                                Boolean(entry.input.immutable),
+                            ),
+                            entry.fileName,
+                            entry.targetPath,
+                            entry.metadataJson,
+                            now,
+                            now,
+                            entry.size,
+                            existing.id,
+                        ],
+                    );
+                    await this.#invalidateEntryCache(existing);
+                    await this.#writeEntryToCache(updatedEntry);
+                    updatedResultsByIndex.set(entry.index, updatedEntry);
+                }
+            }
+
+            if (insertConflictErrors.length > 0) {
+                // Other rows in this user's batch already persisted (the
+                // INSERT IGNORE landed them and overwrite=true racers ran
+                // UPDATE above). Surface the first non-recoverable conflict
+                // as a clean 409 instead of letting ER_DUP_ENTRY escape
+                // through SQLBatcher as a 500.
+                throw insertConflictErrors[0]!;
+            }
+
+            for (const entry of userEntries) {
+                const updatedResult = updatedResultsByIndex.get(entry.index);
+                if (updatedResult) {
+                    resultsByIndex.set(entry.index, updatedResult);
+                    continue;
+                }
+
+                const insertedResult = insertedEntriesByUuid.get(
+                    entry.input.uuid,
+                );
+                if (insertedResult) {
+                    resultsByIndex.set(entry.index, insertedResult);
+                    continue;
+                }
+
+                throw new Error(
+                    `Failed to load final entry for ${entry.targetPath}`,
+                );
+            }
+        }
+
+        const createdEntries: FSEntry[] = [];
+        for (let index = 0; index < entries.length; index++) {
+            const entry = resultsByIndex.get(index);
+            if (!entry) {
+                throw new Error(
+                    `Failed to resolve entry result at index ${index}`,
+                );
+            }
+            createdEntries.push(entry);
+        }
+        return createdEntries;
+    }
+
+    /** The columns a file INSERT sets, exactly as sent. */
+    #fileInsertRow(
+        entry: NormalizedEntryWrite,
+        parent: FSEntry,
+        now: number,
+    ): FSEntryRow {
+        return {
+            id: 0,
+            uuid: entry.input.uuid,
+            bucket: entry.bucket,
+            bucket_region: entry.bucketRegion,
+            public_token: null,
+            file_request_token: null,
+            is_shortcut: 0,
+            shortcut_to: null,
+            user_id: parent.userId,
+            parent_id: parent.id,
+            parent_uid: parent.uuid,
+            associated_app_id: entry.input.associatedAppId ?? null,
+            is_dir: this.clients.db.booleanValue(false),
+            layout: null,
+            sort_by: null,
+            sort_order: null,
+            is_public:
+                entry.input.isPublic === undefined
+                    ? null
+                    : this.clients.db.booleanValue(entry.input.isPublic),
+            thumbnail: entry.input.thumbnail ?? null,
+            immutable: this.clients.db.booleanValue(
+                Boolean(entry.input.immutable),
+            ),
+            name: entry.fileName,
+            metadata: entry.metadataJson,
+            modified: now,
+            created: now,
+            accessed: now,
+            size: entry.size,
+            symlink_path: null,
+            is_symlink: 0,
+            path: entry.targetPath,
+            // A row this new has no subdomains.
+            subdomains_agg: null,
+        };
+    }
+
+    /**
+     * `row` with its new id, when the write proves the database stored it as
+     * sent: one row inserted, no warning (a truncated or converted value warns)
+     * and an id. Null otherwise, and for values stored without a warning but
+     * not as sent: a fractional integer is rounded, a lone surrogate replaced.
+     */
+    #storedAsWritten(row: FSEntryRow, written: WriteResult): FSEntryRow | null {
+        const insertId = Number(written.insertId);
+        if (
+            written.affectedRows !== 1 ||
+            written.warningStatus !== 0 ||
+            !Number.isSafeInteger(insertId) ||
+            insertId <= 0
+        ) {
+            return null;
+        }
+        const exactInteger = (value: unknown) =>
+            value === null || Number.isSafeInteger(value);
+        const exactText = (value: unknown) =>
+            value === null ||
+            (typeof value === 'string' && value.isWellFormed());
+        if (
+            ![row.size, row.associated_app_id].every(exactInteger) ||
+            ![
+                row.uuid,
+                row.bucket,
+                row.bucket_region,
+                row.thumbnail,
+                row.name,
+                row.metadata,
+                row.path,
+            ].every(exactText)
+        ) {
+            return null;
+        }
+        return { ...row, id: insertId };
+    }
+
+    async createPendingEntry(
+        entry: PendingUploadCreateInput,
+    ): Promise<PendingUploadSession> {
+        const [createdEntry] = await this.batchCreatePendingEntries([entry]);
+        if (!createdEntry) {
+            throw new Error('Failed to create pending upload entry');
+        }
+        return createdEntry;
+    }
+
+    async batchCreatePendingEntries(
+        entries: PendingUploadCreateInput[],
+    ): Promise<PendingUploadSession[]> {
+        if (entries.length === 0) {
+            return [];
+        }
+        const now = Date.now();
+        const pendingSessions = entries.map((entry) =>
+            toPendingUploadSession(entry, now),
+        );
+        await this.#writePendingUploadSessions(
+            pendingSessions,
+            'create pending upload sessions',
+        );
+        return pendingSessions;
+    }
+
+    async getPendingEntryBySessionId(
+        sessionId: string,
+    ): Promise<PendingUploadSession | null> {
+        const sessionsById = await this.#getPendingUploadSessionsBySessionIds([
+            sessionId,
+        ]);
+        return sessionsById.get(sessionId) ?? null;
+    }
+
+    async getPendingEntriesBySessionIds(
+        sessionIds: string[],
+    ): Promise<(PendingUploadSession | null)[]> {
+        if (sessionIds.length === 0) {
+            return [];
+        }
+
+        const entriesBySessionId =
+            await this.#getPendingUploadSessionsBySessionIds(sessionIds);
+        return sessionIds.map(
+            (sessionId) => entriesBySessionId.get(sessionId) ?? null,
+        );
+    }
+
+    async markPendingEntryCompleted(sessionId: string): Promise<void> {
+        await this.#markPendingSessionsWithStatus(
+            [sessionId],
+            'completed',
+            null,
+        );
+    }
+
+    async markPendingEntryFailed(
+        sessionId: string,
+        reason: string,
+    ): Promise<void> {
+        await this.#markPendingSessionsWithStatus(
+            [sessionId],
+            'failed',
+            reason,
+        );
+    }
+
+    async markPendingEntriesFailed(
+        sessionIds: string[],
+        reason: string,
+    ): Promise<void> {
+        await this.#markPendingSessionsWithStatus(sessionIds, 'failed', reason);
+    }
+
+    async abortPendingEntry(sessionId: string, reason: string): Promise<void> {
+        await this.#markPendingSessionsWithStatus(
+            [sessionId],
+            'aborted',
+            reason,
+        );
+    }
+
+    async completePendingEntry(
+        session: PendingUploadSession,
+        finalData: FSEntryCreateInput,
+    ): Promise<FSEntry> {
+        const [completedEntry] = await this.batchCompletePendingEntries([
+            { session, finalData },
+        ]);
+        if (!completedEntry) {
+            throw new Error('Failed to complete pending entry');
+        }
+        return completedEntry;
+    }
+
+    /**
+     * Marks each session completed from the caller's copy rather than a fresh
+     * read: a completion rewrites every field that changes after creation, so
+     * the stored item comes out the same either way.
+     */
+    async batchCompletePendingEntries(
+        entries: {
+            session: PendingUploadSession;
+            finalData: FSEntryCreateInput;
+        }[],
+    ): Promise<FSEntry[]> {
+        if (entries.length === 0) {
+            return [];
+        }
+
+        const completedEntries = await this.batchCreateEntries(
+            entries.map((entry) => entry.finalData),
+            true,
+        );
+
+        const now = Date.now();
+        // An expired session reads as missing; leave it to the sweep.
+        const live = entries.filter(
+            ({ session }) =>
+                toPendingUploadSessionExpiresAtSeconds(session.expiresAt) >
+                now / 1000,
+        );
+        await this.#writePendingUploadSessions(
+            live.map(({ session }) =>
+                withPendingUploadSessionStatus(session, 'completed', null, now),
+            ),
+            'mark pending upload sessions as completed',
+        );
+
+        return completedEntries;
+    }
+
+    // -- Non-file entry creation (dirs, shortcuts, symlinks, touch) ------
+
+    /**
+     * Create a single non-file entry: directory, shortcut, or symlink.
+     *
+     * Unlike `batchCreateEntries` (which is geared to S3-backed files), these
+     * rows carry no bucket metadata. The caller is responsible for parent/name
+     * conflict resolution — this method assumes the parent exists and the
+     * target name is free.
+     *
+     * Returns the inserted entry with a refreshed row read. Throws 409 on a
+     * unique-key collision (caller should pre-check and dedupe).
+     *
+     * The row belongs to whoever owns `parent`, not to whoever created it, so a
+     * shared subtree keeps one owner throughout.
+     */
+    async createNonFileEntry(input: {
+        parent: FSEntry;
+        name: string;
+        kind: 'directory' | 'shortcut' | 'symlink' | 'empty-file';
+        shortcutTo?: number | null;
+        symlinkPath?: string | null;
+        associatedAppId?: number | null;
+        metadata?: string | null;
+        immutable?: boolean;
+        isPublic?: boolean | null;
+        thumbnail?: string | null;
+    }): Promise<FSEntry> {
+        const uuid = uuidv4();
+        const now = Math.floor(Date.now() / 1000);
+        const parentPath = this.#normalizePath(input.parent.path);
+        const path =
+            parentPath === '/'
+                ? `/${input.name}`
+                : `${parentPath}/${input.name}`;
+
+        const isDir = this.clients.db.booleanValue(input.kind === 'directory');
+        const isShortcut = this.clients.db.booleanValue(
+            input.kind === 'shortcut',
+        );
+        const isSymlink = this.clients.db.booleanValue(
+            input.kind === 'symlink',
+        );
+
+        const isPublic =
+            input.isPublic === undefined || input.isPublic === null
+                ? null
+                : this.clients.db.booleanValue(input.isPublic);
+        const immutable = this.clients.db.booleanValue(
+            Boolean(input.immutable),
+        );
+
+        const written = await this.clients.db.write(
+            `INSERT INTO fsentries (
+                uuid,
+                user_id,
+                parent_id,
+                parent_uid,
+                name,
+                path,
+                is_dir,
+                is_shortcut,
+                shortcut_to,
+                is_symlink,
+                symlink_path,
+                associated_app_id,
+                metadata,
+                thumbnail,
+                immutable,
+                is_public,
+                created,
+                modified,
+                accessed,
+                size
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            [
+                uuid,
+                input.parent.userId,
+                input.parent.id,
+                input.parent.uuid,
+                input.name,
+                path,
+                isDir,
+                isShortcut,
+                input.shortcutTo ?? null,
+                isSymlink,
+                input.symlinkPath ?? null,
+                input.associatedAppId ?? null,
+                input.metadata ?? null,
+                input.thumbnail ?? null,
+                immutable,
+                isPublic,
+                now,
+                now,
+                now,
+                0,
+            ],
+        );
+
+        // The insert supplied every column; the rest take their schema default
+        // and a row this new has no subdomains. Reading it back would only
+        // return what we just sent, at the price of a primary round trip on a
+        // path app launches wait for.
+        const insertId = Number(written.insertId);
+        const row: FSEntryRow = insertId
+            ? ({
+                  id: insertId,
+                  uuid,
+                  user_id: input.parent.userId,
+                  parent_id: input.parent.id,
+                  parent_uid: input.parent.uuid,
+                  name: input.name,
+                  path,
+                  is_dir: isDir,
+                  is_shortcut: isShortcut,
+                  shortcut_to: input.shortcutTo ?? null,
+                  is_symlink: isSymlink,
+                  symlink_path: input.symlinkPath ?? null,
+                  associated_app_id: input.associatedAppId ?? null,
+                  metadata: input.metadata ?? null,
+                  thumbnail: input.thumbnail ?? null,
+                  immutable,
+                  is_public: isPublic,
+                  created: now,
+                  modified: now,
+                  accessed: now,
+                  size: 0,
+                  bucket: null,
+                  bucket_region: null,
+                  public_token: null,
+                  file_request_token: null,
+                  layout: null,
+                  sort_by: null,
+                  sort_order: null,
+                  subdomains_agg: null,
+              } as unknown as FSEntryRow)
+            : await this.#readCreatedEntryRow(uuid);
+
+        const entry = this.#mapFSEntryRow(row);
+        await this.#writeEntryToCache(entry);
+        return entry;
+    }
+
+    /** Fallback for engines that report no insert id: the row we just wrote. */
+    async #readCreatedEntryRow(uuid: string): Promise<FSEntryRow> {
+        const rows = (await this.clients.db.pread(
+            `SELECT ${this.#selectFsentriesColumns()} FROM fsentries WHERE uuid = ? LIMIT 1`,
+            [uuid],
+        )) as unknown as FSEntryRow[];
+        const row = rows[0];
+        if (!row) {
+            throw new HttpError(500, 'Failed to read created entry', {
+                legacyCode: 'internal_error',
+            });
+        }
+        return row;
+    }
+
+    /**
+     * Update accessed/modified/created timestamps in place. Used by `touch` for
+     * entries that already exist.
+     */
+    async touchEntryTimestamps(
+        uuid: string,
+        options: {
+            setAccessed?: boolean;
+            setModified?: boolean;
+            setCreated?: boolean;
+        },
+    ): Promise<FSEntry> {
+        const now = Math.floor(Date.now() / 1000);
+        const assignments: string[] = [];
+        const values: unknown[] = [];
+        const patch: Partial<FSEntry> = {};
+        if (options.setAccessed) {
+            assignments.push('accessed = ?');
+            values.push(now);
+            patch.accessed = now;
+        }
+        if (options.setModified) {
+            assignments.push('modified = ?');
+            values.push(now);
+            patch.modified = now;
+        }
+        if (options.setCreated) {
+            assignments.push('created = ?');
+            values.push(now);
+            patch.created = now;
+        }
+        if (assignments.length === 0) {
+            // Default: touch all three.
+            assignments.push('accessed = ?', 'modified = ?', 'created = ?');
+            values.push(now, now, now);
+            patch.accessed = now;
+            patch.modified = now;
+            patch.created = now;
+        }
+        await this.clients.db.write(
+            `UPDATE fsentries SET ${assignments.join(', ')} WHERE uuid = ?`,
+            [...values, uuid],
+        );
+        // The timestamps above are the only columns that moved, so the entry
+        // is knowable without reading the row back.
+        const entry = await this.#entryAfterPatch(uuid, patch);
+        if (!entry)
+            throw new HttpError(404, 'Entry not found after touch', {
+                legacyCode: 'not_found',
+            });
+        return entry;
+    }
+
+    // -- Listing / descendants / search ----------------------------------
+
+    // Children of a directory (direct children only). Paginated + sortable.
+    async listChildren(
+        parentUid: string,
+        options: {
+            limit?: number;
+            offset?: number;
+            sortBy?: 'name' | 'modified' | 'type' | 'size' | null;
+            sortOrder?: 'asc' | 'desc' | null;
+        } = {},
+    ): Promise<FSEntry[]> {
+        const limit = Number.isFinite(options.limit)
+            ? Math.max(1, Math.min(10_000, Number(options.limit)))
+            : 10_000;
+        const offset = Number.isFinite(options.offset)
+            ? Math.max(0, Number(options.offset))
+            : 0;
+
+        const sortColumn = childSortExpression(options.sortBy);
+        const sortDirection = options.sortOrder === 'desc' ? 'DESC' : 'ASC';
+
+        const rows = (await this.clients.db.read(
+            `SELECT ${this.#selectFsentriesColumns()}
+             FROM fsentries
+             WHERE parent_uid = ?
+             ORDER BY ${sortColumn} ${sortDirection}, id ${sortDirection}
+             LIMIT ? OFFSET ?`,
+            [parentUid, limit, offset],
+        )) as unknown as FSEntryRow[];
+        return this.#finalizeChildEntries(rows);
+    }
+
+    /**
+     * Cursor-paginated variant of `listChildren`. The cursor is an opaque
+     * keyset position that also pins the sort, so a page sequence stays
+     * consistent; conflicting sort params on a later page are rejected.
+     */
+    async listChildrenPage(
+        parentUid: string,
+        options: {
+            limit?: number;
+            cursor?: string | null;
+            sortBy?: 'name' | 'modified' | 'type' | 'size' | null;
+            sortOrder?: 'asc' | 'desc' | null;
+        } = {},
+    ): Promise<{ entries: FSEntry[]; cursor?: string }> {
+        const payload = openCursor(
+            options.cursor,
+            this.config.jwt_secret_v2,
+        ) as { v: unknown; id: number; s?: string; o?: string } | undefined;
+
+        const requestedSort = options.sortBy ?? null;
+        const requestedOrder = options.sortOrder ?? null;
+        if (
+            payload &&
+            ((requestedSort && payload.s !== requestedSort) ||
+                (requestedOrder && payload.o !== requestedOrder))
+        ) {
+            throw new HttpError(400, 'cursor does not match requested sort', {
+                legacyCode: 'bad_request',
+            });
+        }
+
+        const sortBy =
+            requestedSort ?? (payload?.s as typeof requestedSort) ?? 'name';
+        const sortOrder =
+            requestedOrder ?? (payload?.o as typeof requestedOrder) ?? 'asc';
+        const limit = normalizeLimit(options.limit, { cap: 10_000 }) ?? 1000;
+
+        const sortExpr = childSortExpression(sortBy);
+        const dir = sortOrder === 'desc' ? 'DESC' : 'ASC';
+        const cmp = sortOrder === 'desc' ? '<' : '>';
+
+        const seek = payload
+            ? `AND (${sortExpr} ${cmp} ? OR (${sortExpr} = ? AND id ${cmp} ?))`
+            : '';
+        const params: unknown[] = payload
+            ? [parentUid, payload.v, payload.v, payload.id, limit + 1]
+            : [parentUid, limit + 1];
+
+        const rows = (await this.clients.db.read(
+            `SELECT ${this.#selectFsentriesColumns()}
+             FROM fsentries
+             WHERE parent_uid = ? ${seek}
+             ORDER BY ${sortExpr} ${dir}, id ${dir}
+             LIMIT ?`,
+            params,
+        )) as unknown as FSEntryRow[];
+
+        const page = keysetPage(
+            rows,
+            limit,
+            this.config.jwt_secret_v2,
+            (last) => ({
+                v: sortValue(last, sortBy, 'name'),
+                id: Number(last.id),
+                s: sortBy,
+                o: sortOrder,
+            }),
+        );
+        const entries = await this.#finalizeChildEntries(page.rows);
+        return { entries, ...(page.cursor ? { cursor: page.cursor } : {}) };
+    }
+
+    async countChildren(parentUid: string): Promise<number> {
+        const rows = (await this.clients.db.read(
+            'SELECT COUNT(*) AS n FROM fsentries WHERE parent_uid = ?',
+            [parentUid],
+        )) as unknown as Array<{ n: number | string }>;
+        return Number(rows[0]?.n ?? 0);
+    }
+
+    /**
+     * Whether `listChildren(parentUid)` would return any row: same key, same
+     * replica. `hasChildren` is the primary read that deletes rely on.
+     */
+    async hasChildrenByParentUid(parentUid: string): Promise<boolean> {
+        const rows = await this.clients.db.read(
+            'SELECT 1 AS present FROM fsentries WHERE parent_uid = ? LIMIT 1',
+            [parentUid],
+        );
+        return rows.length > 0;
+    }
+
+    async #finalizeChildEntries(rows: FSEntryRow[]): Promise<FSEntry[]> {
+        const entries = rows.map((row) => this.#mapFSEntryRow(row));
+        // Heal NULL-path rows before they reach the controller — readdir
+        // consumers (GUI, suggested-apps, downstream `pathPosix.dirname`
+        // callers) all expect a populated path on every child.
+        await this.#healEntriesWithMissingPathsInPlace(entries);
+        await this.#writeEntriesToCache(entries);
+        return entries;
+    }
+
+    #escapeLikePattern(value: string): string {
+        return escapeLike(value);
+    }
+
+    // All descendants of a directory path (recursive). Paths in fsentries are
+    // absolute and don't carry a trailing slash, so the prefix pattern is
+    // `${prefix}/%`, served by `idx_fsentries_path`.
+    async listDescendantsByPath(pathPrefix: string): Promise<FSEntry[]> {
+        const likePattern = this.#descendantsPattern(pathPrefix);
+        // Everything under the prefix, whoever owns it. A subtree is meant to
+        // have one owner, but rows written before that was enforced don't, and
+        // `AND user_id = ?` would leave those behind when the caller deletes
+        // the directory above them — orphaned rows, and their S3 objects with
+        // them. `idx_fsentries_path` leads on `path`, so the access path is
+        // unchanged.
+        const rows = new Map<number, FSEntryRow>();
+        for (const patterns of await this.#subtreePatterns(
+            pathPrefix,
+            likePattern,
+        )) {
+            const group = (await this.clients.db.read(
+                `SELECT ${this.#selectFsentriesColumns()} FROM fsentries WHERE ${this.#pathLikeAny(patterns)} ORDER BY path ASC`,
+                patterns,
+            )) as unknown as FSEntryRow[];
+            for (const row of group) rows.set(Number(row.id), row);
+        }
+        return [...rows.values()].map((row) => this.#mapFSEntryRow(row));
+    }
+
+    /**
+     * Whether a directory has any child. Keyed by parent link, so no path
+     * collation can hide one: `parent_uid`, the only one rows from the old
+     * backend carry, then `parent_id`, which the delete cascade follows. Two
+     * lookups, not an OR, which MySQL may answer with a table scan. Read from
+     * the primary because a missed child would be orphaned or cascaded.
+     */
+    async hasChildren(entry: FSEntry): Promise<boolean> {
+        const rows = await this.clients.db.pread(
+            `SELECT 1 AS present FROM fsentries WHERE parent_uid = ?
+             UNION ALL
+             SELECT 1 AS present FROM fsentries WHERE parent_id = ?
+             LIMIT 1`,
+            [entry.uuid, entry.id],
+        );
+        return rows.length > 0;
+    }
+
+    /**
+     * One page of the children of `parents`, by parent and then id; pass the
+     * previous page's last row as `after`. Keyed by `parent_uid`, which every
+     * row carries (old rows have no `parent_id`); on MySQL and SQLite its index
+     * ends in the id, so a page reads only its own rows. Owner-blind.
+     */
+    async listChildrenOfParents(
+        parents: FSEntry[],
+        options: { limit: number; after?: FSEntry | null },
+    ): Promise<FSEntry[]> {
+        if (parents.length === 0) return [];
+        const { after } = options;
+        const seek = after
+            ? 'AND (parent_uid > ? OR (parent_uid = ? AND id > ?))'
+            : '';
+        const rows = (await this.clients.db.read(
+            `SELECT ${this.#selectFsentriesColumns()} FROM fsentries
+             WHERE parent_uid IN (${parents.map(() => '?').join(', ')}) ${seek}
+             ORDER BY parent_uid, id LIMIT ?`,
+            [
+                ...parents.map((parent) => parent.uuid),
+                ...(after ? [after.parentUid, after.parentUid, after.id] : []),
+                Math.max(1, options.limit),
+            ],
+        )) as unknown as FSEntryRow[];
+        const parentPaths = new Map(
+            parents.map((parent) => [parent.uuid, parent.path]),
+        );
+        return rows.map((row) => {
+            const entry = this.#mapFSEntryRow(row);
+            // Legacy rows can lack a path; the parent's says where they sit.
+            const parentPath = parentPaths.get(entry.parentUid ?? '');
+            if (!entry.path && parentPath) {
+                entry.path =
+                    parentPath === '/'
+                        ? `/${entry.name}`
+                        : `${parentPath}/${entry.name}`;
+            }
+            return entry;
+        });
+    }
+
+    #descendantsPattern(pathPrefix: string): string {
+        const normalizedPrefix = this.#normalizePath(pathPrefix);
+        // Every entry sits under root; a caller asking for that means
+        // something else.
+        if (normalizedPrefix === '/') {
+            throw new HttpError(400, 'Refusing to list descendants of root', {
+                legacyCode: 'bad_request',
+            });
+        }
+        return `${this.#escapeLikePattern(normalizedPrefix)}/%`;
+    }
+
+    async countDescendantsByPath(
+        userId: number,
+        pathPrefix: string,
+    ): Promise<number> {
+        const normalizedPrefix = this.#normalizePath(pathPrefix);
+        if (normalizedPrefix === '/') return 0;
+        const likePattern = `${this.#escapeLikePattern(normalizedPrefix)}/%`;
+        const [patterns] = await this.#subtreePatterns(
+            normalizedPrefix,
+            likePattern,
+        );
+        const rows = (await this.clients.db.read(
+            `SELECT COUNT(*) AS n FROM fsentries WHERE user_id = ? AND ${this.#pathLikeAny(patterns)}`,
+            [userId, ...patterns],
+        )) as unknown as { n: number | string }[];
+        return Number(rows[0]?.n ?? 0);
+    }
+
+    /**
+     * LIKE patterns for everything under `pathPrefix`, `likePattern` first,
+     * grouped per statement; a query that must stay one statement takes the
+     * first group. MySQL ends a `prefix/%` index range at `prefix/` + U+FFFF,
+     * which utf8mb4_unicode_ci sorts below supplementary characters (most
+     * emoji), so there a child whose name starts with one, and its subtree, get
+     * a pattern of their own. All start with `prefix/`: they widen the ranges
+     * scanned, not the rows matched. `rootPaths` is where the prefix's own row
+     * may sit, as a rename moves it first.
+     */
+    async #subtreePatterns(
+        pathPrefix: string,
+        likePattern: string,
+        options: { rootPaths?: string[]; primary?: boolean } = {},
+    ): Promise<string[][]> {
+        const patterns = [likePattern];
+        // Also true for a name starting with U+FFFF, which costs one redundant
+        // pattern.
+        const pastRange = this.clients.db.case<string | null>({
+            mysql: "name COLLATE utf8mb4_unicode_ci > _utf8mb4 X'EFBFBF'",
+            otherwise: null,
+        });
+        if (pastRange) {
+            const prefix = this.#normalizePath(pathPrefix);
+            const rootPaths = options.rootPaths ?? [prefix];
+            let parents = `(SELECT uuid FROM fsentries WHERE path IN (${rootPaths.map(() => '?').join(', ')}))`;
+            let parentParams: unknown[] = rootPaths;
+            let parentPaths = new Map<string, string>();
+            // A missed directory's own such children fall outside its pattern's
+            // range in turn, so walk down until none are left. Linked by
+            // `parent_uid`: rows from the old backend have no `parent_id`.
+            while (patterns.length <= SUBTREE_PATTERNS_MAX) {
+                const sql = `SELECT uuid, parent_uid, name, is_dir FROM fsentries
+                     WHERE parent_uid IN ${parents} AND ${pastRange} LIMIT ?`;
+                const params = [
+                    ...parentParams,
+                    SUBTREE_PATTERNS_MAX + 1 - patterns.length,
+                ];
+                const rows = (
+                    options.primary
+                        ? await this.clients.db.pread(sql, params)
+                        : await this.clients.db.read(sql, params)
+                ) as Array<{
+                    uuid: string;
+                    parent_uid: string;
+                    name: string;
+                    is_dir: number | boolean;
+                }>;
+                const dirs = new Map<string, string>();
+                for (const row of rows) {
+                    const path = `${parentPaths.get(row.parent_uid) ?? prefix}/${row.name}`;
+                    patterns.push(`${this.#escapeLikePattern(path)}%`);
+                    if (row.is_dir) dirs.set(row.uuid, path);
+                }
+                if (dirs.size === 0) break;
+                parents = `(${[...dirs.keys()].map(() => '?').join(', ')})`;
+                parentParams = [...dirs.keys()];
+                parentPaths = dirs;
+            }
+        }
+        return this.#chunk(patterns, SUBTREE_PATTERNS_PER_STATEMENT);
+    }
+
+    #pathLikeAny(patterns: string[]): string {
+        return `(${patterns.map(() => "path LIKE ? ESCAPE '!'").join(' OR ')})`;
+    }
+
+    // Slashes in a path — the depth marker. Paths are absolute and carry no
+    // trailing slash, so a direct child of `/u/foo` (2 slashes) is `/u/foo/x`
+    // (3 slashes): its depth relative to the prefix is 1.
+    #slashCount(value: string): number {
+        let count = 0;
+        for (let i = 0; i < value.length; i++) {
+            if (value[i] === '/') count++;
+        }
+        return count;
+    }
+
+    /**
+     * Cursor-paginated descendants of a directory, limited to `maxDepth` levels
+     * below the prefix. Prefix + user_id scan (same index as
+     * `listDescendantsByPath`) with a portable slash-count depth filter.
+     * Keyset-paginated on the requested sort; the cursor pins it, so a later
+     * page can't switch sorts mid-sequence.
+     */
+    async listDescendantsPage(
+        userId: number,
+        pathPrefix: string,
+        options: {
+            limit?: number;
+            cursor?: string | null;
+            maxDepth: number;
+            sortBy?: DescendantSortField | null;
+            sortOrder?: 'asc' | 'desc' | null;
+        },
+    ): Promise<{ entries: FSEntry[]; cursor?: string }> {
+        const normalizedPrefix = this.#normalizePath(pathPrefix);
+        if (normalizedPrefix === '/') {
+            throw new HttpError(400, 'Refusing to list descendants of root', {
+                legacyCode: 'bad_request',
+            });
+        }
+        const likePattern = `${this.#escapeLikePattern(normalizedPrefix)}/%`;
+        const maxSlashes =
+            this.#slashCount(normalizedPrefix) + Math.max(1, options.maxDepth);
+        const limit = normalizeLimit(options.limit, { cap: 10_000 }) ?? 1000;
+
+        const rawPayload = openCursor(
+            options.cursor,
+            this.config.jwt_secret_v2,
+        ) as
+            | { v?: unknown; id?: number; s?: string; o?: string; p?: string }
+            | undefined;
+        // Cursors minted before this listing honored the sort carried only the
+        // last path, always ascending.
+        const payload =
+            rawPayload && rawPayload.v === undefined
+                ? { v: rawPayload.p, s: 'name', o: 'asc' }
+                : rawPayload;
+
+        const requestedSort = options.sortBy ?? null;
+        const requestedOrder = options.sortOrder ?? null;
+        if (
+            payload &&
+            ((requestedSort && payload.s !== requestedSort) ||
+                (requestedOrder && payload.o !== requestedOrder))
+        ) {
+            throw new HttpError(400, 'cursor does not match requested sort', {
+                legacyCode: 'bad_request',
+            });
+        }
+
+        const sortBy = toDescendantSortField(
+            requestedSort ?? payload?.s ?? 'name',
+        );
+        const sortOrder =
+            (requestedOrder ?? payload?.o) === 'desc' ? 'desc' : 'asc';
+        const sortExpr = DESCENDANT_SORT_EXPRESSIONS[sortBy];
+        const dir = sortOrder === 'desc' ? 'DESC' : 'ASC';
+        const cmp = sortOrder === 'desc' ? '<' : '>';
+
+        // A name sort orders on path, which is unique within one user's tree
+        // and so is already a total order; the other fields repeat across the
+        // subtree and fall back on `id`.
+        const tiebreak = sortBy !== 'name';
+        const seekId = Number(payload?.id);
+        const seek = !payload
+            ? ''
+            : tiebreak && Number.isFinite(seekId)
+              ? `AND (${sortExpr} ${cmp} ? OR (${sortExpr} = ? AND id ${cmp} ?))`
+              : `AND ${sortExpr} ${cmp} ?`;
+        const seekParams = !payload
+            ? []
+            : tiebreak && Number.isFinite(seekId)
+              ? [payload.v, payload.v, seekId]
+              : [payload.v];
+        const [patterns] = await this.#subtreePatterns(
+            normalizedPrefix,
+            likePattern,
+        );
+        const params: unknown[] = [
+            userId,
+            ...patterns,
+            maxSlashes,
+            ...seekParams,
+            limit + 1,
+        ];
+
+        const rows = (await this.clients.db.read(
+            `SELECT ${this.#selectFsentriesColumns()}
+             FROM fsentries
+             WHERE user_id = ? AND ${this.#pathLikeAny(patterns)}
+               AND (LENGTH(path) - LENGTH(REPLACE(path, '/', ''))) <= ? ${seek}
+             ORDER BY ${sortExpr} ${dir}${tiebreak ? `, id ${dir}` : ''}
+             LIMIT ?`,
+            params,
+        )) as unknown as FSEntryRow[];
+
+        const page = keysetPage(
+            rows,
+            limit,
+            this.config.jwt_secret_v2,
+            (last) => ({
+                v: sortValue(last, sortBy, 'path'),
+                ...(tiebreak ? { id: Number(last.id) } : {}),
+                s: sortBy,
+                o: sortOrder,
+            }),
+        );
+        const entries = await this.#finalizeChildEntries(page.rows);
+        return { entries, ...(page.cursor ? { cursor: page.cursor } : {}) };
+    }
+
+    async countDescendantsToDepth(
+        userId: number,
+        pathPrefix: string,
+        maxDepth: number,
+    ): Promise<number> {
+        const normalizedPrefix = this.#normalizePath(pathPrefix);
+        if (normalizedPrefix === '/') return 0;
+        const likePattern = `${this.#escapeLikePattern(normalizedPrefix)}/%`;
+        const maxSlashes =
+            this.#slashCount(normalizedPrefix) + Math.max(1, maxDepth);
+        const [patterns] = await this.#subtreePatterns(
+            normalizedPrefix,
+            likePattern,
+        );
+        const rows = (await this.clients.db.read(
+            `SELECT COUNT(*) AS n FROM fsentries
+             WHERE user_id = ? AND ${this.#pathLikeAny(patterns)}
+               AND (LENGTH(path) - LENGTH(REPLACE(path, '/', ''))) <= ?`,
+            [userId, ...patterns, maxSlashes],
+        )) as unknown as { n: number | string }[];
+        return Number(rows[0]?.n ?? 0);
+    }
+
+    // Sum of sizes under a path (inclusive). Files only — dirs have null size.
+    // NOTE: linear scan under the path prefix index; optimize later if it
+    // becomes hot (e.g., incremental size counters or materialized totals).
+    async getSubtreeSize(userId: number, pathPrefix: string): Promise<number> {
+        const normalizedPrefix = this.#normalizePath(pathPrefix);
+        const likePattern =
+            normalizedPrefix === '/'
+                ? '/%'
+                : `${this.#escapeLikePattern(normalizedPrefix)}/%`;
+        const [patterns] = await this.#subtreePatterns(
+            normalizedPrefix,
+            likePattern,
+        );
+        const rows = (await this.clients.db.read(
+            `SELECT COALESCE(SUM(size), 0) AS total FROM fsentries WHERE user_id = ? AND (path = ? OR ${this.#pathLikeAny(patterns)})`,
+            [userId, normalizedPrefix, ...patterns],
+        )) as unknown as { total: number | string }[];
+        return Number(rows[0]?.total ?? 0);
+    }
+
+    // Simple case-insensitive substring search on name, scoped to one user.
+    // When `pathScope` is set, results are further restricted to that path
+    // and its descendants — used to keep app-under-user actors from peeking
+    // outside their AppData subtree via search.
+    async searchByNameForUser(
+        userId: number,
+        query: string,
+        limit = 200,
+        pathScope?: string,
+    ): Promise<FSEntry[]> {
+        const q = query.trim();
+        if (q.length === 0) return [];
+        const likePattern = `%${this.#escapeLikePattern(q)}%`;
+        const capped = Math.max(1, Math.min(1000, Math.floor(limit)));
+        const params: unknown[] = [userId, likePattern];
+        let scopeClause = '';
+        if (pathScope) {
+            const [patterns] = await this.#subtreePatterns(
+                pathScope,
+                `${this.#escapeLikePattern(pathScope)}/%`,
+            );
+            scopeClause = ` AND (path = ? OR ${this.#pathLikeAny(patterns)})`;
+            params.push(pathScope, ...patterns);
+        }
+        const rows = (await this.clients.db.read(
+            `SELECT ${this.#selectFsentriesColumns()} FROM fsentries
+             WHERE user_id = ? AND name LIKE ? ESCAPE '!'${scopeClause}
+             ORDER BY modified DESC
+             LIMIT ${capped}`,
+            params,
+        )) as unknown as FSEntryRow[];
+        const entries = rows.map((row) => this.#mapFSEntryRow(row));
+        // Search matches by `name`, so legacy NULL-path rows can land here.
+        // Heal before returning so clients render `path`/`dirname` correctly.
+        await this.#healEntriesWithMissingPathsInPlace(entries);
+        return entries;
+    }
+
+    // -- Mutation -------------------------------------------------------
+
+    // Generic single-entry update. Only a narrow set of columns are patchable
+    // through this method; the caller provides the JS-shaped patch and we map.
+    async updateEntry(
+        uuid: string,
+        patch: {
+            name?: string;
+            path?: string;
+            userId?: number;
+            parentId?: number | null;
+            parentUid?: string | null;
+            thumbnail?: string | null;
+            metadata?: string | null;
+            isPublic?: boolean | null;
+            immutable?: boolean;
+            associatedAppId?: number | null;
+            layout?: string | null;
+            sortBy?: 'name' | 'modified' | 'type' | 'size' | null;
+            sortOrder?: 'asc' | 'desc' | null;
+            size?: number | null;
+            accessed?: number | null;
+            modified?: number | null;
+        },
+    ): Promise<FSEntry> {
+        const assignments: string[] = [];
+        const values: unknown[] = [];
+        const push = (column: string, value: unknown) => {
+            assignments.push(`${column} = ?`);
+            values.push(value);
+        };
+
+        if (patch.name !== undefined) push('name', patch.name);
+        if (patch.path !== undefined) push('path', patch.path);
+        if (patch.userId !== undefined) push('user_id', patch.userId);
+        if (patch.parentId !== undefined) push('parent_id', patch.parentId);
+        if (patch.parentUid !== undefined) push('parent_uid', patch.parentUid);
+        if (patch.thumbnail !== undefined) push('thumbnail', patch.thumbnail);
+        if (patch.metadata !== undefined) push('metadata', patch.metadata);
+        if (patch.isPublic !== undefined)
+            push(
+                'is_public',
+                patch.isPublic === null
+                    ? null
+                    : this.clients.db.booleanValue(patch.isPublic),
+            );
+        if (patch.immutable !== undefined)
+            push('immutable', this.clients.db.booleanValue(patch.immutable));
+        if (patch.associatedAppId !== undefined)
+            push('associated_app_id', patch.associatedAppId);
+        if (patch.layout !== undefined) push('layout', patch.layout);
+        if (patch.sortBy !== undefined) push('sort_by', patch.sortBy);
+        if (patch.sortOrder !== undefined) push('sort_order', patch.sortOrder);
+        if (patch.size !== undefined) push('size', patch.size);
+        if (patch.accessed !== undefined) push('accessed', patch.accessed);
+        // Always bump modified unless caller provides it explicitly.
+        push('modified', patch.modified ?? Math.floor(Date.now() / 1000));
+
+        if (assignments.length === 0) {
+            const existing = await this.getEntryByUuid(uuid);
+            if (!existing)
+                throw new HttpError(404, 'Entry not found', {
+                    legacyCode: 'not_found',
+                });
+            return existing;
+        }
+
+        // A path-changing patch (rename, move) must also drop the OLD path's
+        // cache key — invalidating only the updated entry leaves
+        // `prodfsv2:fsentry:path:any:<old path>` serving the pre-update entry
+        // for the full TTL. That stale hit made a paste right after renaming
+        // the occupant report a phantom name conflict, and accepting the
+        // Replace it offered deleted the renamed file (the stale entry
+        // carries its uuid). Read the pre-update entry so its keys can be
+        // invalidated alongside the new ones.
+        const previous =
+            patch.path !== undefined ? await this.getEntryByUuid(uuid) : null;
+
+        await this.clients.db.write(
+            `UPDATE fsentries SET ${assignments.join(', ')} WHERE uuid = ?`,
+            [...values, uuid],
+        );
+
+        // Read back from the primary: a lagging replica still holds the pre-update
+        // row, so tryHardRead would return it (and cache it).
+        const refreshedRows = (await this.clients.db.pread(
+            `SELECT ${this.#selectFsentriesColumns()} FROM fsentries WHERE uuid = ? LIMIT 1`,
+            [uuid],
+        )) as unknown as FSEntryRow[];
+        const row = refreshedRows[0];
+        if (!row) {
+            throw new HttpError(404, 'Entry not found after update', {
+                legacyCode: 'not_found',
+            });
+        }
+        const updated = this.#mapFSEntryRow(row);
+        if (previous && previous.path !== updated.path) {
+            await this.#invalidateEntryCache(previous);
+        }
+        await this.#invalidateEntryCache(updated);
+        await this.#writeEntryToCache(updated);
+        return updated;
+    }
+
+    // Authoritative root lookup. A user's home directory is the row with
+    // `parent_uid IS NULL AND user_id = ?`, regardless of what `path`/`name`
+    // currently are — legacy rows may have drifted (e.g. stale username after
+    // a rename that didn't cascade). Callers use this to heal or rename.
+    async getRootEntryForUser(userId: number): Promise<FSEntry | null> {
+        const rows = (await this.clients.db.read(
+            `SELECT ${this.#selectFsentriesColumns()} FROM fsentries
+             WHERE user_id = ? AND parent_uid IS NULL AND is_dir = ${this.clients.db.booleanLiteral(true)}
+             ORDER BY id ASC LIMIT 1`,
+            [userId],
+        )) as unknown as FSEntryRow[];
+        const row = rows[0];
+        if (!row) return null;
+        const entry = this.#mapFSEntryRow(row);
+        await this.#writeEntryToCache(entry);
+        return entry;
+    }
+
+    /**
+     * A row already sitting at `/{username}` that `ownerUserId` doesn't own.
+     * Two rows at one home path make each account's tree answer for the
+     * other's, so every point that claims a username checks this first. Reads
+     * the primary: a racing signup has to see the row just written.
+     *
+     * `includeDescendants` also reports a foreign row under `/{username}/…`
+     * (ACL grants by path prefix) and a home another account vacated recently.
+     * Claim sites only — the heal and the provisioning backstop stay
+     * exact-path.
+     */
+    async findHomePathConflict(
+        username: string,
+        ownerUserId?: number,
+        options?: { includeDescendants?: false },
+    ): Promise<FSEntry | null>;
+    async findHomePathConflict(
+        username: string,
+        ownerUserId: number | undefined,
+        options: { includeDescendants: true },
+    ): Promise<boolean>;
+    async findHomePathConflict(
+        username: string,
+        ownerUserId?: number,
+        options?: { includeDescendants?: boolean },
+    ): Promise<FSEntry | null | boolean> {
+        const path = this.#normalizePath(`/${username}`);
+
+        if (!options?.includeDescendants) {
+            const rows = (await this.clients.db.pread(
+                `SELECT ${this.#selectFsentriesColumns()} FROM fsentries
+                 WHERE path = ? ORDER BY id ASC`,
+                [path],
+            )) as unknown as FSEntryRow[];
+            for (const row of rows) {
+                const entry = this.#mapFSEntryRow(row);
+                if (ownerUserId !== undefined && entry.userId === ownerUserId) {
+                    continue;
+                }
+                return entry;
+            }
+            return null;
+        }
+
+        if (await this.#isVacatedHomeHeld(username, ownerUserId)) return true;
+
+        // One read for both. No ORDER BY, so the planner stays on the path
+        // index.
+        const likePattern = `${this.#escapeLikePattern(path)}/%`;
+        const [patterns] = await this.#subtreePatterns(path, likePattern, {
+            primary: true,
+        });
+        const params: unknown[] = [path, ...patterns];
+        if (ownerUserId !== undefined) params.push(ownerUserId);
+        const rows = (await this.clients.db.pread(
+            `SELECT id FROM fsentries
+             WHERE (path = ? OR ${this.#pathLikeAny(patterns)})${ownerUserId !== undefined ? ' AND user_id <> ?' : ''}
+             LIMIT 1`,
+            params,
+        )) as unknown as Array<{ id: number }>;
+        return rows.length > 0;
+    }
+
+    async #holdVacatedHome(homePath: string, userId: number): Promise<void> {
+        const name = homePath.slice(1);
+        if (!name || name.includes('/')) return;
+        await this.stores.kv.set({
+            key: vacatedHomeKey(name),
+            value: userId,
+            expireAt: Math.floor(Date.now() / 1000) + VACATED_HOME_HOLD_SECONDS,
+        });
+    }
+
+    async #isVacatedHomeHeld(
+        username: string,
+        ownerUserId?: number,
+    ): Promise<boolean> {
+        const { res } = await this.stores.kv.get({
+            key: vacatedHomeKey(username),
+            consistentRead: true,
+        });
+        return res !== null && res !== undefined && Number(res) !== ownerUserId;
+    }
+
+    // Heal a user's home tree to `/{username}`: if the root entry's path/name
+    // already match, no-op; otherwise rewrite the root row and cascade the
+    // prefix to descendants. Used by the username change flow AND by the
+    // on-read backfill for legacy users whose root row drifted (or whose
+    // path column was never populated).
+    async renameUserHome(
+        userId: number,
+        newUsername: string,
+    ): Promise<FSEntry | null> {
+        const root = await this.getRootEntryForUser(userId);
+        if (!root) return null;
+
+        const newPath = `/${newUsername}`;
+        if (root.path === newPath && root.name === newUsername) {
+            return root;
+        }
+
+        // Never heal onto a path someone else's row holds — the two would
+        // resolve interchangeably from then on.
+        const conflict = await this.findHomePathConflict(newUsername, userId);
+        if (conflict) {
+            throw new HttpError(409, `An entry already exists at ${newPath}`, {
+                legacyCode: 'conflict',
+            });
+        }
+
+        const oldPath = root.path;
+        const now = Math.floor(Date.now() / 1000);
+
+        // Before the rewrite, so a claim never sees the old path empty and
+        // unheld.
+        if (oldPath && oldPath !== newPath) {
+            await this.#holdVacatedHome(oldPath, userId);
+        }
+
+        await this.clients.db.write(
+            `UPDATE fsentries SET name = ?, path = ?, modified = ?
+             WHERE id = ?`,
+            [newUsername, newPath, now, root.id],
+        );
+
+        if (oldPath && oldPath !== '/' && oldPath !== newPath) {
+            const likePattern = `${this.#escapeLikePattern(oldPath)}/%`;
+            // SUBSTR counts characters, not UTF-16 code units.
+            const oldLen = [...oldPath].length;
+            const rewrittenPath = this.clients.db.case({
+                postgres: '? || SUBSTR(path, ?)',
+                otherwise: 'CONCAT(?, SUBSTR(path, ?))',
+            });
+            const groups = await this.#subtreePatterns(oldPath, likePattern, {
+                rootPaths: [oldPath, newPath],
+                primary: true,
+            });
+            for (const patterns of groups) {
+                await this.clients.db.write(
+                    `UPDATE fsentries
+                     SET path = ${rewrittenPath},
+                         modified = ?
+                     WHERE user_id = ? AND ${this.#pathLikeAny(patterns)}`,
+                    [newPath, oldLen + 1, now, userId, ...patterns],
+                );
+            }
+            await this.#invalidateRebasedSubtree(oldPath, newPath, groups);
+        }
+
+        // Invalidate root cache under both old and new keys.
+        await this.#invalidateEntryCache(root);
+        const refreshedRows = (await this.clients.db.pread(
+            `SELECT ${this.#selectFsentriesColumns()} FROM fsentries WHERE id = ? LIMIT 1`,
+            [root.id],
+        )) as unknown as FSEntryRow[];
+        const refreshed = refreshedRows[0]
+            ? this.#mapFSEntryRow(refreshedRows[0])
+            : null;
+        if (refreshed) {
+            await this.#invalidateEntryCache(refreshed);
+            await this.#writeEntryToCache(refreshed);
+        }
+        return refreshed;
+    }
+
+    // Rewrites path column for every descendant of `oldPrefix` to use `newPrefix`,
+    // and drops their cached copies. Used by move/rename when a directory is
+    // relocated. Pass `newUserId` when the subtree also changes hands.
+    async updatePathPrefixForUser(
+        userId: number,
+        oldPrefix: string,
+        newPrefix: string,
+        newUserId?: number,
+    ): Promise<number> {
+        const normalizedOld = this.#normalizePath(oldPrefix);
+        const normalizedNew = this.#normalizePath(newPrefix);
+        if (normalizedOld === '/' || normalizedNew === '/') {
+            throw new HttpError(
+                400,
+                'Cannot rewrite path prefix to/from root',
+                { legacyCode: 'bad_request' },
+            );
+        }
+        if (normalizedOld === normalizedNew) return 0;
+
+        const likePattern = `${this.#escapeLikePattern(normalizedOld)}/%`;
+        const now = Math.floor(Date.now() / 1000);
+
+        // CONCAT(?, SUBSTR(path, ? + 1)) to rewrite just the prefix portion.
+        // SUBSTR counts characters, not UTF-16 code units.
+        const oldPrefixLen = [...normalizedOld].length;
+        const rewrittenPath = this.clients.db.case({
+            postgres: '? || SUBSTR(path, ?)',
+            otherwise: 'CONCAT(?, SUBSTR(path, ?))',
+        });
+        const reowning = newUserId !== undefined && newUserId !== userId;
+        // Scoped by path alone. A subtree is meant to have one owner, but rows
+        // written before that was enforced don't — an app writing into another
+        // user's AppData used to stamp itself as the owner — and an `AND
+        // user_id = ?` would walk straight past them, leaving descendants
+        // pointing at a path their parent no longer has. `idx_fsentries_path`
+        // leads on `path`, so this is the same index range either way.
+        let affected = 0;
+        const groups = await this.#subtreePatterns(normalizedOld, likePattern, {
+            rootPaths: [normalizedOld, normalizedNew],
+            primary: true,
+        });
+        for (const patterns of groups) {
+            const result = await this.clients.db.write(
+                `UPDATE fsentries
+                 SET path = ${rewrittenPath},
+                     ${reowning ? 'user_id = ?,' : ''}
+                     modified = ?
+                 WHERE ${this.#pathLikeAny(patterns)}`,
+                [
+                    normalizedNew,
+                    oldPrefixLen + 1,
+                    ...(reowning ? [newUserId] : []),
+                    now,
+                    ...patterns,
+                ],
+            );
+            affected += this.#affectedRows(result);
+        }
+        await this.#invalidateRebasedSubtree(
+            normalizedOld,
+            normalizedNew,
+            groups,
+        );
+        return affected;
+    }
+
+    /**
+     * Drops every key a subtree just moved from `oldPrefix` to `newPrefix` was
+     * cached under. A stale copy still resolves the old path and reports it by
+     * id and uuid, so a write beneath it lands at a path its parent no longer
+     * has. Reads the moved rows from the primary through the rewrite's own
+     * pattern `groups`, shifted onto the new prefix.
+     */
+    async #invalidateRebasedSubtree(
+        oldPrefix: string,
+        newPrefix: string,
+        groups: string[][],
+    ): Promise<void> {
+        // Escaping is per character, so every pattern starts with this.
+        const escapedOld = this.#escapeLikePattern(oldPrefix);
+        const escapedNew = this.#escapeLikePattern(newPrefix);
+        let remaining = REBASED_INVALIDATION_MAX;
+        for (const group of groups) {
+            const patterns = group.map(
+                (pattern) => escapedNew + pattern.slice(escapedOld.length),
+            );
+            const rows = (await this.clients.db.pread(
+                `SELECT id, uuid, path FROM fsentries WHERE ${this.#pathLikeAny(patterns)} LIMIT ?`,
+                [...patterns, remaining],
+            )) as Array<{ id: number; uuid: string; path: string }>;
+            remaining -= rows.length;
+            const moved = rows.map((row) => ({
+                id: Number(row.id),
+                uuid: row.uuid,
+                path: oldPrefix + String(row.path).slice(newPrefix.length),
+            }));
+            await runWithConcurrencyLimit(
+                this.#chunk(moved, BULK_QUERY_CHUNK_SIZE),
+                DEFAULT_DB_CHUNK_CONCURRENCY,
+                (chunk) => this.#invalidateEntriesCache(chunk),
+            );
+            if (remaining <= 0) {
+                console.warn(
+                    `[FSEntryStore] moved ${REBASED_INVALIDATION_MAX}+ entries under ${newPrefix}; any others expire from cache on their TTL`,
+                );
+                return;
+            }
+        }
+    }
+
+    async deleteEntry(entry: FSEntry): Promise<void> {
+        await this.clients.db.write('DELETE FROM fsentries WHERE id = ?', [
+            entry.id,
+        ]);
+        await this.#invalidateEntryCache(entry);
+    }
+
+    async deleteEntries(entries: FSEntry[]): Promise<void> {
+        if (entries.length === 0) return;
+        const chunks = this.#chunk(entries, BULK_QUERY_CHUNK_SIZE);
+        await runWithConcurrencyLimit(
+            chunks,
+            DEFAULT_DB_CHUNK_CONCURRENCY,
+            async (chunk) => {
+                const ids = chunk.map((entry) => entry.id);
+                const placeholders = ids.map(() => '?').join(', ');
+                await this.clients.db.write(
+                    `DELETE FROM fsentries WHERE id IN (${placeholders})`,
+                    ids,
+                );
+                // Per chunk, which also bounds the size of each broadcast.
+                await this.#invalidateEntriesCache(chunk);
+            },
+        );
+    }
+
+    #affectedRows(writeResult: unknown): number {
+        if (typeof writeResult !== 'object' || writeResult === null) return 0;
+        const record = writeResult as Record<string, unknown>;
+        const affected = Number(record.affectedRows ?? record.changes ?? 0);
+        return Number.isFinite(affected) ? affected : 0;
+    }
+
+    /** Bytes held, with no allowance or quota-bonus reckoning attached. */
+    async getHeldBytes(userId: number): Promise<number> {
+        const rows = (await this.clients.db.read(
+            `SELECT COALESCE(SUM(size), 0) AS ${this.clients.db.quoteIdentifier('totalUsage')} FROM fsentries WHERE user_id = ?`,
+            [userId],
+        )) as { totalUsage: number }[];
+        return Number(rows[0]?.totalUsage ?? 0);
+    }
+
+    /**
+     * Held bytes for several accounts in one grouped read, as `getHeldBytes`
+     * does for one.
+     */
+    async getHeldBytesForUsers(
+        userIds: number[],
+    ): Promise<Map<number, number>> {
+        const out = new Map<number, number>();
+        const unique = [
+            ...new Set(
+                (Array.isArray(userIds) ? userIds : []).filter(
+                    (id): id is number => typeof id === 'number',
+                ),
+            ),
+        ];
+        for (const id of unique) out.set(id, 0);
+
+        for (let offset = 0; offset < unique.length; offset += 200) {
+            const chunk = unique.slice(offset, offset + 200);
+            const placeholders = chunk.map(() => '?').join(', ');
+            const rows = (await this.clients.db.read(
+                `SELECT user_id, COALESCE(SUM(size), 0) AS ${this.clients.db.quoteIdentifier('totalUsage')} ` +
+                    `FROM fsentries WHERE user_id IN (${placeholders}) GROUP BY user_id`,
+                chunk,
+            )) as { user_id: number; totalUsage: number }[];
+            for (const row of rows) {
+                out.set(Number(row.user_id), Number(row.totalUsage ?? 0));
+            }
+        }
+        return out;
+    }
+
+    /**
+     * `consistentRead` reads both queries from the primary instead of a replica
+     * — used for the exact re-check when a replica-backed read would reject a
+     * write, so `curr` and `max` come from the same, uncontestable snapshot.
+     */
+    async getUserStorageAllowance(
+        userId: number,
+        opts: { consistentRead?: boolean } = {},
+    ): Promise<{ curr: number; max: number }> {
+        const read = opts.consistentRead
+            ? this.clients.db.pread.bind(this.clients.db)
+            : this.clients.db.read.bind(this.clients.db);
+        const usageRowsPromise = read(
+            `SELECT COALESCE(SUM(size), 0) AS ${this.clients.db.quoteIdentifier('totalUsage')} FROM fsentries WHERE user_id = ?`,
+            [userId],
+        ) as Promise<{ totalUsage: number }[]>;
+        const userRowsPromise = read(
+            `SELECT uuid, free_storage AS ${this.clients.db.quoteIdentifier('freeStorage')} FROM ${this.clients.db.quoteIdentifier('user')} WHERE id = ? LIMIT 1`,
+            [userId],
+        ) as Promise<{ uuid: string; freeStorage: number | null }[]>;
+        const bonusPromise = this.#storageQuotaBonus(userId, userRowsPromise);
+        const [usageRows, userRows] = await Promise.all([
+            usageRowsPromise,
+            userRowsPromise,
+        ]);
+        const usageRow = usageRows[0];
+        const userRow = userRows[0];
+
+        const curr = Number(usageRow?.totalUsage ?? 0);
+        let max = Number(
+            userRow?.freeStorage ?? this.config.storage_capacity ?? 0,
+        );
+
+        const extra = await bonusPromise;
+        if (Number.isFinite(extra) && extra > 0) {
+            max += extra;
+        }
+
+        if (!this.config.is_storage_limited) {
+            const availableDeviceStorage = Number(
+                this.config.available_device_storage ?? 0,
+            );
+            if (availableDeviceStorage > 0) {
+                max = availableDeviceStorage;
+            } else {
+                const freeOnDisk = await this.#getFreeDeviceBytes();
+                max =
+                    freeOnDisk !== null
+                        ? curr + freeOnDisk
+                        : Number.MAX_SAFE_INTEGER;
+            }
+        }
+
+        return { curr, max };
+    }
+
+    /**
+     * What `storage.quota.bonus` listeners add, or 0. They start once the user
+     * row names the uuid to pass them, alongside the usage read, and never
+     * reject: a failed user read is the caller's to surface.
+     */
+    async #storageQuotaBonus(
+        userId: number,
+        userRows: Promise<Array<{ uuid: string }>>,
+    ): Promise<number> {
+        let userUuid: string | undefined;
+        try {
+            userUuid = (await userRows)[0]?.uuid;
+        } catch {
+            return 0;
+        }
+        const event = { userId, ...(userUuid ? { userUuid } : {}), extra: 0 };
+        try {
+            await this.clients.event.emitAndWaitConcurrently(
+                'storage.quota.bonus',
+                event,
+                {},
+            );
+        } catch {
+            /* best-effort */
+        }
+        return event.extra;
+    }
+
+    async #getFreeDeviceBytes(): Promise<number | null> {
+        try {
+            const stats = await statfs(process.cwd());
+            return Number(stats.bavail) * Number(stats.bsize);
+        } catch {
+            return null;
+        }
+    }
+}

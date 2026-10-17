@@ -1,0 +1,10443 @@
+/*
+ * Copyright (C) 2024-present Puter Technologies Inc.
+ *
+ * This file is part of Puter.
+ *
+ * Puter is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published
+ * by the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+/**
+ * E2E-style tests for AuthController signup, login, and token-grant flows.
+ *
+ * Drives the controller's extracted route-handler methods directly with
+ * synthetic req/res shapes — that way we exercise the full controller logic (DB
+ * writes via in-memory sqlite, real password hashing, real JWT
+ * signing/verifying via TokenService, real PermissionService writes) without
+ * needing the HTTP layer's middleware (rate limiting, captcha, anti-CSRF) to
+ * play along. Aligns with AGENTS.md: "Prefer test server over mocking deps."
+ */
+
+import bcrypt from 'bcrypt';
+import jwt from 'jsonwebtoken';
+import { TOTP } from 'otpauth';
+import { v4 as uuidv4, v5 as uuidv5 } from 'uuid';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
+import type { EventClient } from '../../clients/event/EventClient.js';
+import { makeActor, type Actor } from '../../core/actor.js';
+import { Context, runWithContext } from '../../core/context.js';
+import { HttpError } from '../../core/http/HttpError.js';
+import {
+    adminOnlyGate,
+    requireUserActorGate,
+} from '../../core/http/middleware/gates.js';
+import {
+    ROUTES_METADATA_KEY,
+    type CollectedRoute,
+    type TokenSource,
+} from '../../core/http/types.js';
+import { PuterServer } from '../../server.js';
+import { createSecret as otpCreateSecret } from '../../services/auth/OTPUtil.js';
+import { kvSharePermission } from '../../services/events/kvShares.js';
+import { FULL_API_ACCESS } from '../../services/permission/consts.js';
+import { setupTestServer } from '../../testUtil.js';
+import { resetCardVerificationStatusCache } from '../../util/cardFallback.js';
+import { FS_READ_LIMIT } from '../fs/limits.js';
+
+// ── Test harness ────────────────────────────────────────────────────
+
+let server: PuterServer;
+let controller: any;
+let eventClient: EventClient;
+
+beforeAll(async () => {
+    server = await setupTestServer();
+    controller = server.controllers.auth;
+    eventClient = server.clients.event;
+    installSharedListeners();
+});
+
+afterAll(async () => {
+    await server?.shutdown();
+});
+
+// EventClient has no `off()`, and its listener registry is a private field
+// — we can't pop listeners after each test. Instead we register a single
+// shared listener at module init and have it consult mutable state. Tests
+// that need to inspect or manipulate validate-events flip the state and
+// reset it in a `finally` block.
+type SignupValidateOverride = (data: {
+    allow: boolean;
+    no_temp_user: boolean;
+    requires_email_confirmation: boolean;
+    message: string | null;
+    code: string | null;
+    ip: string | null;
+}) => void;
+
+let signupValidateOverride: SignupValidateOverride | null = null;
+const heardSignupSuccess: Array<Record<string, unknown>> = [];
+const heardUserDelete: Array<Record<string, unknown>> = [];
+
+// Card verification is pure mechanism in core: a payments extension fills in the
+// event fields via emitAndWait. These overrides let a test stand in for that
+// extension, using the same shared-listener pattern as the signup validate
+// override above (EventClient has no off()). null override => no extension.
+type CardSetupOverride = (data: {
+    enabled: boolean | null;
+    client_secret: string | null;
+    publishable_key: string | null;
+}) => void;
+type CardConfirmOverride = (data: {
+    enabled: boolean | null;
+    verified: boolean;
+    reason: string | null;
+}) => void;
+let cardSetupOverride: CardSetupOverride | null = null;
+let cardConfirmOverride: CardConfirmOverride | null = null;
+
+const installSharedListeners = () => {
+    eventClient.on('puter.signup.validate', (_k: unknown, data: unknown) => {
+        if (signupValidateOverride) {
+            signupValidateOverride(
+                data as Parameters<SignupValidateOverride>[0],
+            );
+        }
+    });
+    eventClient.on('puter.signup.success', (_k: unknown, data: unknown) => {
+        heardSignupSuccess.push(data as Record<string, unknown>);
+    });
+    eventClient.on('user.delete', (_k: unknown, data: unknown) => {
+        heardUserDelete.push(data as Record<string, unknown>);
+    });
+    eventClient.on(
+        'puter.card-verification.setup',
+        (_k: unknown, data: unknown) => {
+            if (cardSetupOverride) {
+                cardSetupOverride(data as Parameters<CardSetupOverride>[0]);
+            }
+        },
+    );
+    eventClient.on(
+        'puter.card-verification.confirm',
+        (_k: unknown, data: unknown) => {
+            if (cardConfirmOverride) {
+                cardConfirmOverride(data as Parameters<CardConfirmOverride>[0]);
+            }
+        },
+    );
+};
+
+const withSignupValidateOverride = async <T>(
+    override: SignupValidateOverride,
+    fn: () => Promise<T>,
+): Promise<T> => {
+    signupValidateOverride = override;
+    try {
+        return await fn();
+    } finally {
+        signupValidateOverride = null;
+    }
+};
+
+const withCardSetupOverride = async <T>(
+    override: CardSetupOverride,
+    fn: () => Promise<T>,
+): Promise<T> => {
+    cardSetupOverride = override;
+    try {
+        return await fn();
+    } finally {
+        cardSetupOverride = null;
+    }
+};
+
+const withCardConfirmOverride = async <T>(
+    override: CardConfirmOverride,
+    fn: () => Promise<T>,
+): Promise<T> => {
+    cardConfirmOverride = override;
+    try {
+        return await fn();
+    } finally {
+        cardConfirmOverride = null;
+    }
+};
+
+// ── Synthetic req/res helpers ───────────────────────────────────────
+
+interface MockRes {
+    statusCode: number;
+    body: unknown;
+    headersSent: boolean;
+    cookies: Record<string, { value: string; opts?: Record<string, unknown> }>;
+    clearedCookies: string[];
+    sent: string | null;
+    ended: boolean;
+    status(code: number): MockRes;
+    json(body: unknown): MockRes;
+    cookie(
+        name: string,
+        value: string,
+        opts?: Record<string, unknown>,
+    ): MockRes;
+    clearCookie(name: string): MockRes;
+    send(text: string): MockRes;
+    end(): MockRes;
+}
+
+const makeRes = (): MockRes => {
+    const res: MockRes = {
+        statusCode: 200,
+        body: undefined,
+        headersSent: false,
+        cookies: {},
+        clearedCookies: [],
+        sent: null,
+        ended: false,
+        status(code: number) {
+            this.statusCode = code;
+            return this;
+        },
+        json(body: unknown) {
+            this.body = body;
+            this.headersSent = true;
+            return this;
+        },
+        cookie(name: string, value: string, opts?: Record<string, unknown>) {
+            this.cookies[name] = { value, opts };
+            return this;
+        },
+        clearCookie(name: string) {
+            this.clearedCookies.push(name);
+            return this;
+        },
+        send(text: string) {
+            this.sent = text;
+            this.headersSent = true;
+            return this;
+        },
+        end() {
+            this.ended = true;
+            this.headersSent = true;
+            return this;
+        },
+    };
+    return res;
+};
+
+const makeReq = (
+    body: Record<string, unknown> = {},
+    extra: Partial<{
+        actor: Actor;
+        token: string;
+        tokenSource: TokenSource;
+        headers: Record<string, unknown>;
+        ip: string;
+        params: Record<string, string>;
+    }> = {},
+) => ({
+    body,
+    headers: extra.headers ?? {},
+    connection: { remoteAddress: extra.ip ?? '127.0.0.1' },
+    socket: { remoteAddress: extra.ip ?? '127.0.0.1' },
+    ip: extra.ip ?? '127.0.0.1',
+    params: extra.params ?? {},
+    actor: extra.actor,
+    token: extra.token,
+    tokenSource: extra.tokenSource,
+});
+
+// PermissionService-backed handlers (grants, get-user-app-token) call
+// `Context.set(...)` internally, which throws unless invoked within a
+// `runWithContext` scope. Wrap controller calls that hit those paths.
+const inCtx = <T>(actor: Actor | undefined, fn: () => Promise<T>): Promise<T> =>
+    Promise.resolve(runWithContext({ actor: actor ?? undefined }, fn));
+
+// Login/signup happy paths return the full {proceed, token, user} envelope
+const isCompleteLoginResponse = (
+    body: unknown,
+): body is {
+    proceed: boolean;
+    next_step: string;
+    token: string;
+    user: { username: string; uuid: string };
+} =>
+    !!body &&
+    typeof body === 'object' &&
+    'next_step' in (body as Record<string, unknown>) &&
+    (body as Record<string, unknown>).next_step === 'complete';
+
+// ── Existing event-shape sanity check (unchanged) ───────────────────
+
+describe('puter.signup.validate event', () => {
+    it('supports code in the validate event when allow is false', async () => {
+        await withSignupValidateOverride(
+            (event) => {
+                event.allow = false;
+                event.message = 'Region not supported';
+                event.code = 'region_blocked';
+            },
+            async () => {
+                const validateEvent = {
+                    req: {},
+                    data: {},
+                    ip: '127.0.0.1',
+                    email: 'test@example.com',
+                    allow: true,
+                    no_temp_user: false,
+                    requires_email_confirmation: false,
+                    message: null as string | null,
+                    code: null as string | null,
+                };
+
+                await eventClient.emitAndWait(
+                    'puter.signup.validate',
+                    validateEvent,
+                    {},
+                );
+
+                expect(validateEvent.allow).toBe(false);
+                expect(validateEvent.message).toBe('Region not supported');
+                expect(validateEvent.code).toBe('region_blocked');
+
+                const err = new HttpError(
+                    403,
+                    validateEvent.message ?? 'Signup blocked',
+                    {
+                        legacyCode: 'forbidden',
+                        ...(validateEvent.code
+                            ? { code: validateEvent.code }
+                            : {}),
+                    },
+                );
+                expect(err.statusCode).toBe(403);
+                expect(err.message).toBe('Region not supported');
+                expect(err.code).toBe('region_blocked');
+            },
+        );
+    });
+
+    it('omits code from HttpError when extension does not set it', () => {
+        const validateEvent = {
+            req: {},
+            data: {},
+            ip: '127.0.0.1',
+            email: 'nocode@example.com',
+            allow: false,
+            no_temp_user: false,
+            requires_email_confirmation: false,
+            message: 'Blocked',
+            code: null as string | null,
+        };
+
+        const err = new HttpError(
+            403,
+            validateEvent.message ?? 'Signup blocked',
+            {
+                legacyCode: 'forbidden',
+                ...(validateEvent.code ? { code: validateEvent.code } : {}),
+            },
+        );
+        expect(err.statusCode).toBe(403);
+        expect(err.message).toBe('Blocked');
+        expect(err.code).toBeUndefined();
+    });
+});
+
+// ── Signup flow ─────────────────────────────────────────────────────
+
+// ── Concurrent claims on one address ────────────────────────────────
+//
+// The duplicate checks these flows run are not atomic with the writes that
+// follow them — the validate hook and bcrypt sit in between, and both are slow
+// enough for a second request to pass the same check. These tests fire the
+// requests together and assert the address still ends up on exactly one row.
+
+describe('concurrent claims on one email address', () => {
+    const uniq = () => Math.random().toString(36).slice(2, 10);
+
+    const countOwners = async (email: string): Promise<number> => {
+        // `email_confirmed` is TINYINT on MySQL and BOOLEAN on Postgres, so the
+        // literal has to come from the client rather than be hardcoded.
+        const isTrue = server.clients.db.booleanLiteral(true);
+        const rows = (await server.clients.db.read(
+            `SELECT COUNT(*) AS n FROM \`user\` WHERE \`email\` = ? AND (\`email_confirmed\` = ${isTrue} OR \`password\` IS NOT NULL)`,
+            [email],
+        )) as Array<{ n: number }>;
+        return Number(rows[0]?.n ?? 0);
+    };
+
+    it('lets only one of two simultaneous signups take the address', async () => {
+        const email = `race-${uniq()}@test.local`;
+        const signup = (username: string) =>
+            controller.handleSignup(
+                makeReq({ username, email, password: 'correct-horse-battery' }),
+                makeRes(),
+            );
+
+        // Distinct usernames on purpose: the UNIQUE on `username` would
+        // otherwise be what rejects the second request, and the email race
+        // would go untested.
+        const results = await Promise.allSettled([
+            signup(`r_a_${uniq()}`),
+            signup(`r_b_${uniq()}`),
+        ]);
+
+        expect(results.filter((r) => r.status === 'fulfilled')).toHaveLength(1);
+        expect(await countOwners(email)).toBe(1);
+
+        const rejected = results.find((r) => r.status === 'rejected') as
+            PromiseRejectedResult | undefined;
+        expect(rejected?.reason).toMatchObject({ statusCode: 400 });
+    });
+
+    it('lets only one of many simultaneous signups take the address', async () => {
+        const email = `race-many-${uniq()}@test.local`;
+        const results = await Promise.allSettled(
+            Array.from({ length: 5 }, () =>
+                controller.handleSignup(
+                    makeReq({
+                        username: `r_m_${uniq()}`,
+                        email,
+                        password: 'correct-horse-battery',
+                    }),
+                    makeRes(),
+                ),
+            ),
+        );
+
+        expect(results.filter((r) => r.status === 'fulfilled')).toHaveLength(1);
+        expect(await countOwners(email)).toBe(1);
+    });
+
+    it('rejects a signup racing an admin-provisioned placeholder claim', async () => {
+        const email = `race-pseudo-${uniq()}@test.local`;
+        // The placeholder shape signup is allowed to convert: unconfirmed,
+        // no password. Two signups both see it as claimable.
+        await server.stores.user.create({
+            username: `r_p_${uniq()}`,
+            uuid: uuidv4(),
+            password: null,
+            email,
+            clean_email: email,
+        });
+
+        const results = await Promise.allSettled([
+            controller.handleSignup(
+                makeReq({
+                    username: `r_p_a_${uniq()}`,
+                    email,
+                    password: 'correct-horse-battery',
+                }),
+                makeRes(),
+            ),
+            controller.handleSignup(
+                makeReq({
+                    username: `r_p_b_${uniq()}`,
+                    email,
+                    password: 'correct-horse-battery',
+                }),
+                makeRes(),
+            ),
+        ]);
+
+        expect(results.filter((r) => r.status === 'fulfilled')).toHaveLength(1);
+        expect(await countOwners(email)).toBe(1);
+    });
+
+    it('reports a username lost to a simultaneous signup as a 400', async () => {
+        const username = `r_u_${uniq()}`;
+        const results = await Promise.allSettled([
+            controller.handleSignup(
+                makeReq({
+                    username,
+                    email: `race-u-a-${uniq()}@test.local`,
+                    password: 'correct-horse-battery',
+                }),
+                makeRes(),
+            ),
+            controller.handleSignup(
+                makeReq({
+                    username,
+                    email: `race-u-b-${uniq()}@test.local`,
+                    password: 'correct-horse-battery',
+                }),
+                makeRes(),
+            ),
+        ]);
+
+        expect(results.filter((r) => r.status === 'fulfilled')).toHaveLength(1);
+        const rejected = results.find((r) => r.status === 'rejected') as
+            PromiseRejectedResult | undefined;
+        expect(rejected?.reason).toMatchObject({
+            statusCode: 400,
+            message:
+                'This username already exists in our database. Please use another one.',
+        });
+    });
+
+    it('reports a username taken before a placeholder claim lands as a 400', async () => {
+        const username = `r_c_${uniq()}`;
+        const email = `race-claim-${uniq()}@test.local`;
+        const placeholder = await server.stores.user.create({
+            username: `r_p_${uniq()}`,
+            uuid: uuidv4(),
+            password: null,
+            email,
+            clean_email: email,
+        });
+        // The winner, inserted between the duplicate check and the claim.
+        await server.stores.user.create({
+            username,
+            uuid: uuidv4(),
+            password: null,
+            email: `race-claim-winner-${uniq()}@test.local`,
+        });
+        // The duplicate check reads before the winner is visible to it.
+        const store = server.stores.user;
+        const originalGet = (Object.getPrototypeOf(store) as typeof store)
+            .getByUsername;
+        const probeSpy = vi
+            .spyOn(store, 'getByUsername')
+            .mockImplementation(async (candidate, opts) => {
+                if (candidate === username && !opts?.force) return null;
+                return originalGet.call(store, candidate, opts);
+            });
+
+        try {
+            await expect(
+                controller.handleSignup(
+                    makeReq({
+                        username,
+                        email,
+                        password: 'correct-horse-battery',
+                    }),
+                    makeRes(),
+                ),
+            ).rejects.toMatchObject({
+                statusCode: 400,
+                message:
+                    'This username already exists in our database. Please use another one.',
+            });
+        } finally {
+            probeSpy.mockRestore();
+        }
+        const after = await server.stores.user.getById(placeholder.id, {
+            force: true,
+        });
+        expect(after!.password).toBeNull();
+        expect(after!.username).toBe(placeholder.username);
+    });
+
+    it('reports a duplicate address as a 400, not a constraint error', async () => {
+        const email = `dupe-${uniq()}@test.local`;
+        await controller.handleSignup(
+            makeReq({
+                username: `d_a_${uniq()}`,
+                email,
+                password: 'correct-horse-battery',
+            }),
+            makeRes(),
+        );
+
+        // The message has to be the one the pre-check produces — a user who
+        // loses the race should not be able to tell.
+        await expect(
+            controller.handleSignup(
+                makeReq({
+                    username: `d_b_${uniq()}`,
+                    email,
+                    password: 'correct-horse-battery',
+                }),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({
+            statusCode: 400,
+            message:
+                'This email already exists in our database. Please use another one.',
+        });
+    });
+
+    it('refuses to give a placeholder row a password for a taken address', async () => {
+        const email = `recover-${uniq()}@test.local`;
+        await controller.handleSignup(
+            makeReq({
+                username: `rec_own_${uniq()}`,
+                email,
+                password: 'correct-horse-battery',
+            }),
+            makeRes(),
+        );
+
+        // An unconfirmed, password-less row is allowed to sit on the same
+        // address — but password recovery accepts a username, so it can be
+        // driven for this row rather than for the account that owns the
+        // address. Setting a password here would make it a second account able
+        // to recover that inbox.
+        const placeholderName = `rec_ph_${uniq()}`;
+        const placeholder = await server.stores.user.create({
+            username: placeholderName,
+            uuid: uuidv4(),
+            password: null,
+            email,
+            clean_email: email,
+        });
+        const token = uuidv4();
+        await server.stores.user.update(placeholder.id, {
+            pass_recovery_token: token,
+        });
+
+        const jwt = server.services.token.sign(
+            'otp',
+            {
+                token,
+                user_uid: placeholder.uuid,
+                email,
+                purpose: 'pass-recovery',
+            },
+            { expiresIn: '1h' },
+        );
+
+        await expect(
+            controller.handleSetPassUsingToken(
+                makeReq({ token: jwt, password: 'another-strong-password' }),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({
+            statusCode: 400,
+            message:
+                'This email is already in use. Recover the account that uses it instead.',
+        });
+    });
+});
+
+describe('AuthController.handleSignup', () => {
+    const uniq = () => Math.random().toString(36).slice(2, 10);
+
+    it('creates a user, hashes password, and completes login on a fresh signup', async () => {
+        const username = `s_${uniq()}`;
+        const req = makeReq({
+            username,
+            email: `${username}@test.local`,
+            password: 'correct-horse-battery',
+        });
+        const res = makeRes();
+
+        await controller.handleSignup(req, res);
+
+        // Response shape mirrors completeLogin: GUI token + user envelope.
+        expect(isCompleteLoginResponse(res.body)).toBe(true);
+        const body = res.body as {
+            user: {
+                username: string;
+                email: string;
+                requires_email_confirmation: number;
+                is_temp: boolean;
+            };
+            token: string;
+        };
+        expect(body.user.username).toBe(username);
+        expect(body.user.email).toBe(`${username}@test.local`);
+        expect(body.user.is_temp).toBe(false);
+        expect(typeof body.token).toBe('string');
+        expect(body.token.length).toBeGreaterThan(20);
+
+        // Session cookie set with the configured cookie name.
+        expect(res.cookies['puter_auth_token']).toBeDefined();
+
+        // Persisted with a bcrypt-hashed password (NOT plaintext).
+        const persisted = await server.stores.user.getByUsername(username);
+        expect(persisted).toBeTruthy();
+        expect(persisted!.password).not.toBe('correct-horse-battery');
+        expect(
+            await bcrypt.compare('correct-horse-battery', persisted!.password!),
+        ).toBe(true);
+    });
+
+    it('keys the signup abuse signals on req.ip, not the x-forwarded-for header', async () => {
+        const username = `s_${uniq()}`;
+        const forged = 'evil, 198.51.100.1';
+        let seenValidateIp: string | null | undefined;
+
+        await withSignupValidateOverride(
+            (event) => {
+                seenValidateIp = event.ip;
+            },
+            async () => {
+                await controller.handleSignup(
+                    makeReq(
+                        {
+                            username,
+                            email: `${username}@test.local`,
+                            password: 'correct-horse-battery',
+                        },
+                        {
+                            ip: '203.0.113.9',
+                            headers: { 'x-forwarded-for': forged },
+                        },
+                    ),
+                    makeRes(),
+                );
+            },
+        );
+
+        // Validate hook, success hook and the persisted lookup column all have
+        // to agree, or a per-IP counter is written under one key and read
+        // under another.
+        expect(seenValidateIp).toBe('203.0.113.9');
+        expect(
+            heardSignupSuccess.find((e) => e.username === username)?.ip,
+        ).toBe('203.0.113.9');
+
+        const persisted = await server.stores.user.getByUsername(username);
+        expect(persisted!.signup_ip).toBe('203.0.113.9');
+        expect(persisted!.signup_ip_forwarded).toBe('203.0.113.9');
+        // The raw chain is still recorded, but only as audit metadata.
+        const audit = JSON.parse(
+            String(
+                (persisted as unknown as { audit_metadata: string })
+                    .audit_metadata,
+            ),
+        );
+        expect(audit.ip_fwd).toBe(forged);
+    });
+
+    it('forces phone verification on every signup when always_require_phone_verification is set', async () => {
+        const cfg = (controller as { config: Record<string, unknown> }).config;
+        const prev = cfg.always_require_phone_verification;
+        cfg.always_require_phone_verification = true;
+        try {
+            const username = `s_${uniq()}`;
+            const req = makeReq({
+                username,
+                email: `${username}@test.local`,
+                password: 'correct-horse-battery',
+            });
+            const res = makeRes();
+
+            await controller.handleSignup(req, res);
+
+            // The login envelope flags the gate so the GUI shows the dialog …
+            const body = res.body as {
+                user: { requires_phone_verification?: number | boolean };
+            };
+            expect(body.user.requires_phone_verification).toBeTruthy();
+
+            // … and it's persisted so the gate survives re-login.
+            const persisted = await server.stores.user.getByUsername(username);
+            expect(persisted!.requires_phone_verification).toBe(true);
+        } finally {
+            cfg.always_require_phone_verification = prev;
+        }
+    });
+
+    it('rejects a duplicate username with 400', async () => {
+        const username = `s_${uniq()}`;
+        // Seed first.
+        await controller.handleSignup(
+            makeReq({
+                username,
+                email: `${username}@test.local`,
+                password: 'correct-horse-battery',
+            }),
+            makeRes(),
+        );
+
+        // Second signup with the same username must throw.
+        await expect(
+            controller.handleSignup(
+                makeReq({
+                    username,
+                    email: `other-${username}@test.local`,
+                    password: 'correct-horse-battery',
+                }),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 400 });
+    });
+
+    it('rejects role mailboxes and names an admin gate matches on', async () => {
+        const adminName = `a_${uniq()}`;
+        adminOnlyGate([adminName]);
+        for (const username of ['postmaster', 'Webmaster', adminName]) {
+            await expect(
+                controller.handleSignup(
+                    makeReq({
+                        username,
+                        email: `${uniq()}@test.local`,
+                        password: 'correct-horse-battery',
+                    }),
+                    makeRes(),
+                ),
+            ).rejects.toMatchObject({
+                statusCode: 400,
+                legacyCode: 'username_already_in_use',
+            });
+            expect(
+                await server.stores.user.getByUsername(username),
+            ).toBeFalsy();
+        }
+    });
+
+    it('rejects a confirmed-email duplicate with 400', async () => {
+        const u1 = `s_${uniq()}`;
+        const email = `${u1}@test.local`;
+        await controller.handleSignup(
+            makeReq({
+                username: u1,
+                email,
+                password: 'correct-horse-battery',
+            }),
+            makeRes(),
+        );
+        // Promote to email_confirmed so the duplicate-block branch fires.
+        const seeded = await server.stores.user.getByUsername(u1);
+        await server.stores.user.update(seeded!.id, { email_confirmed: 1 });
+
+        await expect(
+            controller.handleSignup(
+                makeReq({
+                    username: `s_${uniq()}`,
+                    email,
+                    password: 'correct-horse-battery',
+                }),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 400 });
+    });
+
+    it('rejects 400 when the home path is already occupied by a foreign row', async () => {
+        const parked = `s_${uniq()}`;
+        const occupantUsername = `s_${uniq()}`;
+        await controller.handleSignup(
+            makeReq({
+                username: occupantUsername,
+                email: `${occupantUsername}@test.local`,
+                password: 'correct-horse-battery',
+            }),
+            makeRes(),
+        );
+        const occupant =
+            await server.stores.user.getByUsername(occupantUsername);
+        const root = (await server.stores.fsEntry.getRootEntryForUser(
+            occupant!.id,
+        ))!;
+        await server.clients.db.write(
+            'UPDATE fsentries SET path = ? WHERE id = ?',
+            [`/${parked}`, root.id],
+        );
+
+        await expect(
+            controller.handleSignup(
+                makeReq({
+                    username: parked,
+                    email: `${parked}@test.local`,
+                    password: 'correct-horse-battery',
+                }),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 400 });
+
+        await expect(
+            server.stores.user.getByUsername(parked, { force: true }),
+        ).resolves.toBeNull();
+    });
+
+    it('rejects 400 when only a foreign row sits under the home path', async () => {
+        const parked = `s_${uniq()}`;
+        const occupantUsername = `s_${uniq()}`;
+        await controller.handleSignup(
+            makeReq({
+                username: occupantUsername,
+                email: `${occupantUsername}@test.local`,
+                password: 'correct-horse-battery',
+            }),
+            makeRes(),
+        );
+        const docs = (await server.stores.fsEntry.getEntryByPath(
+            `/${occupantUsername}/Documents`,
+        ))!;
+        await server.clients.db.write(
+            'UPDATE fsentries SET path = ? WHERE id = ?',
+            [`/${parked}/Documents`, docs.id],
+        );
+
+        await expect(
+            controller.handleSignup(
+                makeReq({
+                    username: parked,
+                    email: `${parked}@test.local`,
+                    password: 'correct-horse-battery',
+                }),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 400 });
+
+        await expect(
+            server.stores.user.getByUsername(parked, { force: true }),
+        ).resolves.toBeNull();
+    });
+
+    it('rejects reserved usernames (e.g. "admin")', async () => {
+        await expect(
+            controller.handleSignup(
+                makeReq({
+                    username: 'admin',
+                    email: `a_${uniq()}@test.local`,
+                    password: 'correct-horse-battery',
+                }),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 400 });
+    });
+
+    it.each(['abuse', 'postmaster', 'fbl'])(
+        'rejects the role mailbox name "%s"',
+        async (username) => {
+            await expect(
+                controller.handleSignup(
+                    makeReq({
+                        username,
+                        email: `a_${uniq()}@test.local`,
+                        password: 'correct-horse-battery',
+                    }),
+                    makeRes(),
+                ),
+            ).rejects.toMatchObject({ statusCode: 400 });
+        },
+    );
+
+    it('rejects an invalid email format', async () => {
+        await expect(
+            controller.handleSignup(
+                makeReq({
+                    username: `s_${uniq()}`,
+                    email: 'not-an-email',
+                    password: 'correct-horse-battery',
+                }),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 400 });
+    });
+
+    it('rejects a too-short password', async () => {
+        await expect(
+            controller.handleSignup(
+                makeReq({
+                    username: `s_${uniq()}`,
+                    email: `${uniq()}@test.local`,
+                    password: '12',
+                }),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 400 });
+    });
+
+    it('honeypot: returns 200 with empty body when p102xyzname is set', async () => {
+        const req = makeReq({
+            username: `s_${uniq()}`,
+            email: `${uniq()}@test.local`,
+            password: 'correct-horse-battery',
+            p102xyzname: 'i-am-a-bot',
+        });
+        const res = makeRes();
+        await controller.handleSignup(req, res);
+        expect(res.body).toEqual({});
+        // No cookie was set — honeypot path bails before completeLogin.
+        expect(res.cookies['puter_auth_token']).toBeUndefined();
+    });
+
+    it('temp user signup auto-fills username/email/password and is_temp=true on response', async () => {
+        const req = makeReq({ is_temp: true });
+        const res = makeRes();
+        await controller.handleSignup(req, res);
+
+        expect(isCompleteLoginResponse(res.body)).toBe(true);
+        const body = res.body as {
+            user: {
+                username: string;
+                email: string | null;
+                is_temp: boolean;
+            };
+        };
+        // Auto-generated username; auto-filled email; persisted email is null
+        // (temp users have no email on file).
+        expect(body.user.username).toBeTruthy();
+        expect(body.user.is_temp).toBe(true);
+        expect(body.user.email).toBeNull();
+    });
+
+    it('extension hook can block signup with 403 + custom legacy code', async () => {
+        await withSignupValidateOverride(
+            (event) => {
+                event.allow = false;
+                event.message = 'Region not supported';
+                event.code = 'region_blocked';
+            },
+            async () => {
+                // The controller forwards `validateEvent.code` as `legacyCode`
+                // on the resulting HttpError (see /signup handler), which is
+                // what the rest of the system treats as the public error code.
+                await expect(
+                    controller.handleSignup(
+                        makeReq({
+                            username: `s_${uniq()}`,
+                            email: `${uniq()}@test.local`,
+                            password: 'correct-horse-battery',
+                        }),
+                        makeRes(),
+                    ),
+                ).rejects.toMatchObject({
+                    statusCode: 403,
+                    legacyCode: 'region_blocked',
+                });
+            },
+        );
+    });
+
+    it('extension hook can block temp signups with no_temp_user', async () => {
+        await withSignupValidateOverride(
+            (event) => {
+                event.no_temp_user = true;
+            },
+            async () => {
+                await expect(
+                    controller.handleSignup(
+                        makeReq({ is_temp: true }),
+                        makeRes(),
+                    ),
+                ).rejects.toMatchObject({
+                    statusCode: 403,
+                    legacyCode: 'must_login_or_signup',
+                });
+            },
+        );
+    });
+
+    it('rejects brand-new temp signups when registration is disabled', async () => {
+        const authConfig = server.controllers.auth.config as {
+            disable_user_signup?: boolean;
+        };
+        const prev = authConfig.disable_user_signup;
+        authConfig.disable_user_signup = true;
+        try {
+            await expect(
+                controller.handleSignup(makeReq({ is_temp: true }), makeRes()),
+            ).rejects.toMatchObject({
+                statusCode: 403,
+                legacyCode: 'signup_disabled',
+            });
+        } finally {
+            authConfig.disable_user_signup = prev;
+        }
+    });
+
+    it('emits puter.signup.success on successful signup', async () => {
+        const baseline = heardSignupSuccess.length;
+        const username = `s_${uniq()}`;
+        await controller.handleSignup(
+            makeReq({
+                username,
+                email: `${username}@test.local`,
+                password: 'correct-horse-battery',
+            }),
+            makeRes(),
+        );
+
+        const fresh = heardSignupSuccess.slice(baseline);
+        expect(fresh.length).toBeGreaterThan(0);
+        // At least one of the new emissions corresponds to this username.
+        expect(
+            fresh.some(
+                (evt) => (evt as { username?: string }).username === username,
+            ),
+        ).toBe(true);
+    });
+
+    it('still allows claiming a pseudo-user row when registration is disabled', async () => {
+        const authConfig = server.controllers.auth.config as {
+            disable_user_signup?: boolean;
+        };
+        const prev = authConfig.disable_user_signup;
+        authConfig.disable_user_signup = true;
+        try {
+            const targetEmail = `disabled_claim_${uniq()}@test.local`;
+            const placeholder = await server.stores.user.create({
+                username: `placeholder_${uniq()}`,
+                uuid: uuidv4(),
+                password: null,
+                email: targetEmail,
+                clean_email: targetEmail,
+                email_confirmed: 0,
+            } as never);
+
+            const res = makeRes();
+            await controller.handleSignup(
+                makeReq({
+                    username: `claim_${uniq()}`,
+                    email: targetEmail,
+                    password: 'correct-horse-battery',
+                }),
+                res,
+            );
+
+            expect(isCompleteLoginResponse(res.body)).toBe(true);
+            const claimed = await server.stores.user.getById(placeholder.id, {
+                force: true,
+            });
+            expect(claimed!.username).not.toBe(placeholder.username);
+        } finally {
+            authConfig.disable_user_signup = prev;
+        }
+    });
+
+    it('does not reveal existing usernames or emails when registration is disabled', async () => {
+        const username = `taken_${uniq()}`;
+        const email = `${username}@test.local`;
+        await controller.handleSignup(
+            makeReq({ username, email, password: 'correct-horse-battery' }),
+            makeRes(),
+        );
+
+        const authConfig = server.controllers.auth.config as {
+            disable_user_signup?: boolean;
+        };
+        const prev = authConfig.disable_user_signup;
+        authConfig.disable_user_signup = true;
+        try {
+            // Taken username → the generic 403, not the duplicate error.
+            await expect(
+                controller.handleSignup(
+                    makeReq({
+                        username,
+                        email: `fresh_${uniq()}@test.local`,
+                        password: 'correct-horse-battery',
+                    }),
+                    makeRes(),
+                ),
+            ).rejects.toMatchObject({
+                statusCode: 403,
+                legacyCode: 'signup_disabled',
+            });
+            // Taken (non-claimable) email → same generic 403.
+            await expect(
+                controller.handleSignup(
+                    makeReq({
+                        username: `fresh_${uniq()}`,
+                        email,
+                        password: 'correct-horse-battery',
+                    }),
+                    makeRes(),
+                ),
+            ).rejects.toMatchObject({
+                statusCode: 403,
+                legacyCode: 'signup_disabled',
+            });
+        } finally {
+            authConfig.disable_user_signup = prev;
+        }
+    });
+});
+
+// -- Signup device signal (fingerprint) --
+
+describe('AuthController.handleSignup device signals', () => {
+    const uniq = () => Math.random().toString(36).slice(2, 10);
+
+    const captureValidateEvents = async (
+        fn: () => Promise<void>,
+    ): Promise<Array<Record<string, unknown>>> => {
+        const seen: Array<Record<string, unknown>> = [];
+        await withSignupValidateOverride((event) => {
+            seen.push(event as unknown as Record<string, unknown>);
+        }, fn);
+        return seen;
+    };
+
+    const successEventsFor = (baseline: number, username: string) =>
+        heardSignupSuccess
+            .slice(baseline)
+            .filter(
+                (evt) => (evt as { username?: string }).username === username,
+            );
+
+    it('forwards fingerprint verbatim to validate and success events', async () => {
+        const username = `fp_${uniq()}`;
+        const baseline = heardSignupSuccess.length;
+        const fingerprint = 'Fp_abc.123-XYZ';
+
+        const seen = await captureValidateEvents(async () => {
+            const res = makeRes();
+            await controller.handleSignup(
+                makeReq({
+                    username,
+                    email: `${username}@test.local`,
+                    password: 'correct-horse-battery',
+                    fingerprint,
+                }),
+                res,
+            );
+            expect(isCompleteLoginResponse(res.body)).toBe(true);
+        });
+
+        expect(seen).toHaveLength(1);
+        expect(seen[0].fingerprint).toBe(fingerprint);
+
+        const successes = successEventsFor(baseline, username);
+        expect(successes).toHaveLength(1);
+        expect(successes[0].fingerprint).toBe(fingerprint);
+        expect(successes[0].is_temp).toBe(false);
+    });
+
+    it('accepts a boundary-length 128-char fingerprint', async () => {
+        const username = `fp_${uniq()}`;
+        const res = makeRes();
+        await controller.handleSignup(
+            makeReq({
+                username,
+                email: `${username}@test.local`,
+                password: 'correct-horse-battery',
+                fingerprint: 'f'.repeat(128),
+            }),
+            res,
+        );
+        expect(isCompleteLoginResponse(res.body)).toBe(true);
+    });
+
+    it('defaults the fingerprint to null on the validate event when absent', async () => {
+        const username = `fp_${uniq()}`;
+        const baseline = heardSignupSuccess.length;
+
+        const seen = await captureValidateEvents(async () => {
+            const res = makeRes();
+            await controller.handleSignup(
+                makeReq({
+                    username,
+                    email: `${username}@test.local`,
+                    password: 'correct-horse-battery',
+                }),
+                res,
+            );
+            // Signup completes exactly as before when the fields are absent.
+            expect(isCompleteLoginResponse(res.body)).toBe(true);
+            expect(res.cookies['puter_auth_token']).toBeDefined();
+        });
+
+        expect(seen).toHaveLength(1);
+        expect(seen[0].fingerprint).toBeNull();
+
+        const successes = successEventsFor(baseline, username);
+        expect(successes).toHaveLength(1);
+        expect(successes[0].fingerprint).toBeNull();
+        expect(successes[0].is_temp).toBe(false);
+    });
+
+    it('treats an empty-string fingerprint as absent', async () => {
+        const username = `fp_${uniq()}`;
+
+        const seen = await captureValidateEvents(async () => {
+            const res = makeRes();
+            await controller.handleSignup(
+                makeReq({
+                    username,
+                    email: `${username}@test.local`,
+                    password: 'correct-horse-battery',
+                    fingerprint: '',
+                }),
+                res,
+            );
+            // An empty signal is "not collected", never a 400.
+            expect(isCompleteLoginResponse(res.body)).toBe(true);
+        });
+
+        expect(seen).toHaveLength(1);
+        expect(seen[0].fingerprint).toBeNull();
+    });
+
+    it('rejects a non-string fingerprint with 400 and fires no success event', async () => {
+        const username = `fp_${uniq()}`;
+        const baseline = heardSignupSuccess.length;
+        await expect(
+            controller.handleSignup(
+                makeReq({
+                    username,
+                    email: `${username}@test.local`,
+                    password: 'correct-horse-battery',
+                    fingerprint: 12345,
+                }),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({
+            statusCode: 400,
+            legacyCode: 'bad_request',
+        });
+        expect(heardSignupSuccess.length).toBe(baseline);
+        // No user row was created either.
+        expect(await server.stores.user.getByUsername(username)).toBeFalsy();
+    });
+
+    it('rejects a fingerprint longer than 128 characters with 400 and fires no success event', async () => {
+        const username = `fp_${uniq()}`;
+        const baseline = heardSignupSuccess.length;
+        await expect(
+            controller.handleSignup(
+                makeReq({
+                    username,
+                    email: `${username}@test.local`,
+                    password: 'correct-horse-battery',
+                    fingerprint: 'f'.repeat(129),
+                }),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 400 });
+        expect(heardSignupSuccess.length).toBe(baseline);
+    });
+
+    it('temp-user signup reports is_temp true and carries the fingerprint on the success event', async () => {
+        const baseline = heardSignupSuccess.length;
+        const res = makeRes();
+        await controller.handleSignup(
+            makeReq({ is_temp: true, fingerprint: 'temp-device-fp' }),
+            res,
+        );
+        expect(isCompleteLoginResponse(res.body)).toBe(true);
+        const username = (res.body as { user: { username: string } }).user
+            .username;
+        const successes = successEventsFor(baseline, username);
+        expect(successes).toHaveLength(1);
+        expect(successes[0].is_temp).toBe(true);
+        expect(successes[0].fingerprint).toBe('temp-device-fp');
+    });
+
+    it('pseudo-user claim reports is_temp false on the success event', async () => {
+        // Seed an unconfirmed placeholder row (email set, password null) —
+        // signing up with the same email claims it instead of inserting.
+        const placeholder = `ph_${uniq()}`;
+        const email = `${placeholder}@test.local`;
+        await server.stores.user.create({
+            username: placeholder,
+            uuid: uuidv4(),
+            password: null,
+            email,
+        });
+
+        const username = `fp_${uniq()}`;
+        const baseline = heardSignupSuccess.length;
+        const res = makeRes();
+        await controller.handleSignup(
+            makeReq({
+                username,
+                email,
+                password: 'correct-horse-battery',
+                fingerprint: 'claim-device-fp',
+            }),
+            res,
+        );
+        expect(isCompleteLoginResponse(res.body)).toBe(true);
+
+        const successes = successEventsFor(baseline, username);
+        expect(successes).toHaveLength(1);
+        expect(successes[0].is_temp).toBe(false);
+        expect(successes[0].fingerprint).toBe('claim-device-fp');
+    });
+});
+
+// ── Login flow ──────────────────────────────────────────────────────
+
+describe('AuthController.handleLogin', () => {
+    const password = 'correct-horse-battery';
+    let username: string;
+    let email: string;
+
+    beforeAll(async () => {
+        username = `l_${Math.random().toString(36).slice(2, 10)}`;
+        email = `${username}@test.local`;
+        await controller.handleSignup(
+            makeReq({ username, email, password }),
+            makeRes(),
+        );
+    });
+
+    it('returns the GUI token + user envelope on a correct username login', async () => {
+        const res = makeRes();
+        await controller.handleLogin(makeReq({ username, password }), res);
+        expect(isCompleteLoginResponse(res.body)).toBe(true);
+        // GUI token is verifiable as an `auth` JWT.
+        const token = (res.body as { token: string }).token;
+        const decoded = server.services.token.verify('auth', token) as {
+            type: string;
+            user_uid: string;
+        };
+        expect(decoded.type).toBe('gui');
+        // Session cookie carries the (different) session token.
+        expect(res.cookies['puter_auth_token'].value).toBeTruthy();
+        expect(res.cookies['puter_auth_token'].value).not.toBe(token);
+    });
+
+    it('also accepts email instead of username', async () => {
+        const res = makeRes();
+        await controller.handleLogin(makeReq({ email, password }), res);
+        expect(isCompleteLoginResponse(res.body)).toBe(true);
+    });
+
+    it('hands back the whoami account shape, without the phone number', async () => {
+        const user = await server.stores.user.getByUsername(username, {
+            force: true,
+        });
+        await server.stores.user.update(user!.id, { phone: '+15550100' });
+        const res = makeRes();
+        await controller.handleLogin(makeReq({ username, password }), res);
+        const body = res.body as { user: Record<string, unknown> };
+        expect(body.user).not.toHaveProperty('phone');
+        expect(body.user).toMatchObject({
+            username,
+            uuid: user!.uuid,
+            oidc_only: false,
+            otp: false,
+            is_user_token: true,
+        });
+        expect(body.user.directories).toBeTypeOf('object');
+        expect(Array.isArray(body.user.taskbar_items)).toBe(true);
+    });
+
+    // A deleted row still answering from cache reaches the session INSERT.
+    it('answers 401 rather than 500 when the account row is gone but still cached', async () => {
+        const goneName = `lg_${Math.random().toString(36).slice(2, 10)}`;
+        await controller.handleSignup(
+            makeReq({
+                username: goneName,
+                email: `${goneName}@test.local`,
+                password,
+            }),
+            makeRes(),
+        );
+        const gone = await server.stores.user.getByUsername(goneName);
+
+        const realWrite = server.clients.db.write.bind(server.clients.db);
+        const writeSpy = vi
+            .spyOn(server.clients.db, 'write')
+            .mockImplementation(async (sql: string, params?: unknown[]) => {
+                if (/INSERT INTO `sessions`/.test(sql)) {
+                    throw Object.assign(new Error('FOREIGN KEY constraint'), {
+                        code: 'SQLITE_CONSTRAINT_FOREIGNKEY',
+                    });
+                }
+                return realWrite(sql, params);
+            });
+
+        try {
+            await expect(
+                controller.handleLogin(
+                    makeReq({ username: goneName, password }),
+                    makeRes(),
+                ),
+            ).rejects.toMatchObject({ statusCode: 401 });
+        } finally {
+            writeSpy.mockRestore();
+        }
+
+        expect(
+            await server.clients.redis.get(`users:username:${goneName}`),
+        ).toBeNull();
+    });
+
+    it('refuses an email the account has moved off', async () => {
+        const moverName = `lm_${Math.random().toString(36).slice(2, 10)}`;
+        const oldEmail = `${moverName}-old@test.local`;
+        const newEmail = `${moverName}-new@test.local`;
+        await controller.handleSignup(
+            makeReq({ username: moverName, email: oldEmail, password }),
+            makeRes(),
+        );
+        // Warm the by-email lookup the way a real login would.
+        await controller.handleLogin(
+            makeReq({ email: oldEmail, password }),
+            makeRes(),
+        );
+
+        const mover = await server.stores.user.getByUsername(moverName);
+        await server.stores.user.update(mover!.id, {
+            email: newEmail,
+            clean_email: newEmail,
+        });
+
+        await expect(
+            controller.handleLogin(
+                makeReq({ email: oldEmail, password }),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 404 });
+        const res = makeRes();
+        await controller.handleLogin(
+            makeReq({ email: newEmail, password }),
+            res,
+        );
+        expect(isCompleteLoginResponse(res.body)).toBe(true);
+    });
+
+    it('returns 400 when neither username nor email is supplied', async () => {
+        await expect(
+            controller.handleLogin(makeReq({ password }), makeRes()),
+        ).rejects.toMatchObject({ statusCode: 400 });
+    });
+
+    it('returns 400 when password is missing', async () => {
+        await expect(
+            controller.handleLogin(makeReq({ username }), makeRes()),
+        ).rejects.toMatchObject({ statusCode: 400 });
+    });
+
+    it('returns 404 for an unknown username', async () => {
+        await expect(
+            controller.handleLogin(
+                makeReq({ username: `does_not_exist_${uuidv4()}`, password }),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 404 });
+    });
+
+    it('returns 401 for the wrong password', async () => {
+        await expect(
+            controller.handleLogin(
+                makeReq({ username, password: 'wrong-password' }),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 401 });
+    });
+
+    it('returns 401 when the account is suspended', async () => {
+        const u = `lsus_${Math.random().toString(36).slice(2, 10)}`;
+        await controller.handleSignup(
+            makeReq({
+                username: u,
+                email: `${u}@test.local`,
+                password: 'correct-horse-battery',
+            }),
+            makeRes(),
+        );
+        const seeded = await server.stores.user.getByUsername(u);
+        await server.stores.user.update(seeded!.id, { suspended: 1 });
+
+        await expect(
+            controller.handleLogin(
+                makeReq({ username: u, password: 'correct-horse-battery' }),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 401 });
+    });
+
+    it('hides the system user when allow_system_login is false', async () => {
+        // Default config has no `allow_system_login`. The system user does
+        // exist (seeded), so the lookup succeeds — but the controller masks
+        // it as 404 to avoid leaking presence.
+        await expect(
+            controller.handleLogin(
+                makeReq({ username: 'system', password: 'whatever' }),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 404 });
+    });
+
+    it('OTP-enabled accounts get a 202 + otp_jwt_token instead of completing login', async () => {
+        const u = `lotp_${Math.random().toString(36).slice(2, 10)}`;
+        await controller.handleSignup(
+            makeReq({
+                username: u,
+                email: `${u}@test.local`,
+                password: 'correct-horse-battery',
+            }),
+            makeRes(),
+        );
+        const seeded = await server.stores.user.getByUsername(u);
+        await server.stores.user.update(seeded!.id, {
+            otp_enabled: 1,
+            otp_secret: 'TESTSECRETBASE32',
+        });
+
+        const res = makeRes();
+        await controller.handleLogin(
+            makeReq({ username: u, password: 'correct-horse-battery' }),
+            res,
+        );
+        expect(res.statusCode).toBe(202);
+        const body = res.body as {
+            proceed: boolean;
+            next_step: string;
+            otp_jwt_token: string;
+        };
+        expect(body.next_step).toBe('otp');
+        expect(typeof body.otp_jwt_token).toBe('string');
+        const decoded = server.services.token.verify(
+            'otp',
+            body.otp_jwt_token,
+        ) as { user_uid: string; purpose: string };
+        expect(decoded.purpose).toBe('otp-login');
+        expect(decoded.user_uid).toBe(seeded!.uuid);
+        // No session cookie set yet — login isn't complete.
+        expect(res.cookies['puter_auth_token']).toBeUndefined();
+    });
+
+    it('rejects with 400 (not a TypeError) when the request has no body', async () => {
+        await expect(
+            controller.handleLogin(
+                { ...makeReq({}), body: undefined },
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({
+            statusCode: 400,
+            legacyCode: 'bad_request',
+        });
+    });
+});
+
+// ── Login: OTP / recovery-code branches ─────────────────────────────
+
+describe('AuthController.handleLoginOtp + handleLoginRecoveryCode', () => {
+    it('handleLoginOtp rejects an invalid token with 400', async () => {
+        await expect(
+            controller.handleLoginOtp(
+                makeReq({ token: 'not-a-jwt', code: '123456' }),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 400 });
+    });
+
+    it('handleLoginOtp rejects with 400 (not a TypeError) when the request has no body', async () => {
+        await expect(
+            controller.handleLoginOtp(
+                { ...makeReq({}), body: undefined },
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 400 });
+    });
+
+    it('handleLoginOtp rejects a valid JWT with the wrong purpose', async () => {
+        const wrongPurposeJwt = server.services.token.sign(
+            'otp',
+            { user_uid: uuidv4(), purpose: 'something-else' },
+            { expiresIn: '5m' },
+        );
+        await expect(
+            controller.handleLoginOtp(
+                makeReq({ token: wrongPurposeJwt, code: '123456' }),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 400 });
+    });
+
+    it('handleLoginOtp returns proceed:false when the code does not verify', async () => {
+        const u = `otp_${Math.random().toString(36).slice(2, 10)}`;
+        await controller.handleSignup(
+            makeReq({
+                username: u,
+                email: `${u}@test.local`,
+                password: 'correct-horse-battery',
+            }),
+            makeRes(),
+        );
+        const seeded = await server.stores.user.getByUsername(u);
+        await server.stores.user.update(seeded!.id, {
+            otp_enabled: 1,
+            otp_secret: 'TESTSECRETBASE32',
+        });
+        const otpJwt = server.services.token.sign(
+            'otp',
+            { user_uid: seeded!.uuid, purpose: 'otp-login' },
+            { expiresIn: '5m' },
+        );
+
+        const res = makeRes();
+        await controller.handleLoginOtp(
+            makeReq({ token: otpJwt, code: '000000' }),
+            res,
+        );
+        expect(res.body).toEqual({ proceed: false });
+    });
+
+    it('handleLoginRecoveryCode consumes a valid code and completes login', async () => {
+        const u = `rec_${Math.random().toString(36).slice(2, 10)}`;
+        await controller.handleSignup(
+            makeReq({
+                username: u,
+                email: `${u}@test.local`,
+                password: 'correct-horse-battery',
+            }),
+            makeRes(),
+        );
+        const seeded = await server.stores.user.getByUsername(u);
+        // Hashed-recovery-code list — pre-hash a known plaintext.
+        const { hashRecoveryCode } =
+            await import('../../services/auth/OTPUtil.js');
+        const PLAIN = 'recover-me-please';
+        const hashed = hashRecoveryCode(PLAIN);
+        await server.stores.user.update(seeded!.id, {
+            otp_recovery_codes: hashed,
+        });
+
+        const otpJwt = server.services.token.sign(
+            'otp',
+            { user_uid: seeded!.uuid, purpose: 'otp-login' },
+            { expiresIn: '5m' },
+        );
+
+        const res = makeRes();
+        await controller.handleLoginRecoveryCode(
+            makeReq({ token: otpJwt, code: PLAIN }),
+            res,
+        );
+        expect(isCompleteLoginResponse(res.body)).toBe(true);
+
+        // Recovery code consumed (single-use): rerunning with the same code
+        // should now return proceed:false.
+        const res2 = makeRes();
+        await controller.handleLoginRecoveryCode(
+            makeReq({ token: otpJwt, code: PLAIN }),
+            res2,
+        );
+        expect(res2.body).toEqual({ proceed: false });
+    });
+
+    /** A password login for a 2FA account, returning its `otp-login` JWT. */
+    const startOtpLogin = async () => {
+        const { user } = await makeUserAndActor();
+        const secret = otpCreateSecret(user.username).secret;
+        await server.stores.user.update(user.id, {
+            otp_enabled: 1,
+            otp_secret: secret,
+        });
+        const otpToken = async () => {
+            const res = makeRes();
+            await controller.handleLogin(
+                makeReq({
+                    username: user.username,
+                    password: 'correct-horse-battery',
+                }),
+                res,
+            );
+            return (res.body as { otp_jwt_token: string }).otp_jwt_token;
+        };
+        return { user, secret, otpToken };
+    };
+
+    it('an otp-login token completes one sign-in only', async () => {
+        const { user, secret, otpToken } = await startOtpLogin();
+        const token = await otpToken();
+
+        const res = makeRes();
+        await controller.handleLoginOtp(
+            makeReq({ token, code: liveTotp(user.username, secret) }),
+            res,
+        );
+        expect(isCompleteLoginResponse(res.body)).toBe(true);
+
+        await expect(
+            controller.handleLoginOtp(
+                makeReq({ token, code: liveTotp(user.username, secret) }),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 400 });
+    });
+
+    it('a wrong code leaves the token usable for a retry', async () => {
+        const { user, secret, otpToken } = await startOtpLogin();
+        const token = await otpToken();
+
+        const wrong = makeRes();
+        await controller.handleLoginOtp(
+            makeReq({ token, code: '000000' }),
+            wrong,
+        );
+        expect(wrong.body).toEqual({ proceed: false });
+
+        const res = makeRes();
+        await controller.handleLoginOtp(
+            makeReq({ token, code: liveTotp(user.username, secret) }),
+            res,
+        );
+        expect(isCompleteLoginResponse(res.body)).toBe(true);
+    });
+
+    it('wrong codes count against the account across tokens and both routes', async () => {
+        const { user, secret, otpToken } = await startOtpLogin();
+        const { hashRecoveryCode } =
+            await import('../../services/auth/OTPUtil.js');
+        await server.stores.user.update(user.id, {
+            otp_recovery_codes: hashRecoveryCode('RECOVER1'),
+        });
+
+        for (let i = 0; i < 10; i++) {
+            const res = makeRes();
+            const handler =
+                i % 2 === 0
+                    ? controller.handleLoginOtp
+                    : controller.handleLoginRecoveryCode;
+            await handler.call(
+                controller,
+                makeReq({ token: await otpToken(), code: '000000' }),
+                res,
+            );
+            expect(res.body).toEqual({ proceed: false });
+        }
+
+        // Spent: even the right code is refused until the window passes.
+        await expect(
+            controller.handleLoginOtp(
+                makeReq({
+                    token: await otpToken(),
+                    code: liveTotp(user.username, secret),
+                }),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 429 });
+        await expect(
+            controller.handleLoginRecoveryCode(
+                makeReq({ token: await otpToken(), code: 'RECOVER1' }),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 429 });
+
+        // Another account keeps its own budget.
+        const other = await startOtpLogin();
+        const res = makeRes();
+        await controller.handleLoginOtp(
+            makeReq({
+                token: await other.otpToken(),
+                code: liveTotp(other.user.username, other.secret),
+            }),
+            res,
+        );
+        expect(isCompleteLoginResponse(res.body)).toBe(true);
+    });
+});
+
+// ── Step-up (elevation) ─────────────────────────────────────────────
+
+describe('AuthController.handleElevate', () => {
+    it('password account: correct password mints the elevation cookie', async () => {
+        const { actor } = await makeUserAndActor();
+        const res = makeRes();
+        await controller.handleElevate(
+            makeReq({ password: 'correct-horse-battery' }, { actor }),
+            res,
+        );
+        expect(res.body).toMatchObject({ elevated: true });
+        expect(res.cookies.puter_elevated).toBeDefined();
+        expect(res.cookies.puter_elevated.opts).toMatchObject({
+            httpOnly: true,
+        });
+
+        // The minted cookie satisfies verifyStepUpSession for this same user.
+        const { verifyStepUpSession } =
+            await import('../../core/http/middleware/stepUpSession.js');
+        const ok = verifyStepUpSession(
+            {
+                cookies: { puter_elevated: res.cookies.puter_elevated.value },
+                actor: { user: { uuid: actor.user.uuid } },
+            } as never,
+            { tokenService: server.services.token },
+        );
+        expect(ok).toBe(true);
+    });
+
+    it('password account: wrong password → 401 password_mismatch', async () => {
+        const { actor } = await makeUserAndActor();
+        await expect(
+            controller.handleElevate(
+                makeReq({ password: 'nope' }, { actor }),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({
+            statusCode: 401,
+            legacyCode: 'password_mismatch',
+        });
+    });
+
+    it('2FA account: a live TOTP code elevates; a wrong code is rejected', async () => {
+        const { TOTP } = await import('otpauth');
+        const { createSecret } = await import('../../services/auth/OTPUtil.js');
+        const { user, actor } = await makeUserAndActor();
+        const { secret } = createSecret(user.username);
+        await server.stores.user.update(user.id, {
+            otp_enabled: 1,
+            otp_secret: secret,
+        });
+        // Reflect the enabled state on the actor the way the auth probe would.
+        const otpActor = {
+            user: { ...actor.user, otp_enabled: true },
+        } as never;
+
+        const totp = new TOTP({
+            issuer: 'puter.com',
+            label: user.username,
+            algorithm: 'SHA1',
+            digits: 6,
+            secret,
+        });
+
+        const res = makeRes();
+        await controller.handleElevate(
+            makeReq({ code: totp.generate() }, { actor: otpActor }),
+            res,
+        );
+        expect(res.body).toMatchObject({ elevated: true });
+        expect(res.cookies.puter_elevated).toBeDefined();
+
+        await expect(
+            controller.handleElevate(
+                makeReq({ code: '000000' }, { actor: otpActor }),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 401 });
+    });
+
+    it('account with no password and 2FA off cannot elevate → 403', async () => {
+        const { user, actor } = await makeUserAndActor();
+        await server.stores.user.update(user.id, { password: null });
+        await expect(
+            controller.handleElevate(
+                makeReq({ password: 'anything' }, { actor }),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({
+            statusCode: 403,
+            legacyCode: 'elevation_unavailable',
+        });
+    });
+
+    it('API clients (no cookie) get the token back to send as a header', async () => {
+        const { actor } = await makeUserAndActor();
+        const res = makeRes();
+        await controller.handleElevate(
+            makeReq({ password: 'correct-horse-battery' }, { actor }),
+            res,
+        );
+        expect(typeof (res.body as { token?: string }).token).toBe('string');
+    });
+
+    it('browser sessions (cookie-authed) do NOT get the raw token in the body', async () => {
+        const { actor } = await makeUserAndActor();
+        const res = makeRes();
+        // Mimic the browser: the resolved token IS the session cookie value.
+        // Cookie name must match `config.cookie_name` (puter_auth_token).
+        const req = {
+            ...makeReq({ password: 'correct-horse-battery' }, { actor }),
+            token: 'session-cookie-value',
+            cookies: { puter_auth_token: 'session-cookie-value' },
+        };
+        await controller.handleElevate(req, res);
+        expect(res.body).toEqual({ elevated: true });
+        expect(res.cookies.puter_elevated).toBeDefined();
+    });
+
+    it('the elevation token is never honored as a main auth token', async () => {
+        const { user } = await makeUserAndActor();
+        const { signStepUpToken } =
+            await import('../../core/http/middleware/stepUpSession.js');
+        const token = signStepUpToken(server.services.token, {
+            uuid: user.uuid,
+        });
+        const result = await server.services.auth.authenticate(token);
+        expect(result.actor).toBeUndefined();
+    });
+});
+
+describe('AuthController — forged non-v2 token mints no reauth_token hint', () => {
+    it('a forged token naming a victim uuid has nothing for /signup{reauth_token} to redeem', async () => {
+        // v1 is fully removed: a forged non-v2 token must not yield a
+        // `reauth` signal, so `signReauthToken` is never reachable for it.
+        const { user } = await makeUserAndActor();
+        const forged = jwt.sign(
+            { auth_id: user.uuid },
+            'attacker-controlled-secret',
+        );
+        const result = await server.services.auth.authenticate(forged);
+        expect(result.reauth).toBeUndefined();
+        expect(result.actor).toBeUndefined();
+    });
+});
+
+// ── Logout ──────────────────────────────────────────────────────────
+
+describe('AuthController.handleLogout', () => {
+    it('clears the session cookie and responds with "logged out"', async () => {
+        const u = `lo_${Math.random().toString(36).slice(2, 10)}`;
+        await controller.handleSignup(
+            makeReq({
+                username: u,
+                email: `${u}@test.local`,
+                password: 'correct-horse-battery',
+            }),
+            makeRes(),
+        );
+        const seeded = await server.stores.user.getByUsername(u);
+
+        const res = makeRes();
+        await controller.handleLogout(
+            makeReq(
+                {},
+                {
+                    actor: {
+                        user: {
+                            id: seeded!.id,
+                            uuid: seeded!.uuid,
+                            username: seeded!.username,
+                            email: seeded!.email ?? null,
+                        },
+                    } as Actor,
+                },
+            ),
+            res,
+        );
+        expect(res.clearedCookies).toContain('puter_auth_token');
+        expect(res.sent).toBe('logged out');
+    });
+});
+
+describe('AuthController account-lifecycle route gating', () => {
+    const routeOptions = (method: string, path: string) => {
+        const proto = Object.getPrototypeOf(controller) as {
+            __puterRoutes?: Array<{
+                method: string;
+                path: string;
+                options?: Record<string, unknown>;
+            }>;
+        };
+        const route = (proto.__puterRoutes ?? []).find(
+            (r) =>
+                r.method.toLowerCase() === method.toLowerCase() &&
+                r.path === path,
+        );
+        expect(route, `route ${method} ${path} not found`).toBeDefined();
+        return route!.options ?? {};
+    };
+
+    it('POST /logout requires a human user actor', () => {
+        const opts = routeOptions('post', '/logout');
+        expect(opts.requireUserActor).toBe(true);
+        expect(opts.antiCsrf).toBe(true);
+    });
+
+    it('GET /get-anticsrf-token requires a human user actor', () => {
+        const opts = routeOptions('get', '/get-anticsrf-token');
+        expect(opts.requireUserActor).toBe(true);
+    });
+
+    // A fresh token is minted per protected mutation and nothing caches them,
+    // so issuance has to outrun the COMBINED rate of everything that spends
+    // one. The session-authenticated download path dominates — a multi-select
+    // download spends a token per file — with logout and the handful of
+    // session-management writes behind it.
+    it('GET /get-anticsrf-token clears the budgets that consume tokens', () => {
+        type Window = { limit: number; window: number };
+        const issuance = routeOptions('get', '/get-anticsrf-token')
+            .rateLimit as Window;
+        const logout = routeOptions('post', '/logout').rateLimit as Window;
+
+        expect(issuance.window).toBe(60_000);
+        expect(logout.window).toBe(60_000);
+        expect(FS_READ_LIMIT.window).toBe(60_000);
+
+        expect(issuance.limit).toBeGreaterThan(
+            FS_READ_LIMIT.limit + logout.limit,
+        );
+    });
+
+    it('requireUserActorGate rejects app-under-user and access-token actors', () => {
+        const gate = requireUserActorGate();
+        const run = (actor: Partial<Actor>) =>
+            new Promise<unknown>((resolve) => {
+                gate({ actor } as never, {} as never, (err?: unknown) =>
+                    resolve(err),
+                );
+            });
+
+        return (async () => {
+            const appActor = await run({
+                user: { uuid: 'u1' },
+                app: { uid: 'app-1' },
+            } as Partial<Actor>);
+            expect(appActor).toMatchObject({ statusCode: 403 });
+
+            const tokenActor = await run({
+                user: { uuid: 'u1' },
+                accessToken: { uid: 'tok-1' },
+            } as Partial<Actor>);
+            expect(tokenActor).toMatchObject({ statusCode: 403 });
+
+            const human = await run({ user: { uuid: 'u1' } } as Partial<Actor>);
+            expect(human).toBeUndefined();
+        })();
+    });
+});
+
+// ── Token grants: user → user / app / group ─────────────────────────
+
+// Mirrors AuthService's namespace for origin-derived app uids, so a test can
+// compute the uid an origin would synthesise without an app row.
+const APP_ORIGIN_UUID_NAMESPACE = '33de3768-8ee0-43e9-9e73-db192b97a5d8';
+
+describe('AuthController grant flows', () => {
+    let issuer: { id: number; uuid: string; username: string; email: string };
+    let target: { id: number; uuid: string; username: string; email: string };
+    let issuerActor: Actor;
+
+    beforeAll(async () => {
+        const issuerName = `gi_${Math.random().toString(36).slice(2, 10)}`;
+        const targetName = `gt_${Math.random().toString(36).slice(2, 10)}`;
+        await controller.handleSignup(
+            makeReq({
+                username: issuerName,
+                email: `${issuerName}@test.local`,
+                password: 'correct-horse-battery',
+            }),
+            makeRes(),
+        );
+        await controller.handleSignup(
+            makeReq({
+                username: targetName,
+                email: `${targetName}@test.local`,
+                password: 'correct-horse-battery',
+            }),
+            makeRes(),
+        );
+        const i = await server.stores.user.getByUsername(issuerName);
+        const t = await server.stores.user.getByUsername(targetName);
+        // Auto-confirm so they can act in permission flows that gate on it.
+        await server.stores.user.update(i!.id, { email_confirmed: 1 });
+        await server.stores.user.update(t!.id, { email_confirmed: 1 });
+        issuer = {
+            id: i!.id,
+            uuid: i!.uuid,
+            username: i!.username,
+            email: i!.email!,
+        };
+        target = {
+            id: t!.id,
+            uuid: t!.uuid,
+            username: t!.username,
+            email: t!.email!,
+        };
+        issuerActor = {
+            user: {
+                id: issuer.id,
+                uuid: issuer.uuid,
+                username: issuer.username,
+                email: issuer.email,
+                email_confirmed: true,
+            },
+        } as Actor;
+    });
+
+    it('grant-user-app: persists a user→app permission grant', async () => {
+        // Create an app row owned by the issuer so the grant has somewhere
+        // to land.
+        const app = await server.stores.app.create(
+            {
+                name: `tg-${uuidv4()}`,
+                title: 'TestGrantApp',
+                index_url: 'https://example.test/index.html',
+            },
+            { ownerUserId: issuer.id },
+        );
+        const permission = `service:tg-app:ii:read`;
+        // The controller's grant call delegates through PermissionService
+        // (which uses ALS Context.set), so wrap in runWithContext.
+        const res = makeRes();
+        await inCtx(issuerActor, () =>
+            controller.handleGrantUserApp(
+                makeReq(
+                    { app_uid: app.uid, permission, extra: {} },
+                    { actor: issuerActor },
+                ),
+                res,
+            ),
+        );
+        expect(res.body).toEqual({});
+
+        // The permission row exists in the user_to_app_permissions table.
+        // Schema uses `app_id` (numeric FK), not `app_uid`.
+        const rows = await server.clients.db.read(
+            'SELECT p.`permission` FROM `user_to_app_permissions` p ' +
+                'JOIN `apps` a ON a.`id` = p.`app_id` ' +
+                'WHERE p.`user_id` = ? AND a.`uid` = ?',
+            [issuer.id, app.uid],
+        );
+        expect(
+            (rows as Array<{ permission: string }>).map((r) => r.permission),
+        ).toContain(permission);
+    });
+
+    it('grant-user-app: resolves `origin` to the app when app_uid is omitted', async () => {
+        // The GUI permission dialog and puter.perms.grantOrigin() identify
+        // third-party sites by origin rather than app uid.
+        const appName = `tg-origin-${uuidv4()}`;
+        const origin = `https://${appName}.example.test`;
+        const app = await server.stores.app.create(
+            {
+                name: appName,
+                title: 'TestGrantOriginApp',
+                index_url: `${origin}/index.html`,
+            },
+            { ownerUserId: issuer.id },
+        );
+        const permission = `service:tg-origin-app:ii:read`;
+        const res = makeRes();
+        await inCtx(issuerActor, () =>
+            controller.handleGrantUserApp(
+                makeReq(
+                    { origin, permission, extra: {} },
+                    { actor: issuerActor },
+                ),
+                res,
+            ),
+        );
+        expect(res.body).toEqual({});
+
+        const rows = await server.clients.db.read(
+            'SELECT p.`permission` FROM `user_to_app_permissions` p ' +
+                'JOIN `apps` a ON a.`id` = p.`app_id` ' +
+                'WHERE p.`user_id` = ? AND a.`uid` = ?',
+            [issuer.id, app.uid],
+        );
+        expect(
+            (rows as Array<{ permission: string }>).map((r) => r.permission),
+        ).toContain(permission);
+    });
+
+    it('revoke-user-app: resolves `origin` to the app when app_uid is omitted', async () => {
+        // Mirrors the grant-by-origin path: grant via origin, then revoke via
+        // origin, and assert the permission row is gone.
+        const appName = `tr-origin-${uuidv4()}`;
+        const origin = `https://${appName}.example.test`;
+        const app = await server.stores.app.create(
+            {
+                name: appName,
+                title: 'TestRevokeOriginApp',
+                index_url: `${origin}/index.html`,
+            },
+            { ownerUserId: issuer.id },
+        );
+        const permission = `service:tr-origin-app:ii:read`;
+        await inCtx(issuerActor, () =>
+            controller.handleGrantUserApp(
+                makeReq(
+                    { origin, permission, extra: {} },
+                    { actor: issuerActor },
+                ),
+                makeRes(),
+            ),
+        );
+
+        const res = makeRes();
+        await inCtx(issuerActor, () =>
+            controller.handleRevokeUserApp(
+                makeReq({ origin, permission }, { actor: issuerActor }),
+                res,
+            ),
+        );
+        expect(res.body).toEqual({});
+
+        const rows = await server.clients.db.read(
+            'SELECT p.`permission` FROM `user_to_app_permissions` p ' +
+                'JOIN `apps` a ON a.`id` = p.`app_id` ' +
+                'WHERE p.`user_id` = ? AND a.`uid` = ?',
+            [issuer.id, app.uid],
+        );
+        expect(
+            (rows as Array<{ permission: string }>).map((r) => r.permission),
+        ).not.toContain(permission);
+    });
+
+    it('revoke-user-app `*`: deletes the worker sessions that app deployed for the user, and only those', async () => {
+        const app = await server.stores.app.create(
+            {
+                name: `tr-worker-${uuidv4()}`,
+                title: 'TestRevokeWorkerApp',
+                index_url: `https://tr-worker-${uuidv4()}.example.test/`,
+            },
+            { ownerUserId: issuer.id },
+        );
+        const workerName = () => `wk-${uuidv4().slice(0, 8)}`;
+        const appWorker = await server.stores.session.getOrCreateWorker(
+            issuer.id,
+            { appUid: app.uid, workerName: workerName() },
+        );
+        const otherApp = await server.stores.session.getOrCreateWorker(
+            issuer.id,
+            { appUid: `app-${uuidv4()}`, workerName: workerName() },
+        );
+        const userScoped = await server.stores.session.getOrCreateWorker(
+            issuer.id,
+            { appUid: null, workerName: workerName() },
+        );
+        const exists = async (uuid: string) =>
+            (
+                await server.clients.db.read(
+                    'SELECT 1 FROM `sessions` WHERE `uuid` = ?',
+                    [uuid],
+                )
+            ).length > 0;
+
+        // A single permission leaves the app's workers running as before.
+        await inCtx(issuerActor, () =>
+            controller.handleRevokeUserApp(
+                makeReq(
+                    { app_uid: app.uid, permission: 'service:x:ii:read' },
+                    { actor: issuerActor },
+                ),
+                makeRes(),
+            ),
+        );
+        expect(await exists(appWorker.uuid)).toBe(true);
+
+        await inCtx(issuerActor, () =>
+            controller.handleRevokeUserApp(
+                makeReq(
+                    { app_uid: app.uid, permission: '*' },
+                    { actor: issuerActor },
+                ),
+                makeRes(),
+            ),
+        );
+        expect(await exists(appWorker.uuid)).toBe(false);
+        expect(await exists(otherApp.uuid)).toBe(true);
+        expect(await exists(userScoped.uuid)).toBe(true);
+    });
+
+    it('grant-user-app: 400 on non-string or oversized origin/app_uid/permission', async () => {
+        const cases = [
+            { origin: { host: 'evil' }, permission: 'service:x:ii:read' },
+            { origin: 'https://a.test', permission: ['service:x:ii:read'] },
+            { app_uid: 12345, permission: 'service:x:ii:read' },
+            {
+                origin: `https://${'a'.repeat(5000)}.test`,
+                permission: 'service:x:ii:read',
+            },
+        ];
+        for (const body of cases) {
+            await expect(
+                controller.handleGrantUserApp(
+                    makeReq(body, { actor: issuerActor }),
+                    makeRes(),
+                ),
+            ).rejects.toMatchObject({ statusCode: 400 });
+        }
+    });
+
+    it('grant/revoke-user-app: an unregistered `origin` cannot be redirected onto an app squatting its synthetic uid', async () => {
+        // `appUidFromOrigin` synthesises `app-<uuidv5(origin)>` when no app row
+        // matches the origin, and the permission services resolve their
+        // identifier as uid-*or-name*. The namespace is a source constant, so
+        // the synthetic uid is computable offline — if it were passed straight
+        // through, registering an app under that literal *name* would collect
+        // grants the user made to the origin.
+        const origin = `https://unregistered-${uuidv4()}.example`;
+        const syntheticUid = `app-${uuidv5(origin, APP_ORIGIN_UUID_NAMESPACE)}`;
+        const squatter = await server.stores.app.create(
+            {
+                name: syntheticUid,
+                title: 'Squatter',
+                index_url: 'https://squatter.example/index.html',
+            },
+            { ownerUserId: target.id },
+        );
+
+        const permission = 'service:squat:ii:read';
+        for (const handler of [
+            'handleGrantUserApp',
+            'handleRevokeUserApp',
+        ] as const) {
+            await expect(
+                inCtx(issuerActor, () =>
+                    controller[handler](
+                        makeReq(
+                            { origin, permission, extra: {} },
+                            { actor: issuerActor },
+                        ),
+                        makeRes(),
+                    ),
+                ),
+            ).rejects.toMatchObject({ statusCode: 404 });
+        }
+
+        const rows = await server.clients.db.read(
+            'SELECT p.`permission` FROM `user_to_app_permissions` p ' +
+                'WHERE p.`user_id` = ? AND p.`app_id` = ?',
+            [issuer.id, squatter.id],
+        );
+        expect(rows).toEqual([]);
+    });
+
+    it('grant/revoke-user-app: an `app_uid` sent beside an `origin` cannot redirect the grant away from that origin', async () => {
+        // The origin is what a consent prompt shows the user, so it has to
+        // decide who receives the grant. Resolving `origin` only when
+        // `app_uid` was absent left the squatter guard bypassable by simply
+        // sending both: the uid won, and it is resolved as uid-*or-name*, so
+        // the synthetic `app-<uuidv5(origin)>` of an unregistered origin landed
+        // on whoever registered an app under that literal name.
+        const origin = `https://unregistered-${uuidv4()}.example`;
+        const syntheticUid = `app-${uuidv5(origin, APP_ORIGIN_UUID_NAMESPACE)}`;
+        const squatter = await server.stores.app.create(
+            {
+                name: syntheticUid,
+                title: 'SquatterBesideOrigin',
+                index_url: 'https://squatter-beside-origin.example/index.html',
+            },
+            { ownerUserId: target.id },
+        );
+
+        const permission = 'service:squat-beside:ii:read';
+        for (const handler of [
+            'handleGrantUserApp',
+            'handleRevokeUserApp',
+        ] as const) {
+            await expect(
+                inCtx(issuerActor, () =>
+                    controller[handler](
+                        makeReq(
+                            {
+                                app_uid: syntheticUid,
+                                origin,
+                                permission,
+                                extra: {},
+                            },
+                            { actor: issuerActor },
+                        ),
+                        makeRes(),
+                    ),
+                ),
+            ).rejects.toMatchObject({ statusCode: 404 });
+        }
+
+        const rows = await server.clients.db.read(
+            'SELECT p.`permission` FROM `user_to_app_permissions` p ' +
+                'WHERE p.`user_id` = ? AND p.`app_id` = ?',
+            [issuer.id, squatter.id],
+        );
+        expect(rows).toEqual([]);
+    });
+
+    it('grant-user-app: a registered `origin` beside an unrelated `app_uid` grants to the origin, not the uid', async () => {
+        // Same precedence rule, on the path where the origin does resolve: the
+        // uid travelling beside it must not steer the grant somewhere else.
+        const appName = `tp-origin-${uuidv4()}`;
+        const origin = `https://${appName}.example.test`;
+        const app = await server.stores.app.create(
+            {
+                name: appName,
+                title: 'TestPrecedenceOriginApp',
+                index_url: `${origin}/index.html`,
+            },
+            { ownerUserId: issuer.id },
+        );
+        const other = await server.stores.app.create(
+            {
+                name: `tp-other-${uuidv4()}`,
+                title: 'TestPrecedenceOtherApp',
+                index_url: `https://tp-other-${uuidv4()}.example.test/index.html`,
+            },
+            { ownerUserId: issuer.id },
+        );
+
+        const permission = 'service:tp-origin:ii:read';
+        await inCtx(issuerActor, () =>
+            controller.handleGrantUserApp(
+                makeReq(
+                    { app_uid: other.uid, origin, permission, extra: {} },
+                    { actor: issuerActor },
+                ),
+                makeRes(),
+            ),
+        );
+
+        const granted = async (appId: number) =>
+            (
+                (await server.clients.db.read(
+                    'SELECT p.`permission` FROM `user_to_app_permissions` p ' +
+                        'WHERE p.`user_id` = ? AND p.`app_id` = ?',
+                    [issuer.id, appId],
+                )) as Array<{ permission: string }>
+            ).map((r) => r.permission);
+        expect(await granted(app.id)).toContain(permission);
+        expect(await granted(other.id)).not.toContain(permission);
+    });
+
+    it('grant-user-app: 400 on a non-object `extra`/`meta` instead of committing then faulting', async () => {
+        // These are forwarded into the audit row and read as objects
+        // downstream, so a bad value used to surface as a 500 *after* the
+        // grant row was already written.
+        const appName = `tm-${uuidv4()}`;
+        const app = await server.stores.app.create(
+            {
+                name: appName,
+                title: 'TestMetaApp',
+                index_url: `https://${appName}.example.test/index.html`,
+            },
+            { ownerUserId: issuer.id },
+        );
+        const permission = 'service:tm-app:ii:read';
+        for (const body of [
+            { app_uid: app.uid, permission, meta: 'nope' },
+            { app_uid: app.uid, permission, meta: [1, 2] },
+            { app_uid: app.uid, permission, extra: 'nope' },
+        ]) {
+            await expect(
+                inCtx(issuerActor, () =>
+                    controller.handleGrantUserApp(
+                        makeReq(body, { actor: issuerActor }),
+                        makeRes(),
+                    ),
+                ),
+            ).rejects.toMatchObject({ statusCode: 400 });
+        }
+
+        // `null` means "absent", matching how the string params are treated,
+        // and must succeed rather than fault after the write.
+        const res = makeRes();
+        await inCtx(issuerActor, () =>
+            controller.handleGrantUserApp(
+                makeReq(
+                    { app_uid: app.uid, permission, extra: null, meta: null },
+                    { actor: issuerActor },
+                ),
+                res,
+            ),
+        );
+        expect(res.body).toEqual({});
+    });
+
+    it('grant-user-app: 400 on an `extra`/`meta` larger than the cap', async () => {
+        const appName = `tb-${uuidv4()}`;
+        const app = await server.stores.app.create(
+            {
+                name: appName,
+                title: 'TestBoundApp',
+                index_url: `https://${appName}.example.test/index.html`,
+            },
+            { ownerUserId: issuer.id },
+        );
+        const permission = 'service:tb-app:ii:read';
+        const oversized = { blob: 'z'.repeat(5000) };
+        for (const body of [
+            { app_uid: app.uid, permission, extra: oversized },
+            { app_uid: app.uid, permission, meta: oversized },
+        ]) {
+            await expect(
+                inCtx(issuerActor, () =>
+                    controller.handleGrantUserApp(
+                        makeReq(body, { actor: issuerActor }),
+                        makeRes(),
+                    ),
+                ),
+            ).rejects.toMatchObject({ statusCode: 400 });
+        }
+
+        const res = makeRes();
+        await inCtx(issuerActor, () =>
+            controller.handleGrantUserApp(
+                makeReq(
+                    {
+                        app_uid: app.uid,
+                        permission,
+                        extra: { blob: 'z'.repeat(1000) },
+                    },
+                    { actor: issuerActor },
+                ),
+                res,
+            ),
+        );
+        expect(res.body).toEqual({});
+    });
+
+    it('grant-user-app: refuses a key-value delegation over a whole namespace', async () => {
+        // The prompt for it would read "let this app show your app data to
+        // whoever it picks", which describes no bounded capability — so the
+        // request is refused where it is made, not after the user answers it.
+        const appName = `tkv-${uuidv4()}`;
+        const app = await server.stores.app.create(
+            {
+                name: appName,
+                title: 'TestKvShareApp',
+                index_url: `https://${appName}.example.test/index.html`,
+            },
+            { ownerUserId: issuer.id },
+        );
+        const namespace = `manage:kv-share:${issuer.uuid}:${app.uid}`;
+
+        await expect(
+            inCtx(issuerActor, () =>
+                controller.handleGrantUserApp(
+                    makeReq(
+                        { app_uid: app.uid, permission: namespace },
+                        { actor: issuerActor },
+                    ),
+                    makeRes(),
+                ),
+            ),
+        ).rejects.toMatchObject({ legacyCode: 'invalid_kv_share_prefix' });
+
+        // A region under it is exactly what the flow is for.
+        const res = makeRes();
+        await inCtx(issuerActor, () =>
+            controller.handleGrantUserApp(
+                makeReq(
+                    {
+                        app_uid: app.uid,
+                        permission: `${namespace}:team:abc`,
+                    },
+                    { actor: issuerActor },
+                ),
+                res,
+            ),
+        );
+        expect(res.body).toEqual({});
+    });
+
+    it('grant-user-app: 400 on a `permission` wider than the column it lands in', async () => {
+        // 300 chars is under the 4096 input cap but over `varchar(255)`, so it
+        // used to reach the INSERT and fault on MySQL/Postgres. The check runs
+        // after the rewrite, so this has to be a permission no rewriter
+        // shortens — and it has to reject before the app is resolved, since
+        // this uid names no app.
+        await expect(
+            inCtx(issuerActor, () =>
+                controller.handleGrantUserApp(
+                    makeReq(
+                        {
+                            app_uid: `app-${uuidv4()}`,
+                            permission: `service:${'a'.repeat(300)}:ii:read`,
+                        },
+                        { actor: issuerActor },
+                    ),
+                    makeRes(),
+                ),
+            ),
+        ).rejects.toMatchObject({ statusCode: 400 });
+    });
+
+    it('grant-user-app: an oversized permission that a rewriter shortens is accepted', async () => {
+        // The width that matters is the rewritten string's, not the caller's.
+        // In production this is `fs:/deep/path:read` collapsing to
+        // `fs:<uuid>:read` — a ~45-char row however deep the path is. Measuring
+        // the raw input instead rejected grants whose stored value was
+        // comfortably inside the column, and the permission dialog dead-ended
+        // on "please try again" for any deeply nested file. Exercised here
+        // through a rewriter of our own, since the real fs rewriter resolves
+        // the path through the fsentry store and this suite has no entries.
+        const appName = `tlp-${uuidv4()}`;
+        const app = await server.stores.app.create(
+            {
+                name: appName,
+                title: 'TestLongPathApp',
+                index_url: `https://${appName}.example.test/index.html`,
+            },
+            { ownerUserId: issuer.id },
+        );
+
+        const prefix = `tlprw-${uuidv4()}`;
+        const longPermission = `${prefix}:${'a'.repeat(300)}:read`;
+        const shortPermission = `${prefix}:${uuidv4()}:read`;
+        expect(longPermission.length).toBeGreaterThan(255);
+        expect(shortPermission.length).toBeLessThanOrEqual(255);
+        server.services.permission.registerRewriter({
+            id: `test-shorten-${prefix}`,
+            matches: (permission: string) => permission === longPermission,
+            rewrite: async () => shortPermission,
+        });
+
+        const res = makeRes();
+        await inCtx(issuerActor, () =>
+            controller.handleGrantUserApp(
+                makeReq(
+                    { app_uid: app.uid, permission: longPermission },
+                    { actor: issuerActor },
+                ),
+                res,
+            ),
+        );
+        expect(res.body).toEqual({});
+
+        const storedPermissions = async () =>
+            (
+                (await server.clients.db.read(
+                    'SELECT p.`permission` FROM `user_to_app_permissions` p ' +
+                        'WHERE p.`user_id` = ? AND p.`app_id` = ?',
+                    [issuer.id, app.id],
+                )) as Array<{ permission: string }>
+            ).map((r) => r.permission);
+        // What landed in the column is the short, rewritten form.
+        expect(await storedPermissions()).toContain(shortPermission);
+
+        // Revoke has to accept the same string grant did, or the dialog's
+        // withdrawal of an uncertain grant can never undo one of these.
+        const revokeRes = makeRes();
+        await inCtx(issuerActor, () =>
+            controller.handleRevokeUserApp(
+                makeReq(
+                    { app_uid: app.uid, permission: longPermission },
+                    { actor: issuerActor },
+                ),
+                revokeRes,
+            ),
+        );
+        expect(revokeRes.body).toEqual({});
+        expect(await storedPermissions()).not.toContain(shortPermission);
+    });
+
+    it('grant-user-app: the granting flag is not visible to work running beside it', async () => {
+        const { user: issuer, actor: issuerActor } = await makeUserAndActor();
+        const app = await (
+            server.stores.app.create as unknown as (
+                fields: Record<string, unknown>,
+                opts: { ownerUserId: number },
+            ) => Promise<{ uid: string; id: number }>
+        )(
+            {
+                name: `conc-${uuidv4()}`,
+                title: 'Concurrency app',
+                index_url: `https://conc-${uuidv4()}.test/`,
+            },
+            { ownerUserId: issuer.id },
+        );
+
+        const prefix = `conc-${uuidv4()}`;
+        let release: () => void;
+        let entered: () => void;
+        const held = new Promise<void>((r) => {
+            release = r;
+        });
+        const reached = new Promise<void>((r) => {
+            entered = r;
+        });
+        let seenDuring: unknown;
+        // Parks the grant's rewrite, so the flag is set while it is parked.
+        server.services.permission.registerRewriter({
+            id: `test-slow-${prefix}`,
+            matches: (permission: string) =>
+                permission.startsWith(`${prefix}:`),
+            rewrite: async () => {
+                seenDuring = Context.get('is_grant_user_app_permission');
+                entered();
+                await held;
+                return `fs:${uuidv4()}:write`;
+            },
+        });
+
+        await inCtx(issuerActor, async () => {
+            const granting = controller.handleGrantUserApp(
+                makeReq(
+                    {
+                        app_uid: app.uid,
+                        permission: `${prefix}:${app.uid}:write`,
+                    },
+                    { actor: issuerActor },
+                ),
+                makeRes(),
+            );
+            // Read while the rewrite above is parked, so the window is open.
+            await reached;
+            const beside = Context.get('is_grant_user_app_permission');
+            release();
+            await granting;
+
+            expect(seenDuring).toBe(true);
+            expect(beside).toBeFalsy();
+        });
+    });
+
+    it('revoke-user-app: undoes a grant whose rewrite only resolves while granting', async () => {
+        // `app-root-dir:<uid>:<mode>` is a pseudo-permission: its rewriter
+        // resolves it to a real `fs:<root_uid>:<mode>` only while a user-app
+        // grant is being written, and deliberately resolves to a match-nothing
+        // sentinel at every other time so a scan can't match through the fs
+        // path. Revoke shares that rewrite, so it used to aim the DELETE at the
+        // sentinel and silently remove nothing — leaving the fs permission live
+        // while the caller was told the revoke succeeded. The permission
+        // dialog's withdrawal of an uncertain grant runs through exactly this
+        // path, so a user who answered "Don't Allow" kept the grant.
+        //
+        // Modelled with a rewriter of our own, shaped like the real one: the
+        // production rewriter resolves an app's root dir through the subdomain
+        // and fsentry stores, and this suite has neither.
+        const appName = `tard-${uuidv4()}`;
+        const app = await server.stores.app.create(
+            {
+                name: appName,
+                title: 'TestAppRootDirApp',
+                index_url: `https://${appName}.example.test/index.html`,
+            },
+            { ownerUserId: issuer.id },
+        );
+
+        const prefix = `tardrw-${uuidv4()}`;
+        const pseudoPermission = `${prefix}:${app.uid}:write`;
+        const resolvedPermission = `fs:${uuidv4()}:write`;
+        const NOTHING = 'nothing-in-particular';
+        server.services.permission.registerRewriter({
+            id: `test-grant-only-${prefix}`,
+            matches: (permission: string) =>
+                permission.startsWith(`${prefix}:`),
+            // The real rewriter's condition, verbatim.
+            rewrite: async (permission: string) =>
+                Context.get('is_grant_user_app_permission')
+                    ? resolvedPermission
+                    : NOTHING,
+        });
+
+        const storedPermissions = async () =>
+            (
+                (await server.clients.db.read(
+                    'SELECT p.`permission` FROM `user_to_app_permissions` p ' +
+                        'WHERE p.`user_id` = ? AND p.`app_id` = ?',
+                    [issuer.id, app.id],
+                )) as Array<{ permission: string }>
+            ).map((r) => r.permission);
+
+        await inCtx(issuerActor, () =>
+            controller.handleGrantUserApp(
+                makeReq(
+                    { app_uid: app.uid, permission: pseudoPermission },
+                    { actor: issuerActor },
+                ),
+                makeRes(),
+            ),
+        );
+        // The grant stored the *resolved* permission, not the pseudo one.
+        expect(await storedPermissions()).toContain(resolvedPermission);
+
+        const revokeRes = makeRes();
+        await inCtx(issuerActor, () =>
+            controller.handleRevokeUserApp(
+                makeReq(
+                    { app_uid: app.uid, permission: pseudoPermission },
+                    { actor: issuerActor },
+                ),
+                revokeRes,
+            ),
+        );
+        expect(revokeRes.body).toEqual({});
+        // Revoking by the same string the caller granted has to remove the row
+        // that grant actually wrote.
+        expect(await storedPermissions()).not.toContain(resolvedPermission);
+        // And it must not have written the sentinel as a row of its own.
+        expect(await storedPermissions()).not.toContain(NOTHING);
+    });
+});
+
+// ── grant-user-app `create` flag ────────────────────────────────────
+
+describe('AuthController.handleGrantUserApp `create` flag', () => {
+    let user: { id: number; uuid: string; username: string };
+    let target: { username: string };
+    let userActor: Actor;
+    let appActor: Actor;
+    let appUid: string;
+    let appId: number;
+
+    beforeAll(async () => {
+        const uname = `fc_${uuidv4().slice(0, 8)}`;
+        await controller.handleSignup(
+            makeReq({
+                username: uname,
+                email: `${uname}@test.local`,
+                password: 'correct-horse-battery',
+            }),
+            makeRes(),
+        );
+        const u = await server.stores.user.getByUsername(uname);
+        await server.stores.user.update(u!.id, { email_confirmed: 1 });
+        user = { id: u!.id, uuid: u!.uuid, username: u!.username };
+        userActor = {
+            user: {
+                id: user.id,
+                uuid: user.uuid,
+                username: user.username,
+                email: u!.email!,
+                email_confirmed: true,
+            },
+        } as Actor;
+
+        const tname = `fct_${uuidv4().slice(0, 8)}`;
+        await controller.handleSignup(
+            makeReq({
+                username: tname,
+                email: `${tname}@test.local`,
+                password: 'correct-horse-battery',
+            }),
+            makeRes(),
+        );
+        target = { username: tname };
+
+        const app = await server.stores.app.create(
+            {
+                name: `fc-app-${uuidv4()}`,
+                title: 'FsCreateApp',
+                index_url: 'https://example.test/fs-create',
+            },
+            { ownerUserId: user.id },
+        );
+        appUid = app.uid;
+        appId = app.id;
+        appActor = makeActor({
+            user: userActor.user,
+            app: { id: app.id, uid: app.uid },
+        });
+    });
+
+    const grant = (body: Record<string, unknown>) =>
+        inCtx(userActor, () =>
+            controller.handleGrantUserApp(
+                makeReq({ app_uid: appUid, ...body }, { actor: userActor }),
+                makeRes(),
+            ),
+        );
+
+    const revoke = (body: Record<string, unknown>) =>
+        inCtx(userActor, () =>
+            controller.handleRevokeUserApp(
+                makeReq({ app_uid: appUid, ...body }, { actor: userActor }),
+                makeRes(),
+            ),
+        );
+
+    /** Reads permission held by the app as granted by `user`, via a real check. */
+    const checkAsApp = async (permission: string): Promise<boolean> => {
+        const res = makeRes();
+        await inCtx(appActor, () =>
+            controller.handleCheckPermissions(
+                makeReq({ permissions: [permission] }, { actor: appActor }),
+                res,
+            ),
+        );
+        return (res.body as { permissions: Record<string, boolean> })
+            .permissions[permission];
+    };
+
+    const grantedPermissions = async (): Promise<string[]> =>
+        (
+            (await server.clients.db.read(
+                'SELECT `permission` FROM `user_to_app_permissions` ' +
+                    'WHERE `user_id` = ? AND `app_id` = ?',
+                [user.id, appId],
+            )) as Array<{ permission: string }>
+        ).map((r) => r.permission);
+
+    const path = (name: string) => `/${user.username}/${name}`;
+    const rand = () => uuidv4().slice(0, 6);
+
+    it('creates a missing directory by default, grants it, and a subsequent check reports it held', async () => {
+        const p = path(`.mail-${rand()}`);
+        expect(await server.stores.fsEntry.getEntryByPath(p)).toBeFalsy();
+
+        await grant({ permission: `fs:${p}:write` });
+
+        const entry = await server.stores.fsEntry.getEntryByPath(p);
+        expect(entry?.isDir).toBe(true);
+        expect(await grantedPermissions()).toContain(`fs:${entry!.uuid}:write`);
+        expect(await checkAsApp(`fs:${p}:write`)).toBe(true);
+    });
+
+    it('creates a missing file when `create: true` and the basename has a dot', async () => {
+        const p = path(`notes-${rand()}.txt`);
+        await grant({ permission: `fs:${p}:write`, create: true });
+        const entry = await server.stores.fsEntry.getEntryByPath(p);
+        expect(entry?.isDir).toBe(false);
+    });
+
+    it('applies the basename heuristic end-to-end for each documented shape', async () => {
+        const cases: Array<[string, boolean]> = [
+            [`.mail-${rand()}`, true],
+            [`.config-${rand()}`, true],
+            [`Docs-${rand()}`, true],
+            [`notes-${rand()}.txt`, false],
+            [`.env-${rand()}.local`, false],
+            [`archive-${rand()}.tar.gz`, false],
+        ];
+        for (const [name, expectDir] of cases) {
+            const p = path(name);
+            await grant({ permission: `fs:${p}:write`, create: true });
+            const entry = await server.stores.fsEntry.getEntryByPath(p);
+            expect(entry?.isDir).toBe(expectDir);
+        }
+    });
+
+    it('an explicit `dir`/`file` overrides the heuristic', async () => {
+        const mailPath = path(`.mail-${rand()}`);
+        await grant({ permission: `fs:${mailPath}:write`, create: 'file' });
+        expect(
+            (await server.stores.fsEntry.getEntryByPath(mailPath))?.isDir,
+        ).toBe(false);
+
+        const notesPath = path(`notes-${rand()}.txt`);
+        await grant({ permission: `fs:${notesPath}:write`, create: 'dir' });
+        expect(
+            (await server.stores.fsEntry.getEntryByPath(notesPath))?.isDir,
+        ).toBe(true);
+    });
+
+    it('`create: false` opts out: a missing path 404s and nothing is created', async () => {
+        const p = path(`missing-${rand()}`);
+        await expect(
+            grant({ permission: `fs:${p}:write`, create: false }),
+        ).rejects.toMatchObject({
+            statusCode: 404,
+            legacyCode: 'subject_does_not_exist',
+        });
+        expect(await server.stores.fsEntry.getEntryByPath(p)).toBeFalsy();
+    });
+
+    it('creates missing intermediate directories along with the leaf', async () => {
+        const seg = rand();
+        const dirA = path(`a-${seg}`);
+        const leaf = path(`a-${seg}/.mail`);
+
+        await grant({ permission: `fs:${leaf}:write`, create: true });
+
+        const parentEntry = await server.stores.fsEntry.getEntryByPath(dirA);
+        expect(parentEntry?.isDir).toBe(true);
+        const leafEntry = await server.stores.fsEntry.getEntryByPath(leaf);
+        expect(leafEntry?.isDir).toBe(true);
+        expect(await grantedPermissions()).toContain(
+            `fs:${leafEntry!.uuid}:write`,
+        );
+    });
+
+    it('rolls back only the leaf, not auto-created intermediate directories, when a later phase fails', async () => {
+        const seg = rand();
+        const dirA = path(`b-${seg}`);
+        const leaf = path(`b-${seg}/.mail`);
+
+        // Same short-then-too-wide rewrite trick as the rollback test above:
+        // phase A's pre-flight passes, phase C's re-check then fails, so the
+        // leaf (and its auto-created parent) already exist by the time the
+        // request unwinds.
+        const prefix = `rbparent-${uuidv4()}`;
+        let calls = 0;
+        server.services.permission.registerRewriter({
+            id: prefix,
+            matches: (permission: string) => permission === `${prefix}:x`,
+            rewrite: async () => {
+                calls += 1;
+                return calls === 1
+                    ? `${prefix}:short`
+                    : `${prefix}:${'x'.repeat(300)}`;
+            },
+        });
+
+        await expect(
+            grant({
+                permissions: [`fs:${leaf}:write`, `${prefix}:x`],
+                create: true,
+            }),
+        ).rejects.toMatchObject({ statusCode: 400 });
+
+        // The intermediate directory created along the way is left in place...
+        const parentEntry = await server.stores.fsEntry.getEntryByPath(dirA);
+        expect(parentEntry?.isDir).toBe(true);
+        // ...but the leaf that `#createGrantTarget` created is rolled back.
+        expect(await server.stores.fsEntry.getEntryByPath(leaf)).toBeFalsy();
+    });
+
+    it("refuses to create under AppData or Trash, even inside the caller's own home", async () => {
+        // AppData itself exists as a standard home folder since signup, but
+        // the app-uid directory below it does not — with parents now
+        // auto-created, that subdirectory is an intermediate parent this
+        // guard must still refuse to seed on the way to the leaf.
+        const appDataSubdir = path(`AppData/some-app-${rand()}`);
+        const appDataPath = `${appDataSubdir}/x`;
+        await expect(
+            grant({ permission: `fs:${appDataPath}:write`, create: true }),
+        ).rejects.toMatchObject({ statusCode: 403, legacyCode: 'forbidden' });
+        expect(
+            await server.stores.fsEntry.getEntryByPath(appDataPath),
+        ).toBeFalsy();
+        expect(
+            await server.stores.fsEntry.getEntryByPath(appDataSubdir),
+        ).toBeFalsy();
+
+        const trashPath = path(`Trash/x-${rand()}`);
+        await expect(
+            grant({ permission: `fs:${trashPath}:write`, create: true }),
+        ).rejects.toMatchObject({ statusCode: 403, legacyCode: 'forbidden' });
+        expect(
+            await server.stores.fsEntry.getEntryByPath(trashPath),
+        ).toBeFalsy();
+    });
+
+    it('rejects a path more than the depth limit below home, creating nothing', async () => {
+        const deep = path(
+            Array.from({ length: 17 }, () => `d-${rand()}`).join('/'),
+        );
+        await expect(
+            grant({ permission: `fs:${deep}:write`, create: true }),
+        ).rejects.toMatchObject({
+            statusCode: 400,
+            legacyCode: 'directory_depth_limit_exceeded',
+        });
+        expect(await server.stores.fsEntry.getEntryByPath(deep)).toBeFalsy();
+    });
+
+    it('caps how many entries one request may create, and creates nothing once over the cap', async () => {
+        const paths = Array.from({ length: 5 }, () => path(`.cap-${rand()}`));
+        await expect(
+            grant({
+                permissions: paths.map((p) => `fs:${p}:write`),
+                create: true,
+            }),
+        ).rejects.toMatchObject({ statusCode: 400, legacyCode: 'bad_request' });
+        for (const p of paths) {
+            expect(await server.stores.fsEntry.getEntryByPath(p)).toBeFalsy();
+        }
+    });
+
+    it('conflicts with 409 when an explicit kind disagrees with an existing entry, and grants nothing', async () => {
+        const dirPath = path(`existing-dir-${rand()}`);
+        await server.services.fs.mkdir(user.id, {
+            path: dirPath,
+            createMissingParents: true,
+        });
+        await expect(
+            grant({ permission: `fs:${dirPath}:write`, create: 'file' }),
+        ).rejects.toMatchObject({ statusCode: 409, legacyCode: 'conflict' });
+        const dirEntry = await server.stores.fsEntry.getEntryByPath(dirPath);
+        expect(await grantedPermissions()).not.toContain(
+            `fs:${dirEntry!.uuid}:write`,
+        );
+
+        const filePath = path(`existing-file-${rand()}.txt`);
+        await server.services.fs.touch(user.id, {
+            path: filePath,
+            createMissingParents: true,
+        });
+        await expect(
+            grant({ permission: `fs:${filePath}:write`, create: 'dir' }),
+        ).rejects.toMatchObject({ statusCode: 409, legacyCode: 'conflict' });
+        const fileEntry = await server.stores.fsEntry.getEntryByPath(filePath);
+        expect(await grantedPermissions()).not.toContain(
+            `fs:${fileEntry!.uuid}:write`,
+        );
+    });
+
+    it('`create: true` never conflicts with an existing entry, even when the heuristic disagrees', async () => {
+        // `.mail` alone would heuristically be a *dir*; create a *file* there
+        // first and confirm `create: true` still resolves it instead of
+        // erroring or overwriting it.
+        const p = path(`.mail-${rand()}`);
+        const created = await server.services.fs.touch(user.id, {
+            path: p,
+            createMissingParents: true,
+        });
+        expect(created.isDir).toBe(false);
+
+        await grant({ permission: `fs:${p}:write`, create: true });
+
+        const entry = await server.stores.fsEntry.getEntryByPath(p);
+        expect(entry?.isDir).toBe(false);
+        expect(entry?.uuid).toBe(created.uuid);
+        expect(await grantedPermissions()).toContain(`fs:${entry!.uuid}:write`);
+    });
+
+    it("rejects creating outside the caller's home directory, leaving the other user's tree untouched", async () => {
+        const p = `/${target.username}/evil-${rand()}`;
+        await expect(
+            grant({ permission: `fs:${p}:write`, create: true }),
+        ).rejects.toMatchObject({
+            statusCode: 403,
+            legacyCode: 'permission_denied',
+        });
+        expect(await server.stores.fsEntry.getEntryByPath(p)).toBeFalsy();
+    });
+
+    it('refuses a foreign path the same way whether or not it is there', async () => {
+        const missing = `/${target.username}/absent-${rand()}`;
+        const present = `/${target.username}/present-${rand()}`;
+        await server.services.fs.mkdir(target.id, {
+            path: present,
+            createMissingParents: true,
+        });
+
+        const refusal = async (path: string) =>
+            grant({ permission: `fs:${path}:write`, create: true }).then(
+                () => null,
+                (e) => ({
+                    statusCode: e.statusCode,
+                    legacyCode: e.legacyCode,
+                    // The caller's own input is all that may differ.
+                    message: String(e.message).replace(path, '<path>'),
+                }),
+            );
+
+        expect(await refusal(missing)).toEqual(await refusal(present));
+    });
+
+    it('rejects a path traversal attempt with 400, and creates nothing', async () => {
+        const p = `/${user.username}/../${target.username}/evil-${rand()}`;
+        await expect(
+            grant({ permission: `fs:${p}:write`, create: true }),
+        ).rejects.toMatchObject({ statusCode: 400, legacyCode: 'bad_request' });
+    });
+
+    it('does not apply `create` to a `manage:` grant — 404 unchanged, nothing created', async () => {
+        const p = path(`manage-missing-${rand()}`);
+        await expect(
+            grant({ permission: `manage:fs:${p}:write` }),
+        ).rejects.toMatchObject({
+            statusCode: 404,
+            legacyCode: 'subject_does_not_exist',
+        });
+        expect(await server.stores.fsEntry.getEntryByPath(p)).toBeFalsy();
+    });
+
+    it('a batch creates only the missing entry and grants both', async () => {
+        const existingPath = path(`already-there-${rand()}`);
+        await server.services.fs.mkdir(user.id, {
+            path: existingPath,
+            createMissingParents: true,
+        });
+        const missingPath = path(`.newmail-${rand()}`);
+        expect(
+            await server.stores.fsEntry.getEntryByPath(missingPath),
+        ).toBeFalsy();
+
+        const mkdirSpy = vi.spyOn(server.services.fs, 'mkdir');
+        const touchSpy = vi.spyOn(server.services.fs, 'touch');
+        try {
+            await grant({
+                permissions: [
+                    `fs:${existingPath}:write`,
+                    `fs:${missingPath}:write`,
+                ],
+                create: true,
+            });
+            // Only the missing one is actually created.
+            expect(
+                mkdirSpy.mock.calls.length + touchSpy.mock.calls.length,
+            ).toBe(1);
+        } finally {
+            mkdirSpy.mockRestore();
+            touchSpy.mockRestore();
+        }
+
+        const existingEntry =
+            await server.stores.fsEntry.getEntryByPath(existingPath);
+        const createdEntry =
+            await server.stores.fsEntry.getEntryByPath(missingPath);
+        expect(createdEntry?.isDir).toBe(true);
+        const perms = await grantedPermissions();
+        expect(perms).toContain(`fs:${existingEntry!.uuid}:write`);
+        expect(perms).toContain(`fs:${createdEntry!.uuid}:write`);
+    });
+
+    it('creates a path named twice in one batch only once, and grants both entries', async () => {
+        const p = path(`.dupmail-${rand()}`);
+
+        const mkdirSpy = vi.spyOn(server.services.fs, 'mkdir');
+        const touchSpy = vi.spyOn(server.services.fs, 'touch');
+        try {
+            await grant({
+                permissions: [`fs:${p}:write`, `fs:${p}:read`],
+                create: true,
+            });
+            expect(
+                mkdirSpy.mock.calls.length + touchSpy.mock.calls.length,
+            ).toBe(1);
+        } finally {
+            mkdirSpy.mockRestore();
+            touchSpy.mockRestore();
+        }
+
+        const entry = await server.stores.fsEntry.getEntryByPath(p);
+        const perms = await grantedPermissions();
+        expect(perms).toContain(`fs:${entry!.uuid}:write`);
+        expect(perms).toContain(`fs:${entry!.uuid}:read`);
+    });
+
+    it('creates and grants nothing when a later entry fails phase-A validation', async () => {
+        const goodPath = path(`.batchmail-${rand()}`);
+        await expect(
+            grant({
+                permissions: [`fs:${goodPath}:write`, 'x'.repeat(300)],
+                create: true,
+            }),
+        ).rejects.toMatchObject({ statusCode: 400 });
+
+        expect(
+            await server.stores.fsEntry.getEntryByPath(goodPath),
+        ).toBeFalsy();
+    });
+
+    it('rolls back what phase B created when phase C fails afterward', async () => {
+        const missingPath = path(`.rollback-${rand()}`);
+
+        // A second entry whose rewrite is short during phase A's pre-flight
+        // (so nothing is rejected before anything is created) but has grown
+        // too wide by the time phase C re-runs it — modelling a grant that
+        // only fails once the fs path from the same batch already exists.
+        const prefix = `rbtest-${uuidv4()}`;
+        let calls = 0;
+        server.services.permission.registerRewriter({
+            id: `test-rollback-${prefix}`,
+            matches: (permission: string) => permission === `${prefix}:x`,
+            rewrite: async () => {
+                calls += 1;
+                return calls === 1
+                    ? `${prefix}:short`
+                    : `${prefix}:${'x'.repeat(300)}`;
+            },
+        });
+
+        await expect(
+            grant({
+                permissions: [`fs:${missingPath}:write`, `${prefix}:x`],
+                create: true,
+            }),
+        ).rejects.toMatchObject({ statusCode: 400 });
+
+        // Phase B created the directory; phase C then failed on the second
+        // entry, and the rollback undid it.
+        expect(
+            await server.stores.fsEntry.getEntryByPath(missingPath),
+        ).toBeFalsy();
+    });
+
+    it('grant/revoke parity: revoking after a `create` grant removes the row and check no longer holds it', async () => {
+        const p = path(`.parity-${rand()}`);
+        await grant({ permission: `fs:${p}:write`, create: true });
+        expect(await checkAsApp(`fs:${p}:write`)).toBe(true);
+
+        await revoke({ permission: `fs:${p}:write` });
+        expect(await checkAsApp(`fs:${p}:write`)).toBe(false);
+
+        const entry = await server.stores.fsEntry.getEntryByPath(p);
+        expect(await grantedPermissions()).not.toContain(
+            `fs:${entry!.uuid}:write`,
+        );
+    });
+
+    it('check-permissions on a missing fs path answers false rather than 404ing, without poisoning a mixed batch', async () => {
+        const missingPath = path(`.checkmissing-${rand()}`);
+        // A held fs grant: the owning user holds it implicitly (is-owner), so
+        // the app-under-user delegation resolves without needing a separate
+        // flat grant on the user themselves.
+        const heldPath = path(`.checkheld-${rand()}`);
+        await grant({ permission: `fs:${heldPath}:write`, create: true });
+        const heldPermission = `fs:${heldPath}:write`;
+
+        const res = makeRes();
+        await inCtx(appActor, () =>
+            controller.handleCheckPermissions(
+                makeReq(
+                    {
+                        permissions: [
+                            `fs:${missingPath}:write`,
+                            heldPermission,
+                        ],
+                    },
+                    { actor: appActor },
+                ),
+                res,
+            ),
+        );
+        expect(res.statusCode).toBe(200);
+        const body = res.body as { permissions: Record<string, boolean> };
+        expect(body.permissions[`fs:${missingPath}:write`]).toBe(false);
+        expect(body.permissions[heldPermission]).toBe(true);
+        expect(
+            await server.stores.fsEntry.getEntryByPath(missingPath),
+        ).toBeFalsy();
+    });
+
+    // The GUI consent gate: a user asking what an app of theirs may reach.
+    const checkViaGate = async (permission: string): Promise<boolean> => {
+        const res = makeRes();
+        await inCtx(userActor, () =>
+            controller.handleCheckPermissions(
+                makeReq(
+                    { permissions: [permission], app_uid: appUid },
+                    { actor: userActor },
+                ),
+                res,
+            ),
+        );
+        return (res.body as { permissions: Record<string, boolean> })
+            .permissions[permission];
+    };
+
+    /** A file with no grant of its own, so only an ancestor can answer for it. */
+    const fileWithNoGrantOfItsOwn = async (dirPath: string) => {
+        const filePath = `${dirPath}/doc-${rand()}.txt`;
+        await grant({ permission: `fs:${filePath}:write`, create: 'file' });
+        await revoke({ permission: `fs:${filePath}:write` });
+        const entry = await server.stores.fsEntry.getEntryByPath(filePath);
+        return entry!.uuid;
+    };
+
+    it('settles the gate from a grant the app holds on a folder above', async () => {
+        const dir = path(`.gatedir-${rand()}`);
+        await grant({ permission: `fs:${dir}:write`, create: true });
+        const fileUuid = await fileWithNoGrantOfItsOwn(dir);
+
+        expect(await grantedPermissions()).not.toContain(
+            `fs:${fileUuid}:write`,
+        );
+        expect(await checkViaGate(`fs:${fileUuid}:write`)).toBe(true);
+    });
+
+    it('still prompts for a file no grant of the app reaches', async () => {
+        const held = path(`.gateheld-${rand()}`);
+        const other = path(`.gateother-${rand()}`);
+        await grant({ permission: `fs:${held}:write`, create: true });
+        await grant({ permission: `fs:${other}:write`, create: true });
+        await revoke({ permission: `fs:${other}:write` });
+        const fileUuid = await fileWithNoGrantOfItsOwn(other);
+
+        expect(await checkViaGate(`fs:${fileUuid}:write`)).toBe(false);
+    });
+
+    it('answers a mode the folder grant does not cover', async () => {
+        const dir = path(`.gatemode-${rand()}`);
+        await grant({ permission: `fs:${dir}:read`, create: true });
+        const fileUuid = await fileWithNoGrantOfItsOwn(dir);
+
+        expect(await checkViaGate(`fs:${fileUuid}:read`)).toBe(true);
+        expect(await checkViaGate(`fs:${fileUuid}:write`)).toBe(false);
+    });
+
+    it('leaves a non-fs permission on the scan it was always answered by', async () => {
+        const permission = `apps-of-user:${user.uuid}:read`;
+        expect(await checkViaGate(permission)).toBe(false);
+        await grant({ permission });
+        expect(await checkViaGate(permission)).toBe(true);
+    });
+
+    it('answers false for a permission that is not a string, rather than faulting', async () => {
+        for (const junk of [123, null, {}, []]) {
+            const res = makeRes();
+            await inCtx(userActor, () =>
+                controller.handleCheckPermissions(
+                    makeReq(
+                        { permissions: [junk], app_uid: appUid },
+                        { actor: userActor },
+                    ),
+                    res,
+                ),
+            );
+            expect(res.statusCode).toBe(200);
+            expect(
+                (res.body as { permissions: Record<string, boolean> })
+                    .permissions[junk as unknown as string],
+            ).toBe(false);
+        }
+    });
+
+    it('answers the same for a file whether it is named by uid or by path', async () => {
+        const dir = path(`.gateform-${rand()}`);
+        await grant({ permission: `fs:${dir}:write`, create: true });
+        const filePath = `${dir}/doc-${rand()}.txt`;
+        await grant({ permission: `fs:${filePath}:write`, create: 'file' });
+        await revoke({ permission: `fs:${filePath}:write` });
+        const entry = await server.stores.fsEntry.getEntryByPath(filePath);
+
+        expect(await checkViaGate(`fs:${entry!.uuid}:write`)).toBe(true);
+        expect(await checkViaGate(`fs:${filePath}:write`)).toBe(true);
+    });
+
+    it('ignores `create` on a non-fs permission and grants it normally', async () => {
+        const permission = `apps-of-user:${user.uuid}:read`;
+        await grant({ permission, create: true });
+        expect(await grantedPermissions()).toContain(permission);
+    });
+
+    it('rejects an invalid `create` value with 400, before anything is created or granted', async () => {
+        for (const badCreate of ['sock', 1, {}]) {
+            const p = path(`.badcreate-${rand()}`);
+            await expect(
+                grant({
+                    permission: `fs:${p}:write`,
+                    create: badCreate as never,
+                }),
+            ).rejects.toMatchObject({
+                statusCode: 400,
+                legacyCode: 'bad_request',
+            });
+            expect(await server.stores.fsEntry.getEntryByPath(p)).toBeFalsy();
+        }
+    });
+});
+
+// ── Token grants: get-user-app-token / check-app ───────────────────
+
+describe('AuthController.handleGetUserAppToken + handleCheckApp', () => {
+    let user: { id: number; uuid: string; username: string; email: string };
+    let actor: Actor;
+    let app: { uid: string };
+
+    beforeAll(async () => {
+        const u = `at_${Math.random().toString(36).slice(2, 10)}`;
+        await controller.handleSignup(
+            makeReq({
+                username: u,
+                email: `${u}@test.local`,
+                password: 'correct-horse-battery',
+            }),
+            makeRes(),
+        );
+        const seeded = await server.stores.user.getByUsername(u);
+        await server.stores.user.update(seeded!.id, { email_confirmed: 1 });
+        user = {
+            id: seeded!.id,
+            uuid: seeded!.uuid,
+            username: seeded!.username,
+            email: seeded!.email!,
+        };
+        actor = {
+            user: { ...user, email_confirmed: true },
+        } as Actor;
+        app = await (
+            server.stores.app.create as unknown as (
+                fields: Record<string, unknown>,
+                opts: { ownerUserId: number; appOwner?: unknown },
+            ) => Promise<{ uid: string; id: number }>
+        )(
+            {
+                name: `at-${uuidv4()}`,
+                title: 'AppToken target',
+                index_url: 'https://example.test/at.html',
+            },
+            { ownerUserId: user.id },
+        );
+    });
+
+    it('rejects missing app_uid AND origin with 400', async () => {
+        await expect(
+            controller.handleGetUserAppToken(makeReq({}, { actor }), makeRes()),
+        ).rejects.toMatchObject({ statusCode: 400 });
+    });
+
+    it('returns a verifiable JWT token + app_uid for an existing app', async () => {
+        const res = makeRes();
+        await inCtx(actor, () =>
+            controller.handleGetUserAppToken(
+                makeReq({ app_uid: app.uid }, { actor }),
+                res,
+            ),
+        );
+        const body = res.body as { token: string; app_uid: string };
+        expect(body.app_uid).toBe(app.uid);
+        const decoded = server.services.token.verify('auth', body.token) as {
+            type: string;
+            user_uid: string;
+            app_uid: string;
+        };
+        expect(decoded.user_uid).toBe(user.uuid);
+        expect(decoded.app_uid).toBe(app.uid);
+    });
+
+    // This handler sits in the app-launch critical path. The permission
+    // grant, the token mint, and the AppData mkdir are mutually independent,
+    // so they must overlap rather than run as three serial round trips —
+    // awaiting any one of them before starting the others silently triples
+    // the latency with every test still passing.
+    it('runs the permission grant, token mint and AppData mkdir concurrently', async () => {
+        const order: string[] = [];
+        const defer = <T>(label: string, value: T) => {
+            order.push(`${label}:start`);
+            return new Promise<T>((resolve) =>
+                setTimeout(() => {
+                    order.push(`${label}:end`);
+                    resolve(value);
+                }, 20),
+            );
+        };
+
+        const permSpy = vi
+            .spyOn(server.services.permission, 'grantUserAppPermission')
+            .mockImplementation(() => defer('grant', undefined as never));
+        const tokenSpy = vi
+            .spyOn(server.services.auth, 'getUserAppToken')
+            .mockImplementation(() => defer('token', 'signed.jwt.value'));
+        const mkdirSpy = vi
+            .spyOn(server.services.fs, 'mkdir')
+            .mockImplementation(() => defer('mkdir', undefined as never));
+
+        try {
+            await inCtx(actor, () =>
+                controller.handleGetUserAppToken(
+                    makeReq({ app_uid: app.uid }, { actor }),
+                    makeRes(),
+                ),
+            );
+        } finally {
+            permSpy.mockRestore();
+            tokenSpy.mockRestore();
+            mkdirSpy.mockRestore();
+        }
+
+        // All three must be in flight before any of them settles.
+        const firstEnd = order.findIndex((e) => e.endsWith(':end'));
+        const starts = order.slice(0, firstEnd);
+        expect(starts).toHaveLength(3);
+        expect(starts).toEqual(
+            expect.arrayContaining([
+                'grant:start',
+                'token:start',
+                'mkdir:start',
+            ]),
+        );
+    });
+
+    // The handler's own lookup is the row the grant and the token use.
+    it('reads the app row once per get-user-app-token and check-app', async () => {
+        const getByUid = vi.spyOn(server.stores.app, 'getByUid');
+        const lookupsOf = () =>
+            getByUid.mock.calls.filter(([uid]) => uid === app.uid).length;
+        try {
+            const tokenRes = makeRes();
+            await inCtx(actor, () =>
+                controller.handleGetUserAppToken(
+                    makeReq({ app_uid: app.uid }, { actor }),
+                    tokenRes,
+                ),
+            );
+            expect(lookupsOf()).toBe(1);
+            const minted = tokenRes.body as { token: string };
+
+            getByUid.mockClear();
+            const checkRes = makeRes();
+            await inCtx(actor, () =>
+                controller.handleCheckApp(
+                    makeReq({ app_uid: app.uid }, { actor }),
+                    checkRes,
+                ),
+            );
+            expect(lookupsOf()).toBe(1);
+            const checked = checkRes.body as { token: string };
+
+            // Both tokens name the same app session.
+            const sessionOf = (token: string) =>
+                (
+                    server.services.token.verify('auth', token) as {
+                        session_uid: string;
+                    }
+                ).session_uid;
+            expect(sessionOf(checked.token)).toBe(sessionOf(minted.token));
+        } finally {
+            getByUid.mockRestore();
+        }
+    });
+
+    it('after get-user-app-token, check-app reports authenticated:true and returns a token', async () => {
+        // Ensure the flag is granted (re-run is idempotent).
+        await inCtx(actor, () =>
+            controller.handleGetUserAppToken(
+                makeReq({ app_uid: app.uid }, { actor }),
+                makeRes(),
+            ),
+        );
+
+        const res = makeRes();
+        await inCtx(actor, () =>
+            controller.handleCheckApp(
+                makeReq({ app_uid: app.uid }, { actor }),
+                res,
+            ),
+        );
+        const body = res.body as {
+            app_uid: string;
+            authenticated: boolean;
+            token?: string;
+        };
+        expect(body.app_uid).toBe(app.uid);
+        expect(body.authenticated).toBe(true);
+        expect(typeof body.token).toBe('string');
+    });
+
+    // What decides whether a cancelled "Sign in with Puter" still hands over a token.
+    it('check-app reports an app the user never opened as unauthorized, with no token', async () => {
+        const untouched = await (
+            server.stores.app.create as unknown as (
+                fields: Record<string, unknown>,
+                opts: { ownerUserId: number },
+            ) => Promise<{ uid: string; id: number }>
+        )(
+            {
+                name: `ca-${uuidv4()}`,
+                title: 'Never opened',
+                index_url: 'https://never-opened.example.test/index.html',
+            },
+            { ownerUserId: user.id },
+        );
+
+        const res = makeRes();
+        await inCtx(actor, () =>
+            controller.handleCheckApp(
+                makeReq({ app_uid: untouched.uid }, { actor }),
+                res,
+            ),
+        );
+        expect(res.body).toEqual({
+            app_uid: untouched.uid,
+            authenticated: false,
+        });
+    });
+
+    it('check-app returns the {app_uid, authenticated} envelope shape', async () => {
+        // Create a brand-new actor with no app-related history so the
+        // permission scan can't cache-hit anything from prior tests, AND
+        // create an app owned by a *different* user so the fresh actor
+        // doesn't pick up owner-level implicit perms on `service:<app>:*`.
+        const freshUser = `cf_${uuidv4().slice(0, 6)}`;
+        await controller.handleSignup(
+            makeReq({
+                username: freshUser,
+                email: `${freshUser}@test.local`,
+                password: 'correct-horse-battery',
+            }),
+            makeRes(),
+        );
+        const fresh = await server.stores.user.getByUsername(freshUser);
+        await server.stores.user.update(fresh!.id, { email_confirmed: 1 });
+        const freshActor = {
+            user: {
+                id: fresh!.id,
+                uuid: fresh!.uuid,
+                username: fresh!.username,
+                email: fresh!.email!,
+                email_confirmed: true,
+            },
+        } as Actor;
+
+        const ownerUser = `co_${uuidv4().slice(0, 6)}`;
+        await controller.handleSignup(
+            makeReq({
+                username: ownerUser,
+                email: `${ownerUser}@test.local`,
+                password: 'correct-horse-battery',
+            }),
+            makeRes(),
+        );
+        const owner = await server.stores.user.getByUsername(ownerUser);
+        const otherApp = await (
+            server.stores.app.create as unknown as (
+                fields: Record<string, unknown>,
+                opts: { ownerUserId: number; appOwner?: unknown },
+            ) => Promise<{ uid: string; id: number }>
+        )(
+            {
+                name: `at-${uuidv4()}`,
+                title: 'Untouched',
+                index_url: 'https://example.test/untouched.html',
+            },
+            { ownerUserId: owner!.id },
+        );
+
+        const res = makeRes();
+        await inCtx(freshActor, () =>
+            controller.handleCheckApp(
+                makeReq({ app_uid: otherApp.uid }, { actor: freshActor }),
+                res,
+            ),
+        );
+        const body = res.body as {
+            app_uid: string;
+            authenticated: boolean;
+            token?: string;
+        };
+        expect(body).toEqual({ app_uid: otherApp.uid, authenticated: false });
+    });
+
+    it('falls back to origin → app_uid resolution and bootstraps a new app row', async () => {
+        const origin = `https://test-origin-${uuidv4()}.example`;
+        const res = makeRes();
+        await inCtx(actor, () =>
+            controller.handleGetUserAppToken(
+                makeReq({ origin }, { actor }),
+                res,
+            ),
+        );
+        const body = res.body as { token: string; app_uid: string };
+        expect(body.app_uid).toMatch(/^app-/);
+        // A bootstrap app row was created for that origin. External
+        // origins have no hosted subdomain, so no owner is stamped.
+        const bootstrapped = await server.stores.app.getByUid(body.app_uid);
+        expect(bootstrapped).toBeTruthy();
+        expect(bootstrapped?.owner_user_id ?? null).toBeNull();
+    });
+
+    it('stamps the hosted-subdomain owner as the bootstrap app creator', async () => {
+        // Test config inherits `static_hosting_domain: site.puter.localhost`
+        // from config.default.json. The subdomain belongs to a different
+        // user than the visitor minting the token — the app must be owned
+        // by the site owner, not the visitor.
+        const ownerName = `so_${uuidv4().slice(0, 8)}`;
+        await controller.handleSignup(
+            makeReq({
+                username: ownerName,
+                email: `${ownerName}@test.local`,
+                password: 'correct-horse-battery',
+            }),
+            makeRes(),
+        );
+        const owner = await server.stores.user.getByUsername(ownerName);
+        expect(owner!.id).not.toBe(user.id);
+        const subdomain = `sd-${uuidv4().slice(0, 8)}`;
+        await server.stores.subdomain.create({
+            userId: owner!.id,
+            subdomain,
+        });
+
+        const res = makeRes();
+        await inCtx(actor, () =>
+            controller.handleGetUserAppToken(
+                makeReq(
+                    { origin: `https://${subdomain}.site.puter.localhost` },
+                    { actor },
+                ),
+                res,
+            ),
+        );
+        const body = res.body as { token: string; app_uid: string };
+        const bootstrapped = await server.stores.app.getByUid(body.app_uid);
+        expect(bootstrapped).toBeTruthy();
+        expect(bootstrapped?.owner_user_id).toBe(owner!.id);
+    });
+
+    it('canonicalizes alternate-host origins to one bootstrap row per subdomain', async () => {
+        const subdomain = `sd-${uuidv4().slice(0, 8)}`;
+        await server.stores.subdomain.create({ userId: user.id, subdomain });
+
+        const res = makeRes();
+        await inCtx(actor, () =>
+            controller.handleGetUserAppToken(
+                makeReq(
+                    { origin: `https://${subdomain}.host.puter.localhost` },
+                    { actor },
+                ),
+                res,
+            ),
+        );
+        const body = res.body as { token: string; app_uid: string };
+        const bootstrapped = await server.stores.app.getByUid(body.app_uid);
+        expect(bootstrapped?.index_url).toBe(
+            `http://${subdomain}.site.puter.localhost`,
+        );
+
+        const res2 = makeRes();
+        await inCtx(actor, () =>
+            controller.handleGetUserAppToken(
+                makeReq(
+                    { origin: `https://${subdomain}.app.puter.localhost` },
+                    { actor },
+                ),
+                res2,
+            ),
+        );
+        expect((res2.body as { app_uid: string }).app_uid).toBe(body.app_uid);
+    });
+
+    it('supports browser extension origins in handleGetUserAppToken', async () => {
+        // Random id: a pre-existing row for this origin would resolve through
+        // the canonical lookup and never exercise the bootstrap path.
+        const origin = `chrome-extension://${uuidv4()}`;
+        const res = makeRes();
+        await inCtx(actor, () =>
+            controller.handleGetUserAppToken(
+                makeReq({ origin }, { actor }),
+                res,
+            ),
+        );
+        const body = res.body as { token: string; app_uid: string };
+        expect(body.app_uid).toBe(
+            `app-${uuidv5(origin, APP_ORIGIN_UUID_NAMESPACE)}`,
+        );
+        const bootstrapped = await server.stores.app.getByUid(body.app_uid);
+        expect(bootstrapped?.index_url).toBe(origin);
+        // Proves the row came from the bootstrap path, not an earlier test.
+        expect(bootstrapped?.description).toMatch(/^App created from origin /);
+    });
+
+    it('does not hand an origin the app that was repointed away from it', async () => {
+        // Whoever holds the origin next must not inherit the app, or the
+        // users who already authorized it.
+        const origin = `https://repointed-${uuidv4()}.example`;
+        const first = makeRes();
+        await inCtx(actor, () =>
+            controller.handleGetUserAppToken(
+                makeReq({ origin }, { actor }),
+                first,
+            ),
+        );
+        const movedUid = (first.body as { app_uid: string }).app_uid;
+        const moved = await server.stores.app.getByUid(movedUid);
+        await server.stores.app.update(moved!.id, {
+            index_url: `https://new-home-${uuidv4()}.example`,
+        });
+
+        const check = makeRes();
+        await inCtx(actor, () =>
+            controller.handleCheckApp(makeReq({ origin }, { actor }), check),
+        );
+        const checked = check.body as {
+            app_uid: string;
+            authenticated: boolean;
+            token?: string;
+        };
+        expect(checked.app_uid).not.toBe(movedUid);
+        expect(checked.authenticated).toBe(false);
+        expect(checked.token).toBeUndefined();
+
+        const res = makeRes();
+        await inCtx(actor, () =>
+            controller.handleGetUserAppToken(
+                makeReq({ origin }, { actor }),
+                res,
+            ),
+        );
+        const body = res.body as { token: string; app_uid: string };
+        expect(body.app_uid).toBe(checked.app_uid);
+        const decoded = server.services.token.verify('auth', body.token) as {
+            app_uid: string;
+        };
+        expect(decoded.app_uid).toBe(body.app_uid);
+        const fresh = await server.stores.app.getByUid(body.app_uid);
+        expect(fresh?.index_url).toBe(origin);
+    });
+
+    // sqlite doesn't enforce FKs, so inject the driver error at the db client.
+    // The grant row keys both the app and the user; which one vanished decides
+    // the answer, and the drivers don't all name the constraint.
+    describe('when a parent row is gone but still cached', () => {
+        const fkError = () =>
+            Object.assign(new Error('FOREIGN KEY constraint'), {
+                code: 'SQLITE_CONSTRAINT_FOREIGNKEY',
+            });
+
+        const makeApp = async () =>
+            (
+                server.stores.app.create as unknown as (
+                    fields: Record<string, unknown>,
+                    opts: { ownerUserId: number },
+                ) => Promise<{ uid: string; id: number }>
+            )(
+                {
+                    name: `fk-${uuidv4()}`,
+                    title: 'Deleted under a warm cache',
+                    index_url: 'https://example.test/fk.html',
+                },
+                { ownerUserId: user.id },
+            );
+
+        /** Fails the grant insert without disturbing the rest of the handler. */
+        const failingGrant = async (fn: () => Promise<unknown>) => {
+            const realWrite = server.clients.db.write.bind(server.clients.db);
+            const spy = vi
+                .spyOn(server.clients.db, 'write')
+                .mockImplementation(async (sql: string, params?: unknown[]) => {
+                    if (/user_to_app_permissions/.test(sql)) throw fkError();
+                    return realWrite(sql, params);
+                });
+            try {
+                return await fn();
+            } finally {
+                spy.mockRestore();
+            }
+        };
+
+        it('answers 404 for a deleted app, and retires the stale cache entry', async () => {
+            const doomed = await makeApp();
+            // Straight to SQL; AppStore.delete would clear the stale entry.
+            await server.clients.db.write('DELETE FROM `apps` WHERE `id` = ?', [
+                doomed.id,
+            ]);
+
+            await expect(
+                failingGrant(() =>
+                    inCtx(actor, () =>
+                        controller.handleGetUserAppToken(
+                            makeReq({ app_uid: doomed.uid }, { actor }),
+                            makeRes(),
+                        ),
+                    ),
+                ),
+            ).rejects.toMatchObject({ statusCode: 404 });
+
+            expect(
+                await server.clients.redis.get(`apps:uid:${doomed.uid}`),
+            ).toBeNull();
+        });
+
+        it('answers 401 for a deleted account, leaving the live app cacheable', async () => {
+            const live = await makeApp();
+            await server.stores.app.getByUid(live.uid);
+
+            await expect(
+                failingGrant(() =>
+                    inCtx(actor, () =>
+                        controller.handleGetUserAppToken(
+                            makeReq({ app_uid: live.uid }, { actor }),
+                            makeRes(),
+                        ),
+                    ),
+                ),
+            ).rejects.toMatchObject({ statusCode: 401 });
+
+            // Tombstoning the app here would strand a perfectly live row.
+            expect(await server.stores.app.getByUid(live.uid)).toBeTruthy();
+            expect(
+                await server.clients.redis.get(`apps:uid:${live.uid}:deleted`),
+            ).toBeNull();
+        });
+    });
+});
+
+// ── Access tokens: create + revoke ─────────────────────────────────
+
+describe('AuthController.handleCreateAccessToken + handleRevokeAccessToken', () => {
+    let actor: Actor;
+
+    beforeAll(async () => {
+        const u = `acc_${Math.random().toString(36).slice(2, 10)}`;
+        await controller.handleSignup(
+            makeReq({
+                username: u,
+                email: `${u}@test.local`,
+                password: 'correct-horse-battery',
+            }),
+            makeRes(),
+        );
+        const seeded = await server.stores.user.getByUsername(u);
+        await server.stores.user.update(seeded!.id, { email_confirmed: 1 });
+        actor = {
+            user: {
+                id: seeded!.id,
+                uuid: seeded!.uuid,
+                username: seeded!.username,
+                email: seeded!.email!,
+                email_confirmed: true,
+            },
+        } as Actor;
+    });
+
+    it('rejects an empty permissions array with 400', async () => {
+        await expect(
+            controller.handleCreateAccessToken(
+                makeReq({ permissions: [] }, { actor }),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 400 });
+    });
+
+    it('rejects a non-array permissions field with 400', async () => {
+        await expect(
+            controller.handleCreateAccessToken(
+                makeReq(
+                    { permissions: 'not-an-array' as unknown as never[] },
+                    { actor },
+                ),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 400 });
+    });
+
+    it.each([
+        ['an object', {}],
+        ['an array', ['30d']],
+        ['a boolean', true],
+        ['a fraction', 1.5],
+        ['a negative', -60],
+        ['an unparseable duration', 'banana'],
+        ['an unknown unit', '30x'],
+    ])('rejects %s as expiresIn with 400', async (_label, expiresIn) => {
+        // Anything the signer can't read reaches it only after the session row
+        // is already inserted, so it has to be refused here.
+        await expect(
+            controller.handleCreateAccessToken(
+                makeReq(
+                    {
+                        permissions: ['fs:read'],
+                        expiresIn: expiresIn as unknown as string,
+                    },
+                    { actor },
+                ),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 400 });
+    });
+
+    it('answers 400 when the request has no parsable body', async () => {
+        const req = makeReq({}, { actor });
+        (req as { body?: unknown }).body = undefined;
+        await expect(
+            controller.handleCreateAccessToken(req, makeRes()),
+        ).rejects.toMatchObject({ statusCode: 400 });
+    });
+
+    it('rejects a permission spec that is neither a string nor a tuple with 400', async () => {
+        await expect(
+            controller.handleCreateAccessToken(
+                makeReq(
+                    { permissions: [{ not: 'a-spec' } as unknown as string] },
+                    { actor },
+                ),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 400 });
+    });
+
+    it('rejects a permission wider than the column, leaving no session behind', async () => {
+        // Nothing rewrites these, so an over-wide one would reach the INSERT
+        // only after the session row was created and the JWT signed.
+        const before = (await server.clients.db.read(
+            "SELECT COUNT(*) AS n FROM sessions WHERE kind = 'access_token'",
+            [],
+        )) as Array<{ n: number }>;
+        await expect(
+            controller.handleCreateAccessToken(
+                makeReq(
+                    { permissions: [`service:${'a'.repeat(300)}:ii:read`] },
+                    { actor },
+                ),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 400 });
+        const after = (await server.clients.db.read(
+            "SELECT COUNT(*) AS n FROM sessions WHERE kind = 'access_token'",
+            [],
+        )) as Array<{ n: number }>;
+        expect(after[0].n).toBe(before[0].n);
+    });
+
+    it('rejects more permissions than one request may carry', async () => {
+        // Each entry costs a permission check and an INSERT.
+        const permissions = Array.from(
+            { length: 17 },
+            (_, i) => `service:cap-${i}:ii:read`,
+        );
+        await expect(
+            controller.handleCreateAccessToken(
+                makeReq({ permissions }, { actor }),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 400 });
+    });
+
+    it('still mints at the cap', async () => {
+        const permissions = Array.from(
+            { length: 16 },
+            (_, i) => `service:atcap-${i}:ii:read`,
+        );
+        const res = makeRes();
+        await controller.handleCreateAccessToken(
+            makeReq({ permissions }, { actor }),
+            res,
+        );
+        expect((res.body as { token: string }).token).toEqual(
+            expect.any(String),
+        );
+    });
+
+    it.each([
+        ['an oversized permission string', ['x'.repeat(4097)]],
+        [
+            'an oversized `extra`',
+            [['service:x:ii:read', { a: 'y'.repeat(5000) }]],
+        ],
+        ['a non-object `extra`', [['service:x:ii:read', 'nope']]],
+        ['an empty permission string', ['']],
+    ])('rejects %s with 400', async (_label, permissions) => {
+        await expect(
+            controller.handleCreateAccessToken(
+                makeReq({ permissions: permissions as never[] }, { actor }),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 400 });
+    });
+
+    it('mints a verifiable access-token JWT for valid permissions', async () => {
+        const res = makeRes();
+        await controller.handleCreateAccessToken(
+            makeReq(
+                {
+                    permissions: ['service:foo:ii:read'],
+                    expiresIn: '1h',
+                },
+                { actor },
+            ),
+            res,
+        );
+        const body = res.body as { token: string };
+        expect(typeof body.token).toBe('string');
+        // Token should be verifiable + carry the issuer's user_uid.
+        const decoded = server.services.token.verify('auth', body.token) as {
+            user_uid: string;
+        };
+        expect(decoded.user_uid).toBe(actor.user.uuid);
+    });
+
+    // -- Full-API-access + labels --
+
+    it('mints a full-access token and stores a trimmed label on the session row', async () => {
+        const res = makeRes();
+        await controller.handleCreateAccessToken(
+            makeReq(
+                { permissions: [FULL_API_ACCESS], label: '  My CLI  ' },
+                { actor },
+            ),
+            res,
+        );
+        const decoded = server.services.token.verify(
+            'auth',
+            (res.body as { token: string }).token,
+        ) as {
+            type: string;
+            token_uid: string;
+            session_uid: string;
+            full_access?: boolean;
+        };
+        expect(decoded.type).toBe('access-token');
+
+        // Full access is a signed claim, not a stored permission row.
+        expect(decoded.full_access).toBe(true);
+        const permRows = (await server.clients.db.read(
+            'SELECT `permission` FROM `access_token_permissions` WHERE `token_uid` = ?',
+            [decoded.token_uid],
+        )) as Array<{ permission: string }>;
+        expect(permRows).toHaveLength(0);
+
+        const sessRows = (await server.clients.db.read(
+            'SELECT `label` FROM `sessions` WHERE `uuid` = ?',
+            [decoded.session_uid],
+        )) as Array<{ label: string }>;
+        expect(sessRows[0]?.label).toBe('My CLI');
+    });
+
+    it('caps an over-long label at 64 characters', async () => {
+        const res = makeRes();
+        await controller.handleCreateAccessToken(
+            makeReq(
+                { permissions: [FULL_API_ACCESS], label: 'x'.repeat(120) },
+                { actor },
+            ),
+            res,
+        );
+        const decoded = server.services.token.verify(
+            'auth',
+            (res.body as { token: string }).token,
+        ) as { session_uid: string };
+        const sessRows = (await server.clients.db.read(
+            'SELECT `label` FROM `sessions` WHERE `uuid` = ?',
+            [decoded.session_uid],
+        )) as Array<{ label: string }>;
+        expect(sessRows[0]?.label.length).toBe(64);
+    });
+
+    it('rejects a non-string label with 400', async () => {
+        await expect(
+            controller.handleCreateAccessToken(
+                makeReq(
+                    {
+                        permissions: [FULL_API_ACCESS],
+                        label: 123 as unknown as string,
+                    },
+                    { actor },
+                ),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 400 });
+    });
+
+    it('revoke-access-token: requires tokenOrUuid and returns ok:true on success', async () => {
+        // Mint, then revoke.
+        const created = makeRes();
+        await controller.handleCreateAccessToken(
+            makeReq(
+                { permissions: ['service:foo:ii:read'], expiresIn: '1h' },
+                { actor },
+            ),
+            created,
+        );
+        const tokenJwt = (created.body as { token: string }).token;
+
+        // Missing tokenOrUuid → 400.
+        await expect(
+            controller.handleRevokeAccessToken(
+                makeReq({}, { actor }),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 400 });
+
+        // Successful revoke.
+        const revoked = makeRes();
+        await controller.handleRevokeAccessToken(
+            makeReq({ tokenOrUuid: tokenJwt }, { actor }),
+            revoked,
+        );
+        expect(revoked.body).toEqual({ ok: true });
+    });
+
+    it('revoke-access-token: extracts JWT from /token-read URLs', async () => {
+        const created = makeRes();
+        await controller.handleCreateAccessToken(
+            makeReq(
+                { permissions: ['service:foo:ii:read'], expiresIn: '1h' },
+                { actor },
+            ),
+            created,
+        );
+        const tokenJwt = (created.body as { token: string }).token;
+        const url = `https://example.com/token-read/${tokenJwt}?other=1`;
+
+        const res = makeRes();
+        await controller.handleRevokeAccessToken(
+            makeReq({ tokenOrUuid: url }, { actor }),
+            res,
+        );
+        expect(res.body).toEqual({ ok: true });
+    });
+});
+
+// ── Helpers shared by the rest of the test groups ───────────────────
+
+const uniq = () => Math.random().toString(36).slice(2, 10);
+
+const makeUserAndActor = async (overrides: Record<string, unknown> = {}) => {
+    const username = `u_${uniq()}`;
+    await controller.handleSignup(
+        makeReq({
+            username,
+            email: `${username}@test.local`,
+            password: 'correct-horse-battery',
+        }),
+        makeRes(),
+    );
+    const u = await server.stores.user.getByUsername(username);
+    if (overrides && Object.keys(overrides).length > 0) {
+        await server.stores.user.update(u!.id, overrides);
+    }
+    const refreshed = await server.stores.user.getById(u!.id, { force: true });
+    const actor = {
+        user: {
+            id: refreshed!.id,
+            uuid: refreshed!.uuid,
+            username: refreshed!.username,
+            email: refreshed!.email ?? null,
+            email_confirmed: !!refreshed!.email_confirmed,
+        },
+    } as Actor;
+    return { user: refreshed!, actor };
+};
+
+// ── Email confirmation flows ────────────────────────────────────────
+
+describe('AuthController.handleSendConfirmEmail', () => {
+    it('throws 400 when the user has no email on file', async () => {
+        const { actor } = await makeUserAndActor();
+        // Wipe the email to exercise the "no email on file" branch.
+        await server.stores.user.update(actor.user.id!, { email: null });
+        await expect(
+            controller.handleSendConfirmEmail(
+                makeReq({}, { actor }),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 400 });
+    });
+
+    it('throws 403 when the account is suspended', async () => {
+        const { actor } = await makeUserAndActor({ suspended: 1 });
+        await expect(
+            controller.handleSendConfirmEmail(
+                makeReq({}, { actor }),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 403 });
+    });
+
+    it('rotates the email_confirm_code and returns {} on success', async () => {
+        const { user, actor } = await makeUserAndActor();
+        const before = await server.stores.user.getById(user.id, {
+            force: true,
+        });
+        const res = makeRes();
+        await controller.handleSendConfirmEmail(makeReq({}, { actor }), res);
+        expect(res.body).toEqual({});
+        const after = await server.stores.user.getById(user.id, {
+            force: true,
+        });
+        expect(after!.email_confirm_code).not.toBe(before!.email_confirm_code);
+        expect(String(after!.email_confirm_code).length).toBe(6);
+    });
+
+    // The resend is the recovery path for a lost code, so it must not fail
+    // silently either.
+    it('alarms — and still returns {} — when the resend send throws', async () => {
+        const { actor } = await makeUserAndActor();
+        const alarm = vi
+            .spyOn(server.clients.alarm, 'create')
+            .mockImplementation(() => undefined);
+        const send = vi
+            .spyOn(server.clients.email, 'send')
+            .mockRejectedValue(new Error('smtp down'));
+        try {
+            const res = makeRes();
+            await controller.handleSendConfirmEmail(
+                makeReq({}, { actor }),
+                res,
+            );
+            // Not the caller's fault; still a 200.
+            expect(res.body).toEqual({});
+
+            const raised = alarm.mock.calls.find(
+                (c) => c[0] === 'auth:confirmation-email-send-failed:resend',
+            );
+            expect(raised).toBeTruthy();
+            const fields = raised![2] as Record<string, unknown>;
+            expect(fields.stage).toBe('resend');
+            expect(fields.detail).toBe('smtp down');
+            expect(fields.error).toBeInstanceOf(Error);
+        } finally {
+            send.mockRestore();
+            alarm.mockRestore();
+        }
+    });
+});
+
+// The per-account / per-number SMS send caps used to live here as a hardcoded
+// `MAX_PHONE_VERIFY_SENDS` in the backend. They now live entirely in the abuse
+// extension (no abuse thresholds in the OSS repo): the backend only asks via
+// `puter.phone-verification.check` and reports sends via
+// `puter.phone-verification.sent`. The cap behavior is covered by the
+// extension's phoneVerification / phoneSendLog tests; the backend side (it
+// forwards a veto, and emits `sent` only on success) is covered below.
+
+describe('AuthController.handleSendConfirmPhone validation', () => {
+    // Stub the Prelude client (a real external boundary) so we exercise the
+    // controller's validation branches, not the network. Override per case.
+    const stubPrelude = (over: Record<string, unknown> = {}) => ({
+        isConfigured: () => true,
+        isCountrySupported: () => true,
+        defaultCountry: 'US',
+        createVerification: vi.fn(async () => ({ status: 'success' })),
+        ...over,
+    });
+    const withPrelude = async (
+        prelude: unknown,
+        fn: () => Promise<void>,
+    ): Promise<void> => {
+        const ctrl = controller as { clients: { prelude: unknown } };
+        const real = ctrl.clients.prelude;
+        ctrl.clients.prelude = prelude;
+        try {
+            await fn();
+        } finally {
+            ctrl.clients.prelude = real;
+        }
+    };
+
+    it('throws 400 for an unparseable phone number', async () => {
+        const { actor } = await makeUserAndActor();
+        await withPrelude(stubPrelude(), async () => {
+            await expect(
+                controller.handleSendConfirmPhone(
+                    makeReq({ phone: 'not a phone' }, { actor }),
+                    makeRes(),
+                ),
+            ).rejects.toMatchObject({ statusCode: 400 });
+        });
+    });
+
+    it('throws 400 (and sends nothing) when the country is over the cost cap', async () => {
+        const { actor } = await makeUserAndActor();
+        const createVerification = vi.fn(async () => ({ status: 'success' }));
+        await withPrelude(
+            stubPrelude({
+                isCountrySupported: () => false,
+                createVerification,
+            }),
+            async () => {
+                await expect(
+                    controller.handleSendConfirmPhone(
+                        makeReq({ phone: '+14155550123' }, { actor }),
+                        makeRes(),
+                    ),
+                ).rejects.toMatchObject({ statusCode: 400 });
+                expect(createVerification).not.toHaveBeenCalled();
+            },
+        );
+    });
+
+    it('throws 503 when Prelude is not configured', async () => {
+        const { actor } = await makeUserAndActor();
+        await withPrelude(
+            stubPrelude({ isConfigured: () => false }),
+            async () => {
+                await expect(
+                    controller.handleSendConfirmPhone(
+                        makeReq({ phone: '+14155550123' }, { actor }),
+                        makeRes(),
+                    ),
+                ).rejects.toMatchObject({ statusCode: 503 });
+            },
+        );
+    });
+
+    it('surfaces a Prelude block as 429', async () => {
+        const { actor } = await makeUserAndActor();
+        await withPrelude(
+            stubPrelude({
+                createVerification: vi.fn(async () => ({ status: 'blocked' })),
+            }),
+            async () => {
+                await expect(
+                    controller.handleSendConfirmPhone(
+                        makeReq({ phone: '+14155550123' }, { actor }),
+                        makeRes(),
+                    ),
+                ).rejects.toMatchObject({ statusCode: 429 });
+            },
+        );
+    });
+
+    it('attaches a support error_id to a Prelude block', async () => {
+        const { actor } = await makeUserAndActor();
+        await withPrelude(
+            stubPrelude({
+                createVerification: vi.fn(async () => ({ status: 'blocked' })),
+            }),
+            async () => {
+                await expect(
+                    controller.handleSendConfirmPhone(
+                        makeReq({ phone: '+14155550123' }, { actor }),
+                        makeRes(),
+                    ),
+                ).rejects.toMatchObject({
+                    statusCode: 429,
+                    fields: { error_id: expect.any(String) },
+                });
+            },
+        );
+    });
+
+    it('attaches a support error_id when the Prelude request throws', async () => {
+        const { actor } = await makeUserAndActor();
+        await withPrelude(
+            stubPrelude({
+                createVerification: vi.fn(async () => {
+                    throw new Error('network down');
+                }),
+            }),
+            async () => {
+                await expect(
+                    controller.handleSendConfirmPhone(
+                        makeReq({ phone: '+14155550123' }, { actor }),
+                        makeRes(),
+                    ),
+                ).rejects.toMatchObject({
+                    statusCode: 502,
+                    fields: { error_id: expect.any(String) },
+                });
+            },
+        );
+    });
+
+    it('persists the send failure to KV under the error_id with a 7-day expiry', async () => {
+        const { user, actor } = await makeUserAndActor();
+        const kvSet = vi.spyOn(server.stores.kv, 'set');
+        try {
+            await withPrelude(
+                stubPrelude({
+                    createVerification: vi.fn(async () => {
+                        throw new Error('network down');
+                    }),
+                }),
+                async () => {
+                    let thrown: HttpError | undefined;
+                    try {
+                        await controller.handleSendConfirmPhone(
+                            makeReq({ phone: '+14155550123' }, { actor }),
+                            makeRes(),
+                        );
+                    } catch (e) {
+                        thrown = e as HttpError;
+                    }
+                    const errorId = thrown!.fields!.error_id as string;
+
+                    const { res: record } = await server.stores.kv.get({
+                        key: `sms-send-error:${errorId}`,
+                    });
+                    expect(record).toMatchObject({
+                        reason: 'prelude_request_failed',
+                        status: 502,
+                        user_id: user.id,
+                        user_uid: user.uuid,
+                        detail: 'network down',
+                        t: expect.any(Number),
+                    });
+
+                    const errorSet = kvSet.mock.calls.find(([arg]) =>
+                        (arg as { key?: string }).key?.startsWith(
+                            'sms-send-error:',
+                        ),
+                    );
+                    const { expireAt } = errorSet![0] as {
+                        expireAt: number;
+                    };
+                    const nowSec = Math.floor(Date.now() / 1000);
+                    expect(expireAt).toBeGreaterThan(
+                        nowSec + 7 * 24 * 60 * 60 - 60,
+                    );
+                    expect(expireAt).toBeLessThanOrEqual(
+                        nowSec + 7 * 24 * 60 * 60,
+                    );
+                },
+            );
+        } finally {
+            kvSet.mockRestore();
+        }
+    });
+
+    it('forwards ip, device fingerprint, and user-agent to Prelude as signals', async () => {
+        const { actor } = await makeUserAndActor();
+        const createVerification = vi.fn(async () => ({ status: 'success' }));
+        await withPrelude(stubPrelude({ createVerification }), async () => {
+            const req = makeReq(
+                { phone: '+14155550123' },
+                {
+                    actor,
+                    ip: '203.0.113.7',
+                    headers: { 'user-agent': 'Mozilla/5.0' },
+                },
+            );
+            // Stamped by the global fingerprint middleware in production.
+            (req as { deviceFingerprint?: string }).deviceFingerprint =
+                'thumb_abc123';
+            await controller.handleSendConfirmPhone(req, makeRes());
+        });
+        expect(createVerification).toHaveBeenCalledWith('+14155550123', {
+            ip: '203.0.113.7',
+            device_id: 'thumb_abc123',
+            user_agent: 'Mozilla/5.0',
+        });
+    });
+
+    it('omits absent device fingerprint and user-agent from the Prelude signals', async () => {
+        const { actor } = await makeUserAndActor();
+        const createVerification = vi.fn(async () => ({ status: 'success' }));
+        await withPrelude(stubPrelude({ createVerification }), async () => {
+            await controller.handleSendConfirmPhone(
+                makeReq(
+                    { phone: '+14155550123' },
+                    { actor, ip: '203.0.113.7' },
+                ),
+                makeRes(),
+            );
+        });
+        expect(createVerification).toHaveBeenCalledWith('+14155550123', {
+            ip: '203.0.113.7',
+            device_id: undefined,
+            user_agent: undefined,
+        });
+    });
+
+    it('returns the delivery channel Prelude picked so the client can point at the right app', async () => {
+        const { actor } = await makeUserAndActor();
+        await withPrelude(
+            stubPrelude({
+                createVerification: vi.fn(async () => ({
+                    status: 'success',
+                    channels: ['whatsapp', 'sms'],
+                })),
+            }),
+            async () => {
+                const res = makeRes();
+                await controller.handleSendConfirmPhone(
+                    makeReq({ phone: '+14155550123' }, { actor }),
+                    res,
+                );
+                expect(res.body).toMatchObject({ channel: 'whatsapp' });
+            },
+        );
+    });
+
+    it('omits `channel` when Prelude reports no delivery sequence', async () => {
+        const { actor } = await makeUserAndActor();
+        await withPrelude(stubPrelude(), async () => {
+            const res = makeRes();
+            await controller.handleSendConfirmPhone(
+                makeReq({ phone: '+14155550123' }, { actor }),
+                res,
+            );
+            expect(res.body).not.toHaveProperty('channel');
+        });
+    });
+});
+
+describe('AuthController phone verification — staging & reuse', () => {
+    const stubPrelude = (over: Record<string, unknown> = {}) => ({
+        isConfigured: () => true,
+        isCountrySupported: () => true,
+        defaultCountry: 'US',
+        createVerification: vi.fn(async () => ({ status: 'success' })),
+        checkVerification: vi.fn(async () => ({ status: 'success' })),
+        ...over,
+    });
+    const withClients = async (
+        over: { prelude?: unknown; event?: unknown },
+        fn: () => Promise<void>,
+    ): Promise<void> => {
+        const ctrl = controller as {
+            clients: { prelude: unknown; event: unknown };
+        };
+        const realPrelude = ctrl.clients.prelude;
+        const realEvent = ctrl.clients.event;
+        if ('prelude' in over) ctrl.clients.prelude = over.prelude;
+        if ('event' in over) ctrl.clients.event = over.event;
+        try {
+            await fn();
+        } finally {
+            ctrl.clients.prelude = realPrelude;
+            ctrl.clients.event = realEvent;
+        }
+    };
+
+    it('stages the number in KV and does NOT write it to the user row before verification', async () => {
+        const { user, actor } = await makeUserAndActor();
+        await withClients({ prelude: stubPrelude() }, async () => {
+            await controller.handleSendConfirmPhone(
+                makeReq({ phone: '+14155550123' }, { actor }),
+                makeRes(),
+            );
+        });
+        const after = await server.stores.user.getById(user.id, {
+            force: true,
+        });
+        // The unverified number is not persisted to the indexed column …
+        expect(after!.phone ?? null).toBeNull();
+        // … it's staged in KV instead, for /confirm-phone to read back.
+        const { res: staged } = await server.stores.kv.get({
+            key: `phone-verify-pending:${user.id}`,
+        });
+        expect(staged).toBe('+14155550123');
+    });
+
+    it('forwards an abuse-extension veto as 429 with the opaque reason, and sends nothing', async () => {
+        const { user, actor } = await makeUserAndActor();
+        const emitAndWait = vi.fn(
+            async (
+                name: string,
+                ev: { allowed: boolean; reason: string | null },
+            ) => {
+                if (name === 'puter.phone-verification.check') {
+                    ev.allowed = false;
+                    ev.reason = 'phone_already_used';
+                }
+            },
+        );
+        const createVerification = vi.fn(async () => ({ status: 'success' }));
+        await withClients(
+            {
+                prelude: stubPrelude({ createVerification }),
+                event: { emitAndWait, emit: vi.fn() },
+            },
+            async () => {
+                // 429 (not 403), and the extension's reason is forwarded
+                // verbatim for the client to message on — the backend never
+                // interprets it.
+                await expect(
+                    controller.handleSendConfirmPhone(
+                        makeReq({ phone: '+14155550123' }, { actor }),
+                        makeRes(),
+                    ),
+                ).rejects.toMatchObject({
+                    statusCode: 429,
+                    fields: { reason: 'phone_already_used' },
+                });
+            },
+        );
+        // Vetoed before the send — no SMS dispatched, nothing staged.
+        expect(createVerification).not.toHaveBeenCalled();
+        const { res: staged } = await server.stores.kv.get({
+            key: `phone-verify-pending:${user.id}`,
+        });
+        expect(staged ?? null).toBeNull();
+    });
+
+    it('emits puter.phone-verification.sent after a successful send', async () => {
+        const { actor } = await makeUserAndActor();
+        const emit = vi.fn();
+        const emitAndWait = vi.fn(async () => {}); // no veto
+        await withClients(
+            { prelude: stubPrelude(), event: { emit, emitAndWait } },
+            async () => {
+                await controller.handleSendConfirmPhone(
+                    makeReq({ phone: '+14155550123' }, { actor }),
+                    makeRes(),
+                );
+            },
+        );
+        expect(emit).toHaveBeenCalledWith(
+            'puter.phone-verification.sent',
+            expect.objectContaining({
+                phone: '+14155550123',
+                dispatch_id: null,
+            }),
+            expect.anything(),
+        );
+    });
+
+    it('carries the client dispatch id on the sent signal', async () => {
+        const { actor } = await makeUserAndActor();
+        const emit = vi.fn();
+        const emitAndWait = vi.fn(async () => {});
+        await withClients(
+            { prelude: stubPrelude(), event: { emit, emitAndWait } },
+            async () => {
+                await controller.handleSendConfirmPhone(
+                    makeReq(
+                        { phone: '+14155550123', dispatch_id: 'disp-123' },
+                        { actor },
+                    ),
+                    makeRes(),
+                );
+            },
+        );
+        expect(emit).toHaveBeenCalledWith(
+            'puter.phone-verification.sent',
+            expect.objectContaining({ dispatch_id: 'disp-123' }),
+            expect.anything(),
+        );
+    });
+
+    it('does NOT emit the sent signal when the send fails upstream', async () => {
+        const { actor } = await makeUserAndActor();
+        const emit = vi.fn();
+        const emitAndWait = vi.fn(async () => {});
+        await withClients(
+            {
+                prelude: stubPrelude({
+                    createVerification: vi.fn(async () => {
+                        throw new Error('prelude down');
+                    }),
+                }),
+                event: { emit, emitAndWait },
+            },
+            async () => {
+                await expect(
+                    controller.handleSendConfirmPhone(
+                        makeReq({ phone: '+14155550123' }, { actor }),
+                        makeRes(),
+                    ),
+                ).rejects.toMatchObject({ statusCode: 502 });
+            },
+        );
+        const sentCalls = emit.mock.calls.filter(
+            (c) => c[0] === 'puter.phone-verification.sent',
+        );
+        expect(sentCalls).toHaveLength(0);
+    });
+
+    it('confirms against the staged number and persists it to the row only on success', async () => {
+        const { user, actor } = await makeUserAndActor({
+            requires_phone_verification: 1,
+        });
+        // No phone on the row; the number lives only in the KV staging slot.
+        await server.stores.kv.set({
+            key: `phone-verify-pending:${user.id}`,
+            value: '+14155550123',
+        });
+        const checkVerification = vi.fn(async () => ({ status: 'success' }));
+        await withClients(
+            { prelude: stubPrelude({ checkVerification }) },
+            async () => {
+                const res = makeRes();
+                await controller.handleConfirmPhone(
+                    makeReq({ code: '123456' }, { actor }),
+                    res,
+                );
+                expect(res.body).toMatchObject({ phone_verified: true });
+            },
+        );
+        expect(checkVerification).toHaveBeenCalledWith(
+            '+14155550123',
+            '123456',
+        );
+        const after = await server.stores.user.getById(user.id, {
+            force: true,
+        });
+        expect(after!.requires_phone_verification).toBe(false);
+        // Persisted to the row only now, on success.
+        expect(after!.phone).toBe('+14155550123');
+    });
+});
+
+describe('AuthController.handleConfirmPhone', () => {
+    const stubPrelude = (over: Record<string, unknown> = {}) => ({
+        isConfigured: () => true,
+        checkVerification: vi.fn(async () => ({ status: 'success' })),
+        ...over,
+    });
+    const withPrelude = async (
+        prelude: unknown,
+        fn: () => Promise<void>,
+    ): Promise<void> => {
+        const ctrl = controller as { clients: { prelude: unknown } };
+        const real = ctrl.clients.prelude;
+        ctrl.clients.prelude = prelude;
+        try {
+            await fn();
+        } finally {
+            ctrl.clients.prelude = real;
+        }
+    };
+
+    it('throws 400 when code is missing', async () => {
+        const { actor } = await makeUserAndActor({
+            requires_phone_verification: 1,
+            phone: '+14155550123',
+        });
+        await expect(
+            controller.handleConfirmPhone(makeReq({}, { actor }), makeRes()),
+        ).rejects.toMatchObject({ statusCode: 400 });
+    });
+
+    it('short-circuits to verified when a verified number is on file (no Prelude call)', async () => {
+        const { actor } = await makeUserAndActor({ phone: '+14155550123' });
+        const checkVerification = vi.fn();
+        await withPrelude(stubPrelude({ checkVerification }), async () => {
+            const res = makeRes();
+            await controller.handleConfirmPhone(
+                makeReq({ code: '123456' }, { actor }),
+                res,
+            );
+            expect(res.body).toMatchObject({ phone_verified: true });
+            expect(checkVerification).not.toHaveBeenCalled();
+        });
+    });
+
+    it('verifies for real when the gate was never set but no number is on file', async () => {
+        // A route requiring a verified phone sends never-flagged users here;
+        // answering "verified" on the clear flag alone would store nothing and
+        // leave that route refusing them.
+        const { user, actor } = await makeUserAndActor();
+        await server.stores.kv.set({
+            key: `phone-verify-pending:${user.id}`,
+            value: '+14155550123',
+        });
+        const checkVerification = vi.fn(async () => ({ status: 'success' }));
+        await withPrelude(stubPrelude({ checkVerification }), async () => {
+            const res = makeRes();
+            await controller.handleConfirmPhone(
+                makeReq({ code: '123456' }, { actor }),
+                res,
+            );
+            expect(res.body).toMatchObject({ phone_verified: true });
+        });
+        expect(checkVerification).toHaveBeenCalledWith(
+            '+14155550123',
+            '123456',
+        );
+        const after = await server.stores.user.getById(user.id, {
+            force: true,
+        });
+        expect(after!.phone).toBe('+14155550123');
+    });
+
+    it('throws 400 when the gate is set but no phone is on file', async () => {
+        const { actor } = await makeUserAndActor({
+            requires_phone_verification: 1,
+        });
+        await expect(
+            controller.handleConfirmPhone(
+                makeReq({ code: '123456' }, { actor }),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 400 });
+    });
+
+    it('throws 503 when the gate is set but Prelude is not configured', async () => {
+        const { actor } = await makeUserAndActor({
+            requires_phone_verification: 1,
+            phone: '+14155550123',
+        });
+        await withPrelude(
+            stubPrelude({ isConfigured: () => false }),
+            async () => {
+                await expect(
+                    controller.handleConfirmPhone(
+                        makeReq({ code: '123456' }, { actor }),
+                        makeRes(),
+                    ),
+                ).rejects.toMatchObject({ statusCode: 503 });
+            },
+        );
+    });
+
+    it('returns phone_verified:false on a wrong code without clearing the gate', async () => {
+        const { user, actor } = await makeUserAndActor({
+            requires_phone_verification: 1,
+            phone: '+14155550123',
+        });
+        await withPrelude(
+            stubPrelude({
+                checkVerification: vi.fn(async () => ({ status: 'failure' })),
+            }),
+            async () => {
+                const res = makeRes();
+                await controller.handleConfirmPhone(
+                    makeReq({ code: '000000' }, { actor }),
+                    res,
+                );
+                expect(res.body).toMatchObject({ phone_verified: false });
+                const after = await server.stores.user.getById(user.id, {
+                    force: true,
+                });
+                expect(after!.requires_phone_verification).toBe(true);
+            },
+        );
+    });
+
+    it('clears the gate on a correct code and echoes the socket id', async () => {
+        const { user, actor } = await makeUserAndActor({
+            requires_phone_verification: 1,
+            phone: '+14155550123',
+        });
+        await withPrelude(
+            stubPrelude({
+                checkVerification: vi.fn(async () => ({ status: 'success' })),
+            }),
+            async () => {
+                const res = makeRes();
+                await controller.handleConfirmPhone(
+                    makeReq(
+                        { code: '123456', original_client_socket_id: 'sock_1' },
+                        { actor },
+                    ),
+                    res,
+                );
+                expect(res.body).toMatchObject({
+                    phone_verified: true,
+                    original_client_socket_id: 'sock_1',
+                });
+                const after = await server.stores.user.getById(user.id, {
+                    force: true,
+                });
+                expect(after!.requires_phone_verification).toBe(false);
+            },
+        );
+    });
+
+    it('awaits the user.phone-verified listeners (emitAndWait, not fire-and-forget)', async () => {
+        // The carrier-based card-verification waiver (abuse extension) listens
+        // on user.phone-verified and must clear the card gate BEFORE confirm
+        // responds — so the event has to be awaited, not fire-and-forget.
+        const { actor } = await makeUserAndActor({
+            requires_phone_verification: 1,
+            phone: '+14155550123',
+        });
+        const emit = vi.fn();
+        const emitAndWait = vi.fn(async () => {});
+        const ctrl = controller as { clients: { event: unknown } };
+        const realEvent = ctrl.clients.event;
+        ctrl.clients.event = { emit, emitAndWait };
+        try {
+            await withPrelude(
+                stubPrelude({
+                    checkVerification: vi.fn(async () => ({
+                        status: 'success',
+                    })),
+                }),
+                async () => {
+                    await controller.handleConfirmPhone(
+                        makeReq({ code: '123456' }, { actor }),
+                        makeRes(),
+                    );
+                },
+            );
+        } finally {
+            ctrl.clients.event = realEvent;
+        }
+        expect(emitAndWait).toHaveBeenCalledWith(
+            'user.phone-verified',
+            expect.objectContaining({ phone: '+14155550123' }),
+            expect.anything(),
+        );
+        const fireAndForget = emit.mock.calls.filter(
+            (c) => c[0] === 'user.phone-verified',
+        );
+        expect(fireAndForget).toHaveLength(0);
+    });
+
+    it('throws 502 when the upstream check fails', async () => {
+        const { actor } = await makeUserAndActor({
+            requires_phone_verification: 1,
+            phone: '+14155550123',
+        });
+        await withPrelude(
+            stubPrelude({
+                checkVerification: vi.fn(async () => {
+                    throw new Error('prelude down');
+                }),
+            }),
+            async () => {
+                await expect(
+                    controller.handleConfirmPhone(
+                        makeReq({ code: '123456' }, { actor }),
+                        makeRes(),
+                    ),
+                ).rejects.toMatchObject({ statusCode: 502 });
+            },
+        );
+    });
+});
+
+describe('AuthController.handleCardVerificationSetup', () => {
+    it('short-circuits to verified for an account with a card on file', async () => {
+        const { actor } = await makeUserAndActor({
+            card_fingerprint: 'fp_existing',
+        });
+        const res = makeRes();
+        await controller.handleCardVerificationSetup(
+            makeReq({}, { actor }),
+            res,
+        );
+        expect(res.body).toMatchObject({ card_verified: true });
+    });
+
+    it('lets a free trial add a card even with one already on file', async () => {
+        const { actor } = await makeUserAndActor({
+            card_fingerprint: 'fp_existing',
+        });
+        const res = makeRes();
+        let purpose: unknown;
+        await withCardSetupOverride(
+            (data) => {
+                purpose = data.purpose;
+                data.enabled = true;
+                data.client_secret = 'seti_trial';
+                data.publishable_key = 'pk_test';
+            },
+            () =>
+                controller.handleCardVerificationSetup(
+                    makeReq({ purpose: 'trial' }, { actor }),
+                    res,
+                ),
+        );
+        expect(purpose).toBe('trial');
+        expect(res.body).toMatchObject({ client_secret: 'seti_trial' });
+    });
+
+    it('starts the flow for an account that was never asked and never verified', async () => {
+        // A route requiring a verified card (`requireCardVerified`) sends a
+        // user here with the gate clear and no card on file. Answering
+        // "already verified" on the flag alone would bounce them between a
+        // dialog reporting success and a route that keeps refusing; reaching
+        // the extension (absent here, hence 503) is the flow actually running.
+        const { actor } = await makeUserAndActor();
+        await expect(
+            controller.handleCardVerificationSetup(
+                makeReq({}, { actor }),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 503 });
+    });
+
+    it('throws 403 when the account is suspended', async () => {
+        const { actor } = await makeUserAndActor({
+            requires_card_verification: 1,
+            suspended: 1,
+        });
+        await expect(
+            controller.handleCardVerificationSetup(
+                makeReq({}, { actor }),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 403 });
+    });
+
+    it('throws 409 when phone verification must be completed first', async () => {
+        const { actor } = await makeUserAndActor({
+            requires_card_verification: 1,
+            requires_phone_verification: 1,
+            phone: '+14155550123',
+        });
+        await expect(
+            controller.handleCardVerificationSetup(
+                makeReq({}, { actor }),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 409 });
+    });
+
+    it('throws 503 when no payments extension is listening', async () => {
+        const { actor } = await makeUserAndActor({
+            requires_card_verification: 1,
+        });
+        await expect(
+            controller.handleCardVerificationSetup(
+                makeReq({}, { actor }),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 503 });
+    });
+
+    it('clears the gate when the extension reports the feature disabled', async () => {
+        const { user, actor } = await makeUserAndActor({
+            requires_card_verification: 1,
+        });
+        const res = makeRes();
+        await withCardSetupOverride(
+            (data) => {
+                data.enabled = false;
+            },
+            () =>
+                controller.handleCardVerificationSetup(
+                    makeReq({}, { actor }),
+                    res,
+                ),
+        );
+        expect(res.body).toMatchObject({ card_verified: true, disabled: true });
+        const after = await server.stores.user.getById(user.id, {
+            force: true,
+        });
+        expect(after!.requires_card_verification).toBe(false);
+    });
+
+    it('returns the provider credentials on success', async () => {
+        const { actor } = await makeUserAndActor({
+            requires_card_verification: 1,
+        });
+        const res = makeRes();
+        await withCardSetupOverride(
+            (data) => {
+                data.enabled = true;
+                data.client_secret = 'seti_secret';
+                data.publishable_key = 'pk_test';
+            },
+            () =>
+                controller.handleCardVerificationSetup(
+                    makeReq({}, { actor }),
+                    res,
+                ),
+        );
+        expect(res.body).toEqual({
+            client_secret: 'seti_secret',
+            publishable_key: 'pk_test',
+        });
+    });
+});
+
+describe('AuthController.handleCardVerificationConfirm', () => {
+    it('throws 400 for a missing or invalid setup_intent_id', async () => {
+        const { actor } = await makeUserAndActor({
+            requires_card_verification: 1,
+        });
+        for (const bad of [undefined, '', 123, 'x'.repeat(256)]) {
+            await expect(
+                controller.handleCardVerificationConfirm(
+                    makeReq({ setup_intent_id: bad }, { actor }),
+                    makeRes(),
+                ),
+            ).rejects.toMatchObject({ statusCode: 400 });
+        }
+    });
+
+    it('short-circuits to verified for an account with a card on file', async () => {
+        const { actor } = await makeUserAndActor({
+            card_fingerprint: 'fp_existing',
+        });
+        const res = makeRes();
+        await controller.handleCardVerificationConfirm(
+            makeReq({ setup_intent_id: 'seti_1' }, { actor }),
+            res,
+        );
+        expect(res.body).toMatchObject({ card_verified: true });
+    });
+
+    it('runs the confirm for an account that was never asked and never verified', async () => {
+        // Same reason as setup: the pending flag says nobody asked, not that
+        // a card was checked, so a voluntary verification has to go through.
+        const { actor } = await makeUserAndActor();
+        await expect(
+            controller.handleCardVerificationConfirm(
+                makeReq({ setup_intent_id: 'seti_1' }, { actor }),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 503 });
+    });
+
+    it('throws 409 when phone verification must be completed first', async () => {
+        const { actor } = await makeUserAndActor({
+            requires_card_verification: 1,
+            requires_phone_verification: 1,
+            phone: '+14155550123',
+        });
+        await expect(
+            controller.handleCardVerificationConfirm(
+                makeReq({ setup_intent_id: 'seti_1' }, { actor }),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 409 });
+    });
+
+    it('throws 503 when no payments extension is listening', async () => {
+        const { actor } = await makeUserAndActor({
+            requires_card_verification: 1,
+        });
+        await expect(
+            controller.handleCardVerificationConfirm(
+                makeReq({ setup_intent_id: 'seti_1' }, { actor }),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 503 });
+    });
+
+    it('clears the gate when the extension reports the feature disabled', async () => {
+        const { user, actor } = await makeUserAndActor({
+            requires_card_verification: 1,
+        });
+        const res = makeRes();
+        await withCardConfirmOverride(
+            (data) => {
+                data.enabled = false;
+            },
+            () =>
+                controller.handleCardVerificationConfirm(
+                    makeReq({ setup_intent_id: 'seti_1' }, { actor }),
+                    res,
+                ),
+        );
+        expect(res.body).toMatchObject({ card_verified: true, disabled: true });
+        const after = await server.stores.user.getById(user.id, {
+            force: true,
+        });
+        expect(after!.requires_card_verification).toBe(false);
+    });
+
+    it('returns card_verified:false with a reason when not verified', async () => {
+        const { user, actor } = await makeUserAndActor({
+            requires_card_verification: 1,
+        });
+        const res = makeRes();
+        await withCardConfirmOverride(
+            (data) => {
+                data.enabled = true;
+                data.verified = false;
+                data.reason = 'prepaid_not_allowed';
+            },
+            () =>
+                controller.handleCardVerificationConfirm(
+                    makeReq({ setup_intent_id: 'seti_1' }, { actor }),
+                    res,
+                ),
+        );
+        expect(res.body).toMatchObject({
+            card_verified: false,
+            reason: 'prepaid_not_allowed',
+        });
+        const after = await server.stores.user.getById(user.id, {
+            force: true,
+        });
+        expect(after!.requires_card_verification).toBe(true);
+    });
+
+    it('clears the gate when the extension verifies the card', async () => {
+        const { user, actor } = await makeUserAndActor({
+            requires_card_verification: 1,
+        });
+        const res = makeRes();
+        await withCardConfirmOverride(
+            (data) => {
+                data.enabled = true;
+                data.verified = true;
+            },
+            () =>
+                controller.handleCardVerificationConfirm(
+                    makeReq(
+                        {
+                            setup_intent_id: 'seti_1',
+                            original_client_socket_id: 'sock_1',
+                        },
+                        { actor },
+                    ),
+                    res,
+                ),
+        );
+        expect(res.body).toMatchObject({ card_verified: true });
+        const after = await server.stores.user.getById(user.id, {
+            force: true,
+        });
+        expect(after!.requires_card_verification).toBe(false);
+    });
+});
+
+describe('AuthController SMS → card fallback', () => {
+    const stubPrelude = (over: Record<string, unknown> = {}) => ({
+        isConfigured: () => true,
+        isCountrySupported: () => true,
+        defaultCountry: 'US',
+        createVerification: vi.fn(async () => ({ status: 'success' })),
+        ...over,
+    });
+    const withPrelude = async (
+        prelude: unknown,
+        fn: () => Promise<void>,
+    ): Promise<void> => {
+        const ctrl = controller as { clients: { prelude: unknown } };
+        const real = ctrl.clients.prelude;
+        ctrl.clients.prelude = prelude;
+        try {
+            await fn();
+        } finally {
+            ctrl.clients.prelude = real;
+        }
+    };
+    const withFallbackConfig = async (
+        value: unknown,
+        fn: () => Promise<void>,
+    ): Promise<void> => {
+        const cfg = (controller as { config: Record<string, unknown> }).config;
+        const prev = cfg.phone_verification_card_fallback;
+        cfg.phone_verification_card_fallback = value;
+        try {
+            await fn();
+        } finally {
+            cfg.phone_verification_card_fallback = prev;
+        }
+    };
+    // Drive the attempt counter directly so the threshold is deterministic
+    // (the handler keys it the same way: `phone-verify-attempts:<id>`).
+    const seedAttempts = (userId: number, attempts: number) =>
+        server.stores.kv.incr({
+            key: `phone-verify-attempts:${userId}`,
+            pathAndAmountMap: { attempts },
+        });
+    // Stamp the eligibility flag the card endpoints check, the same way a
+    // threshold-crossing send does (`card-fallback-open:<id>`).
+    const openFallback = (userId: number) =>
+        server.stores.kv.set({
+            key: `card-fallback-open:${userId}`,
+            value: true,
+        });
+
+    // An abuse extension vetoing with `card_fallback_instead` asks for the
+    // card path in place of SMS.
+    const withFallbackVeto = async (fn: () => Promise<void>) => {
+        const ctrl = controller as { clients: { event: unknown } };
+        const real = ctrl.clients.event;
+        ctrl.clients.event = {
+            emit: vi.fn(),
+            emitAndWait: vi.fn(
+                async (_name: string, payload: Record<string, unknown>) => {
+                    payload.allowed = false;
+                    payload.reason = 'phone_virtual_number';
+                    payload.card_fallback_instead = true;
+                },
+            ),
+        };
+        try {
+            await fn();
+        } finally {
+            ctrl.clients.event = real;
+        }
+    };
+
+    it('routes a vetoed send to the card fallback when the extension asks', async () => {
+        const { user, actor } = await makeUserAndActor({
+            requires_phone_verification: 1,
+        });
+        const prelude = stubPrelude();
+        await withFallbackConfig({ enabled: true }, async () => {
+            await withPrelude(prelude, async () => {
+                await withFallbackVeto(async () => {
+                    await expect(
+                        controller.handleSendConfirmPhone(
+                            makeReq({ phone: '+14155550123' }, { actor }),
+                            makeRes(),
+                        ),
+                    ).rejects.toMatchObject({
+                        statusCode: 429,
+                        fields: {
+                            card_fallback_available: true,
+                            reason: 'phone_virtual_number',
+                        },
+                    });
+                });
+            });
+        });
+        expect(prelude.createVerification).not.toHaveBeenCalled();
+        const { res: flag } = await server.stores.kv.get({
+            key: `card-fallback-open:${user.id}`,
+        });
+        expect(flag).toBe(true);
+    });
+
+    it('lets that send through when the fallback is off', async () => {
+        const { actor } = await makeUserAndActor({
+            requires_phone_verification: 1,
+        });
+        const prelude = stubPrelude();
+        await withFallbackConfig({ enabled: false }, async () => {
+            await withPrelude(prelude, async () => {
+                await withFallbackVeto(async () => {
+                    await controller.handleSendConfirmPhone(
+                        makeReq({ phone: '+14155550123' }, { actor }),
+                        makeRes(),
+                    );
+                });
+            });
+        });
+        expect(prelude.createVerification).toHaveBeenCalled();
+    });
+
+    it('offers the fallback on send only once SMS attempts are exhausted', async () => {
+        const { user, actor } = await makeUserAndActor({
+            requires_phone_verification: 1,
+        });
+        // No after_attempts → the default is the send route's whole allowance,
+        // so the offer appears on the last send that limit allows and not
+        // before: the card path is for a phone that has run out of tries.
+        await withFallbackConfig({ enabled: true }, async () => {
+            await withPrelude(stubPrelude(), async () => {
+                const early = makeRes();
+                await controller.handleSendConfirmPhone(
+                    makeReq({ phone: '+14155550123' }, { actor }),
+                    early,
+                );
+                // One attempt spent, nine still available — no offer.
+                expect(early.body).toEqual({});
+
+                // Stop one short of the allowance: still nothing on offer.
+                await seedAttempts(user.id, 7);
+                const penultimate = makeRes();
+                await controller.handleSendConfirmPhone(
+                    makeReq({ phone: '+14155550123' }, { actor }),
+                    penultimate,
+                );
+                expect(penultimate.body).toEqual({});
+
+                // The tenth send is the last one the route will allow, so this
+                // is the point the user is out of SMS attempts.
+                const last = makeRes();
+                await controller.handleSendConfirmPhone(
+                    makeReq({ phone: '+14155550123' }, { actor }),
+                    last,
+                );
+                expect(last.body).toEqual({
+                    card_fallback_available: true,
+                });
+            });
+        });
+    });
+
+    // The card gate lives in an extension, so the backend asks for its status
+    // over the event bus. Stub that one client: `null` stands for no extension
+    // listening at all, which is what a stock build looks like.
+    const withCardStatus = async (
+        enabled: boolean | null,
+        fn: () => Promise<void>,
+    ): Promise<void> => {
+        const ctrl = controller as { clients: { event: unknown } };
+        const real = ctrl.clients.event;
+        ctrl.clients.event = {
+            emitAndWait: async (
+                key: string,
+                event: Record<string, unknown>,
+            ) => {
+                if (key === 'puter.card-verification.status') {
+                    if (enabled !== null) event.enabled = enabled;
+                }
+            },
+            emit: () => undefined,
+        };
+        resetCardVerificationStatusCache();
+        try {
+            await fn();
+        } finally {
+            ctrl.clients.event = real;
+            resetCardVerificationStatusCache();
+        }
+    };
+
+    it('defaults on when SMS and card verification are both available', async () => {
+        const { user, actor } = await makeUserAndActor({
+            requires_phone_verification: 1,
+        });
+        // No `phone_verification_card_fallback` at all: the pair it bridges is
+        // what decides, and here both halves work.
+        await withFallbackConfig(undefined, async () => {
+            await withPrelude(stubPrelude(), async () => {
+                await withCardStatus(true, async () => {
+                    await seedAttempts(user.id, 9);
+                    const res = makeRes();
+                    await controller.handleSendConfirmPhone(
+                        makeReq({ phone: '+14155550123' }, { actor }),
+                        res,
+                    );
+                    expect(res.body).toEqual({
+                        card_fallback_available: true,
+                    });
+                });
+            });
+        });
+    });
+
+    it('stays off by default with no card gate behind it', async () => {
+        const { user, actor } = await makeUserAndActor({
+            requires_phone_verification: 1,
+        });
+        // Nothing answers the status probe (stock build) — offering a card path
+        // here could only strand the user, so the default holds it closed.
+        await withFallbackConfig(undefined, async () => {
+            await withPrelude(stubPrelude(), async () => {
+                await withCardStatus(null, async () => {
+                    await seedAttempts(user.id, 9);
+                    const res = makeRes();
+                    await controller.handleSendConfirmPhone(
+                        makeReq({ phone: '+14155550123' }, { actor }),
+                        res,
+                    );
+                    expect(res.body).toEqual({});
+                });
+            });
+        });
+    });
+
+    it('stays off by default when the card gate reports itself disabled', async () => {
+        const { user, actor } = await makeUserAndActor({
+            requires_phone_verification: 1,
+        });
+        await withFallbackConfig(undefined, async () => {
+            await withPrelude(stubPrelude(), async () => {
+                await withCardStatus(false, async () => {
+                    await seedAttempts(user.id, 9);
+                    const res = makeRes();
+                    await controller.handleSendConfirmPhone(
+                        makeReq({ phone: '+14155550123' }, { actor }),
+                        res,
+                    );
+                    expect(res.body).toEqual({});
+                });
+            });
+        });
+    });
+
+    it('honours an explicit opt-out even when both gates are available', async () => {
+        const { user, actor } = await makeUserAndActor({
+            requires_phone_verification: 1,
+        });
+        await withFallbackConfig({ enabled: false }, async () => {
+            await withPrelude(stubPrelude(), async () => {
+                await withCardStatus(true, async () => {
+                    await seedAttempts(user.id, 9);
+                    const res = makeRes();
+                    await controller.handleSendConfirmPhone(
+                        makeReq({ phone: '+14155550123' }, { actor }),
+                        res,
+                    );
+                    expect(res.body).toEqual({});
+                });
+            });
+        });
+    });
+
+    it('clamps after_attempts to the send allowance so it stays reachable', async () => {
+        const { user, actor } = await makeUserAndActor({
+            requires_phone_verification: 1,
+        });
+        // A threshold above the send limit could never be crossed on its own
+        // terms — requests past the limit are rejected in middleware and never
+        // reach the counter — so it is clamped down to the allowance.
+        await withFallbackConfig(
+            { enabled: true, after_attempts: 50 },
+            async () => {
+                await withPrelude(stubPrelude(), async () => {
+                    await seedAttempts(user.id, 9);
+                    const res = makeRes();
+                    await controller.handleSendConfirmPhone(
+                        makeReq({ phone: '+14155550123' }, { actor }),
+                        res,
+                    );
+                    expect(res.body).toEqual({
+                        card_fallback_available: true,
+                    });
+                });
+            },
+        );
+    });
+
+    it('never offers the fallback on send when disabled', async () => {
+        const { actor } = await makeUserAndActor({
+            requires_phone_verification: 1,
+        });
+        await withFallbackConfig(
+            { enabled: false, after_attempts: 1 },
+            async () => {
+                await withPrelude(stubPrelude(), async () => {
+                    const res = makeRes();
+                    await controller.handleSendConfirmPhone(
+                        makeReq({ phone: '+14155550123' }, { actor }),
+                        res,
+                    );
+                    expect(res.body).toEqual({});
+                });
+            },
+        );
+    });
+
+    it('flags the fallback on a Prelude block once eligible', async () => {
+        const { actor } = await makeUserAndActor({
+            requires_phone_verification: 1,
+        });
+        await withFallbackConfig(
+            { enabled: true, after_attempts: 1 },
+            async () => {
+                await withPrelude(
+                    stubPrelude({
+                        createVerification: vi.fn(async () => ({
+                            status: 'blocked',
+                        })),
+                    }),
+                    async () => {
+                        await expect(
+                            controller.handleSendConfirmPhone(
+                                makeReq({ phone: '+14155550123' }, { actor }),
+                                makeRes(),
+                            ),
+                        ).rejects.toMatchObject({
+                            statusCode: 429,
+                            fields: { card_fallback_available: true },
+                        });
+                    },
+                );
+            },
+        );
+    });
+
+    it('lets card setup proceed past the phone gate once eligible', async () => {
+        const { user, actor } = await makeUserAndActor({
+            requires_card_verification: 1,
+            requires_phone_verification: 1,
+            phone: '+14155550123',
+        });
+        await openFallback(user.id);
+        await withFallbackConfig({ enabled: true }, async () => {
+            const res = makeRes();
+            await withCardSetupOverride(
+                (data) => {
+                    data.enabled = true;
+                    data.client_secret = 'seti_secret';
+                    data.publishable_key = 'pk_test';
+                },
+                () =>
+                    controller.handleCardVerificationSetup(
+                        makeReq({}, { actor }),
+                        res,
+                    ),
+            );
+            expect(res.body).toEqual({
+                client_secret: 'seti_secret',
+                publishable_key: 'pk_test',
+            });
+        });
+    });
+
+    it('still 409s card setup when no send has opened the fallback', async () => {
+        const { user, actor } = await makeUserAndActor({
+            requires_card_verification: 1,
+            requires_phone_verification: 1,
+            phone: '+14155550123',
+        });
+        // Counter above the threshold but no flag: eligibility is the flag a
+        // threshold-crossing send stamps, never the raw counter.
+        await seedAttempts(user.id, 5);
+        await withFallbackConfig(
+            { enabled: true, after_attempts: 3 },
+            async () => {
+                await expect(
+                    controller.handleCardVerificationSetup(
+                        makeReq({}, { actor }),
+                        makeRes(),
+                    ),
+                ).rejects.toMatchObject({ statusCode: 409 });
+            },
+        );
+    });
+
+    it('send crossing the threshold opens card setup end-to-end', async () => {
+        const { actor } = await makeUserAndActor({
+            requires_card_verification: 1,
+            requires_phone_verification: 1,
+        });
+        await withFallbackConfig(
+            { enabled: true, after_attempts: 1 },
+            async () => {
+                await withPrelude(stubPrelude(), async () => {
+                    const sendRes = makeRes();
+                    await controller.handleSendConfirmPhone(
+                        makeReq({ phone: '+14155550123' }, { actor }),
+                        sendRes,
+                    );
+                    expect(sendRes.body).toEqual({
+                        card_fallback_available: true,
+                    });
+                });
+                const res = makeRes();
+                await withCardSetupOverride(
+                    (data) => {
+                        data.enabled = true;
+                        data.client_secret = 'seti_secret';
+                        data.publishable_key = 'pk_test';
+                    },
+                    () =>
+                        controller.handleCardVerificationSetup(
+                            makeReq({}, { actor }),
+                            res,
+                        ),
+                );
+                expect(res.body).toEqual({
+                    client_secret: 'seti_secret',
+                    publishable_key: 'pk_test',
+                });
+            },
+        );
+    });
+
+    it('clamps after_attempts to the send route rate limit', async () => {
+        const { user, actor } = await makeUserAndActor({
+            requires_phone_verification: 1,
+        });
+        // 9 prior attempts + this send = 10, the route limit. A threshold of
+        // 50 could never be crossed, so it clamps down and the offer opens.
+        await seedAttempts(user.id, 9);
+        await withFallbackConfig(
+            { enabled: true, after_attempts: 50 },
+            async () => {
+                await withPrelude(stubPrelude(), async () => {
+                    const res = makeRes();
+                    await controller.handleSendConfirmPhone(
+                        makeReq({ phone: '+14155550123' }, { actor }),
+                        res,
+                    );
+                    expect(res.body).toEqual({
+                        card_fallback_available: true,
+                    });
+                });
+            },
+        );
+    });
+
+    it('clears BOTH gates when the fallback card verifies', async () => {
+        const { user, actor } = await makeUserAndActor({
+            requires_card_verification: 1,
+            requires_phone_verification: 1,
+            phone: '+14155550123',
+        });
+        await openFallback(user.id);
+        await withFallbackConfig({ enabled: true }, async () => {
+            const res = makeRes();
+            await withCardConfirmOverride(
+                (data) => {
+                    data.enabled = true;
+                    data.verified = true;
+                },
+                () =>
+                    controller.handleCardVerificationConfirm(
+                        makeReq({ setup_intent_id: 'seti_1' }, { actor }),
+                        res,
+                    ),
+            );
+            expect(res.body).toMatchObject({
+                card_verified: true,
+                phone_verified: true,
+            });
+        });
+        const after = await server.stores.user.getById(user.id, {
+            force: true,
+        });
+        expect(after!.requires_card_verification).toBe(false);
+        expect(after!.requires_phone_verification).toBe(false);
+    });
+
+    it('clears the phone gate via card even when card was not required', async () => {
+        const { user, actor } = await makeUserAndActor({
+            requires_phone_verification: 1,
+            phone: '+14155550123',
+        });
+        await openFallback(user.id);
+        await withFallbackConfig({ enabled: true }, async () => {
+            const res = makeRes();
+            await withCardConfirmOverride(
+                (data) => {
+                    data.enabled = true;
+                    data.verified = true;
+                },
+                () =>
+                    controller.handleCardVerificationConfirm(
+                        makeReq({ setup_intent_id: 'seti_1' }, { actor }),
+                        res,
+                    ),
+            );
+            expect(res.body).toMatchObject({ phone_verified: true });
+        });
+        const after = await server.stores.user.getById(user.id, {
+            force: true,
+        });
+        expect(after!.requires_phone_verification).toBe(false);
+    });
+});
+
+describe('AuthController.handleConfirmEmail', () => {
+    it('throws 400 when code is missing', async () => {
+        const { actor } = await makeUserAndActor();
+        await expect(
+            controller.handleConfirmEmail(makeReq({}, { actor }), makeRes()),
+        ).rejects.toMatchObject({ statusCode: 400 });
+    });
+
+    it('returns email_confirmed:false on a wrong code', async () => {
+        const { actor } = await makeUserAndActor();
+        const res = makeRes();
+        await controller.handleConfirmEmail(
+            makeReq(
+                { code: '000000', original_client_socket_id: 'sock1' },
+                { actor },
+            ),
+            res,
+        );
+        expect(res.body).toEqual({
+            email_confirmed: false,
+            original_client_socket_id: 'sock1',
+        });
+    });
+
+    it('confirms the email when the code matches', async () => {
+        const { user, actor } = await makeUserAndActor();
+        const refreshed = await server.stores.user.getById(user.id, {
+            force: true,
+        });
+        const res = makeRes();
+        await controller.handleConfirmEmail(
+            makeReq({ code: refreshed!.email_confirm_code! }, { actor }),
+            res,
+        );
+        expect((res.body as { email_confirmed: boolean }).email_confirmed).toBe(
+            true,
+        );
+        const after = await server.stores.user.getById(user.id, {
+            force: true,
+        });
+        expect(after!.email_confirmed).toBeTruthy();
+    });
+
+    it('short-circuits to email_confirmed:true when the email is already confirmed', async () => {
+        const { actor } = await makeUserAndActor({ email_confirmed: 1 });
+        const res = makeRes();
+        await controller.handleConfirmEmail(
+            makeReq(
+                { code: 'ignored', original_client_socket_id: 's' },
+                { actor },
+            ),
+            res,
+        );
+        expect(res.body).toEqual({
+            email_confirmed: true,
+            original_client_socket_id: 's',
+        });
+    });
+
+    it('rejects "null" as a code when no confirmation code is stored', async () => {
+        const { user, actor } = await makeUserAndActor();
+        // A row with no stored code must never be confirmable: String(null)
+        // would otherwise equal a submitted "null" and confirm the email.
+        await server.stores.user.update(user.id, { email_confirm_code: null });
+        const res = makeRes();
+        await controller.handleConfirmEmail(
+            makeReq(
+                { code: 'null', original_client_socket_id: 's' },
+                { actor },
+            ),
+            res,
+        );
+        expect(res.body).toEqual({
+            email_confirmed: false,
+            original_client_socket_id: 's',
+        });
+        const after = await server.stores.user.getById(user.id, {
+            force: true,
+        });
+        expect(after!.email_confirmed).toBeFalsy();
+    });
+
+    it('strips a rival placeholder before confirming, not after', async () => {
+        const { user, actor } = await makeUserAndActor();
+        const email = user.email as string;
+
+        // A placeholder sitting on the same address. Confirming first and
+        // demoting second would momentarily leave two rows owning it, which
+        // the unique index rejects — turning a legitimate confirmation into a
+        // 500.
+        const rival = await server.stores.user.create({
+            username: `rival_${Math.random().toString(36).slice(2, 10)}`,
+            uuid: uuidv4(),
+            password: null,
+            email,
+            clean_email: email,
+        });
+
+        const refreshed = await server.stores.user.getById(user.id, {
+            force: true,
+        });
+        const res = makeRes();
+        await controller.handleConfirmEmail(
+            makeReq({ code: refreshed!.email_confirm_code! }, { actor }),
+            res,
+        );
+
+        expect(res.body).toMatchObject({ email_confirmed: true });
+        const confirmed = await server.stores.user.getById(user.id, {
+            force: true,
+        });
+        expect(confirmed!.email_confirmed).toBe(true);
+        const strippedRival = await server.stores.user.getById(rival.id, {
+            force: true,
+        });
+        expect(strippedRival!.email).toBeNull();
+    });
+
+    it('refuses when another account already confirmed the address', async () => {
+        const email = `owned-${uniq()}@test.local`;
+
+        // Confirmed with no password is the shape an identity provider
+        // creates, and it is what the old rival check (which also demanded a
+        // password) let through. Demoting it would take the address off an
+        // account that proved it owns the inbox.
+        const owner = await server.stores.user.create({
+            username: `owner_${uniq()}`,
+            uuid: uuidv4(),
+            password: null,
+            email,
+            clean_email: email,
+            email_confirmed: true,
+        });
+
+        // A second, unconfirmed row on the same address holding a confirm
+        // code — the legacy duplicate this path used to resolve in its favour.
+        const claimant = await server.stores.user.create({
+            username: `claim_${uniq()}`,
+            uuid: uuidv4(),
+            password: null,
+            email,
+            clean_email: email,
+            email_confirm_code: '123456',
+        });
+        const actor = {
+            user: {
+                id: claimant.id,
+                uuid: claimant.uuid,
+                username: claimant.username,
+                email,
+                email_confirmed: false,
+            },
+        } as Actor;
+
+        await expect(
+            controller.handleConfirmEmail(
+                makeReq({ code: '123456' }, { actor }),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 400 });
+
+        const untouched = await server.stores.user.getById(owner.id, {
+            force: true,
+        });
+        expect(untouched!.email).toBe(email);
+        expect(untouched!.email_confirmed).toBe(true);
+        const stillUnconfirmed = await server.stores.user.getById(claimant.id, {
+            force: true,
+        });
+        expect(stillUnconfirmed!.email_confirmed).toBeFalsy();
+    });
+});
+
+describe('AuthController.handleSaveAccount address conflicts', () => {
+    it('refuses to promote a temp account onto a taken address', async () => {
+        const email = `save-${Math.random().toString(36).slice(2, 10)}@test.local`;
+        await controller.handleSignup(
+            makeReq({
+                username: `save_own_${Math.random().toString(36).slice(2, 10)}`,
+                email,
+                password: 'correct-horse-battery',
+            }),
+            makeRes(),
+        );
+
+        const tempRes = makeRes();
+        await controller.handleSignup(makeReq({ is_temp: true }), tempRes);
+        const tempUser = (
+            tempRes.body as { user: { username: string; uuid: string } }
+        ).user;
+        const tempRow = await server.stores.user.getByUuid(tempUser.uuid);
+        const actor = {
+            user: {
+                id: tempRow!.id,
+                uuid: tempRow!.uuid,
+                username: tempRow!.username,
+                email: null,
+                email_confirmed: false,
+            },
+        } as Actor;
+
+        await expect(
+            controller.handleSaveAccount(
+                makeReq(
+                    {
+                        username: `save_new_${Math.random().toString(36).slice(2, 10)}`,
+                        email,
+                        password: 'another-strong-password',
+                    },
+                    { actor },
+                ),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({
+            statusCode: 400,
+            legacyCode: 'email_already_in_use',
+        });
+
+        // The temp row must be left alone — a failed promotion that already
+        // wrote the username would strand the account half-converted.
+        const untouched = await server.stores.user.getById(tempRow!.id, {
+            force: true,
+        });
+        expect(untouched!.email).toBeNull();
+        expect(untouched!.password).toBeNull();
+    });
+
+    it('refuses to promote a temp account when the home path is already occupied', async () => {
+        const parked = `save_home_${Math.random().toString(36).slice(2, 10)}`;
+        const { user: occupant } = await makeUserAndActor();
+        const root = (await server.stores.fsEntry.getRootEntryForUser(
+            occupant.id,
+        ))!;
+        await server.clients.db.write(
+            'UPDATE fsentries SET path = ? WHERE id = ?',
+            [`/${parked}`, root.id],
+        );
+
+        const tempRes = makeRes();
+        await controller.handleSignup(makeReq({ is_temp: true }), tempRes);
+        const tempUser = (
+            tempRes.body as { user: { username: string; uuid: string } }
+        ).user;
+        const tempRow = await server.stores.user.getByUuid(tempUser.uuid);
+        const actor = {
+            user: {
+                id: tempRow!.id,
+                uuid: tempRow!.uuid,
+                username: tempRow!.username,
+                email: null,
+                email_confirmed: false,
+            },
+        } as Actor;
+
+        await expect(
+            controller.handleSaveAccount(
+                makeReq(
+                    {
+                        username: parked,
+                        email: `${parked}@test.local`,
+                        password: 'another-strong-password',
+                    },
+                    { actor },
+                ),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 400 });
+
+        const untouched = await server.stores.user.getById(tempRow!.id, {
+            force: true,
+        });
+        expect(untouched!.username).toBe(tempRow!.username);
+        expect(untouched!.password).toBeNull();
+    });
+
+    it('refuses to promote a temp account when only a foreign row sits under the home path', async () => {
+        const parked = `save_home_${Math.random().toString(36).slice(2, 10)}`;
+        const { user: occupant } = await makeUserAndActor();
+        const docs = (await server.stores.fsEntry.getEntryByPath(
+            `/${occupant.username}/Documents`,
+        ))!;
+        await server.clients.db.write(
+            'UPDATE fsentries SET path = ? WHERE id = ?',
+            [`/${parked}/Documents`, docs.id],
+        );
+
+        const tempRes = makeRes();
+        await controller.handleSignup(makeReq({ is_temp: true }), tempRes);
+        const tempUser = (
+            tempRes.body as { user: { username: string; uuid: string } }
+        ).user;
+        const tempRow = await server.stores.user.getByUuid(tempUser.uuid);
+        const actor = {
+            user: {
+                id: tempRow!.id,
+                uuid: tempRow!.uuid,
+                username: tempRow!.username,
+                email: null,
+                email_confirmed: false,
+            },
+        } as Actor;
+
+        await expect(
+            controller.handleSaveAccount(
+                makeReq(
+                    {
+                        username: parked,
+                        email: `${parked}@test.local`,
+                        password: 'another-strong-password',
+                    },
+                    { actor },
+                ),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 400 });
+
+        const untouched = await server.stores.user.getById(tempRow!.id, {
+            force: true,
+        });
+        expect(untouched!.username).toBe(tempRow!.username);
+        expect(untouched!.password).toBeNull();
+    });
+});
+
+// ── Password recovery flow ──────────────────────────────────────────
+
+describe('AuthController password recovery', () => {
+    it('send-pass-recovery-email: 400 when neither username nor email supplied', async () => {
+        await expect(
+            controller.handleSendPassRecoveryEmail(makeReq({}), makeRes()),
+        ).rejects.toMatchObject({ statusCode: 400 });
+    });
+
+    it('send-pass-recovery-email: returns the generic message even for an unknown username (no leak)', async () => {
+        const res = makeRes();
+        await controller.handleSendPassRecoveryEmail(
+            makeReq({ username: `nonexistent_${uuidv4()}` }),
+            res,
+        );
+        expect((res.body as { message: string }).message).toMatch(
+            /If that account exists/i,
+        );
+    });
+
+    it('send-pass-recovery-email: stores a recovery token on a real user and returns the generic message', async () => {
+        const { user } = await makeUserAndActor();
+        const res = makeRes();
+        await controller.handleSendPassRecoveryEmail(
+            makeReq({ email: user.email! }),
+            res,
+        );
+        expect((res.body as { message: string }).message).toMatch(/account/);
+        const after = await server.stores.user.getById(user.id, {
+            force: true,
+        });
+        expect(after!.pass_recovery_token).toBeTruthy();
+    });
+
+    it('send-pass-recovery-email: a second send keeps the outstanding token', async () => {
+        const { user } = await makeUserAndActor();
+        const send = vi
+            .spyOn(server.clients.email, 'send')
+            .mockResolvedValue(undefined as never);
+        try {
+            await controller.handleSendPassRecoveryEmail(
+                makeReq({ email: user.email! }),
+                makeRes(),
+            );
+            const first = await server.stores.user.getById(user.id, {
+                force: true,
+            });
+            await controller.handleSendPassRecoveryEmail(
+                makeReq({ email: user.email! }),
+                makeRes(),
+            );
+            const second = await server.stores.user.getById(user.id, {
+                force: true,
+            });
+            expect(first!.pass_recovery_token).toBeTruthy();
+            expect(second!.pass_recovery_token).toBe(
+                first!.pass_recovery_token,
+            );
+            expect(send).toHaveBeenCalledTimes(2);
+        } finally {
+            send.mockRestore();
+        }
+    });
+
+    it('send-pass-recovery-email: stops mailing one account after five sends, with the same answer', async () => {
+        const { user } = await makeUserAndActor();
+        const send = vi
+            .spyOn(server.clients.email, 'send')
+            .mockResolvedValue(undefined as never);
+        try {
+            for (let i = 0; i < 6; i++) {
+                const res = makeRes();
+                await controller.handleSendPassRecoveryEmail(
+                    makeReq(
+                        { username: user.username },
+                        { ip: `10.77.${i}.${Math.floor(Math.random() * 200)}` },
+                    ),
+                    res,
+                );
+                expect((res.body as { message: string }).message).toMatch(
+                    /If that account exists/i,
+                );
+            }
+            expect(
+                send.mock.calls.filter((c) => c[0] === user.email),
+            ).toHaveLength(5);
+        } finally {
+            send.mockRestore();
+        }
+    });
+
+    it('send-pass-recovery-email: refuses a team seat, and writes no token', async () => {
+        // The seat's address is admin-supplied and unverified; recovery there
+        // would be a takeover channel. Its recovery is the admin's reset.
+        const { user: owner } = await makeUserAndActor();
+        const { user: seat } = await makeUserAndActor();
+        const team = await server.stores.team.create({
+            ownerUserId: owner.id,
+            name: 'Acme',
+        });
+        await server.stores.user.update(seat.id, { password: null });
+        await server.stores.team.addMember(team.uid, seat.id, {
+            orgOwned: true,
+        });
+
+        const res = makeRes();
+        await controller.handleSendPassRecoveryEmail(
+            makeReq({ username: seat.username }),
+            res,
+        );
+        expect((res.body as { message: string }).message).toMatch(
+            /If that account exists/i,
+        );
+        const after = await server.stores.user.getById(seat.id, {
+            force: true,
+        });
+        expect(after!.pass_recovery_token).toBeFalsy();
+    });
+
+    // `system` is seeded by migration; `admin` only by the self-hosted boot.
+    const builtInAdmin = async (username: 'admin' | 'system') => {
+        const existing = await server.stores.user.getByUsername(username);
+        const row =
+            existing ??
+            (await server.stores.user.create({
+                username,
+                uuid: uuidv4(),
+                password: await bcrypt.hash('admin-password', 8),
+                email: null,
+                requires_email_confirmation: false,
+            }));
+        await server.stores.user.update(row.id, {
+            email: `${username}_${uniq()}@test.local`,
+            pass_recovery_token: null,
+        });
+        return (await server.stores.user.getById(row.id, { force: true }))!;
+    };
+
+    it('send-pass-recovery-email: sends nothing for a built-in admin account and alarms with the requester IP', async () => {
+        const ip = '203.0.113.7';
+        const send = vi
+            .spyOn(server.clients.email, 'send')
+            .mockResolvedValue(undefined as never);
+        const alarm = vi
+            .spyOn(server.clients.alarm, 'create')
+            .mockImplementation(() => undefined);
+        try {
+            for (const name of ['admin', 'system'] as const) {
+                const admin = await builtInAdmin(name);
+                for (const body of [
+                    { username: name },
+                    { email: admin.email },
+                ]) {
+                    const res = makeRes();
+                    await controller.handleSendPassRecoveryEmail(
+                        makeReq(body, { ip }),
+                        res,
+                    );
+                    expect((res.body as { message: string }).message).toMatch(
+                        /If that account exists/i,
+                    );
+                }
+                const after = await server.stores.user.getById(admin.id, {
+                    force: true,
+                });
+                expect(after!.pass_recovery_token).toBeFalsy();
+                expect(alarm).toHaveBeenCalledWith(
+                    `auth:admin-pass-recovery-attempt:${ip}`,
+                    expect.any(String),
+                    expect.objectContaining({ target: name, ip }),
+                    'critical',
+                    { dedup: true },
+                );
+            }
+            expect(send).not.toHaveBeenCalled();
+            expect(alarm).toHaveBeenCalledTimes(4);
+        } finally {
+            send.mockRestore();
+            alarm.mockRestore();
+        }
+    });
+
+    it('set-pass-using-token: refuses a recovery token for a built-in admin account', async () => {
+        const admin = await builtInAdmin('admin');
+        const recoveryToken = uuidv4();
+        await server.stores.user.update(admin.id, {
+            pass_recovery_token: recoveryToken,
+        });
+        const jwt = server.services.token.sign(
+            'otp',
+            {
+                token: recoveryToken,
+                user_uid: admin.uuid,
+                email: admin.email,
+                purpose: 'pass-recovery',
+            },
+            { expiresIn: '1h' },
+        );
+
+        await expect(
+            controller.handleVerifyPassRecoveryToken(
+                makeReq({ token: jwt }),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 400 });
+        await expect(
+            controller.handleSetPassUsingToken(
+                makeReq({ token: jwt, password: 'a-brand-new-password' }),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 400 });
+        const after = await server.stores.user.getById(admin.id, {
+            force: true,
+        });
+        expect(after!.password).toBe(admin.password);
+    });
+
+    it('verify-pass-recovery-token: 400 on missing token', async () => {
+        await expect(
+            controller.handleVerifyPassRecoveryToken(makeReq({}), makeRes()),
+        ).rejects.toMatchObject({ statusCode: 400 });
+    });
+
+    it('verify-pass-recovery-token: 400 on a token with the wrong purpose', async () => {
+        const wrong = server.services.token.sign(
+            'otp',
+            { purpose: 'something-else', user_uid: uuidv4(), email: 'x' },
+            { expiresIn: '1h' },
+        );
+        await expect(
+            controller.handleVerifyPassRecoveryToken(
+                makeReq({ token: wrong }),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 400 });
+    });
+
+    it('verify-pass-recovery-token: returns time_remaining for a valid token', async () => {
+        const { user } = await makeUserAndActor();
+        const recoveryToken = uuidv4();
+        await server.stores.user.update(user.id, {
+            pass_recovery_token: recoveryToken,
+        });
+        const jwt = server.services.token.sign(
+            'otp',
+            {
+                token: recoveryToken,
+                user_uid: user.uuid,
+                email: user.email,
+                purpose: 'pass-recovery',
+            },
+            { expiresIn: '1h' },
+        );
+        const res = makeRes();
+        await controller.handleVerifyPassRecoveryToken(
+            makeReq({ token: jwt }),
+            res,
+        );
+        const body = res.body as { time_remaining: number };
+        expect(body.time_remaining).toBeGreaterThan(0);
+    });
+
+    it('set-pass-using-token: 400 on missing token or password', async () => {
+        await expect(
+            controller.handleSetPassUsingToken(
+                makeReq({ token: 'abc' }),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 400 });
+        await expect(
+            controller.handleSetPassUsingToken(
+                makeReq({ password: 'abcdefgh' }),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 400 });
+    });
+
+    it('set-pass-using-token: rejects too-short passwords', async () => {
+        await expect(
+            controller.handleSetPassUsingToken(
+                makeReq({ token: 'abc', password: '12' }),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 400 });
+    });
+
+    it('set-pass-using-token: rotates the password atomically and consumes the recovery token', async () => {
+        const { user } = await makeUserAndActor();
+        const recoveryToken = uuidv4();
+        await server.stores.user.update(user.id, {
+            pass_recovery_token: recoveryToken,
+        });
+        const jwt = server.services.token.sign(
+            'otp',
+            {
+                token: recoveryToken,
+                user_uid: user.uuid,
+                email: user.email,
+                purpose: 'pass-recovery',
+            },
+            { expiresIn: '1h' },
+        );
+
+        const res = makeRes();
+        await controller.handleSetPassUsingToken(
+            makeReq({ token: jwt, password: 'a-brand-new-password' }),
+            res,
+        );
+        expect(res.sent).toBe('Password successfully updated.');
+
+        const after = await server.stores.user.getById(user.id, {
+            force: true,
+        });
+        expect(after!.pass_recovery_token).toBeNull();
+        expect(
+            await bcrypt.compare('a-brand-new-password', after!.password!),
+        ).toBe(true);
+
+        // Replay must fail (token was consumed atomically).
+        await expect(
+            controller.handleSetPassUsingToken(
+                makeReq({ token: jwt, password: 'another-different-pass' }),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 400 });
+    });
+
+    it('set-pass-using-token: revokes all of the user’s interactive sessions', async () => {
+        // A password reset is the "someone may have my account" flow, so
+        // existing sessions must not survive it.
+        const { user } = await makeUserAndActor();
+        const recoveryToken = uuidv4();
+        await server.stores.user.update(user.id, {
+            pass_recovery_token: recoveryToken,
+        });
+        const jwt = server.services.token.sign(
+            'otp',
+            {
+                token: recoveryToken,
+                user_uid: user.uuid,
+                email: user.email,
+                purpose: 'pass-recovery',
+            },
+            { expiresIn: '1h' },
+        );
+
+        const s1 = await server.services.auth.createSessionToken(user, {});
+        const s2 = await server.services.auth.createSessionToken(user, {});
+        const uuid1 = (s1.session as { uuid: string }).uuid;
+        const uuid2 = (s2.session as { uuid: string }).uuid;
+        // Both are live before the reset.
+        expect(await server.stores.session.getByUuid(uuid1)).not.toBeNull();
+        expect(await server.stores.session.getByUuid(uuid2)).not.toBeNull();
+
+        await controller.handleSetPassUsingToken(
+            makeReq({ token: jwt, password: 'a-brand-new-password' }),
+            makeRes(),
+        );
+
+        // Every interactive session is revoked (getByUuid gates on revoked_at).
+        expect(await server.stores.session.getByUuid(uuid1)).toBeNull();
+        expect(await server.stores.session.getByUuid(uuid2)).toBeNull();
+    });
+});
+
+// ── User-protected change-* (skipping middleware-driven setup) ─────
+
+describe('AuthController user-protected mutations (validation paths)', () => {
+    it('change-password: 400 on missing new_pass', async () => {
+        const { actor } = await makeUserAndActor();
+        const req = makeReq({}, { actor });
+        // The route's middleware would normally populate req.userProtected.user
+        // — provide a stub so the validation path before it can run.
+        (req as unknown as { userProtected: unknown }).userProtected = {
+            user: actor.user,
+        };
+        await expect(
+            controller.handleChangePassword(req, makeRes()),
+        ).rejects.toMatchObject({ statusCode: 400 });
+    });
+
+    it('change-password: 400 on too-short new_pass', async () => {
+        const { actor } = await makeUserAndActor();
+        const req = makeReq({ new_pass: '12' }, { actor });
+        (req as unknown as { userProtected: unknown }).userProtected = {
+            user: actor.user,
+        };
+        await expect(
+            controller.handleChangePassword(req, makeRes()),
+        ).rejects.toMatchObject({ statusCode: 400 });
+    });
+
+    it('change-password: rotates the password hash on success', async () => {
+        const { user, actor } = await makeUserAndActor();
+        const req = makeReq({ new_pass: 'correct-horse-battery-2' }, { actor });
+        (req as unknown as { userProtected: unknown }).userProtected = {
+            user,
+        };
+        const res = makeRes();
+        await controller.handleChangePassword(req, res);
+        expect(res.sent).toBe('Password successfully updated.');
+        const after = await server.stores.user.getById(user.id, {
+            force: true,
+        });
+        expect(
+            await bcrypt.compare('correct-horse-battery-2', after!.password!),
+        ).toBe(true);
+    });
+
+    it('change-password: revokes the user’s other web sessions but keeps the current one', async () => {
+        const { user, actor } = await makeUserAndActor();
+        // Two web sessions for this user; one is the session performing the
+        // change (the "current" one, identified via actor.session.uid).
+        const current = await server.services.auth.createSessionToken(user, {});
+        const other = await server.services.auth.createSessionToken(user, {});
+        const currentUuid = (current.session as { uuid: string }).uuid;
+        const otherUuid = (other.session as { uuid: string }).uuid;
+
+        const req = makeReq(
+            { new_pass: 'a-fresh-password-123' },
+            {
+                actor: {
+                    ...actor,
+                    session: { uid: currentUuid },
+                } as typeof actor,
+            },
+        );
+        (req as unknown as { userProtected: unknown }).userProtected = { user };
+        await controller.handleChangePassword(req, makeRes());
+
+        // The other session is revoked; the one that made the change survives.
+        expect(await server.stores.session.getByUuid(otherUuid)).toBeNull();
+        expect(
+            await server.stores.session.getByUuid(currentUuid),
+        ).not.toBeNull();
+    });
+
+    it('change-username: 400 on missing/invalid/reserved/already-taken usernames', async () => {
+        const { actor } = await makeUserAndActor();
+        await expect(
+            controller.handleChangeUsername(makeReq({}, { actor }), makeRes()),
+        ).rejects.toMatchObject({ statusCode: 400 });
+        await expect(
+            controller.handleChangeUsername(
+                makeReq({ new_username: 'has space' }, { actor }),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 400 });
+        await expect(
+            controller.handleChangeUsername(
+                makeReq({ new_username: 'admin' }, { actor }),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 400 });
+        // A name an admin gate matches on, freed by its holder, stays unclaimable.
+        const adminName = `a_${uniq()}`;
+        adminOnlyGate([adminName]);
+        await expect(
+            controller.handleChangeUsername(
+                makeReq({ new_username: adminName }, { actor }),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 400 });
+        // Already-taken
+        const { user: other } = await makeUserAndActor();
+        await expect(
+            controller.handleChangeUsername(
+                makeReq({ new_username: other.username }, { actor }),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 400 });
+    });
+
+    it('change-username: a name lost to a simultaneous rename is a 400 and leaves the loser untouched', async () => {
+        const a = await makeUserAndActor();
+        const b = await makeUserAndActor();
+        const target = `r_${uniq()}`;
+
+        const results = await Promise.allSettled(
+            [a, b].map(({ actor }) =>
+                controller.handleChangeUsername(
+                    makeReq({ new_username: target }, { actor }),
+                    makeRes(),
+                ),
+            ),
+        );
+
+        expect(results.filter((r) => r.status === 'fulfilled')).toHaveLength(1);
+        const rejected = results.find((r) => r.status === 'rejected') as
+            PromiseRejectedResult | undefined;
+        expect(rejected?.reason).toMatchObject({
+            statusCode: 400,
+            legacyCode: 'username_already_in_use',
+        });
+
+        const loser = results[0].status === 'rejected' ? a.user : b.user;
+        const after = await server.stores.user.getById(loser.id, {
+            force: true,
+        });
+        expect(after!.username).toBe(loser.username);
+        const root = await server.stores.fsEntry.getRootEntryForUser(loser.id);
+        expect(root!.path).toBe(`/${loser.username}`);
+    });
+
+    it('change-email: 403 for an account its team provisioned', async () => {
+        const { user: owner } = await makeUserAndActor();
+        const { user: seat, actor } = await makeUserAndActor();
+        const team = await server.stores.team.create({
+            ownerUserId: owner.id,
+            name: 'Acme',
+        });
+        await server.stores.user.update(seat.id, { password: null });
+        await server.stores.team.addMember(team.uid, seat.id, {
+            orgOwned: true,
+        });
+
+        await expect(
+            controller.handleChangeEmail(
+                makeReq(
+                    { new_email: `moved_${uniq()}@example.com` },
+                    { actor },
+                ),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 403 });
+    });
+
+    it('change-username: 403 for an account its team provisioned', async () => {
+        // The console lists members by username and the audit log records them
+        // by it; a self-service rename would desync both.
+        const { user: owner } = await makeUserAndActor();
+        const { user: seat, actor } = await makeUserAndActor();
+        const team = await server.stores.team.create({
+            ownerUserId: owner.id,
+            name: 'Acme',
+        });
+        // addMember refuses to adopt an account that has one.
+        await server.stores.user.update(seat.id, { password: null });
+        await server.stores.team.addMember(team.uid, seat.id, {
+            orgOwned: true,
+        });
+
+        await expect(
+            controller.handleChangeUsername(
+                makeReq({ new_username: `r_${uniq()}` }, { actor }),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 403 });
+
+        const after = await server.stores.user.getById(seat.id, {
+            force: true,
+        });
+        expect(after!.username).toBe(seat.username);
+    });
+
+    it('change-username: persists the rename and emits user.username-changed', async () => {
+        const { user, actor } = await makeUserAndActor();
+        const newUsername = `r_${uniq()}`;
+        const heard: Array<Record<string, unknown>> = [];
+        const off = (() => {
+            const fn = (_k: unknown, data: unknown) => {
+                heard.push(data as Record<string, unknown>);
+            };
+            eventClient.on('user.username-changed', fn);
+            return fn;
+        })();
+        try {
+            const res = makeRes();
+            await controller.handleChangeUsername(
+                makeReq({ new_username: newUsername }, { actor }),
+                res,
+            );
+            expect(res.body).toEqual({ username: newUsername });
+            const after = await server.stores.user.getById(user.id, {
+                force: true,
+            });
+            expect(after!.username).toBe(newUsername);
+            expect(
+                heard.some(
+                    (e) =>
+                        (e as { new_username?: string }).new_username ===
+                        newUsername,
+                ),
+            ).toBe(true);
+        } finally {
+            void off; // listener stays attached; harmless for the rest of the suite.
+        }
+    });
+
+    it('change-username: only completed renames spend the 2-per-30-days budget', async () => {
+        const { user: other } = await makeUserAndActor();
+        const { actor } = await makeUserAndActor();
+        for (let i = 0; i < 3; i++) {
+            await expect(
+                controller.handleChangeUsername(
+                    makeReq({ new_username: other.username }, { actor }),
+                    makeRes(),
+                ),
+            ).rejects.toMatchObject({ statusCode: 400 });
+        }
+
+        for (let i = 0; i < 2; i++) {
+            await controller.handleChangeUsername(
+                makeReq({ new_username: `r_${uniq()}` }, { actor }),
+                makeRes(),
+            );
+        }
+        await expect(
+            controller.handleChangeUsername(
+                makeReq({ new_username: `r_${uniq()}` }, { actor }),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({
+            statusCode: 429,
+            legacyCode: 'too_many_requests',
+        });
+    });
+
+    it('change-username: 400 when the home path is already occupied, before the rename', async () => {
+        const { user, actor } = await makeUserAndActor();
+        // A name no account holds, whose home path a stray row does. This is
+        // the shape of legacy drift; it used to leave two roots at one path.
+        const parked = `p_${uniq()}`;
+        const root = (await server.stores.fsEntry.getRootEntryForUser(
+            user.id,
+        ))!;
+        await server.clients.db.write(
+            'UPDATE fsentries SET path = ? WHERE id = ?',
+            [`/${parked}`, root.id],
+        );
+        const { user: mover, actor: moverActor } = await makeUserAndActor();
+
+        await expect(
+            controller.handleChangeUsername(
+                makeReq({ new_username: parked }, { actor: moverActor }),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 400 });
+
+        // The username claim is refused whole: the user row keeps its name.
+        const after = await server.stores.user.getById(mover.id, {
+            force: true,
+        });
+        expect(after!.username).toBe(mover.username);
+        void actor;
+    });
+
+    it('change-username: 400 when only a foreign row sits under the target home path', async () => {
+        const { user } = await makeUserAndActor();
+        // Nothing sits at `/parked` itself — only a leftover child row does,
+        // the shape a partial cascade or a user-scoped cleanup leaves behind.
+        const parked = `p_${uniq()}`;
+        const docs = (await server.stores.fsEntry.getEntryByPath(
+            `/${user.username}/Documents`,
+        ))!;
+        await server.clients.db.write(
+            'UPDATE fsentries SET path = ? WHERE id = ?',
+            [`/${parked}/Documents`, docs.id],
+        );
+        const { user: mover, actor: moverActor } = await makeUserAndActor();
+
+        await expect(
+            controller.handleChangeUsername(
+                makeReq({ new_username: parked }, { actor: moverActor }),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 400 });
+
+        const after = await server.stores.user.getById(mover.id, {
+            force: true,
+        });
+        expect(after!.username).toBe(mover.username);
+    });
+
+    it('change-username: a name just vacated stays closed to other accounts, not to its last holder', async () => {
+        const { user: leaver, actor: leaverActor } = await makeUserAndActor();
+        const vacated = leaver.username;
+        // Warm the entry cache under the old path, as any read would.
+        await server.stores.fsEntry.getEntryByPath(`/${vacated}/Documents`);
+        await controller.handleChangeUsername(
+            makeReq({ new_username: `r_${uniq()}` }, { actor: leaverActor }),
+            makeRes(),
+        );
+
+        // Dropped here, but a peer region or lagging replica can still map the
+        // old path to the leaver's folder, where a new holder of the name
+        // would pass ACL on it.
+        await expect(
+            server.stores.fsEntry.getEntryByPath(`/${vacated}/Documents`),
+        ).resolves.toBeNull();
+
+        const { user: claimer, actor: claimerActor } = await makeUserAndActor();
+        await expect(
+            controller.handleChangeUsername(
+                makeReq({ new_username: vacated }, { actor: claimerActor }),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({
+            statusCode: 400,
+            legacyCode: 'username_already_in_use',
+        });
+        const after = await server.stores.user.getById(claimer.id, {
+            force: true,
+        });
+        expect(after!.username).toBe(claimer.username);
+
+        const res = makeRes();
+        await controller.handleChangeUsername(
+            makeReq({ new_username: vacated }, { actor: leaverActor }),
+            res,
+        );
+        expect(res.body).toEqual({ username: vacated });
+    });
+
+    it('change-email: 400 on missing/invalid email and on a confirmed-account collision', async () => {
+        const { actor } = await makeUserAndActor();
+        await expect(
+            controller.handleChangeEmail(makeReq({}, { actor }), makeRes()),
+        ).rejects.toMatchObject({ statusCode: 400 });
+        await expect(
+            controller.handleChangeEmail(
+                makeReq({ new_email: 'not-an-email' }, { actor }),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 400 });
+        // Pre-existing confirmed account on another email.
+        const { user: other } = await makeUserAndActor({ email_confirmed: 1 });
+        await expect(
+            controller.handleChangeEmail(
+                makeReq({ new_email: other.email! }, { actor }),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 400 });
+    });
+
+    it('change-email: accepts an address that resolves back to the caller', async () => {
+        // `foo+tag@gmail.com` canonicalizes to the caller's own row, so the
+        // collision check has to exclude them — otherwise Puter reports your
+        // own address as already in use and there's no way to set it.
+        const local = `ch_${uniq()}`;
+        const { user, actor } = await makeUserAndActor();
+        await server.stores.user.update(user.id, {
+            email: `${local}@gmail.com`,
+            clean_email: `${local}@gmail.com`,
+            email_confirmed: 1,
+        });
+
+        const res = makeRes();
+        await controller.handleChangeEmail(
+            makeReq({ new_email: `${local}+work@gmail.com` }, { actor }),
+            res,
+        );
+        expect(res.body).toEqual({});
+        const after = await server.stores.user.getById(user.id, {
+            force: true,
+        });
+        expect(after!.unconfirmed_change_email).toBe(`${local}+work@gmail.com`);
+    });
+
+    it('change-email: stages the new email + token on success', async () => {
+        const { user, actor } = await makeUserAndActor();
+        const newEmail = `ch_${uniq()}@test.local`;
+        const res = makeRes();
+        await controller.handleChangeEmail(
+            makeReq({ new_email: newEmail }, { actor }),
+            res,
+        );
+        expect(res.body).toEqual({});
+        const after = await server.stores.user.getById(user.id, {
+            force: true,
+        });
+        expect(after!.unconfirmed_change_email).toBe(newEmail);
+        expect(after!.change_email_confirm_token).toBeTruthy();
+        // Original email is unchanged until the user confirms.
+        expect(after!.email).toBe(user.email);
+    });
+
+    it('change_email/confirm: rejects an invalid/non-change-email-purpose JWT', async () => {
+        const wrong = server.services.token.sign(
+            'otp',
+            { purpose: 'pass-recovery', token: uuidv4() },
+            { expiresIn: '1h' },
+        );
+        const req = makeReq({});
+        (req as unknown as { query: Record<string, string> }).query = {
+            token: wrong,
+        };
+        await expect(
+            controller.handleChangeEmailConfirm(req, makeRes()),
+        ).rejects.toMatchObject({ statusCode: 400 });
+    });
+
+    it('change_email/confirm: refuses to promote a staged address we would not store', async () => {
+        const { user } = await makeUserAndActor();
+        const markup = '"<img/src=x/onerror=alert(1)>"@example.com';
+        const token = uuidv4();
+        // Staged by an earlier build, so gated by whatever ran back then.
+        await server.stores.user.update(user.id, {
+            unconfirmed_change_email: markup,
+            change_email_confirm_token: token,
+        });
+        const linkJwt = server.services.token.sign(
+            'otp',
+            { token, user_id: user.id, purpose: 'change-email' },
+            { expiresIn: '1h' },
+        );
+        const req = makeReq({});
+        (req as unknown as { query: Record<string, string> }).query = {
+            token: linkJwt,
+        };
+        await expect(
+            controller.handleChangeEmailConfirm(req, makeRes()),
+        ).rejects.toMatchObject({ statusCode: 400 });
+
+        const after = await server.stores.user.getById(user.id, {
+            force: true,
+        });
+        expect(after!.email).not.toBe(markup);
+    });
+
+    it('change_email/confirm: completes the swap when the token matches the staged row', async () => {
+        const { user, actor } = await makeUserAndActor();
+        const newEmail = `chc_${uniq()}@test.local`;
+        await controller.handleChangeEmail(
+            makeReq({ new_email: newEmail }, { actor }),
+            makeRes(),
+        );
+        const staged = await server.stores.user.getById(user.id, {
+            force: true,
+        });
+        const linkJwt = server.services.token.sign(
+            'otp',
+            {
+                token: staged!.change_email_confirm_token,
+                user_id: user.id,
+                purpose: 'change-email',
+            },
+            { expiresIn: '1h' },
+        );
+
+        const req = makeReq({});
+        (req as unknown as { query: Record<string, string> }).query = {
+            token: linkJwt,
+        };
+        const res = makeRes();
+        await controller.handleChangeEmailConfirm(req, res);
+        expect(res.sent).toMatch(/Email changed successfully/);
+
+        const after = await server.stores.user.getById(user.id, {
+            force: true,
+        });
+        expect(after!.email).toBe(newEmail);
+        expect(after!.unconfirmed_change_email).toBeNull();
+        expect(after!.email_confirmed).toBeTruthy();
+    });
+});
+
+// ── Save account (temp → permanent) ────────────────────────────────
+
+describe('AuthController.handleSaveAccount', () => {
+    const makeTempActor = async () => {
+        const tempRes = makeRes();
+        await controller.handleSignup(makeReq({ is_temp: true }), tempRes);
+        const body = tempRes.body as {
+            user: { username: string; uuid: string };
+        };
+        const u = await server.stores.user.getByUsername(body.user.username);
+        return {
+            user: u!,
+            actor: {
+                user: {
+                    id: u!.id,
+                    uuid: u!.uuid,
+                    username: u!.username,
+                    email: u!.email ?? null,
+                },
+            } as Actor,
+        };
+    };
+
+    it('rejects non-temp accounts with 400', async () => {
+        const { actor } = await makeUserAndActor();
+        await expect(
+            controller.handleSaveAccount(
+                makeReq(
+                    {
+                        username: `s_${uniq()}`,
+                        email: `${uniq()}@test.local`,
+                        password: 'correct-horse-battery',
+                    },
+                    { actor },
+                ),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 400 });
+    });
+
+    it('promotes a temp user to a permanent account', async () => {
+        const { user, actor } = await makeTempActor();
+        const newUsername = `s_${uniq()}`;
+        const newEmail = `${newUsername}@test.local`;
+
+        const res = makeRes();
+        await controller.handleSaveAccount(
+            makeReq(
+                {
+                    username: newUsername,
+                    email: newEmail,
+                    password: 'correct-horse-battery',
+                },
+                { actor },
+            ),
+            res,
+        );
+        const body = res.body as {
+            user: { username: string; email: string; is_temp: boolean };
+        };
+        expect(body.user.username).toBe(newUsername);
+        expect(body.user.email).toBe(newEmail);
+        expect(body.user.is_temp).toBe(false);
+
+        const after = await server.stores.user.getById(user.id, {
+            force: true,
+        });
+        expect(after!.username).toBe(newUsername);
+        expect(after!.email).toBe(newEmail);
+        expect(
+            await bcrypt.compare('correct-horse-battery', after!.password!),
+        ).toBe(true);
+    });
+
+    it('reports a username lost to a simultaneous save as a 400 and leaves the loser temporary', async () => {
+        const a = await makeTempActor();
+        const b = await makeTempActor();
+        const target = `s_${uniq()}`;
+
+        const results = await Promise.allSettled(
+            [a, b].map(({ actor }) =>
+                controller.handleSaveAccount(
+                    makeReq(
+                        {
+                            username: target,
+                            email: `${uniq()}@test.local`,
+                            password: 'correct-horse-battery',
+                        },
+                        { actor },
+                    ),
+                    makeRes(),
+                ),
+            ),
+        );
+
+        expect(results.filter((r) => r.status === 'fulfilled')).toHaveLength(1);
+        const rejected = results.find((r) => r.status === 'rejected') as
+            PromiseRejectedResult | undefined;
+        expect(rejected?.reason).toMatchObject({
+            statusCode: 400,
+            legacyCode: 'username_already_in_use',
+        });
+
+        const loser = results[0].status === 'rejected' ? a.user : b.user;
+        const after = await server.stores.user.getById(loser.id, {
+            force: true,
+        });
+        expect(after!.username).toBe(loser.username);
+        expect(after!.password).toBeNull();
+    });
+
+    it('rejects invalid username/email/password validations', async () => {
+        const { actor } = await makeTempActor();
+        await expect(
+            controller.handleSaveAccount(
+                makeReq(
+                    {
+                        username: 'has space',
+                        email: 'a@b.c',
+                        password: 'xxxxxx',
+                    },
+                    { actor },
+                ),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 400 });
+        await expect(
+            controller.handleSaveAccount(
+                makeReq(
+                    { username: 'admin', email: 'a@b.com', password: 'xxxxxx' },
+                    { actor },
+                ),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 400 });
+        await expect(
+            controller.handleSaveAccount(
+                makeReq(
+                    {
+                        username: 'okname',
+                        email: 'not-an-email',
+                        password: 'xxxxxx',
+                    },
+                    { actor },
+                ),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 400 });
+        await expect(
+            controller.handleSaveAccount(
+                makeReq(
+                    { username: 'okname', email: 'a@b.com', password: '12' },
+                    { actor },
+                ),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 400 });
+    });
+});
+
+// ── Captcha + anti-CSRF ────────────────────────────────────────────
+
+describe('AuthController.handleCaptchaGenerate + handleGetAntiCsrfToken', () => {
+    it('captcha-generate returns {token, image}', async () => {
+        const res = makeRes();
+        await controller.handleCaptchaGenerate(makeReq({}), res);
+        const body = res.body as { token: string; image: string };
+        expect(typeof body.token).toBe('string');
+        expect(typeof body.image).toBe('string');
+        expect(body.token.length).toBeGreaterThan(0);
+    });
+
+    it('get-anticsrf-token: 401 without an authenticated actor', async () => {
+        await expect(
+            controller.handleGetAntiCsrfToken(makeReq({}), makeRes()),
+        ).rejects.toMatchObject({ statusCode: 401 });
+    });
+
+    it('get-anticsrf-token: returns a token bound to the user UUID', async () => {
+        const { actor } = await makeUserAndActor();
+        const res = makeRes();
+        await controller.handleGetAntiCsrfToken(makeReq({}, { actor }), res);
+        const body = res.body as { token: string };
+        expect(typeof body.token).toBe('string');
+        expect(body.token.length).toBeGreaterThan(0);
+    });
+});
+
+// ── Permission revoke flows ────────────────────────────────────────
+
+describe('AuthController permission revokes', () => {
+    it('revoke-user-user: 400 on missing target_username/permission', async () => {
+        const { actor } = await makeUserAndActor();
+        await expect(
+            controller.handleRevokeUserUser(
+                makeReq({ permission: 'fs:read' }, { actor }),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 400 });
+    });
+
+    it('revoke-user-app: 400 on missing app_uid/permission', async () => {
+        const { actor } = await makeUserAndActor();
+        await expect(
+            controller.handleRevokeUserApp(
+                makeReq({ permission: 'fs:read' }, { actor }),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 400 });
+    });
+
+    // No in-tree caller, so a later cleanup would read it as dead: pin the gate.
+    it('revoke-user-user: stays registered as a user-actor route', () => {
+        const proto = Object.getPrototypeOf(controller) as Record<
+            string,
+            CollectedRoute[] | undefined
+        >;
+        const route = (proto[ROUTES_METADATA_KEY] ?? []).find(
+            (r) => r.path === '/auth/revoke-user-user',
+        );
+        expect(route, '/auth/revoke-user-user is not registered').toBeDefined();
+        expect(route!.method).toBe('post');
+        expect(route!.options).toMatchObject({
+            subdomain: 'api',
+            requireUserActor: true,
+        });
+    });
+
+    // Why the deprecated route exists: older grants stay withdrawable.
+    it('revoke-user-user: round-trips a grant + revoke without throwing', async () => {
+        const { actor: issuerActor, user: issuer } = await makeUserAndActor();
+        const { user: target } = await makeUserAndActor();
+        const permission = `service:test-revoke-${uuidv4()}:ii:read`;
+        await server.stores.permission.setFlatUserPerm(
+            issuer.id,
+            `manage:${permission}`,
+            {
+                permission: `manage:${permission}`,
+                deleted: false,
+                issuer_user_id: issuer.id,
+            } as never,
+        );
+        // Through the service: the grant route is retired, the revoke is not.
+        await inCtx(issuerActor, () =>
+            server.services.permission.grantUserUserPermission(
+                issuerActor,
+                target.username,
+                permission,
+            ),
+        );
+
+        // Asserts the controller path only: the process-wide Redis-mock scan
+        // cache makes a post-revoke `check()` unreliable across tests.
+        const res = makeRes();
+        await inCtx(issuerActor, () =>
+            controller.handleRevokeUserUser(
+                makeReq(
+                    { target_username: target.username, permission },
+                    { actor: issuerActor },
+                ),
+                res,
+            ),
+        );
+        expect(res.body).toEqual({});
+    });
+});
+
+// ── Permission checks + listing ────────────────────────────────────
+
+describe('AuthController.handleCheckPermissions + handleListPermissions', () => {
+    it('check-permissions: 400 when permissions is not an array', async () => {
+        const { actor } = await makeUserAndActor();
+        await expect(
+            controller.handleCheckPermissions(
+                makeReq(
+                    { permissions: 'not-an-array' as unknown as string[] },
+                    { actor },
+                ),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 400 });
+    });
+
+    it('check-permissions: returns a per-permission boolean map for known + unknown perms', async () => {
+        const { actor } = await makeUserAndActor();
+        const res = makeRes();
+        await controller.handleCheckPermissions(
+            makeReq(
+                {
+                    permissions: [
+                        'service:foo:ii:read',
+                        'service:foo:ii:read', // dedup-tested
+                        'service:bar:ii:write',
+                    ],
+                },
+                { actor },
+            ),
+            res,
+        );
+        const body = res.body as { permissions: Record<string, boolean> };
+        expect(Object.keys(body.permissions).sort()).toEqual([
+            'service:bar:ii:write',
+            'service:foo:ii:read',
+        ]);
+    });
+
+    // What lets a permission request settle without a prompt. The second string
+    // is a consent scope nothing implies, so the first's `true` is the grant.
+    it('check-permissions: an app-under-user actor sees a grant made to that app', async () => {
+        const { user, actor } = await makeUserAndActor();
+        const app = await server.stores.app.create(
+            {
+                name: `cp-${uuidv4()}`,
+                title: 'TestCheckPermsApp',
+                index_url: 'https://check-perms.example.test/index.html',
+            },
+            { ownerUserId: user.id },
+        );
+        const granted = `user:${user.uuid}:email:read`;
+        const ungranted = `apps-of-user:${user.uuid}:read`;
+
+        const appActor = makeActor({
+            user: actor.user,
+            app: { id: app.id, uid: app.uid },
+        });
+        const before = makeRes();
+        await inCtx(appActor, () =>
+            controller.handleCheckPermissions(
+                makeReq(
+                    { permissions: [granted, ungranted] },
+                    { actor: appActor },
+                ),
+                before,
+            ),
+        );
+        expect(before.body).toEqual({
+            permissions: { [granted]: false, [ungranted]: false },
+        });
+
+        await inCtx(actor, () =>
+            controller.handleGrantUserApp(
+                makeReq(
+                    { app_uid: app.uid, permission: granted, extra: {} },
+                    { actor },
+                ),
+                makeRes(),
+            ),
+        );
+
+        const after = makeRes();
+        await inCtx(appActor, () =>
+            controller.handleCheckPermissions(
+                makeReq(
+                    { permissions: [granted, ungranted] },
+                    { actor: appActor },
+                ),
+                after,
+            ),
+        );
+        expect(after.body).toEqual({
+            permissions: { [granted]: true, [ungranted]: false },
+        });
+    });
+
+    // What lets a launch settle a consent prompt it holds no app token for.
+    it('check-permissions: `app_uid` answers for that app, not for the asking user', async () => {
+        const { user, actor } = await makeUserAndActor();
+        const app = await server.stores.app.create(
+            {
+                name: `cpa-${uuidv4()}`,
+                title: 'TestCheckPermsAppUid',
+                index_url: 'https://check-perms-uid.example.test/index.html',
+            },
+            { ownerUserId: user.id },
+        );
+        const permission = `user:${user.uuid}:email:read`;
+
+        // Held by the user, so asking as the user would answer `true`.
+        const asUser = makeRes();
+        await inCtx(actor, () =>
+            controller.handleCheckPermissions(
+                makeReq({ permissions: [permission] }, { actor }),
+                asUser,
+            ),
+        );
+        expect(asUser.body).toEqual({ permissions: { [permission]: true } });
+
+        const before = makeRes();
+        await inCtx(actor, () =>
+            controller.handleCheckPermissions(
+                makeReq(
+                    { permissions: [permission], app_uid: app.uid },
+                    { actor },
+                ),
+                before,
+            ),
+        );
+        expect(before.body).toEqual({ permissions: { [permission]: false } });
+
+        await inCtx(actor, () =>
+            controller.handleGrantUserApp(
+                makeReq({ app_uid: app.uid, permission, extra: {} }, { actor }),
+                makeRes(),
+            ),
+        );
+
+        const after = makeRes();
+        await inCtx(actor, () =>
+            controller.handleCheckPermissions(
+                makeReq(
+                    { permissions: [permission], app_uid: app.uid },
+                    { actor },
+                ),
+                after,
+            ),
+        );
+        expect(after.body).toEqual({ permissions: { [permission]: true } });
+    });
+
+    it('check-permissions: an app cannot ask about another app, and an unknown app 404s', async () => {
+        const { user, actor } = await makeUserAndActor();
+        const app = await server.stores.app.create(
+            {
+                name: `cpx-${uuidv4()}`,
+                title: 'TestCheckPermsCrossApp',
+                index_url: 'https://check-perms-x.example.test/index.html',
+            },
+            { ownerUserId: user.id },
+        );
+        const appActor = makeActor({
+            user: actor.user,
+            app: { id: app.id, uid: app.uid },
+        });
+
+        await expect(
+            inCtx(appActor, () =>
+                controller.handleCheckPermissions(
+                    makeReq(
+                        {
+                            permissions: ['service:foo:ii:read'],
+                            app_uid: app.uid,
+                        },
+                        { actor: appActor },
+                    ),
+                    makeRes(),
+                ),
+            ),
+        ).rejects.toMatchObject({ statusCode: 403 });
+
+        await expect(
+            inCtx(actor, () =>
+                controller.handleCheckPermissions(
+                    makeReq(
+                        {
+                            permissions: ['service:foo:ii:read'],
+                            app_uid: `app-${uuidv4()}`,
+                        },
+                        { actor },
+                    ),
+                    makeRes(),
+                ),
+            ),
+        ).rejects.toMatchObject({ statusCode: 404 });
+
+        await expect(
+            inCtx(actor, () =>
+                controller.handleCheckPermissions(
+                    makeReq(
+                        {
+                            permissions: ['service:foo:ii:read'],
+                            app_uid: { not: 'a string' } as unknown as string,
+                        },
+                        { actor },
+                    ),
+                    makeRes(),
+                ),
+            ),
+        ).rejects.toMatchObject({ statusCode: 400 });
+    });
+
+    // Falling through to the user here would answer `true` for any file they own.
+    it('check-permissions: a present-but-empty `app_uid` is refused, not read as "no app"', async () => {
+        const { user, actor } = await makeUserAndActor();
+        const permission = `user:${user.uuid}:email:read`;
+
+        for (const app_uid of ['', null]) {
+            await expect(
+                inCtx(actor, () =>
+                    controller.handleCheckPermissions(
+                        makeReq(
+                            { permissions: [permission], app_uid },
+                            { actor },
+                        ),
+                        makeRes(),
+                    ),
+                ),
+            ).rejects.toMatchObject({ statusCode: 400 });
+        }
+
+        // Omitted entirely still means "what do I hold?".
+        const res = makeRes();
+        await inCtx(actor, () =>
+            controller.handleCheckPermissions(
+                makeReq({ permissions: [permission] }, { actor }),
+                res,
+            ),
+        );
+        expect(res.body).toEqual({ permissions: { [permission]: true } });
+    });
+
+    it('list-permissions: returns the shape and includes a user→app grant with its app_uid', async () => {
+        const { user, actor } = await makeUserAndActor();
+        const app = await server.stores.app.create(
+            {
+                name: `tl-${uuidv4()}`,
+                title: 'TestListPermsApp',
+                index_url: 'https://list-perms.example.test/index.html',
+            },
+            { ownerUserId: user.id },
+        );
+        const permission = 'service:tl-app:ii:read';
+        await inCtx(actor, () =>
+            controller.handleGrantUserApp(
+                makeReq({ app_uid: app.uid, permission, extra: {} }, { actor }),
+                makeRes(),
+            ),
+        );
+
+        // A user→user grant must show up under `myself_to_user` for the
+        // issuer and `user_to_myself` for the holder. Seeded through the
+        // service: the grant route is retired, but the listing still has to
+        // report grants made before that, and the ones sharing writes.
+        // Grants gate on `manage:<permission>`, so bootstrap that flag first.
+        const { user: holder, actor: holderActor } = await makeUserAndActor();
+        const userPermission = 'service:tl-user:ii:read';
+        await server.stores.permission.setFlatUserPerm(
+            user.id,
+            `manage:${userPermission}`,
+            {
+                permission: `manage:${userPermission}`,
+                deleted: false,
+                issuer_user_id: user.id,
+            } as never,
+        );
+        await inCtx(actor, () =>
+            server.services.permission.grantUserUserPermission(
+                actor,
+                holder.username,
+                userPermission,
+                {},
+            ),
+        );
+
+        const res = makeRes();
+        await controller.handleListPermissions(makeReq({}, { actor }), res);
+        const body = res.body as {
+            myself_to_app: Array<{ app_uid: string; permission: string }>;
+            myself_to_user: Array<{ user: string; permission: string }>;
+            user_to_myself: unknown[];
+        };
+        expect(Array.isArray(body.user_to_myself)).toBe(true);
+        expect(body.myself_to_app).toContainEqual(
+            expect.objectContaining({ app_uid: app.uid, permission }),
+        );
+        expect(body.myself_to_user).toContainEqual(
+            expect.objectContaining({
+                user: holder.username,
+                permission: userPermission,
+            }),
+        );
+
+        const holderRes = makeRes();
+        await controller.handleListPermissions(
+            makeReq({}, { actor: holderActor }),
+            holderRes,
+        );
+        expect(
+            (
+                holderRes.body as {
+                    user_to_myself: Array<{ user: string; permission: string }>;
+                }
+            ).user_to_myself,
+        ).toContainEqual(
+            expect.objectContaining({
+                user: user.username,
+                permission: userPermission,
+            }),
+        );
+    });
+
+    it('list-permissions: never shows a holder the key-value share grant behind their handle', async () => {
+        const { user: owner, actor: ownerActor } = await makeUserAndActor();
+        const { user: holder, actor: holderActor } = await makeUserAndActor();
+
+        // The grant a mint issues, seeded the same way: the owner implicator
+        // is what lets them issue it on their own namespace.
+        const permission = kvSharePermission(
+            owner.uuid as string,
+            'os-global',
+            'team:abc:',
+        );
+        await inCtx(ownerActor, () =>
+            server.services.permission.grantUserUserPermission(
+                ownerActor,
+                holder.username,
+                permission,
+                {},
+            ),
+        );
+
+        const holderRes = makeRes();
+        await controller.handleListPermissions(
+            makeReq({}, { actor: holderActor }),
+            holderRes,
+        );
+        const holderBody = holderRes.body as {
+            user_to_myself: Array<{ user: string; permission: string }>;
+        };
+        // Neither the grant nor the owner it names: the string carries their
+        // uuid and the granted prefix, and the handle is all the holder has.
+        expect(holderBody.user_to_myself).not.toContainEqual(
+            expect.objectContaining({ permission }),
+        );
+        expect(JSON.stringify(holderBody.user_to_myself)).not.toContain(
+            owner.uuid,
+        );
+
+        // The owner's own side is untouched — it is their record of what they
+        // shared out.
+        const ownerRes = makeRes();
+        await controller.handleListPermissions(
+            makeReq({}, { actor: ownerActor }),
+            ownerRes,
+        );
+        expect(
+            (ownerRes.body as { myself_to_user: unknown[] }).myself_to_user,
+        ).toContainEqual(
+            expect.objectContaining({
+                user: holder.username,
+                permission,
+            }),
+        );
+    });
+});
+
+// ── Sessions ───────────────────────────────────────────────────────
+
+describe('AuthController session endpoints', () => {
+    it('list-sessions: returns an array shape (possibly empty)', async () => {
+        const { actor } = await makeUserAndActor();
+        const res = makeRes();
+        await controller.handleListSessions(makeReq({}, { actor }), res);
+        // listSessions returns an array — it may be empty for a freshly-
+        // created actor without an active session row.
+        expect(res.body).toBeDefined();
+    });
+
+    it('revoke-session: 400 when uuid is missing or non-string', async () => {
+        const { actor } = await makeUserAndActor();
+        await expect(
+            controller.handleRevokeSession(makeReq({}, { actor }), makeRes()),
+        ).rejects.toMatchObject({ statusCode: 400 });
+        await expect(
+            controller.handleRevokeSession(
+                makeReq({ uuid: 123 as unknown as string }, { actor }),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 400 });
+    });
+
+    it('revoke-session: 403 when revoking someone else’s session', async () => {
+        const { user: u1 } = await makeUserAndActor();
+        const { actor: a2 } = await makeUserAndActor();
+        // Create a real session for u1 so the lookup succeeds, then attempt
+        // to revoke it as a2 — must 403.
+        const sessionRes = await server.services.auth.createSessionToken(
+            u1,
+            {},
+        );
+        await expect(
+            controller.handleRevokeSession(
+                makeReq(
+                    { uuid: (sessionRes.session as { uuid: string }).uuid },
+                    { actor: a2 },
+                ),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 403 });
+    });
+
+    it('rename-session: 400 when uuid param is missing', async () => {
+        const { actor } = await makeUserAndActor();
+        await expect(
+            controller.handleRenameSession(
+                makeReq({ label: 'x' }, { actor, params: {} }),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 400 });
+    });
+
+    it('rename-session: 400 when label is the wrong type', async () => {
+        const { actor } = await makeUserAndActor();
+        await expect(
+            controller.handleRenameSession(
+                makeReq(
+                    { label: 123 as unknown as string },
+                    { actor, params: { uuid: 'whatever' } },
+                ),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 400 });
+    });
+
+    it('rename-session: 400 when label field is missing entirely', async () => {
+        // Guards against accidental "PATCH with empty body silently clears
+        // the label". Type guard rejects `undefined` before reaching the
+        // service layer.
+        const { actor } = await makeUserAndActor();
+        await expect(
+            controller.handleRenameSession(
+                makeReq({}, { actor, params: { uuid: 'whatever' } }),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 400 });
+    });
+
+    it('rename-session: 404 when the uuid belongs to another user', async () => {
+        const { user: u1 } = await makeUserAndActor();
+        const { actor: a2 } = await makeUserAndActor();
+        const sessionRes = await server.services.auth.createSessionToken(
+            u1,
+            {},
+        );
+        const uuid = (sessionRes.session as { uuid: string }).uuid;
+        await expect(
+            controller.handleRenameSession(
+                makeReq({ label: 'pwned' }, { actor: a2, params: { uuid } }),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 404 });
+    });
+
+    it('rename-session: success updates the row label', async () => {
+        const { user, actor } = await makeUserAndActor();
+        const sessionRes = await server.services.auth.createSessionToken(
+            user,
+            {},
+        );
+        const uuid = (sessionRes.session as { uuid: string }).uuid;
+        const res = makeRes();
+        await controller.handleRenameSession(
+            makeReq({ label: 'My Phone' }, { actor, params: { uuid } }),
+            res,
+        );
+        expect(res.body).toEqual({});
+        const rows = await server.clients.db.read(
+            'SELECT `label` FROM `sessions` WHERE `uuid` = ?',
+            [uuid],
+        );
+        expect((rows[0] as { label: string }).label).toBe('My Phone');
+    });
+
+    it('rename-session: accepts null to clear the label', async () => {
+        const { user, actor } = await makeUserAndActor();
+        const sessionRes = await server.services.auth.createSessionToken(
+            user,
+            {},
+        );
+        const uuid = (sessionRes.session as { uuid: string }).uuid;
+        // Seed a non-null label so the clear-to-null transition is observable.
+        await server.clients.db.write(
+            'UPDATE `sessions` SET `label` = ? WHERE `uuid` = ?',
+            ['something', uuid],
+        );
+        await controller.handleRenameSession(
+            makeReq({ label: null }, { actor, params: { uuid } }),
+            makeRes(),
+        );
+        const rows = await server.clients.db.read(
+            'SELECT `label` FROM `sessions` WHERE `uuid` = ?',
+            [uuid],
+        );
+        expect((rows[0] as { label: string | null }).label).toBeNull();
+    });
+});
+
+// ── Dev-app grants/revokes ─────────────────────────────────────────
+
+describe('AuthController dev-app permission flows', () => {
+    it('grant-dev-app: 400 on missing app_uid/origin/permission', async () => {
+        const { actor } = await makeUserAndActor();
+        await expect(
+            controller.handleGrantDevApp(
+                makeReq({ permission: 'fs:read' }, { actor }),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 400 });
+    });
+
+    it.each([
+        ['a non-object `extra`', { extra: 'nope' }],
+        ['an array `extra`', { extra: [1, 2] }],
+        ['an oversized `extra`', { extra: { blob: 'z'.repeat(5000) } }],
+        ['an oversized `meta`', { meta: { blob: 'z'.repeat(5000) } }],
+        ['an oversized `permission`', { permission: 'x'.repeat(4097) }],
+        // Survives the route cap but not the column it lands in.
+        [
+            'a `permission` wider than the column',
+            { permission: `service:${'a'.repeat(300)}:ii:read` },
+        ],
+    ])('grant-dev-app: 400 on %s', async (_label, patch) => {
+        const { actor } = await makeUserAndActor();
+        await expect(
+            controller.handleGrantDevApp(
+                makeReq(
+                    {
+                        app_uid: `app-${uuidv4()}`,
+                        permission: 'fs:read',
+                        ...patch,
+                    },
+                    { actor },
+                ),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 400 });
+    });
+
+    it('revoke-dev-app: 400 on missing app_uid/origin/permission', async () => {
+        const { actor } = await makeUserAndActor();
+        await expect(
+            controller.handleRevokeDevApp(
+                makeReq({ permission: 'fs:read' }, { actor }),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 400 });
+    });
+
+    it('grant/revoke-dev-app: an unregistered `origin` cannot be redirected onto an app squatting its synthetic uid', async () => {
+        // Same hole the user-app handlers close: `appUidFromOrigin`
+        // synthesises `app-<uuidv5(origin)>` for an origin with no app row,
+        // and the permission services resolve their identifier as
+        // uid-*or-name*. A dev-app grant is scanned with the *issuer's*
+        // authority for anyone running as that app, so landing one on a
+        // squatter hands over this user's permission. Without a squatter the
+        // origin 404s anyway, so requiring a registered app costs nothing.
+        const { user, actor } = await makeUserAndActor();
+        const origin = `https://unregistered-dev-${uuidv4()}.example`;
+        const syntheticUid = `app-${uuidv5(origin, APP_ORIGIN_UUID_NAMESPACE)}`;
+        const squatter = await server.stores.app.create(
+            {
+                name: syntheticUid,
+                title: 'DevSquatter',
+                index_url: 'https://dev-squatter.example/index.html',
+            },
+            { ownerUserId: user.id },
+        );
+
+        const permission = 'service:dev-squat:ii:read';
+        // Let the grant past `canManagePermission`, so a failure here can only
+        // be the app-resolution guard rather than a missing manage right.
+        await server.stores.permission.setFlatUserPerm(
+            user.id,
+            `manage:${permission}`,
+            {
+                permission: `manage:${permission}`,
+                deleted: false,
+                issuer_user_id: user.id,
+            } as never,
+        );
+
+        for (const handler of [
+            'handleGrantDevApp',
+            'handleRevokeDevApp',
+        ] as const) {
+            await expect(
+                inCtx(actor, () =>
+                    controller[handler](
+                        makeReq({ origin, permission }, { actor }),
+                        makeRes(),
+                    ),
+                ),
+            ).rejects.toMatchObject({ statusCode: 404 });
+        }
+
+        const rows = await server.clients.db.read(
+            'SELECT `permission` FROM `dev_to_app_permissions` ' +
+                'WHERE `user_id` = ? AND `app_id` = ?',
+            [user.id, squatter.id],
+        );
+        expect(rows).toEqual([]);
+    });
+
+    it('grant-dev-app: a registered `origin` still resolves to its app', async () => {
+        // The guard above must not cost the legitimate case: an origin that
+        // really does name an app still grants to it.
+        const { user, actor } = await makeUserAndActor();
+        const appName = `dev-origin-${uuidv4()}`;
+        const origin = `https://${appName}.example.test`;
+        const app = await server.stores.app.create(
+            {
+                name: appName,
+                title: 'DevOriginApp',
+                index_url: `${origin}/index.html`,
+            },
+            { ownerUserId: user.id },
+        );
+
+        const permission = 'service:dev-origin:ii:read';
+        await server.stores.permission.setFlatUserPerm(
+            user.id,
+            `manage:${permission}`,
+            {
+                permission: `manage:${permission}`,
+                deleted: false,
+                issuer_user_id: user.id,
+            } as never,
+        );
+
+        const res = makeRes();
+        await inCtx(actor, () =>
+            controller.handleGrantDevApp(
+                makeReq({ origin, permission }, { actor }),
+                res,
+            ),
+        );
+        expect(res.body).toEqual({});
+
+        const rows = (await server.clients.db.read(
+            'SELECT `permission` FROM `dev_to_app_permissions` ' +
+                'WHERE `user_id` = ? AND `app_id` = ?',
+            [user.id, app.id],
+        )) as Array<{ permission: string }>;
+        expect(rows.map((r) => r.permission)).toContain(permission);
+    });
+
+    it('revoke-dev-app: `*` revokes everything exactly once', async () => {
+        // The `*` arm used to fall through: after `revokeDevAppAll` the
+        // handler also ran `revokeDevAppPermission(…, '*')` — a no-op DELETE
+        // for a row named literally `*` plus a second `revoke` audit entry.
+        // The user-app twin if/elses the two arms; this pins the parity.
+        const { user, actor } = await makeUserAndActor();
+        const appName = `dev-star-${uuidv4()}`;
+        const app = await server.stores.app.create(
+            {
+                name: appName,
+                title: 'DevStarApp',
+                index_url: `https://${appName}.example.test/index.html`,
+            },
+            { ownerUserId: user.id },
+        );
+
+        const permission = 'service:dev-star:ii:read';
+        await server.stores.permission.setFlatUserPerm(
+            user.id,
+            `manage:${permission}`,
+            {
+                permission: `manage:${permission}`,
+                deleted: false,
+                issuer_user_id: user.id,
+            } as never,
+        );
+        await inCtx(actor, () =>
+            controller.handleGrantDevApp(
+                makeReq({ app_uid: app.uid, permission }, { actor }),
+                makeRes(),
+            ),
+        );
+
+        const res = makeRes();
+        await inCtx(actor, () =>
+            controller.handleRevokeDevApp(
+                makeReq({ app_uid: app.uid, permission: '*' }, { actor }),
+                res,
+            ),
+        );
+        expect(res.body).toEqual({});
+
+        const rows = await server.clients.db.read(
+            'SELECT `permission` FROM `dev_to_app_permissions` ' +
+                'WHERE `user_id` = ? AND `app_id` = ?',
+            [user.id, app.id],
+        );
+        expect(rows).toEqual([]);
+
+        // The audit write is fire-and-forget, so wait for it to land — and
+        // then a beat longer, since the defect here is a *second* row.
+        let audits: Array<{ permission: string; action: string }> = [];
+        const readAudits = async () =>
+            (await server.clients.db.read(
+                'SELECT `permission`, `action` ' +
+                    'FROM `audit_dev_to_app_permissions` ' +
+                    'WHERE `user_id_keep` = ? AND `app_id_keep` = ? ' +
+                    "AND `action` = 'revoke'",
+                [user.id, app.id],
+            )) as Array<{ permission: string; action: string }>;
+        for (let i = 0; i < 100 && audits.length === 0; i++) {
+            audits = await readAudits();
+            if (audits.length === 0)
+                await new Promise((r) => setTimeout(r, 10));
+        }
+        await new Promise((r) => setTimeout(r, 50));
+        audits = await readAudits();
+        expect(audits).toEqual([{ permission: '*', action: 'revoke' }]);
+    });
+});
+
+// ── App origin resolution ──────────────────────────────────────────
+
+describe('AuthController.handleAppUidFromOrigin', () => {
+    it('400 when origin is missing', async () => {
+        await expect(
+            controller.handleAppUidFromOrigin(makeReq({}), makeRes()),
+        ).rejects.toMatchObject({ statusCode: 400 });
+    });
+
+    it('returns a deterministic app- prefixed uid for an arbitrary origin', async () => {
+        const origin = `https://origin-${uuidv4()}.example`;
+        const res = makeRes();
+        await controller.handleAppUidFromOrigin(makeReq({ origin }), res);
+        const body = res.body as { uid: string };
+        expect(body.uid).toMatch(/^app-/);
+    });
+});
+
+// ── 2FA configure / disable ────────────────────────────────────────
+
+/** The code an authenticator app would show right now for `secret`. */
+const liveTotp = (username: string, secret: string) =>
+    new TOTP({
+        issuer: 'puter.com',
+        label: username,
+        algorithm: 'SHA1',
+        digits: 6,
+        secret,
+    }).generate();
+
+/** Calls the handler directly; the route's gate is tested over HTTP. */
+const setup2fa = async (actor: Actor) => {
+    const res = makeRes();
+    await controller.handleSetup2fa(makeReq({}, { actor }), res);
+    return res.body as { url: string; secret: string; codes: string[] };
+};
+
+const enable2fa = (actor: Actor, body: Record<string, unknown> = {}) =>
+    controller.handleConfigure2fa(
+        makeReq(body, { actor, params: { action: 'enable' } }),
+        makeRes(),
+    );
+
+describe('AuthController 2FA flows', () => {
+    it('configure-2fa: 400 on an unknown :action', async () => {
+        const { actor } = await makeUserAndActor();
+        await expect(
+            controller.handleConfigure2fa(
+                makeReq({}, { actor, params: { action: 'frobnicate' } }),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 400 });
+    });
+
+    it('configure-2fa: has no setup action, so a bare session mints no secret', async () => {
+        const { user, actor } = await makeUserAndActor();
+        await expect(
+            controller.handleConfigure2fa(
+                makeReq({}, { actor, params: { action: 'setup' } }),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 400 });
+        const after = await server.stores.user.getById(user.id, {
+            force: true,
+        });
+        expect(after!.otp_secret ?? null).toBeNull();
+    });
+
+    it('lets a team seat enable 2FA without a confirmed email', async () => {
+        // A seat has no address by design (PUT-1792) while its team can
+        // require 2FA, so this check would bar it forever.
+        const owner = await makeUserAndActor();
+        const team = await server.services.team.createTeam(owner.user.id, {
+            name: 'Acme',
+        });
+        const seatName = `s_${uniq()}`;
+        await server.services.team.provisionAccount(team.uid, owner.user.id, {
+            username: seatName,
+        });
+        const seat = await server.stores.user.getByUsername(seatName);
+        const actor = {
+            user: {
+                id: seat!.id,
+                uuid: seat!.uuid,
+                username: seat!.username,
+                email: seat!.email ?? null,
+                email_confirmed: !!seat!.email_confirmed,
+            },
+        } as Actor;
+        expect(Boolean(seat!.email_confirmed)).toBe(false);
+
+        const { secret } = await setup2fa(actor);
+        await enable2fa(actor, { code: liveTotp(seat!.username, secret) });
+        const after = await server.stores.user.getById(seat!.id, {
+            force: true,
+        });
+        expect(Boolean(after!.otp_enabled)).toBe(true);
+    });
+
+    it('refuses to disable 2FA while the team requires it', async () => {
+        const owner = await makeUserAndActor({ otp_enabled: 1 });
+        const team = await server.services.team.createTeam(owner.user.id, {
+            name: 'Acme',
+        });
+        const seatName = `s_${uniq()}`;
+        await server.services.team.provisionAccount(team.uid, owner.user.id, {
+            username: seatName,
+        });
+        const seat = await server.stores.user.getByUsername(seatName);
+        const actor = {
+            user: {
+                id: seat!.id,
+                uuid: seat!.uuid,
+                username: seat!.username,
+                email: seat!.email ?? null,
+            },
+        } as Actor;
+        const { secret } = await setup2fa(actor);
+        await enable2fa(actor, { code: liveTotp(seat!.username, secret) });
+        await server.services.team.updateTeam(team.uid, owner.user.id, {
+            require2fa: true,
+        });
+
+        await expect(
+            controller.handleDisable2fa(makeReq({}, { actor }), makeRes()),
+        ).rejects.toMatchObject({ statusCode: 409 });
+        const after = await server.stores.user.getById(seat!.id, {
+            force: true,
+        });
+        expect(Boolean(after!.otp_enabled)).toBe(true);
+    });
+
+    it('still refuses an ordinary account with an unconfirmed email', async () => {
+        const { user, actor } = await makeUserAndActor({ email_confirmed: 0 });
+        const { secret } = await setup2fa(actor);
+        await expect(
+            enable2fa(actor, { code: liveTotp(user.username, secret) }),
+        ).rejects.toMatchObject({ statusCode: 403 });
+    });
+
+    it('setup-2fa: returns {url, secret, codes[10]} and stores the secret', async () => {
+        const { user, actor } = await makeUserAndActor();
+        const body = await setup2fa(actor);
+        expect(body.codes).toHaveLength(10);
+        expect(typeof body.secret).toBe('string');
+        const after = await server.stores.user.getById(user.id, {
+            force: true,
+        });
+        expect(after!.otp_secret).toBe(body.secret);
+        expect(
+            ((after!.otp_recovery_codes as string | null) ?? '').split(','),
+        ).toHaveLength(10);
+    });
+
+    it('a recovery code minted by setup-2fa satisfies /login/recovery-code', async () => {
+        const { user, actor } = await makeUserAndActor({ email_confirmed: 1 });
+        const { secret, codes } = await setup2fa(actor);
+        await enable2fa(actor, { code: liveTotp(user.username, secret) });
+
+        const otpJwt = server.services.token.sign(
+            'otp',
+            { user_uid: user.uuid, purpose: 'otp-login' },
+            { expiresIn: '5m' },
+        );
+        const res = makeRes();
+        await controller.handleLoginRecoveryCode(
+            makeReq({ token: otpJwt, code: codes[0] }),
+            res,
+        );
+        expect(isCompleteLoginResponse(res.body)).toBe(true);
+    });
+
+    it('setup-2fa: 409 when 2FA is already enabled', async () => {
+        const { actor } = await makeUserAndActor({ otp_enabled: 1 });
+        await expect(setup2fa(actor)).rejects.toMatchObject({
+            statusCode: 409,
+        });
+    });
+
+    it('configure-2fa test: 400 when code is missing', async () => {
+        const { actor } = await makeUserAndActor();
+        await expect(
+            controller.handleConfigure2fa(
+                makeReq({}, { actor, params: { action: 'test' } }),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 400 });
+    });
+
+    it('configure-2fa enable: refuses a missing or wrong code and leaves 2FA off', async () => {
+        const { user, actor } = await makeUserAndActor({ email_confirmed: 1 });
+        const { secret } = await setup2fa(actor);
+
+        await expect(enable2fa(actor)).rejects.toMatchObject({
+            statusCode: 400,
+            legacyCode: 'bad_request',
+        });
+        // A live code for a secret the server never issued, as from a
+        // session enrolling an authenticator of its own.
+        const foreign = otpCreateSecret(user.username).secret;
+        await expect(
+            enable2fa(actor, { code: liveTotp(user.username, foreign) }),
+        ).rejects.toMatchObject({
+            statusCode: 400,
+            legacyCode: 'code_mismatch',
+        });
+        // Not coerced: a number is not a code.
+        await expect(
+            enable2fa(actor, {
+                code: Number(liveTotp(user.username, secret)),
+            }),
+        ).rejects.toMatchObject({ statusCode: 400 });
+
+        const after = await server.stores.user.getById(user.id, {
+            force: true,
+        });
+        expect(after!.otp_enabled).toBeFalsy();
+        expect(after!.otp_secret).toBe(secret);
+    });
+
+    it('configure-2fa enable: 403 if email is unconfirmed; 409 if already enabled or no secret', async () => {
+        // Email unconfirmed → 403.
+        const { actor: aUnconfirmed } = await makeUserAndActor();
+        await expect(
+            controller.handleConfigure2fa(
+                makeReq(
+                    {},
+                    { actor: aUnconfirmed, params: { action: 'enable' } },
+                ),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 403 });
+
+        // Confirmed but no secret → 409.
+        const { actor: aNoSecret } = await makeUserAndActor({
+            email_confirmed: 1,
+        });
+        await expect(
+            controller.handleConfigure2fa(
+                makeReq({}, { actor: aNoSecret, params: { action: 'enable' } }),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 409 });
+
+        // Already enabled → 409.
+        const { actor: aEnabled } = await makeUserAndActor({
+            email_confirmed: 1,
+            otp_enabled: 1,
+            otp_secret: 'TESTSECRETBASE32',
+        });
+        await expect(
+            controller.handleConfigure2fa(
+                makeReq({}, { actor: aEnabled, params: { action: 'enable' } }),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 409 });
+    });
+
+    it('disable-2fa: clears otp_enabled / otp_secret / otp_recovery_codes', async () => {
+        const { user, actor } = await makeUserAndActor({
+            otp_enabled: 1,
+            otp_secret: 'TESTSECRETBASE32',
+            otp_recovery_codes: 'a,b,c',
+        });
+        const res = makeRes();
+        await controller.handleDisable2fa(makeReq({}, { actor }), res);
+        expect(res.body).toEqual({ success: true });
+        const after = await server.stores.user.getById(user.id, {
+            force: true,
+        });
+        expect(after!.otp_enabled).toBeFalsy();
+        expect(after!.otp_secret).toBeNull();
+        expect(after!.otp_recovery_codes).toBeNull();
+    });
+});
+
+// ── Dev profile ────────────────────────────────────────────────────
+
+describe('AuthController.handleGetDevProfile', () => {
+    it('returns the public dev-profile shape with sensible defaults', async () => {
+        const { actor } = await makeUserAndActor();
+        const res = makeRes();
+        await controller.handleGetDevProfile(makeReq({}, { actor }), res);
+        const body = res.body as Record<string, unknown>;
+        expect(body).toMatchObject({
+            first_name: null,
+            last_name: null,
+            approved_for_incentive_program: false,
+            joined_incentive_program: false,
+            paypal: null,
+        });
+    });
+});
+
+// ── GUI token + session sync cookie ────────────────────────────────
+
+describe('AuthController.handleGetGuiToken + handleSessionSyncCookie', () => {
+    it('get-gui-token: 400 when actor has no session bound', async () => {
+        const { actor } = await makeUserAndActor();
+        await expect(
+            controller.handleGetGuiToken(makeReq({}, { actor }), makeRes()),
+        ).rejects.toMatchObject({ statusCode: 400 });
+    });
+
+    it('get-gui-token: returns a verifiable GUI token for an actor with a session', async () => {
+        const { user, actor } = await makeUserAndActor();
+        const sessionRes = await server.services.auth.createSessionToken(
+            user,
+            {},
+        );
+        const sessionUid = (sessionRes.session as { uuid: string }).uuid;
+        const sessionedActor = {
+            ...actor,
+            session: { uid: sessionUid },
+        } as Actor;
+
+        const res = makeRes();
+        await controller.handleGetGuiToken(
+            makeReq({}, { actor: sessionedActor }),
+            res,
+        );
+        const body = res.body as { token: string };
+        const decoded = server.services.token.verify('auth', body.token) as {
+            type: string;
+            user_uid: string;
+        };
+        expect(decoded.type).toBe('gui');
+        expect(decoded.user_uid).toBe(user.uuid);
+    });
+
+    it('session/sync-cookie: 400 when no session; 204 + cookie when bound', async () => {
+        const { user, actor } = await makeUserAndActor();
+        // No session → 400.
+        const r1 = makeRes();
+        await controller.handleSessionSyncCookie(
+            makeReq({}, { actor, tokenSource: 'header' }),
+            r1,
+        );
+        expect(r1.statusCode).toBe(400);
+
+        // Bound session → 204 with the session cookie set.
+        const sessionRes = await server.services.auth.createSessionToken(
+            user,
+            {},
+        );
+        const sessionUid = (sessionRes.session as { uuid: string }).uuid;
+        const sessionedActor = {
+            ...actor,
+            session: { uid: sessionUid },
+        } as Actor;
+
+        const r2 = makeRes();
+        await controller.handleSessionSyncCookie(
+            makeReq({}, { actor: sessionedActor, tokenSource: 'header' }),
+            r2,
+        );
+        expect(r2.statusCode).toBe(204);
+        expect(r2.cookies['puter_auth_token']).toBeDefined();
+    });
+
+    it('session/sync-cookie: refuses a token that arrived anywhere but the Authorization header', async () => {
+        const { user, actor } = await makeUserAndActor();
+        const sessionRes = await server.services.auth.createSessionToken(
+            user,
+            {},
+        );
+        const sessionUid = (sessionRes.session as { uuid: string }).uuid;
+        const sessionedActor = {
+            ...actor,
+            session: { uid: sessionUid },
+        } as Actor;
+
+        for (const tokenSource of [
+            'query',
+            'cookie',
+            'body',
+            'x-api-key',
+            'handshake',
+            undefined,
+        ] as (TokenSource | undefined)[]) {
+            const res = makeRes();
+            await expect(
+                controller.handleSessionSyncCookie(
+                    makeReq({}, { actor: sessionedActor, tokenSource }),
+                    res,
+                ),
+            ).rejects.toMatchObject({ statusCode: 401 });
+            expect(res.cookies['puter_auth_token']).toBeUndefined();
+        }
+    });
+});
+
+// ── Delete own user ────────────────────────────────────────────────
+
+describe('AuthController.handleDeleteOwnUser', () => {
+    it('cascade-deletes the user row and clears the session cookie', async () => {
+        const { user, actor } = await makeUserAndActor();
+        const res = makeRes();
+        await controller.handleDeleteOwnUser(makeReq({}, { actor }), res);
+        expect(res.body).toEqual({ success: true });
+        expect(res.clearedCookies).toContain('puter_auth_token');
+        expect(res.clearedCookies).toContain('puter_revalidation');
+        // Row is gone.
+        const after = await server.stores.user.getById(user.id, {
+            force: true,
+        });
+        expect(after).toBeFalsy();
+    });
+
+    it('refuses, and keeps the row, for an account its team provisioned', async () => {
+        // The team is billed for the seat and closing it is theirs to do, from
+        // the console that keeps the audit trail.
+        const { user: owner } = await makeUserAndActor();
+        const { user: seat, actor } = await makeUserAndActor();
+        const team = await server.stores.team.create({
+            ownerUserId: owner.id,
+            name: 'Acme',
+        });
+        await server.stores.user.update(seat.id, { password: null });
+        await server.stores.team.addMember(team.uid, seat.id, {
+            orgOwned: true,
+        });
+
+        await expect(
+            controller.handleDeleteOwnUser(makeReq({}, { actor }), makeRes()),
+        ).rejects.toMatchObject({ statusCode: 403 });
+
+        const after = await server.stores.user.getById(seat.id, {
+            force: true,
+        });
+        expect(after).toBeTruthy();
+    });
+
+    it('emits user.delete with the uuid + stripe customer id for downstream teardown', async () => {
+        // `stripe_customer_id` ships in the MySQL/Postgres migrations but not
+        // the sqlite ones the test harness runs — add it so the delete path
+        // captures it (it's how the marketplace extension cancels the sub).
+        try {
+            await server.clients.db.write(
+                'ALTER TABLE user ADD COLUMN stripe_customer_id TEXT',
+                [],
+            );
+        } catch {
+            /* already exists */
+        }
+        const { user, actor } = await makeUserAndActor();
+        await server.clients.db.write(
+            'UPDATE user SET stripe_customer_id = ? WHERE id = ?',
+            ['cus_delete_test', user.id],
+        );
+
+        heardUserDelete.length = 0;
+        await controller.handleDeleteOwnUser(makeReq({}, { actor }), makeRes());
+
+        const evt = heardUserDelete.find((e) => e.user_id === user.id);
+        expect(evt).toMatchObject({
+            user_id: user.id,
+            user_uuid: user.uuid,
+            stripe_customer_id: 'cus_delete_test',
+        });
+    });
+});
+
+// ── Additional branch coverage ─────────────────────────────────────
+
+describe('AuthController.handleLogin additional branches', () => {
+    it('rejects non-string password with 400', async () => {
+        await expect(
+            controller.handleLogin(
+                makeReq({
+                    username: 'someone',
+                    password: 123 as unknown as string,
+                }),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 400 });
+    });
+
+    it('rejects too-short password with 400', async () => {
+        await expect(
+            controller.handleLogin(
+                makeReq({ username: 'someone', password: '12' }),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 400 });
+    });
+
+    it('rejects non-string username with 400', async () => {
+        await expect(
+            controller.handleLogin(
+                makeReq({
+                    username: 42 as unknown as string,
+                    password: 'correct-horse-battery',
+                }),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 400 });
+    });
+
+    it('returns 404 for an unknown email address (parallel to unknown-username case)', async () => {
+        await expect(
+            controller.handleLogin(
+                makeReq({
+                    email: `unknown-${uuidv4()}@test.local`,
+                    password: 'correct-horse-battery',
+                }),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 404 });
+    });
+
+    it('returns 401 when the stored password is null (e.g. OIDC-only account)', async () => {
+        const { user } = await makeUserAndActor();
+        // Mimic an OIDC account: confirmed email but no password.
+        await server.stores.user.update(user.id, {
+            password: null,
+            email_confirmed: 1,
+        });
+        await expect(
+            controller.handleLogin(
+                makeReq({
+                    username: user.username,
+                    password: 'correct-horse-battery',
+                }),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 401 });
+    });
+});
+
+describe('AuthController.handleLoginOtp additional branches', () => {
+    it('rejects missing token with 400', async () => {
+        await expect(
+            controller.handleLoginOtp(makeReq({ code: '123456' }), makeRes()),
+        ).rejects.toMatchObject({ statusCode: 400 });
+    });
+
+    it('rejects missing code with 400', async () => {
+        const otpJwt = server.services.token.sign(
+            'otp',
+            { user_uid: uuidv4(), purpose: 'otp-login' },
+            { expiresIn: '5m' },
+        );
+        await expect(
+            controller.handleLoginOtp(makeReq({ token: otpJwt }), makeRes()),
+        ).rejects.toMatchObject({ statusCode: 400 });
+    });
+
+    it('returns 404 when the user_uid in the token has no matching user', async () => {
+        const otpJwt = server.services.token.sign(
+            'otp',
+            { user_uid: uuidv4(), purpose: 'otp-login' },
+            { expiresIn: '5m' },
+        );
+        await expect(
+            controller.handleLoginOtp(
+                makeReq({ token: otpJwt, code: '123456' }),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 404 });
+    });
+
+    it('returns 401 when the user is suspended', async () => {
+        const { user } = await makeUserAndActor({ suspended: 1 });
+        const otpJwt = server.services.token.sign(
+            'otp',
+            { user_uid: user.uuid, purpose: 'otp-login' },
+            { expiresIn: '5m' },
+        );
+        await expect(
+            controller.handleLoginOtp(
+                makeReq({ token: otpJwt, code: '123456' }),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 401 });
+    });
+});
+
+describe('AuthController.handleLoginRecoveryCode additional branches', () => {
+    it('rejects missing token with 400', async () => {
+        await expect(
+            controller.handleLoginRecoveryCode(
+                makeReq({ code: 'foo' }),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 400 });
+    });
+
+    it('rejects missing code with 400', async () => {
+        const otpJwt = server.services.token.sign(
+            'otp',
+            { user_uid: uuidv4(), purpose: 'otp-login' },
+            { expiresIn: '5m' },
+        );
+        await expect(
+            controller.handleLoginRecoveryCode(
+                makeReq({ token: otpJwt }),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 400 });
+    });
+
+    it('rejects an invalid (unverifiable) JWT with 400', async () => {
+        await expect(
+            controller.handleLoginRecoveryCode(
+                makeReq({ token: 'not-a-jwt', code: 'foo' }),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 400 });
+    });
+
+    it('rejects a valid JWT with the wrong purpose', async () => {
+        const wrong = server.services.token.sign(
+            'otp',
+            { user_uid: uuidv4(), purpose: 'something-else' },
+            { expiresIn: '5m' },
+        );
+        await expect(
+            controller.handleLoginRecoveryCode(
+                makeReq({ token: wrong, code: 'foo' }),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 400 });
+    });
+
+    it('returns 404 when the user_uid does not match any user', async () => {
+        const otpJwt = server.services.token.sign(
+            'otp',
+            { user_uid: uuidv4(), purpose: 'otp-login' },
+            { expiresIn: '5m' },
+        );
+        await expect(
+            controller.handleLoginRecoveryCode(
+                makeReq({ token: otpJwt, code: 'foo' }),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 404 });
+    });
+
+    it('returns 401 when the user is suspended', async () => {
+        const { user } = await makeUserAndActor({ suspended: 1 });
+        const otpJwt = server.services.token.sign(
+            'otp',
+            { user_uid: user.uuid, purpose: 'otp-login' },
+            { expiresIn: '5m' },
+        );
+        await expect(
+            controller.handleLoginRecoveryCode(
+                makeReq({ token: otpJwt, code: 'foo' }),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 401 });
+    });
+});
+
+describe('AuthController.handleSignup additional branches', () => {
+    it('rejects missing username with 400', async () => {
+        await expect(
+            controller.handleSignup(
+                makeReq({
+                    email: `${uniq()}@test.local`,
+                    password: 'correct-horse-battery',
+                }),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 400 });
+    });
+
+    it('rejects non-string username with 400', async () => {
+        await expect(
+            controller.handleSignup(
+                makeReq({
+                    username: 123 as unknown as string,
+                    email: `${uniq()}@test.local`,
+                    password: 'correct-horse-battery',
+                }),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 400 });
+    });
+
+    it('rejects username containing invalid characters with 400', async () => {
+        await expect(
+            controller.handleSignup(
+                makeReq({
+                    username: 'has space',
+                    email: `${uniq()}@test.local`,
+                    password: 'correct-horse-battery',
+                }),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 400 });
+    });
+
+    it('rejects username longer than 45 characters with 400', async () => {
+        const longUsername = 'a'.repeat(46);
+        await expect(
+            controller.handleSignup(
+                makeReq({
+                    username: longUsername,
+                    email: `${uniq()}@test.local`,
+                    password: 'correct-horse-battery',
+                }),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 400 });
+    });
+
+    it('rejects missing email with 400 for non-temp signups', async () => {
+        await expect(
+            controller.handleSignup(
+                makeReq({
+                    username: `s_${uniq()}`,
+                    password: 'correct-horse-battery',
+                }),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 400 });
+    });
+
+    it('rejects non-string email with 400', async () => {
+        await expect(
+            controller.handleSignup(
+                makeReq({
+                    username: `s_${uniq()}`,
+                    email: 12345 as unknown as string,
+                    password: 'correct-horse-battery',
+                }),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 400 });
+    });
+
+    it('rejects missing password with 400 for non-temp signups', async () => {
+        await expect(
+            controller.handleSignup(
+                makeReq({
+                    username: `s_${uniq()}`,
+                    email: `${uniq()}@test.local`,
+                }),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 400 });
+    });
+
+    it('rejects non-string password with 400', async () => {
+        await expect(
+            controller.handleSignup(
+                makeReq({
+                    username: `s_${uniq()}`,
+                    email: `${uniq()}@test.local`,
+                    password: 12345 as unknown as string,
+                }),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 400 });
+    });
+
+    it('claims a pseudo-user (password=null, email_confirmed=0) on email match', async () => {
+        // Seed a pseudo user (admin-style placeholder): email present,
+        // password null, unconfirmed.
+        const targetEmail = `pseudo_${uniq()}@test.local`;
+        const placeholder = await server.stores.user.create({
+            username: `placeholder_${uniq()}`,
+            uuid: uuidv4(),
+            password: null,
+            email: targetEmail,
+            clean_email: targetEmail,
+            email_confirmed: 0,
+        } as never);
+
+        // Now signup with the same email — should claim the pseudo row,
+        // not throw.
+        const newUsername = `claim_${uniq()}`;
+        const res = makeRes();
+        await controller.handleSignup(
+            makeReq({
+                username: newUsername,
+                email: targetEmail,
+                password: 'correct-horse-battery',
+            }),
+            res,
+        );
+        expect(isCompleteLoginResponse(res.body)).toBe(true);
+
+        // The placeholder row was repurposed (same id, new username).
+        const claimed = await server.stores.user.getById(placeholder.id, {
+            force: true,
+        });
+        expect(claimed!.username).toBe(newUsername);
+        expect(claimed!.password).not.toBeNull();
+    });
+
+    it('claim clears stale phone/card gates on the placeholder when the decision no longer requires them', async () => {
+        // Placeholder seeded with both gates already set. A benign claim
+        // (no validate override → no requirements) must reset them rather
+        // than silently inheriting the stale requirement.
+        const targetEmail = `pseudo_${uniq()}@test.local`;
+        const placeholder = await server.stores.user.create({
+            username: `placeholder_${uniq()}`,
+            uuid: uuidv4(),
+            password: null,
+            email: targetEmail,
+            clean_email: targetEmail,
+            email_confirmed: 0,
+            requires_phone_verification: 1,
+            requires_card_verification: 1,
+        } as never);
+
+        const res = makeRes();
+        await controller.handleSignup(
+            makeReq({
+                username: `claim_${uniq()}`,
+                email: targetEmail,
+                password: 'correct-horse-battery',
+            }),
+            res,
+        );
+        expect(isCompleteLoginResponse(res.body)).toBe(true);
+
+        const claimed = await server.stores.user.getById(placeholder.id, {
+            force: true,
+        });
+        expect(claimed!.requires_phone_verification).toBe(false);
+        expect(claimed!.requires_card_verification).toBe(false);
+    });
+
+    it('claim carries the phone/card gates when the decision requires them', async () => {
+        const targetEmail = `pseudo_${uniq()}@test.local`;
+        const placeholder = await server.stores.user.create({
+            username: `placeholder_${uniq()}`,
+            uuid: uuidv4(),
+            password: null,
+            email: targetEmail,
+            clean_email: targetEmail,
+            email_confirmed: 0,
+        } as never);
+
+        await withSignupValidateOverride(
+            (event) => {
+                event.requires_phone_verification = true;
+                event.requires_card_verification = true;
+            },
+            async () => {
+                const res = makeRes();
+                await controller.handleSignup(
+                    makeReq({
+                        username: `claim_${uniq()}`,
+                        email: targetEmail,
+                        password: 'correct-horse-battery',
+                    }),
+                    res,
+                );
+                expect(isCompleteLoginResponse(res.body)).toBe(true);
+            },
+        );
+
+        const claimed = await server.stores.user.getById(placeholder.id, {
+            force: true,
+        });
+        expect(claimed!.requires_phone_verification).toBe(true);
+        expect(claimed!.requires_card_verification).toBe(true);
+    });
+
+    it('extension hook can require email confirmation via requires_email_confirmation=true', async () => {
+        await withSignupValidateOverride(
+            (event) => {
+                event.requires_email_confirmation = true;
+            },
+            async () => {
+                const username = `efce_${uniq()}`;
+                const res = makeRes();
+                await controller.handleSignup(
+                    makeReq({
+                        username,
+                        email: `${username}@test.local`,
+                        password: 'correct-horse-battery',
+                    }),
+                    res,
+                );
+                // Login still completes; the user row carries the flag.
+                const persisted =
+                    await server.stores.user.getByUsername(username);
+                expect(persisted!.requires_email_confirmation).toBeTruthy();
+            },
+        );
+    });
+
+    // No mail transport in the test server, so `send` returns null — the
+    // silent-drop case.
+    it('alarms when the signup confirmation email is not delivered', async () => {
+        const alarm = vi
+            .spyOn(server.clients.alarm, 'create')
+            .mockImplementation(() => undefined);
+        try {
+            await withSignupValidateOverride(
+                (event) => {
+                    event.requires_email_confirmation = true;
+                },
+                async () => {
+                    const username = `cefail_${uniq()}`;
+                    await controller.handleSignup(
+                        makeReq({
+                            username,
+                            email: `${username}@test.local`,
+                            password: 'correct-horse-battery',
+                        }),
+                        makeRes(),
+                    );
+                },
+            );
+
+            const raised = alarm.mock.calls.find(
+                (c) => c[0] === 'auth:confirmation-email-send-failed:signup',
+            );
+            expect(raised).toBeTruthy();
+            const fields = raised![2] as Record<string, unknown>;
+            expect(fields.stage).toBe('signup');
+            // No phone/card gate outstanding: stuck on the email alone.
+            expect(fields.sole_gate).toBe(true);
+            expect(fields.email_domain).toBe('test.local');
+            expect(raised![3]).toBe('warning');
+            expect(raised![4]).toEqual({ dedup: true });
+        } finally {
+            alarm.mockRestore();
+        }
+    });
+});
+
+describe('AuthController.handleSendPassRecoveryEmail additional branches', () => {
+    it('rejects an invalid email format with 400 (when no username supplied)', async () => {
+        await expect(
+            controller.handleSendPassRecoveryEmail(
+                makeReq({ email: 'not-an-email' }),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 400 });
+    });
+
+    it('returns the generic message for a suspended user (no leak)', async () => {
+        const { user } = await makeUserAndActor({ suspended: 1 });
+        const res = makeRes();
+        await controller.handleSendPassRecoveryEmail(
+            makeReq({ username: user.username }),
+            res,
+        );
+        // Generic message — does not reveal the suspension state.
+        expect((res.body as { message: string }).message).toMatch(
+            /If that account exists/i,
+        );
+        // No recovery token persisted on a suspended account.
+        const after = await server.stores.user.getById(user.id, {
+            force: true,
+        });
+        expect(after!.pass_recovery_token).toBeFalsy();
+    });
+});
+
+describe('AuthController.handleVerifyPassRecoveryToken additional branches', () => {
+    it('rejects an unverifiable JWT with 400', async () => {
+        await expect(
+            controller.handleVerifyPassRecoveryToken(
+                makeReq({ token: 'not-a-jwt' }),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 400 });
+    });
+
+    it('rejects when the user does not exist (user_uid is bogus)', async () => {
+        const jwt = server.services.token.sign(
+            'otp',
+            {
+                token: uuidv4(),
+                user_uid: uuidv4(),
+                email: 'someone@test.local',
+                purpose: 'pass-recovery',
+            },
+            { expiresIn: '1h' },
+        );
+        await expect(
+            controller.handleVerifyPassRecoveryToken(
+                makeReq({ token: jwt }),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 400 });
+    });
+
+    it('rejects when the email in the token no longer matches the user', async () => {
+        const { user } = await makeUserAndActor();
+        const jwt = server.services.token.sign(
+            'otp',
+            {
+                token: uuidv4(),
+                user_uid: user.uuid,
+                email: 'someone-else@test.local', // mismatch
+                purpose: 'pass-recovery',
+            },
+            { expiresIn: '1h' },
+        );
+        await expect(
+            controller.handleVerifyPassRecoveryToken(
+                makeReq({ token: jwt }),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 400 });
+    });
+
+    it('returns 401 when the user is suspended', async () => {
+        const { user } = await makeUserAndActor({ suspended: 1 });
+        const jwt = server.services.token.sign(
+            'otp',
+            {
+                token: uuidv4(),
+                user_uid: user.uuid,
+                email: user.email,
+                purpose: 'pass-recovery',
+            },
+            { expiresIn: '1h' },
+        );
+        await expect(
+            controller.handleVerifyPassRecoveryToken(
+                makeReq({ token: jwt }),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 401 });
+    });
+});
+
+describe('AuthController.handleSetPassUsingToken additional branches', () => {
+    it('rejects missing both token and password with 400', async () => {
+        await expect(
+            controller.handleSetPassUsingToken(makeReq({}), makeRes()),
+        ).rejects.toMatchObject({ statusCode: 400 });
+    });
+
+    it('rejects an unverifiable JWT with 400', async () => {
+        await expect(
+            controller.handleSetPassUsingToken(
+                makeReq({
+                    token: 'not-a-jwt',
+                    password: 'a-brand-new-password',
+                }),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 400 });
+    });
+
+    it('rejects a JWT with the wrong purpose', async () => {
+        const wrong = server.services.token.sign(
+            'otp',
+            { purpose: 'otp-login', user_uid: uuidv4() },
+            { expiresIn: '1h' },
+        );
+        await expect(
+            controller.handleSetPassUsingToken(
+                makeReq({
+                    token: wrong,
+                    password: 'a-brand-new-password',
+                }),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 400 });
+    });
+
+    it('rejects when the user no longer exists', async () => {
+        const jwt = server.services.token.sign(
+            'otp',
+            {
+                token: uuidv4(),
+                user_uid: uuidv4(),
+                email: 'someone@test.local',
+                purpose: 'pass-recovery',
+            },
+            { expiresIn: '1h' },
+        );
+        await expect(
+            controller.handleSetPassUsingToken(
+                makeReq({
+                    token: jwt,
+                    password: 'a-brand-new-password',
+                }),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 400 });
+    });
+
+    it('returns 401 when the user is suspended', async () => {
+        const { user } = await makeUserAndActor({ suspended: 1 });
+        const jwt = server.services.token.sign(
+            'otp',
+            {
+                token: uuidv4(),
+                user_uid: user.uuid,
+                email: user.email,
+                purpose: 'pass-recovery',
+            },
+            { expiresIn: '1h' },
+        );
+        await expect(
+            controller.handleSetPassUsingToken(
+                makeReq({
+                    token: jwt,
+                    password: 'a-brand-new-password',
+                }),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 401 });
+    });
+});
+
+describe('AuthController user-protected mutations: additional branches', () => {
+    it('change-username: 400 on too-long new_username', async () => {
+        const { actor } = await makeUserAndActor();
+        await expect(
+            controller.handleChangeUsername(
+                makeReq({ new_username: 'a'.repeat(46) }, { actor }),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 400 });
+    });
+
+    it('change-email: 400 when an unconfirmed-but-password-holding account already owns the email', async () => {
+        // Other user: password set, email NOT confirmed → still blocks
+        // (existing.password !== null branch).
+        const { user: other } = await makeUserAndActor();
+        const { actor } = await makeUserAndActor();
+        await expect(
+            controller.handleChangeEmail(
+                makeReq({ new_email: other.email! }, { actor }),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 400 });
+    });
+
+    it('change_email/confirm: 400 on missing token', async () => {
+        const req = makeReq({});
+        (req as unknown as { query: Record<string, string> }).query = {};
+        await expect(
+            controller.handleChangeEmailConfirm(req, makeRes()),
+        ).rejects.toMatchObject({ statusCode: 400 });
+    });
+
+    it('change_email/confirm: 400 on a bogus JWT', async () => {
+        const req = makeReq({});
+        (req as unknown as { query: Record<string, string> }).query = {
+            token: 'not-a-jwt',
+        };
+        await expect(
+            controller.handleChangeEmailConfirm(req, makeRes()),
+        ).rejects.toMatchObject({ statusCode: 400 });
+    });
+
+    it('change_email/confirm: 400 when no row matches the staged token', async () => {
+        // Sign a properly-shaped JWT with a nonexistent change_email token.
+        const linkJwt = server.services.token.sign(
+            'otp',
+            {
+                token: uuidv4(),
+                user_id: 999_999,
+                purpose: 'change-email',
+            },
+            { expiresIn: '1h' },
+        );
+        const req = makeReq({});
+        (req as unknown as { query: Record<string, string> }).query = {
+            token: linkJwt,
+        };
+        await expect(
+            controller.handleChangeEmailConfirm(req, makeRes()),
+        ).rejects.toMatchObject({ statusCode: 400 });
+    });
+});
+
+describe('AuthController.handleSaveAccount additional branches', () => {
+    it('returns 404 when the actor has no matching user row (deleted)', async () => {
+        const { user, actor } = await makeUserAndActor();
+        // Delete the row out from under the actor.
+        await server.clients.db.write('DELETE FROM `user` WHERE `id` = ?', [
+            user.id,
+        ]);
+        await server.stores.user.invalidateById(user.id);
+        await expect(
+            controller.handleSaveAccount(
+                makeReq(
+                    {
+                        username: `s_${uniq()}`,
+                        email: `${uniq()}@test.local`,
+                        password: 'correct-horse-battery',
+                    },
+                    { actor },
+                ),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 404 });
+    });
+
+    it('rejects too-long username with 400', async () => {
+        // Need a temp actor for the username-validation path to be
+        // reachable (non-temp short-circuits at "not a temporary account").
+        const tempRes = makeRes();
+        await controller.handleSignup(makeReq({ is_temp: true }), tempRes);
+        const tempBody = tempRes.body as {
+            user: { username: string; uuid: string };
+        };
+        const tempUser = await server.stores.user.getByUsername(
+            tempBody.user.username,
+        );
+        const tempActor = {
+            user: {
+                id: tempUser!.id,
+                uuid: tempUser!.uuid,
+                username: tempUser!.username,
+                email: tempUser!.email ?? null,
+            },
+        } as Actor;
+
+        await expect(
+            controller.handleSaveAccount(
+                makeReq(
+                    {
+                        username: 'a'.repeat(46),
+                        email: `${uniq()}@test.local`,
+                        password: 'correct-horse-battery',
+                    },
+                    { actor: tempActor },
+                ),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 400 });
+    });
+});
+
+describe('AuthController grant/revoke additional branches', () => {
+    it('grant-user-app: 400 on missing app_uid', async () => {
+        const { actor } = await makeUserAndActor();
+        await expect(
+            controller.handleGrantUserApp(
+                makeReq({ permission: 'fs:read' }, { actor }),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 400 });
+    });
+
+    it('revoke-user-app: 400 when permission is "*" but app_uid is missing', async () => {
+        const { actor } = await makeUserAndActor();
+        await expect(
+            controller.handleRevokeUserApp(
+                makeReq({ permission: '*' }, { actor }),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 400 });
+    });
+});
+
+describe('AuthController.handleAppUidFromOrigin additional branches', () => {
+    it('reads origin from req.query as well as req.body', async () => {
+        const origin = `https://qparam-${uuidv4()}.example`;
+        const req = makeReq({});
+        (req as unknown as { query: Record<string, string> }).query = {
+            origin,
+        };
+        const res = makeRes();
+        await controller.handleAppUidFromOrigin(req, res);
+        expect((res.body as { uid: string }).uid).toMatch(/^app-/);
+    });
+});
+
+describe('AuthController.handleCheckApp additional branches', () => {
+    it('rejects missing app_uid AND origin with 400', async () => {
+        const { actor } = await makeUserAndActor();
+        await expect(
+            controller.handleCheckApp(makeReq({}, { actor }), makeRes()),
+        ).rejects.toMatchObject({ statusCode: 400 });
+    });
+
+    it('resolves origin → app_uid when app_uid is omitted', async () => {
+        const { actor } = await makeUserAndActor();
+        const origin = `https://co-${uuidv4()}.example`;
+        const res = makeRes();
+        await inCtx(actor, () =>
+            controller.handleCheckApp(makeReq({ origin }, { actor }), res),
+        );
+        const body = res.body as {
+            app_uid: string;
+            authenticated: boolean;
+        };
+        expect(body.app_uid).toMatch(/^app-/);
+        expect(typeof body.authenticated).toBe('boolean');
+    });
+});
+
+describe('AuthController 2FA additional branches', () => {
+    it('configure-2fa test: returns ok:false on a mismatched code', async () => {
+        // Setup so otp_secret is populated.
+        const { user, actor } = await makeUserAndActor();
+        await setup2fa(actor);
+        const refreshed = await server.stores.user.getById(user.id, {
+            force: true,
+        });
+        // Re-build the actor so it sees the freshly stored secret if cached.
+        void refreshed;
+
+        const res = makeRes();
+        await controller.handleConfigure2fa(
+            makeReq({ code: '000000' }, { actor, params: { action: 'test' } }),
+            res,
+        );
+        expect(res.body).toEqual({ ok: false });
+    });
+
+    it('configure-2fa enable: succeeds with a live code for the stored secret', async () => {
+        const { user, actor } = await makeUserAndActor({ email_confirmed: 1 });
+        // Bootstrap a secret directly so we don't depend on the setup
+        // handler's side effects.
+        await server.clients.db.write(
+            'UPDATE `user` SET `otp_secret` = ? WHERE `uuid` = ?',
+            ['TESTSECRETBASE32', user.uuid],
+        );
+        await server.stores.user.invalidateById(user.id);
+
+        const res = makeRes();
+        await controller.handleConfigure2fa(
+            makeReq(
+                { code: liveTotp(user.username, 'TESTSECRETBASE32') },
+                { actor, params: { action: 'enable' } },
+            ),
+            res,
+        );
+        expect(res.body).toEqual({});
+        const after = await server.stores.user.getById(user.id, {
+            force: true,
+        });
+        expect(after!.otp_enabled).toBeTruthy();
+    });
+
+    it('disable-2fa: throws 404 when the user no longer exists', async () => {
+        const { user, actor } = await makeUserAndActor();
+        await server.clients.db.write('DELETE FROM `user` WHERE `id` = ?', [
+            user.id,
+        ]);
+        await server.stores.user.invalidateById(user.id);
+        await expect(
+            controller.handleDisable2fa(makeReq({}, { actor }), makeRes()),
+        ).rejects.toMatchObject({ statusCode: 404 });
+    });
+});
+
+describe('AuthController.handleGetDevProfile additional branches', () => {
+    it('throws 404 when the actor has no matching user row', async () => {
+        const { user, actor } = await makeUserAndActor();
+        await server.clients.db.write('DELETE FROM `user` WHERE `id` = ?', [
+            user.id,
+        ]);
+        await server.stores.user.invalidateById(user.id);
+        await expect(
+            controller.handleGetDevProfile(makeReq({}, { actor }), makeRes()),
+        ).rejects.toMatchObject({ statusCode: 404 });
+    });
+});
+
+describe('AuthController.handleSendConfirmEmail additional branches', () => {
+    it('throws 404 when the actor user row no longer exists', async () => {
+        const { user, actor } = await makeUserAndActor();
+        await server.clients.db.write('DELETE FROM `user` WHERE `id` = ?', [
+            user.id,
+        ]);
+        await server.stores.user.invalidateById(user.id);
+        await expect(
+            controller.handleSendConfirmEmail(
+                makeReq({}, { actor }),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 404 });
+    });
+});
+
+describe('AuthController.handleConfirmEmail additional branches', () => {
+    it('throws 404 when the actor user row no longer exists', async () => {
+        const { user, actor } = await makeUserAndActor();
+        await server.clients.db.write('DELETE FROM `user` WHERE `id` = ?', [
+            user.id,
+        ]);
+        await server.stores.user.invalidateById(user.id);
+        await expect(
+            controller.handleConfirmEmail(
+                makeReq({ code: '000000' }, { actor }),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 404 });
+    });
+});
+
+describe('AuthController.handleRevokeSession additional branches', () => {
+    it('successfully revokes the actor’s own session', async () => {
+        const { user, actor } = await makeUserAndActor();
+        const sessionRes = await server.services.auth.createSessionToken(
+            user,
+            {},
+        );
+        const sessionUid = (sessionRes.session as { uuid: string }).uuid;
+        const res = makeRes();
+        await controller.handleRevokeSession(
+            makeReq({ uuid: sessionUid }, { actor }),
+            res,
+        );
+        const body = res.body as { sessions: unknown[] };
+        expect(Array.isArray(body.sessions)).toBe(true);
+    });
+
+    it('refuses to revoke the caller’s OWN current session row (400)', async () => {
+        // Invariant: a self-revoke leaves the client in an ambiguous
+        // identity state because the response can't write fresh auth
+        // state. /logout is the only path that should end the session
+        // you're currently authenticated under.
+        const { user, actor } = await makeUserAndActor();
+        const sessionRes = await server.services.auth.createSessionToken(
+            user,
+            {},
+        );
+        const sessionUid = (sessionRes.session as { uuid: string }).uuid;
+        const actorWithSession = {
+            ...actor,
+            session: { uid: sessionUid },
+        } as Actor;
+        await expect(
+            controller.handleRevokeSession(
+                makeReq({ uuid: sessionUid }, { actor: actorWithSession }),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({
+            statusCode: 400,
+            legacyCode: 'bad_request',
+        });
+    });
+
+    it('still allows revoking a DIFFERENT session belonging to the same user', async () => {
+        // Sanity check that the self-revoke guard only blocks the
+        // caller's own uuid — sibling rows must still be revokable
+        // (that's the whole point of manage-sessions).
+        const { user, actor } = await makeUserAndActor();
+        const callerSession = await server.services.auth.createSessionToken(
+            user,
+            {},
+        );
+        const targetSession = await server.services.auth.createSessionToken(
+            user,
+            {},
+        );
+        const actorWithSession = {
+            ...actor,
+            session: {
+                uid: (callerSession.session as { uuid: string }).uuid,
+            },
+        } as Actor;
+        const res = makeRes();
+        await controller.handleRevokeSession(
+            makeReq(
+                { uuid: (targetSession.session as { uuid: string }).uuid },
+                { actor: actorWithSession },
+            ),
+            res,
+        );
+        expect((res.body as { sessions: unknown[] }).sessions).toBeDefined();
+    });
+});
+
+// -- auth_id preservation on forced re-login --
+
+describe('AuthController auth_id preservation on reauth', () => {
+    const password = 'correct-horse-battery';
+    const mintReauth = (
+        uuid: string,
+        reason: 'session_expired' | 'session_revoked' = 'session_expired',
+    ): string => server.services.auth.signReauthToken(uuid, reason);
+
+    it('handleLogin with matching reauth_token completes login as the same user', async () => {
+        const u = `aid_${Math.random().toString(36).slice(2, 10)}`;
+        const ip = `127.0.${Math.floor(Math.random() * 200)}.1`;
+        await controller.handleSignup(
+            makeReq(
+                { username: u, email: `${u}@test.local`, password },
+                { ip },
+            ),
+            makeRes(),
+        );
+        const seeded = await server.stores.user.getByUsername(u);
+
+        const res = makeRes();
+        await controller.handleLogin(
+            makeReq(
+                {
+                    username: u,
+                    password,
+                    reauth_token: mintReauth(seeded!.uuid),
+                },
+                { ip },
+            ),
+            res,
+        );
+        expect(isCompleteLoginResponse(res.body)).toBe(true);
+        expect((res.body as { user: { uuid: string } }).user.uuid).toBe(
+            seeded!.uuid,
+        );
+    });
+
+    it('handleLogin with mismatched reauth_token is rejected 409', async () => {
+        const a = `aida_${Math.random().toString(36).slice(2, 10)}`;
+        const b = `aidb_${Math.random().toString(36).slice(2, 10)}`;
+        const ip = `127.0.${Math.floor(Math.random() * 200)}.2`;
+        await controller.handleSignup(
+            makeReq(
+                { username: a, email: `${a}@test.local`, password },
+                { ip },
+            ),
+            makeRes(),
+        );
+        await controller.handleSignup(
+            makeReq(
+                { username: b, email: `${b}@test.local`, password },
+                { ip },
+            ),
+            makeRes(),
+        );
+        const userB = await server.stores.user.getByUsername(b);
+
+        await expect(
+            controller.handleLogin(
+                makeReq(
+                    {
+                        username: a,
+                        password,
+                        reauth_token: mintReauth(userB!.uuid),
+                    },
+                    { ip },
+                ),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({
+            statusCode: 409,
+            fields: { code: 'auth_id_mismatch' },
+        });
+    });
+
+    it('handleLogin with reauth_token for an unknown user returns 404', async () => {
+        const u = `aidu_${Math.random().toString(36).slice(2, 10)}`;
+        const ip = `127.0.${Math.floor(Math.random() * 200)}.3`;
+        await controller.handleSignup(
+            makeReq(
+                { username: u, email: `${u}@test.local`, password },
+                { ip },
+            ),
+            makeRes(),
+        );
+        await expect(
+            controller.handleLogin(
+                makeReq(
+                    {
+                        username: u,
+                        password,
+                        reauth_token: mintReauth(uuidv4()),
+                    },
+                    { ip },
+                ),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 404 });
+    });
+
+    it('handleLogin with a non-string reauth_token returns 400', async () => {
+        const u = `aidb_${Math.random().toString(36).slice(2, 10)}`;
+        const ip = `127.0.${Math.floor(Math.random() * 200)}.4`;
+        await controller.handleSignup(
+            makeReq(
+                { username: u, email: `${u}@test.local`, password },
+                { ip },
+            ),
+            makeRes(),
+        );
+        await expect(
+            controller.handleLogin(
+                makeReq({ username: u, password, reauth_token: 42 }, { ip }),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 400 });
+    });
+
+    it('handleLogin with a forged/garbage reauth_token returns 401', async () => {
+        const u = `aidf_${Math.random().toString(36).slice(2, 10)}`;
+        const ip = `127.0.${Math.floor(Math.random() * 200)}.9`;
+        await controller.handleSignup(
+            makeReq(
+                { username: u, email: `${u}@test.local`, password },
+                { ip },
+            ),
+            makeRes(),
+        );
+        await expect(
+            controller.handleLogin(
+                makeReq(
+                    { username: u, password, reauth_token: 'not-a-jwt' },
+                    { ip },
+                ),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 401 });
+    });
+
+    it('handleLogin OTP branch echoes auth_id into the OTP JWT', async () => {
+        const u = `aidotp_${Math.random().toString(36).slice(2, 10)}`;
+        const ip = `127.0.${Math.floor(Math.random() * 200)}.5`;
+        await controller.handleSignup(
+            makeReq(
+                { username: u, email: `${u}@test.local`, password },
+                { ip },
+            ),
+            makeRes(),
+        );
+        const seeded = await server.stores.user.getByUsername(u);
+        await server.stores.user.update(seeded!.id, {
+            otp_enabled: 1,
+            otp_secret: 'TESTSECRETBASE32',
+        });
+
+        const res = makeRes();
+        await controller.handleLogin(
+            makeReq(
+                {
+                    username: u,
+                    password,
+                    reauth_token: mintReauth(seeded!.uuid),
+                },
+                { ip },
+            ),
+            res,
+        );
+        expect(res.statusCode).toBe(202);
+        const body = res.body as { otp_jwt_token: string };
+        const decoded = server.services.token.verify(
+            'otp',
+            body.otp_jwt_token,
+        ) as {
+            user_uid: string;
+            auth_id?: string;
+        };
+        expect(decoded.auth_id).toBe(seeded!.uuid);
+    });
+
+    it('handleSignup is_temp + matching reauth_token returns the SAME temp user', async () => {
+        const tempRes1 = makeRes();
+        const ip = `127.0.${Math.floor(Math.random() * 200)}.6`;
+        await controller.handleSignup(
+            makeReq({ is_temp: true }, { ip }),
+            tempRes1,
+        );
+        const body1 = tempRes1.body as { user: { uuid: string } };
+        const tempUuid = body1.user.uuid;
+        const tempUser1 = await server.stores.user.getByUuid(tempUuid);
+        expect(tempUser1).toBeTruthy();
+        const markerId = tempUser1!.id;
+
+        const tempRes2 = makeRes();
+        await controller.handleSignup(
+            makeReq(
+                { is_temp: true, reauth_token: mintReauth(tempUuid) },
+                { ip },
+            ),
+            tempRes2,
+        );
+        expect(isCompleteLoginResponse(tempRes2.body)).toBe(true);
+        const body2 = tempRes2.body as {
+            user: { uuid: string; is_temp: boolean };
+        };
+        expect(body2.user.uuid).toBe(tempUuid);
+        expect(body2.user.is_temp).toBe(true);
+
+        const tempUser2 = await server.stores.user.getByUuid(tempUuid);
+        expect(tempUser2!.id).toBe(markerId);
+    });
+
+    it('handleSignup is_temp refuses a reauth_token from a revoked session', async () => {
+        const ip = `127.0.${Math.floor(Math.random() * 200)}.9`;
+        const first = makeRes();
+        await controller.handleSignup(
+            makeReq({ is_temp: true }, { ip }),
+            first,
+        );
+        const tempUuid = (first.body as { user: { uuid: string } }).user.uuid;
+
+        await expect(
+            controller.handleSignup(
+                makeReq(
+                    {
+                        is_temp: true,
+                        reauth_token: mintReauth(tempUuid, 'session_revoked'),
+                    },
+                    { ip },
+                ),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 401 });
+
+        // A token that names no reason is refused the same way.
+        const noReason = server.services.token.sign(
+            'otp',
+            { auth_id: tempUuid, purpose: 'reauth' },
+            { expiresIn: '10m' },
+        );
+        await expect(
+            controller.handleSignup(
+                makeReq({ is_temp: true, reauth_token: noReason }, { ip }),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 401 });
+    });
+
+    it('handleSignup is_temp + reauth_token pointing at a permanent user is rejected', async () => {
+        const u = `aidperm_${Math.random().toString(36).slice(2, 10)}`;
+        const ip = `127.0.${Math.floor(Math.random() * 200)}.7`;
+        await controller.handleSignup(
+            makeReq(
+                { username: u, email: `${u}@test.local`, password },
+                { ip },
+            ),
+            makeRes(),
+        );
+        const seeded = await server.stores.user.getByUsername(u);
+
+        await expect(
+            controller.handleSignup(
+                makeReq(
+                    {
+                        is_temp: true,
+                        reauth_token: mintReauth(seeded!.uuid),
+                    },
+                    { ip },
+                ),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 400 });
+    });
+
+    it('handleSignup is_temp + reauth_token for an unknown user returns 404', async () => {
+        const ip = `127.0.${Math.floor(Math.random() * 200)}.8`;
+        await expect(
+            controller.handleSignup(
+                makeReq(
+                    {
+                        is_temp: true,
+                        reauth_token: mintReauth(uuidv4()),
+                    },
+                    { ip },
+                ),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 404 });
+    });
+
+    it('handleSignup is_temp rejects a forged reauth_token (401)', async () => {
+        const ip = `127.0.${Math.floor(Math.random() * 200)}.10`;
+        await expect(
+            controller.handleSignup(
+                makeReq({ is_temp: true, reauth_token: 'not-a-jwt' }, { ip }),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 401 });
+    });
+
+    it('rate-limits reauth_token login attempts per IP', async () => {
+        const ip = `10.99.${Math.floor(Math.random() * 200)}.${Math.floor(Math.random() * 200)}`;
+        const u = `aidrl_${Math.random().toString(36).slice(2, 10)}`;
+        await controller.handleSignup(
+            makeReq(
+                { username: u, email: `${u}@test.local`, password },
+                { ip },
+            ),
+            makeRes(),
+        );
+        const seeded = await server.stores.user.getByUsername(u);
+
+        for (let i = 0; i < 5; i++) {
+            const res = makeRes();
+            await controller.handleLogin(
+                makeReq(
+                    {
+                        username: u,
+                        password,
+                        reauth_token: mintReauth(seeded!.uuid),
+                    },
+                    { ip },
+                ),
+                res,
+            );
+            expect(isCompleteLoginResponse(res.body)).toBe(true);
+        }
+        await expect(
+            controller.handleLogin(
+                makeReq(
+                    {
+                        username: u,
+                        password,
+                        reauth_token: mintReauth(seeded!.uuid),
+                    },
+                    { ip },
+                ),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 429 });
+    });
+});
+
+// ── Popup sign-in relay (/login/wait + /login/set) ──────────────────
+
+/**
+ * The relay stands in for the popup's `postMessage` hand-off on
+ * cross-origin-isolated openers, where COOP has severed `window.opener`.
+ * postMessage is audience-bound for free (it posts with `targetOrigin`); these
+ * tests pin the equivalent binding on the server-side path, since the session
+ * id is a link-borne value and not a secret.
+ */
+describe('AuthController.loginWait audience binding', () => {
+    const OPENER = 'https://opener.test';
+
+    /** Mint a real app-under-user token for `origin`, as the popup would. */
+    const mintAppToken = async (actor: Actor, origin: string) => {
+        const res = makeRes();
+        await inCtx(actor, () =>
+            controller.handleGetUserAppToken(
+                makeReq({ origin }, { actor }),
+                res,
+            ),
+        );
+        return (res.body as { token: string }).token;
+    };
+
+    /**
+     * Start a wait, then relay `token` into it. The handler resolves the origin
+     * (async, DB-backed) before subscribing, so the emit is retried until the
+     * wait settles rather than fired after a fixed sleep.
+     */
+    const waitWithRelay = async (
+        session: string,
+        headers: Record<string, unknown>,
+        token: string | null,
+    ) => {
+        const res = makeRes();
+        const waiting = controller.loginWait(
+            makeReq({ session }, { headers }),
+            res,
+        );
+        const settled = waiting.then(
+            () => 'ok' as const,
+            (e: unknown) => e,
+        );
+
+        if (token !== null) {
+            let done = false;
+            settled.then(() => {
+                done = true;
+            });
+            for (let i = 0; i < 100 && !done; i++) {
+                await controller.loginSet(
+                    makeReq({ session, auth_token: token }),
+                    makeRes(),
+                );
+                await new Promise((r) => setTimeout(r, 10));
+            }
+        }
+        return { res, outcome: await settled };
+    };
+
+    it('returns the token when the caller Origin matches the app it was minted for', async () => {
+        const { actor } = await makeUserAndActor();
+        const token = await mintAppToken(actor, OPENER);
+
+        const { res, outcome } = await waitWithRelay(
+            uuidv4(),
+            { origin: OPENER },
+            token,
+        );
+        expect(outcome).toBe('ok');
+        expect((res.body as { auth_token: string }).auth_token).toBe(token);
+    });
+
+    it('withholds a token minted for a different app from a mismatched Origin', async () => {
+        const { actor } = await makeUserAndActor();
+        // The attack: the popup was talked into minting for OPENER, but the
+        // party holding the session id is somewhere else entirely.
+        const token = await mintAppToken(actor, OPENER);
+
+        const { res, outcome } = await waitWithRelay(
+            uuidv4(),
+            { origin: 'https://evil.test' },
+            token,
+        );
+        // Same 408 the empty path returns — a mismatched caller must not be
+        // able to tell "nothing arrived" from "something arrived for someone
+        // else".
+        expect(outcome).toMatchObject({ statusCode: 408 });
+        expect(res.body).toBeUndefined();
+    });
+
+    it('rejects a caller that sends no Origin header', async () => {
+        // curl and any server-side fetch land here. Without this the session
+        // id alone — which travels in a link — would be enough to collect.
+        await expect(
+            controller.loginWait(makeReq({ session: uuidv4() }, {}), makeRes()),
+        ).rejects.toMatchObject({ statusCode: 403 });
+    });
+
+    it('rejects the opaque "null" origin', async () => {
+        // Sandboxed iframes and file:// documents both serialise to "null",
+        // so honouring it would make two unrelated opaque origins equal.
+        await expect(
+            controller.loginWait(
+                makeReq({ session: uuidv4() }, { headers: { origin: 'null' } }),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 403 });
+    });
+
+    it('answers 400 when the request has no parsable body', async () => {
+        // Destructuring an absent body is a TypeError, not a 400.
+        const req = makeReq({}, { headers: { origin: OPENER } });
+        (req as { body?: unknown }).body = undefined;
+        await expect(
+            controller.loginWait(req, makeRes()),
+        ).rejects.toMatchObject({ statusCode: 400, legacyCode: 'bad_request' });
+    });
+
+    it('rejects a non-string session id with 400', async () => {
+        await expect(
+            controller.loginWait(
+                makeReq(
+                    { session: { nested: true } as unknown as string },
+                    { headers: { origin: OPENER } },
+                ),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 400 });
+    });
+
+    it('still rejects a malformed session id before looking at Origin', async () => {
+        await expect(
+            controller.loginWait(
+                makeReq(
+                    { session: 'not-a-uuid' },
+                    { headers: { origin: OPENER } },
+                ),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 400 });
+    });
+
+    it('withholds a token that is not an app-under-user token', async () => {
+        // A session/GUI token relayed through here would sign the opener in
+        // as the user outright, not as the app.
+        const username = `relay_${uniq()}`;
+        const loginRes = makeRes();
+        await controller.handleSignup(
+            makeReq({
+                username,
+                email: `${username}@test.local`,
+                password: 'correct-horse-battery',
+            }),
+            loginRes,
+        );
+        const guiToken = (loginRes.body as { token: string }).token;
+
+        const { res, outcome } = await waitWithRelay(
+            uuidv4(),
+            { origin: OPENER },
+            guiToken,
+        );
+        expect(outcome).toMatchObject({ statusCode: 408 });
+        expect(res.body).toBeUndefined();
+    });
+
+    it('withholds a token with a valid shape but a forged signature', async () => {
+        const { actor } = await makeUserAndActor();
+        const real = await mintAppToken(actor, OPENER);
+        const forged = jwt.sign(
+            jwt.decode(real) as object,
+            'not-the-server-secret',
+            { keyid: 'v2' },
+        );
+
+        const { res, outcome } = await waitWithRelay(
+            uuidv4(),
+            { origin: OPENER },
+            forged,
+        );
+        expect(outcome).toMatchObject({ statusCode: 408 });
+        expect(res.body).toBeUndefined();
+    });
+});
+
+// -- Batch grant / revoke + cross-app data grants -----------------------
+
+describe('AuthController — app-data grants', () => {
+    let issuer: { id: number; username: string };
+    let issuerActor: Actor;
+
+    beforeAll(async () => {
+        const name = `ad_${Math.random().toString(36).slice(2, 10)}`;
+        await controller.handleSignup(
+            makeReq({
+                username: name,
+                email: `${name}@test.local`,
+                password: 'correct-horse-battery',
+            }),
+            makeRes(),
+        );
+        const row = await server.stores.user.getByUsername(name);
+        await server.stores.user.update(row!.id, { email_confirmed: 1 });
+        issuer = { id: row!.id, username: row!.username };
+        issuerActor = {
+            user: {
+                id: row!.id,
+                uuid: row!.uuid,
+                username: row!.username,
+                email: row!.email,
+                email_confirmed: true,
+            },
+        } as Actor;
+    });
+    const makeAppRow = async (fields: Record<string, unknown> = {}) =>
+        (await server.stores.app.create(
+            {
+                name: `ad-${uuidv4()}`,
+                title: 'AppDataTest',
+                index_url: 'https://example.test/index.html',
+                ...fields,
+            },
+            { ownerUserId: issuer.id },
+        )) as { id: number; uid: string };
+
+    const grantedPermissions = async (appUid: string): Promise<string[]> => {
+        const rows = (await server.clients.db.read(
+            'SELECT p.`permission` FROM `user_to_app_permissions` p ' +
+                'JOIN `apps` a ON a.`id` = p.`app_id` ' +
+                'WHERE p.`user_id` = ? AND a.`uid` = ?',
+            [issuer.id, appUid],
+        )) as Array<{ permission: string }>;
+        return rows.map((r) => r.permission);
+    };
+
+    const post = (
+        handler: 'handleGrantUserApp' | 'handleRevokeUserApp',
+        body: Record<string, unknown>,
+    ) => {
+        const res = makeRes();
+        return inCtx(issuerActor, () =>
+            controller[handler](makeReq(body, { actor: issuerActor }), res),
+        ).then(() => res);
+    };
+
+    it('grants every permission in a list in one request', async () => {
+        const grantee = await makeAppRow();
+        const target = await makeAppRow();
+        const permissions = [
+            `app-data:${target.uid}:kv:read`,
+            `app-data:${target.uid}:kv:delete`,
+        ];
+
+        await post('handleGrantUserApp', {
+            app_uid: grantee.uid,
+            permissions,
+        });
+
+        expect(await grantedPermissions(grantee.uid)).toEqual(
+            expect.arrayContaining(permissions),
+        );
+    });
+
+    it('revokes every permission in a list in one request', async () => {
+        const grantee = await makeAppRow();
+        const target = await makeAppRow();
+        const permissions = [
+            `app-data:${target.uid}:kv:read`,
+            `app-data:${target.uid}:fs:read`,
+        ];
+        await post('handleGrantUserApp', {
+            app_uid: grantee.uid,
+            permissions,
+        });
+
+        await post('handleRevokeUserApp', {
+            app_uid: grantee.uid,
+            permissions,
+        });
+
+        const remaining = await grantedPermissions(grantee.uid);
+        for (const permission of permissions) {
+            expect(remaining).not.toContain(permission);
+        }
+    });
+
+    it('rejects the scalar and list forms together', async () => {
+        const grantee = await makeAppRow();
+        const target = await makeAppRow();
+        await expect(
+            post('handleGrantUserApp', {
+                app_uid: grantee.uid,
+                permission: `app-data:${target.uid}:kv:read`,
+                permissions: [`app-data:${target.uid}:kv:write`],
+            }),
+        ).rejects.toMatchObject({ statusCode: 400 });
+    });
+
+    it('rejects an empty, oversized, or `*`-bearing list', async () => {
+        const grantee = await makeAppRow();
+        const target = await makeAppRow();
+        for (const permissions of [
+            [],
+            Array.from(
+                { length: 17 },
+                (_x, i) => `app-data:${target.uid}:kv:read${i}`,
+            ),
+            [`app-data:${target.uid}:kv:read`, '*'],
+        ]) {
+            await expect(
+                post('handleGrantUserApp', {
+                    app_uid: grantee.uid,
+                    permissions,
+                }),
+            ).rejects.toMatchObject({ statusCode: 400 });
+        }
+    });
+
+    it('writes nothing when one entry in the list is invalid', async () => {
+        const grantee = await makeAppRow();
+        const target = await makeAppRow();
+        await expect(
+            post('handleGrantUserApp', {
+                app_uid: grantee.uid,
+                permissions: [
+                    `app-data:${target.uid}:kv:read`,
+                    `app-data:app-does-not-exist:kv:read`,
+                ],
+            }),
+        ).rejects.toMatchObject({ statusCode: 404 });
+        // The valid entry must not have landed: validation runs over the whole
+        // list before any row is written.
+        expect(await grantedPermissions(grantee.uid)).not.toContain(
+            `app-data:${target.uid}:kv:read`,
+        );
+    });
+
+    it('writes nothing when an entry is too wide for the column it lands in', async () => {
+        // `#validateAppPermissionParams` allows 4096 chars but the column is 255,
+        // so this passes shape validation and fails inside the grant. Before the
+        // pre-flight, the first entry committed and the caller still got a 400 —
+        // and the dialog reads a 4xx as "nothing was written".
+        const grantee = await makeAppRow();
+        const target = await makeAppRow();
+        const good = `app-data:${target.uid}:kv:read`;
+        await expect(
+            post('handleGrantUserApp', {
+                app_uid: grantee.uid,
+                permissions: [good, 'x'.repeat(300)],
+            }),
+        ).rejects.toMatchObject({ statusCode: 400 });
+        expect(await grantedPermissions(grantee.uid)).not.toContain(good);
+    });
+
+    it('404s when the target app does not exist', async () => {
+        const grantee = await makeAppRow();
+        await expect(
+            post('handleGrantUserApp', {
+                app_uid: grantee.uid,
+                permission: 'app-data:app-nope/:kv:read',
+            }),
+        ).rejects.toMatchObject({ statusCode: 404 });
+    });
+
+    it('rejects a bare `app-data` with no target app', async () => {
+        const grantee = await makeAppRow();
+        for (const permission of ['app-data', 'app-data:', 'app-data::kv']) {
+            await expect(
+                post('handleGrantUserApp', {
+                    app_uid: grantee.uid,
+                    permission,
+                }),
+            ).rejects.toMatchObject({ statusCode: 400 });
+        }
+    });
+
+    it('refuses a grant when the target opted out of sharing', async () => {
+        const grantee = await makeAppRow();
+        const closed = await makeAppRow({
+            metadata: JSON.stringify({ share_app_data: false }),
+        });
+        await expect(
+            post('handleGrantUserApp', {
+                app_uid: grantee.uid,
+                permission: `app-data:${closed.uid}:kv:read`,
+            }),
+        ).rejects.toMatchObject({ statusCode: 403 });
+    });
+
+    it('still allows revoking a grant after the target opts out', async () => {
+        const grantee = await makeAppRow();
+        const target = await makeAppRow();
+        const permission = `app-data:${target.uid}:kv:read`;
+        await post('handleGrantUserApp', {
+            app_uid: grantee.uid,
+            permission,
+        });
+
+        await server.stores.app.update(target.id, {
+            metadata: JSON.stringify({ share_app_data: false }),
+        });
+
+        // A user must always be able to withdraw consent, whatever the target
+        // now says about sharing.
+        await post('handleRevokeUserApp', { app_uid: grantee.uid, permission });
+        expect(await grantedPermissions(grantee.uid)).not.toContain(permission);
+    });
+
+    it("creates the target's AppData directory for an fs grant", async () => {
+        const grantee = await makeAppRow();
+        const target = await makeAppRow();
+        const path = `/${issuer.username}/AppData/${target.uid}`;
+        expect(await server.stores.fsEntry.getEntryByPath(path)).toBeFalsy();
+
+        await post('handleGrantUserApp', {
+            app_uid: grantee.uid,
+            permission: `app-data:${target.uid}:fs:read`,
+        });
+
+        // Without this the grant is valid but every read 404s until the target
+        // app happens to run for the first time.
+        expect(await server.stores.fsEntry.getEntryByPath(path)).toBeTruthy();
+    });
+
+    it('leaves unrelated permissions untouched by the new validation', async () => {
+        const grantee = await makeAppRow();
+        const permission = 'service:unrelated:ii:read';
+        await post('handleGrantUserApp', {
+            app_uid: grantee.uid,
+            permission,
+        });
+        expect(await grantedPermissions(grantee.uid)).toContain(permission);
+    });
+});
+
+// -- An address a team seat holds without confirming it --
+
+describe('AuthController — a seat address nobody confirmed', () => {
+    /** A seat whose address its team typed in; unconfirmed. */
+    const makeSeat = async () => {
+        const { user: owner } = await makeUserAndActor();
+        const { user: seat } = await makeUserAndActor();
+        const team = await server.stores.team.create({
+            ownerUserId: owner.id,
+            name: 'Acme',
+        });
+        // A seat is created password-less and given a temporary one after.
+        await server.stores.user.update(seat.id, { password: null });
+        await server.stores.team.addMember(team.uid, seat.id, {
+            orgOwned: true,
+        });
+        await server.stores.user.update(seat.id, {
+            password: await bcrypt.hash('temporary-password', 8),
+        });
+        return seat;
+    };
+
+    const emailOf = async (id: number) =>
+        (await server.stores.user.getById(id, { force: true }))!.email ?? null;
+
+    it('signup takes the address, and the seat gives it up', async () => {
+        const seat = await makeSeat();
+        const username = `own_${uniq()}`;
+        await controller.handleSignup(
+            makeReq({
+                username,
+                email: seat.email!,
+                password: 'correct-horse-battery',
+            }),
+            makeRes(),
+        );
+
+        const owner = await server.stores.user.getByUsername(username);
+        expect(owner?.email).toBe(seat.email);
+        expect(await emailOf(seat.id)).toBeNull();
+    });
+
+    it('signup still refuses an address the seat confirmed', async () => {
+        const seat = await makeSeat();
+        await server.stores.user.update(seat.id, { email_confirmed: 1 });
+
+        await expect(
+            controller.handleSignup(
+                makeReq({
+                    username: `own_${uniq()}`,
+                    email: seat.email!,
+                    password: 'correct-horse-battery',
+                }),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 400 });
+        expect(await emailOf(seat.id)).toBe(seat.email);
+    });
+
+    it('a signup refused before the write leaves the seat its address', async () => {
+        const seat = await makeSeat();
+        await withSignupValidateOverride(
+            (event) => {
+                event.allow = false;
+            },
+            async () => {
+                await expect(
+                    controller.handleSignup(
+                        makeReq({
+                            username: `own_${uniq()}`,
+                            email: seat.email!,
+                            password: 'correct-horse-battery',
+                        }),
+                        makeRes(),
+                    ),
+                ).rejects.toBeTruthy();
+            },
+        );
+        expect(await emailOf(seat.id)).toBe(seat.email);
+    });
+
+    it('saving a temp account takes the address too', async () => {
+        const seat = await makeSeat();
+        const tempRes = makeRes();
+        await controller.handleSignup(makeReq({ is_temp: true }), tempRes);
+        const tempUuid = (tempRes.body as { user: { uuid: string } }).user.uuid;
+        const tempRow = await server.stores.user.getByUuid(tempUuid);
+        const actor = {
+            user: {
+                id: tempRow!.id,
+                uuid: tempRow!.uuid,
+                username: tempRow!.username,
+                email: null,
+                email_confirmed: false,
+            },
+        } as Actor;
+
+        await controller.handleSaveAccount(
+            makeReq(
+                {
+                    username: `save_${uniq()}`,
+                    email: seat.email!,
+                    password: 'another-strong-password',
+                },
+                { actor },
+            ),
+            makeRes(),
+        );
+        expect(await emailOf(tempRow!.id)).toBe(seat.email);
+        expect(await emailOf(seat.id)).toBeNull();
+    });
+});

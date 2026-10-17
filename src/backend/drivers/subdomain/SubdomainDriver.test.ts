@@ -1,0 +1,1346 @@
+/*
+ * Copyright (C) 2024-present Puter Technologies Inc.
+ *
+ * This file is part of Puter.
+ *
+ * Puter is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published
+ * by the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
+import { v4 as uuidv4 } from 'uuid';
+import { makeActor } from '../../core/actor.js';
+import type { Actor } from '../../core/actor.js';
+import { runWithContext } from '../../core/context.js';
+import { PuterServer } from '../../server.js';
+import {
+    APP_ICONS_SUBDOMAIN,
+    PROFILES_SUBDOMAIN,
+} from '../../util/systemSite.js';
+import { setupTestServer } from '../../testUtil.js';
+import { decodeCursor } from '../../util/pagination.js';
+import { generateDefaultFsentries } from '../../util/userProvisioning.js';
+import type { SubdomainDriver } from './SubdomainDriver.js';
+
+// ── Test harness ────────────────────────────────────────────────────
+//
+// Boots one PuterServer (in-memory sqlite + dynamo + s3 + mock redis)
+// and exercises the live SubdomainDriver against the real wired stores.
+// Each test makes its own user via `makeUser` so subdomain rows / quota
+// counts don't leak across cases.
+
+let server: PuterServer;
+let driver: SubdomainDriver;
+
+beforeAll(async () => {
+    server = await setupTestServer();
+    driver = server.drivers.subdomains as unknown as SubdomainDriver;
+});
+
+afterAll(async () => {
+    await server?.shutdown();
+});
+
+const makeUser = async (): Promise<{ actor: Actor; userId: number }> => {
+    const username = `sd-${Math.random().toString(36).slice(2, 10)}`;
+    const created = await server.stores.user.create({
+        username,
+        uuid: uuidv4(),
+        password: null,
+        email: `${username}@test.local`,
+        free_storage: 100 * 1024 * 1024,
+        requires_email_confirmation: false,
+    });
+    // Driver checks ACL on `root_dir`, which requires the home tree to
+    // exist — without provisioning, every create call would 400.
+    await generateDefaultFsentries(
+        server.clients.db,
+        server.stores.user,
+        created,
+    );
+    const refreshed = (await server.stores.user.getById(created.id))!;
+    return {
+        userId: refreshed.id,
+        actor: {
+            user: {
+                id: refreshed.id,
+                uuid: refreshed.uuid,
+                username: refreshed.username,
+                email: refreshed.email ?? null,
+                email_confirmed: true,
+            } as Actor['user'],
+        },
+    };
+};
+
+const withActor = async <T>(actor: Actor, fn: () => Promise<T>): Promise<T> =>
+    runWithContext({ actor }, fn);
+
+const uniqueSubdomain = (prefix: string) =>
+    `${prefix}-${Math.random().toString(36).slice(2, 10)}`;
+
+// ── create ──────────────────────────────────────────────────────────
+
+describe('SubdomainDriver.create', () => {
+    it('creates a subdomain pointing at an owned fs path', async () => {
+        const { actor, userId } = await makeUser();
+        const username = actor.user!.username!;
+        const sub = uniqueSubdomain('site');
+
+        const result = (await withActor(actor, () =>
+            driver.create({
+                object: {
+                    subdomain: sub,
+                    root_dir: `/${username}/Public`,
+                },
+            }),
+        )) as Record<string, unknown> | null;
+
+        expect(result).not.toBeNull();
+        expect(result?.subdomain).toBe(sub);
+        // Owner is hydrated as `{ username, uuid }`, not a numeric id.
+        expect(result?.owner).toMatchObject({ username });
+
+        const row =
+            await server.stores.subdomain.getBySubdomain(sub);
+        expect(row?.user_id).toBe(userId);
+    });
+
+    it('expands `~/Public` against the actor home before resolving root_dir', async () => {
+        const { actor } = await makeUser();
+        const sub = uniqueSubdomain('tilde');
+
+        await withActor(actor, () =>
+            driver.create({
+                object: { subdomain: sub, root_dir: '~/Public' },
+            }),
+        );
+
+        const row =
+            await server.stores.subdomain.getBySubdomain(sub);
+        expect(row).not.toBeNull();
+    });
+
+    it('rejects an invalid subdomain format with 400', async () => {
+        const { actor } = await makeUser();
+        await expect(
+            withActor(actor, () =>
+                driver.create({
+                    object: {
+                        subdomain: 'NOT_VALID!',
+                        root_dir: `/${actor.user!.username}/Public`,
+                    },
+                }),
+            ),
+        ).rejects.toMatchObject({ statusCode: 400 });
+    });
+
+    it('rejects a reserved subdomain word with 400', async () => {
+        const { actor } = await makeUser();
+        await expect(
+            withActor(actor, () =>
+                driver.create({
+                    object: {
+                        subdomain: 'admin',
+                        root_dir: `/${actor.user!.username}/Public`,
+                    },
+                }),
+            ),
+        ).rejects.toMatchObject({ statusCode: 400 });
+    });
+
+    it('rejects the system-owned subdomains as reserved', async () => {
+        const { actor } = await makeUser();
+        for (const subdomain of [
+            APP_ICONS_SUBDOMAIN,
+            PROFILES_SUBDOMAIN,
+            'Puter-Profiles',
+        ]) {
+            await expect(
+                withActor(actor, () =>
+                    driver.create({
+                        object: {
+                            subdomain,
+                            root_dir: `/${actor.user!.username}/Public`,
+                        },
+                    }),
+                ),
+            ).rejects.toMatchObject({ statusCode: 400 });
+        }
+    });
+
+    it('rejects a duplicate subdomain with 409', async () => {
+        const a = await makeUser();
+        const b = await makeUser();
+        const sub = uniqueSubdomain('dup');
+
+        await withActor(a.actor, () =>
+            driver.create({
+                object: {
+                    subdomain: sub,
+                    root_dir: `/${a.actor.user!.username}/Public`,
+                },
+            }),
+        );
+
+        await expect(
+            withActor(b.actor, () =>
+                driver.create({
+                    object: {
+                        subdomain: sub,
+                        root_dir: `/${b.actor.user!.username}/Public`,
+                    },
+                }),
+            ),
+        ).rejects.toMatchObject({ statusCode: 409 });
+    });
+
+    it('reports a lost uniqueness race as 409, not a 500', async () => {
+        const { actor } = await makeUser();
+
+        // The uniqueness check and the insert are two statements, so a name can
+        // be claimed in between and only the index catches it. The in-memory
+        // sqlite schema has no unique index on `subdomain` (mysql and postgres
+        // do), so the losing insert is what gets stubbed here.
+        const dup = Object.assign(new Error('Duplicate entry'), {
+            code: 'ER_DUP_ENTRY',
+            errno: 1062,
+        });
+        const create = vi
+            .spyOn(server.stores.subdomain, 'create')
+            .mockRejectedValueOnce(dup);
+
+        try {
+            await expect(
+                withActor(actor, () =>
+                    driver.create({
+                        object: {
+                            subdomain: uniqueSubdomain('race'),
+                            root_dir: `/${actor.user!.username}/Public`,
+                        },
+                    }),
+                ),
+            ).rejects.toMatchObject({ statusCode: 409 });
+        } finally {
+            create.mockRestore();
+        }
+    });
+
+    it('lets a non-uniqueness insert failure surface as a server error', async () => {
+        const { actor } = await makeUser();
+
+        const create = vi
+            .spyOn(server.stores.subdomain, 'create')
+            .mockRejectedValueOnce(new Error('connection lost'));
+
+        try {
+            await expect(
+                withActor(actor, () =>
+                    driver.create({
+                        object: {
+                            subdomain: uniqueSubdomain('boom'),
+                            root_dir: `/${actor.user!.username}/Public`,
+                        },
+                    }),
+                ),
+            ).rejects.toThrow('connection lost');
+        } finally {
+            create.mockRestore();
+        }
+    });
+
+    it('rejects when root_dir does not exist', async () => {
+        const { actor } = await makeUser();
+        await expect(
+            withActor(actor, () =>
+                driver.create({
+                    object: {
+                        subdomain: uniqueSubdomain('missing'),
+                        root_dir: `/${actor.user!.username}/does-not-exist`,
+                    },
+                }),
+            ),
+        ).rejects.toMatchObject({ statusCode: 400 });
+    });
+
+    it("rejects pointing root_dir at another user's tree", async () => {
+        const a = await makeUser();
+        const b = await makeUser();
+        await expect(
+            withActor(a.actor, () =>
+                driver.create({
+                    object: {
+                        subdomain: uniqueSubdomain('intruder'),
+                        root_dir: `/${b.actor.user!.username}/Public`,
+                    },
+                }),
+            ),
+        ).rejects.toMatchObject({
+            statusCode: expect.any(Number),
+        });
+    });
+
+    it('rejects a missing object body with 400', async () => {
+        const { actor } = await makeUser();
+        await expect(
+            withActor(actor, () =>
+                driver.create({} as Record<string, unknown>),
+            ),
+        ).rejects.toMatchObject({ statusCode: 400 });
+    });
+
+    it('throws 401 with no actor in context', async () => {
+        await expect(
+            driver.create({
+                object: {
+                    subdomain: uniqueSubdomain('noctx'),
+                    root_dir: '/x',
+                },
+            }),
+        ).rejects.toMatchObject({ statusCode: 401 });
+    });
+});
+
+// ── read / select ───────────────────────────────────────────────────
+
+describe('SubdomainDriver.read / select', () => {
+    it('reads a subdomain by uid for its owner', async () => {
+        const { actor } = await makeUser();
+        const username = actor.user!.username!;
+        const sub = uniqueSubdomain('read');
+
+        const created = (await withActor(actor, () =>
+            driver.create({
+                object: { subdomain: sub, root_dir: `/${username}/Public` },
+            }),
+        )) as Record<string, unknown>;
+
+        const fetched = (await withActor(actor, () =>
+            driver.read({ uid: created.uid }),
+        )) as Record<string, unknown> | null;
+
+        expect(fetched?.subdomain).toBe(sub);
+    });
+
+    it('reads via id object with `{ subdomain }`', async () => {
+        const { actor } = await makeUser();
+        const sub = uniqueSubdomain('read-by-name');
+        await withActor(actor, () =>
+            driver.create({
+                object: {
+                    subdomain: sub,
+                    root_dir: `/${actor.user!.username}/Public`,
+                },
+            }),
+        );
+
+        const fetched = (await withActor(actor, () =>
+            driver.read({ id: { subdomain: sub } }),
+        )) as Record<string, unknown> | null;
+
+        expect(fetched?.subdomain).toBe(sub);
+    });
+
+    it("rejects reading another user's subdomain with 403", async () => {
+        const a = await makeUser();
+        const b = await makeUser();
+        const sub = uniqueSubdomain('private');
+
+        const created = (await withActor(a.actor, () =>
+            driver.create({
+                object: {
+                    subdomain: sub,
+                    root_dir: `/${a.actor.user!.username}/Public`,
+                },
+            }),
+        )) as Record<string, unknown>;
+
+        await expect(
+            withActor(b.actor, () => driver.read({ uid: created.uid })),
+        ).rejects.toMatchObject({ statusCode: 403 });
+    });
+
+    it('returns 404 when reading a missing subdomain', async () => {
+        const { actor } = await makeUser();
+        await expect(
+            withActor(actor, () =>
+                driver.read({ uid: 'nonexistent-uuid' }),
+            ),
+        ).rejects.toMatchObject({ statusCode: 404 });
+    });
+
+    it('select returns only the actor-owned subdomains', async () => {
+        const a = await makeUser();
+        const b = await makeUser();
+        await withActor(a.actor, () =>
+            driver.create({
+                object: {
+                    subdomain: uniqueSubdomain('mine'),
+                    root_dir: `/${a.actor.user!.username}/Public`,
+                },
+            }),
+        );
+        await withActor(b.actor, () =>
+            driver.create({
+                object: {
+                    subdomain: uniqueSubdomain('theirs'),
+                    root_dir: `/${b.actor.user!.username}/Public`,
+                },
+            }),
+        );
+
+        const result = (await withActor(a.actor, () =>
+            driver.select({}),
+        )) as Array<Record<string, unknown>>;
+
+        // Owners surface as `{ username, uuid }`; assert we only see a's.
+        for (const row of result) {
+            expect((row.owner as { username: string }).username).toBe(
+                a.actor.user!.username,
+            );
+        }
+    });
+});
+
+// -- select pagination --
+
+describe('SubdomainDriver.select pagination', () => {
+    const makeSubs = async (count: number) => {
+        const { actor } = await makeUser();
+        const username = actor.user!.username!;
+        const subs: string[] = [];
+        for (let i = 0; i < count; i++) {
+            const sub = uniqueSubdomain(`page${i}`);
+            subs.push(sub);
+            await withActor(actor, () =>
+                driver.create({
+                    object: { subdomain: sub, root_dir: `/${username}/Public` },
+                }),
+            );
+        }
+        return { actor, subs };
+    };
+
+    it('keeps the bare array response for plain limit requests', async () => {
+        const { actor } = await makeSubs(2);
+        const result = await withActor(actor, () =>
+            driver.select({ limit: 10 }),
+        );
+        expect(Array.isArray(result)).toBe(true);
+    });
+
+    it('pages through subdomains with cursors', async () => {
+        const { actor, subs } = await makeSubs(3);
+        const seen: string[] = [];
+        let cursor: string | null | undefined = null;
+        do {
+            const page = (await withActor(actor, () =>
+                driver.select({ limit: 2, cursor }),
+            )) as { items: Array<{ subdomain: string }>; cursor?: string };
+            seen.push(...page.items.map((r) => r.subdomain));
+            cursor = page.cursor;
+            // Sealed: it reads as nothing but a cursor.
+            if (cursor) expect(() => decodeCursor(cursor)).toThrow();
+        } while (cursor);
+        expect(seen.sort()).toEqual([...subs].sort());
+    });
+
+    it('supports offset paging', async () => {
+        const { actor, subs } = await makeSubs(3);
+        const page = (await withActor(actor, () =>
+            driver.select({ limit: 10, offset: 1 }),
+        )) as { items: Array<{ subdomain: string }> };
+        expect(page.items.length).toBe(subs.length - 1);
+    });
+
+    it('rejects cursor combined with offset', async () => {
+        const { actor } = await makeSubs(2);
+        const first = (await withActor(actor, () =>
+            driver.select({ limit: 1, cursor: null }),
+        )) as { cursor?: string };
+        expect(first.cursor).toBeDefined();
+        await expect(
+            withActor(actor, () =>
+                driver.select({ offset: 1, cursor: first.cursor }),
+            ),
+        ).rejects.toMatchObject({ statusCode: 400 });
+    });
+
+    it('excludes worker-backed subdomains from listings and totals', async () => {
+        const { actor, subs } = await makeSubs(2);
+        await server.stores.subdomain.create({
+            userId: actor.user!.id as number,
+            subdomain: `workers.puter.wk-${Date.now()}`,
+            rootDirId: null,
+            associatedAppId: null,
+            appOwner: null,
+        });
+
+        const bare = (await withActor(actor, () =>
+            driver.select({}),
+        )) as Array<{ subdomain: string }>;
+        expect(bare.map((r) => r.subdomain).sort()).toEqual([...subs].sort());
+
+        const page = (await withActor(actor, () =>
+            driver.select({ limit: 10, cursor: null, includeTotal: true }),
+        )) as { items: Array<{ subdomain: string }>; total?: number };
+        expect(page.items.map((r) => r.subdomain).sort()).toEqual(
+            [...subs].sort(),
+        );
+        expect(page.total).toBe(subs.length);
+    });
+
+    it('reports total scoped to the actor with includeTotal', async () => {
+        const { actor, subs } = await makeSubs(3);
+        await makeSubs(2); // another user's rows must not count
+        const page = (await withActor(actor, () =>
+            driver.select({ limit: 1, includeTotal: true }),
+        )) as { items: unknown[]; total?: number };
+        expect(page.items.length).toBe(1);
+        expect(page.total).toBe(subs.length);
+    });
+});
+
+// ── update ──────────────────────────────────────────────────────────
+
+describe('SubdomainDriver.update', () => {
+    it('updates root_dir to another owned path', async () => {
+        const { actor } = await makeUser();
+        const username = actor.user!.username!;
+        const sub = uniqueSubdomain('upd');
+
+        const created = (await withActor(actor, () =>
+            driver.create({
+                object: { subdomain: sub, root_dir: `/${username}/Public` },
+            }),
+        )) as Record<string, unknown>;
+
+        const updated = (await withActor(actor, () =>
+            driver.update({
+                uid: created.uid,
+                object: { root_dir: `/${username}/Documents` },
+            }),
+        )) as Record<string, unknown> | null;
+
+        expect(updated).not.toBeNull();
+        const rootDir = updated!.root_dir as Record<string, unknown> | null;
+        expect(rootDir?.path).toBe(`/${username}/Documents`);
+    });
+
+    it('does not let an update set the custom domain', async () => {
+        const { actor } = await makeUser();
+        const username = actor.user!.username!;
+        const sub = uniqueSubdomain('upd-domain');
+
+        const created = (await withActor(actor, () =>
+            driver.create({
+                object: { subdomain: sub, root_dir: `/${username}/Public` },
+            }),
+        )) as Record<string, unknown>;
+
+        await withActor(actor, () =>
+            driver.update({
+                uid: created.uid,
+                object: {
+                    root_dir: `/${username}/Documents`,
+                    domain: 'someone-elses.example',
+                },
+            }),
+        );
+
+        const row = await server.stores.subdomain.getByUuid(
+            String(created.uid),
+        );
+        expect(row?.domain ?? null).toBeNull();
+    });
+
+    it('refuses to update a subdomain owned by another user with 403', async () => {
+        const a = await makeUser();
+        const b = await makeUser();
+        const sub = uniqueSubdomain('cross-upd');
+
+        const created = (await withActor(a.actor, () =>
+            driver.create({
+                object: {
+                    subdomain: sub,
+                    root_dir: `/${a.actor.user!.username}/Public`,
+                },
+            }),
+        )) as Record<string, unknown>;
+
+        await expect(
+            withActor(b.actor, () =>
+                driver.update({
+                    uid: created.uid,
+                    object: {
+                        root_dir: `/${b.actor.user!.username}/Public`,
+                    },
+                }),
+            ),
+        ).rejects.toMatchObject({ statusCode: 403 });
+    });
+
+    it('returns 404 for a missing object body', async () => {
+        const { actor } = await makeUser();
+        await expect(
+            withActor(actor, () =>
+                driver.update({ uid: 'whatever' } as Record<string, unknown>),
+            ),
+        ).rejects.toMatchObject({ statusCode: 400 });
+    });
+});
+
+// ── publishing someone else's directory ─────────────────────────────
+//
+// Hosting serves the root dir with the ACL bypassed, so pointing a subdomain
+// at a directory publishes it. A `write` share does not carry that decision:
+// the row would live under the recipient's account, cover files the owner adds
+// later, and show up in nothing the owner can list.
+
+const shareDir = async (
+    owner: { actor: Actor },
+    holder: { actor: Actor },
+    path: string,
+    mode: 'read' | 'write' | 'manage',
+): Promise<void> => {
+    const entry = (await server.stores.fsEntry.getEntryByPath(path))!;
+    await server.services.acl.setUserUser(
+        owner.actor,
+        holder.actor,
+        {
+            path: entry.path,
+            resolveAncestors: () =>
+                server.services.fs.getAncestorChain(entry.path),
+        },
+        mode,
+    );
+};
+
+describe('SubdomainDriver root_dir publishing rights', () => {
+    it('refuses a directory shared with the actor at write', async () => {
+        const owner = await makeUser();
+        const writer = await makeUser();
+        const shared = `/${owner.actor.user!.username}/Documents`;
+        await shareDir(owner, writer, shared, 'write');
+
+        await expect(
+            withActor(writer.actor, () =>
+                driver.create({
+                    object: {
+                        subdomain: uniqueSubdomain('borrowed'),
+                        root_dir: shared,
+                    },
+                }),
+            ),
+        ).rejects.toMatchObject({ statusCode: 403 });
+    });
+
+    // "Can edit & share" is the owner delegating the decision.
+    it('accepts a directory shared with the actor at manage', async () => {
+        const owner = await makeUser();
+        const manager = await makeUser();
+        const shared = `/${owner.actor.user!.username}/Documents`;
+        await shareDir(owner, manager, shared, 'manage');
+        const sub = uniqueSubdomain('delegated');
+
+        const created = (await withActor(manager.actor, () =>
+            driver.create({
+                object: { subdomain: sub, root_dir: shared },
+            }),
+        )) as Record<string, unknown> | null;
+
+        expect(created?.subdomain).toBe(sub);
+    });
+
+    it('refuses to repoint an existing subdomain at a write-shared directory', async () => {
+        const owner = await makeUser();
+        const writer = await makeUser();
+        const shared = `/${owner.actor.user!.username}/Documents`;
+        await shareDir(owner, writer, shared, 'write');
+
+        const created = (await withActor(writer.actor, () =>
+            driver.create({
+                object: {
+                    subdomain: uniqueSubdomain('repoint'),
+                    root_dir: `/${writer.actor.user!.username}/Public`,
+                },
+            }),
+        )) as Record<string, unknown>;
+
+        await expect(
+            withActor(writer.actor, () =>
+                driver.update({
+                    uid: created.uid,
+                    object: { root_dir: shared },
+                }),
+            ),
+        ).rejects.toMatchObject({ statusCode: 403 });
+    });
+
+    // The owner's own path still only needs write, so an app hosting a
+    // directory its user gave it keeps working.
+    it("still accepts the actor's own directory", async () => {
+        const { actor } = await makeUser();
+        const sub = uniqueSubdomain('own');
+
+        const created = (await withActor(actor, () =>
+            driver.create({
+                object: {
+                    subdomain: sub,
+                    root_dir: `/${actor.user!.username}/Documents`,
+                },
+            }),
+        )) as Record<string, unknown> | null;
+
+        expect(created?.subdomain).toBe(sub);
+    });
+});
+
+// ── upsert ──────────────────────────────────────────────────────────
+
+describe('SubdomainDriver.upsert', () => {
+    it('creates when no row matches the args', async () => {
+        const { actor } = await makeUser();
+        const sub = uniqueSubdomain('ups');
+        const result = (await withActor(actor, () =>
+            driver.upsert({
+                object: {
+                    subdomain: sub,
+                    root_dir: `/${actor.user!.username}/Public`,
+                },
+            }),
+        )) as Record<string, unknown> | null;
+        expect(result?.subdomain).toBe(sub);
+    });
+
+    it('updates when an existing row resolves via id.subdomain', async () => {
+        const { actor } = await makeUser();
+        const username = actor.user!.username!;
+        const sub = uniqueSubdomain('ups-existing');
+        await withActor(actor, () =>
+            driver.create({
+                object: { subdomain: sub, root_dir: `/${username}/Public` },
+            }),
+        );
+
+        const result = (await withActor(actor, () =>
+            driver.upsert({
+                id: { subdomain: sub },
+                object: { root_dir: `/${username}/Documents` },
+            }),
+        )) as Record<string, unknown> | null;
+
+        const rootDir = result!.root_dir as Record<string, unknown> | null;
+        expect(rootDir?.path).toBe(`/${username}/Documents`);
+    });
+});
+
+// ── delete ──────────────────────────────────────────────────────────
+
+describe('SubdomainDriver.delete', () => {
+    it('deletes an owned subdomain and reports success', async () => {
+        const { actor } = await makeUser();
+        const sub = uniqueSubdomain('del');
+        const created = (await withActor(actor, () =>
+            driver.create({
+                object: {
+                    subdomain: sub,
+                    root_dir: `/${actor.user!.username}/Public`,
+                },
+            }),
+        )) as Record<string, unknown>;
+
+        const result = (await withActor(actor, () =>
+            driver.delete({ uid: created.uid }),
+        )) as { success: boolean; uid: string };
+
+        expect(result.success).toBe(true);
+        expect(result.uid).toBe(created.uid);
+        expect(
+            await server.stores.subdomain.getBySubdomain(sub),
+        ).toBeNull();
+    });
+
+    it("refuses to delete another user's subdomain with 403", async () => {
+        const a = await makeUser();
+        const b = await makeUser();
+        const sub = uniqueSubdomain('cross-del');
+        const created = (await withActor(a.actor, () =>
+            driver.create({
+                object: {
+                    subdomain: sub,
+                    root_dir: `/${a.actor.user!.username}/Public`,
+                },
+            }),
+        )) as Record<string, unknown>;
+
+        await expect(
+            withActor(b.actor, () => driver.delete({ uid: created.uid })),
+        ).rejects.toMatchObject({ statusCode: 403 });
+
+        // a's row is still there.
+        expect(
+            await server.stores.subdomain.getBySubdomain(sub),
+        ).not.toBeNull();
+    });
+
+    it('returns 404 for a non-existent subdomain', async () => {
+        const { actor } = await makeUser();
+        await expect(
+            withActor(actor, () =>
+                driver.delete({ uid: 'nonexistent-uuid' }),
+            ),
+        ).rejects.toMatchObject({ statusCode: 404 });
+    });
+});
+
+// ── associated_app derivation (security fix) ───────────────────────
+//
+// `associated_app_uid` was previously a user-writable field on the
+// subdomain row, with no check that the targeted app belonged to the
+// caller. That let an attacker bind their own subdomain to another
+// user's app (notably a private app), tricking the hosted-site
+// middleware into running the entitlement gate for the victim's app on
+// the attacker's subdomain. The field is now ignored on writes and
+// derived on reads from `apps.owner_user_id = subdomain.user_id` plus
+// an `index_url` match against the subdomain's host variants.
+
+const createAppWithIndexUrl = async (
+    ownerUserId: number | null,
+    indexUrl: string,
+    opts: { isPrivate?: boolean; appOwner?: number } = {},
+): Promise<{ id: number; uid: string }> => {
+    const uid = `app-${uuidv4()}`;
+    await server.clients.db.write(
+        `INSERT INTO \`apps\` (\`uid\`, \`name\`, \`title\`, \`index_url\`, \`owner_user_id\`, \`is_private\`, \`app_owner\`)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        [
+            uid,
+            `app-${uid}`,
+            `app-${uid}`,
+            indexUrl,
+            ownerUserId,
+            opts.isPrivate ? 1 : 0,
+            opts.appOwner ?? null,
+        ],
+    );
+    const row = (
+        await server.clients.db.read('SELECT id, uid FROM apps WHERE uid = ?', [
+            uid,
+        ])
+    )[0] as { id: number; uid: string };
+    return row;
+};
+
+// ── Launch-origin takeover on re-registration ──────────────────────
+//
+// Deleting a hosted subdomain leaves the app row's `index_url` pointing
+// at the freed name. The GUI launcher appends `puter.auth.token` to that
+// URL, so whoever registers the name next would receive launch tokens
+// for the original app. `create` therefore refuses a name an app still
+// references — while leaving the app's owner free to re-create it, though
+// not through an unrelated app they have open.
+
+describe('SubdomainDriver.create launch-origin reservation', () => {
+    it("refuses a name another user's app still points at", async () => {
+        const victim = await makeUser();
+        const attacker = await makeUser();
+        const sub = uniqueSubdomain('freed');
+
+        await createAppWithIndexUrl(
+            victim.userId,
+            `http://${sub}.site.puter.localhost/`,
+        );
+
+        await expect(
+            withActor(attacker.actor, () =>
+                driver.create({
+                    object: {
+                        subdomain: sub,
+                        root_dir: `/${attacker.actor.user!.username}/Public`,
+                    },
+                }),
+            ),
+        ).rejects.toMatchObject({ statusCode: 409 });
+        expect(await server.stores.subdomain.getBySubdomain(sub)).toBeFalsy();
+    });
+
+    it('refuses a name an unowned origin-bootstrapped app points at', async () => {
+        const attacker = await makeUser();
+        const sub = uniqueSubdomain('orphan');
+
+        await createAppWithIndexUrl(
+            null,
+            `http://${sub}.site.puter.localhost`,
+        );
+
+        await expect(
+            withActor(attacker.actor, () =>
+                driver.create({
+                    object: {
+                        subdomain: sub,
+                        root_dir: `/${attacker.actor.user!.username}/Public`,
+                    },
+                }),
+            ),
+        ).rejects.toMatchObject({ statusCode: 409 });
+    });
+
+    it('lets the referencing app owner re-create the name', async () => {
+        const owner = await makeUser();
+        const sub = uniqueSubdomain('recreate');
+
+        await createAppWithIndexUrl(
+            owner.userId,
+            `http://${sub}.site.puter.localhost/`,
+        );
+
+        const created = (await withActor(owner.actor, () =>
+            driver.create({
+                object: {
+                    subdomain: sub,
+                    root_dir: `/${owner.actor.user!.username}/Public`,
+                },
+            }),
+        )) as Record<string, unknown>;
+        expect(created.subdomain).toBe(sub);
+    });
+
+    // Built through `makeActor` so `effectiveApp` is derived the way the auth
+    // path derives it.
+    const asApp = (base: Actor, app: { uid: string; id: number }): Actor =>
+        makeActor({ ...base, app: { uid: app.uid, id: app.id } });
+
+    // An app may publish its own AppData directory without a grant.
+    const appDataDir = async (
+        user: { actor: Actor; userId: number },
+        app: { uid: string },
+    ): Promise<string> => {
+        const path = `/${user.actor.user!.username}/AppData/${app.uid}`;
+        await server.services.fs.mkdir(user.userId, {
+            path,
+            createMissingParents: true,
+        });
+        return path;
+    };
+
+    it("refuses the owner's name to an unrelated app they have open", async () => {
+        const owner = await makeUser();
+        const otherDev = await makeUser();
+        const sub = uniqueSubdomain('crossapp');
+
+        await createAppWithIndexUrl(
+            owner.userId,
+            `http://${sub}.site.puter.localhost/`,
+        );
+        const unrelated = await createAppWithIndexUrl(
+            otherDev.userId,
+            `https://unrelated-${sub}.example.test/`,
+        );
+        const root = await appDataDir(owner, unrelated);
+
+        await expect(
+            withActor(asApp(owner.actor, unrelated), () =>
+                driver.create({ object: { subdomain: sub, root_dir: root } }),
+            ),
+        ).rejects.toMatchObject({ statusCode: 409 });
+        expect(await server.stores.subdomain.getBySubdomain(sub)).toBeFalsy();
+    });
+
+    it('lets the holding app re-create its own name', async () => {
+        const owner = await makeUser();
+        const sub = uniqueSubdomain('selfheal');
+
+        const app = await createAppWithIndexUrl(
+            owner.userId,
+            `http://${sub}.site.puter.localhost/`,
+        );
+        const root = await appDataDir(owner, app);
+
+        const created = (await withActor(asApp(owner.actor, app), () =>
+            driver.create({ object: { subdomain: sub, root_dir: root } }),
+        )) as Record<string, unknown>;
+        expect(created.subdomain).toBe(sub);
+    });
+
+    it('lets the app that built the holder re-create its name', async () => {
+        const owner = await makeUser();
+        const sub = uniqueSubdomain('builder');
+
+        const builder = await createAppWithIndexUrl(
+            null,
+            `https://builder-${sub}.example.test/`,
+        );
+        await createAppWithIndexUrl(
+            owner.userId,
+            `http://${sub}.site.puter.localhost/`,
+            { appOwner: builder.id },
+        );
+        const root = await appDataDir(owner, builder);
+
+        const created = (await withActor(asApp(owner.actor, builder), () =>
+            driver.create({ object: { subdomain: sub, root_dir: root } }),
+        )) as Record<string, unknown>;
+        expect(created.subdomain).toBe(sub);
+    });
+
+    it('leaves names no app references claimable', async () => {
+        const other = await makeUser();
+        const claimant = await makeUser();
+        const sub = uniqueSubdomain('unrelated');
+
+        // Same owner, unrelated host: the reservation keys off the name,
+        // not off the existence of other people's apps.
+        await createAppWithIndexUrl(
+            other.userId,
+            'https://elsewhere.example.test/',
+        );
+
+        const created = (await withActor(claimant.actor, () =>
+            driver.create({
+                object: {
+                    subdomain: sub,
+                    root_dir: `/${claimant.actor.user!.username}/Public`,
+                },
+            }),
+        )) as Record<string, unknown>;
+        expect(created.subdomain).toBe(sub);
+    });
+});
+
+describe('SubdomainDriver associated_app derivation', () => {
+    it('ignores `associated_app_uid` on create and derives null when no app matches', async () => {
+        const { actor } = await makeUser();
+        const username = actor.user!.username!;
+        const sub = uniqueSubdomain('assoc-create');
+
+        // Caller asserts an arbitrary app uid — must be silently dropped.
+        const result = (await withActor(actor, () =>
+            driver.create({
+                object: {
+                    subdomain: sub,
+                    root_dir: `/${username}/Public`,
+                    associated_app_uid: 'app-does-not-exist',
+                },
+            }),
+        )) as Record<string, unknown>;
+
+        expect(result.associated_app).toBeNull();
+        const row = await server.stores.subdomain.getBySubdomain(sub);
+        expect(row?.associated_app_id).toBeFalsy();
+    });
+
+    it('ignores `associated_app_uid` on update', async () => {
+        const { actor, userId } = await makeUser();
+        const username = actor.user!.username!;
+        const sub = uniqueSubdomain('assoc-update');
+
+        const created = (await withActor(actor, () =>
+            driver.create({
+                object: { subdomain: sub, root_dir: `/${username}/Public` },
+            }),
+        )) as Record<string, unknown>;
+
+        // Plant an app owned by another user that the index_url-derive
+        // would otherwise reject anyway. Even with the (now-defunct)
+        // explicit `associated_app_uid` knob, the field must stay null.
+        const other = await makeUser();
+        const otherApp = await createAppWithIndexUrl(
+            other.userId,
+            'http://anything.example.test/',
+        );
+        const updated = (await withActor(actor, () =>
+            driver.update({
+                uid: created.uid,
+                object: { associated_app_uid: otherApp.uid },
+            }),
+        )) as Record<string, unknown>;
+
+        expect(updated.associated_app).toBeNull();
+        const row = await server.stores.subdomain.getBySubdomain(sub);
+        expect(row?.associated_app_id).toBeFalsy();
+        // user_id should still be the original owner.
+        expect(row?.user_id).toBe(userId);
+    });
+
+    it("derives `associated_app` from the owner's app whose index_url matches the subdomain host", async () => {
+        const { actor, userId } = await makeUser();
+        const username = actor.user!.username!;
+        const sub = uniqueSubdomain('assoc-derive');
+
+        // App owned by the same user, registered with a URL on the
+        // default test hosting domain. The derive logic crosses host
+        // variants × protocols × paths, so any reasonable index_url
+        // anchored at the subdomain's name should match.
+        const indexUrl = `http://${sub}.site.puter.localhost/`;
+        const app = await createAppWithIndexUrl(userId, indexUrl);
+
+        const created = (await withActor(actor, () =>
+            driver.create({
+                object: { subdomain: sub, root_dir: `/${username}/Public` },
+            }),
+        )) as Record<string, unknown>;
+
+        const associated = created.associated_app as {
+            uid: string;
+        } | null;
+        expect(associated?.uid).toBe(app.uid);
+    });
+
+    it("does not derive an `associated_app` for another user's app at the same host", async () => {
+        // The core IDOR: attacker (a) holds a subdomain whose host matches
+        // the index_url of a victim's (b) private app. Even on exact
+        // index_url match, the ownership filter must reject the app from
+        // another user's account.
+        //
+        // `create` now refuses that pairing outright (see the launch-origin
+        // reservation above), so the row is planted through the store — this
+        // is the legacy-data shape the derive filter still has to handle.
+        const a = await makeUser();
+        const b = await makeUser();
+        const sub = uniqueSubdomain('idor');
+
+        await createAppWithIndexUrl(
+            b.userId,
+            `http://${sub}.site.puter.localhost/`,
+            { isPrivate: true },
+        );
+
+        const row = await server.stores.subdomain.create({
+            userId: a.userId,
+            subdomain: sub,
+        });
+
+        const read = (await withActor(a.actor, () =>
+            driver.read({ uid: (row as { uuid: string }).uuid }),
+        )) as Record<string, unknown>;
+
+        expect(read.associated_app).toBeNull();
+    });
+});
+
+// -- Row hydration ordering --
+
+describe('SubdomainDriver row hydration', () => {
+    const DERIVE_SQL = '`index_url` IN';
+
+    const seedRow = async () => {
+        const { actor } = await makeUser();
+        const created = (await withActor(actor, () =>
+            driver.create({
+                object: {
+                    subdomain: uniqueSubdomain('hydrate'),
+                    root_dir: `/${actor.user!.username}/Public`,
+                },
+            }),
+        )) as Record<string, unknown>;
+        return { actor, uid: created.uid };
+    };
+
+    it('loads owners and root dirs while the app derive is still running', async () => {
+        const { actor, uid } = await seedRow();
+        const db = server.clients.db;
+        const realRead = db.read.bind(db);
+        let release!: () => void;
+        const gate = new Promise<void>((resolve) => {
+            release = resolve;
+        });
+        let deriveStarted = false;
+        const read = vi
+            .spyOn(db, 'read')
+            .mockImplementation(async (sql, ...rest) => {
+                if (String(sql).includes(DERIVE_SQL)) {
+                    deriveStarted = true;
+                    await gate;
+                }
+                return realRead(sql, ...rest);
+            });
+        const users = vi.spyOn(server.stores.user, 'getByIds');
+        const entries = vi.spyOn(server.stores.fsEntry, 'getEntriesByIds');
+        try {
+            const pending = withActor(actor, () => driver.read({ uid }));
+            await vi.waitFor(() => expect(deriveStarted).toBe(true));
+            expect(users).toHaveBeenCalled();
+            expect(entries).toHaveBeenCalled();
+            release();
+            const row = (await pending) as Record<string, unknown>;
+            expect((row.owner as { username: string }).username).toBe(
+                actor.user!.username,
+            );
+            expect((row.root_dir as { path: string }).path).toBe(
+                `/${actor.user!.username}/Public`,
+            );
+        } finally {
+            release();
+            read.mockRestore();
+            users.mockRestore();
+            entries.mockRestore();
+        }
+    });
+
+    it('surfaces a failed derive over failed owner and root dir lookups, with no unhandled rejection', async () => {
+        const { actor, uid } = await seedRow();
+        const db = server.clients.db;
+        const realRead = db.read.bind(db);
+        const unhandled = vi.fn();
+        process.on('unhandledRejection', unhandled);
+        const read = vi
+            .spyOn(db, 'read')
+            .mockImplementation(async (sql, ...rest) => {
+                if (String(sql).includes(DERIVE_SQL)) {
+                    // Settles after the lookups below have already failed.
+                    await new Promise((resolve) => setTimeout(resolve, 10));
+                    throw new Error('derive failed');
+                }
+                return realRead(sql, ...rest);
+            });
+        const users = vi
+            .spyOn(server.stores.user, 'getByIds')
+            .mockRejectedValue(new Error('users failed'));
+        const entries = vi
+            .spyOn(server.stores.fsEntry, 'getEntriesByIds')
+            .mockRejectedValue(new Error('entries failed'));
+        try {
+            await expect(
+                withActor(actor, () => driver.read({ uid })),
+            ).rejects.toThrow('derive failed');
+            await new Promise((resolve) => setTimeout(resolve, 20));
+            expect(unhandled).not.toHaveBeenCalled();
+        } finally {
+            process.off('unhandledRejection', unhandled);
+            read.mockRestore();
+            users.mockRestore();
+            entries.mockRestore();
+        }
+    });
+});
+
+// -- Embedded apps get the launch gates a direct app read applies --
+
+describe('SubdomainDriver embedded app launch gates', () => {
+    const readRow = async (actor: Actor, uuid: string) =>
+        (await withActor(actor, () => driver.read({ uid: uuid }))) as Record<
+            string,
+            Record<string, unknown> | null
+        >;
+
+    it("withholds a private app_owner's index_url from a viewer without access", async () => {
+        const viewer = await makeUser();
+        const developer = await makeUser();
+        const indexUrl = `https://${uniqueSubdomain('priv')}.example.test/`;
+        const app = await createAppWithIndexUrl(developer.userId, indexUrl, {
+            isPrivate: true,
+        });
+        const row = await server.stores.subdomain.create({
+            userId: viewer.userId,
+            subdomain: uniqueSubdomain('embed-priv'),
+            appOwner: app.id,
+        });
+
+        const read = await readRow(viewer.actor, String(row.uuid));
+
+        expect(read.app_owner?.uid).toBe(app.uid);
+        expect(read.app_owner).not.toHaveProperty('index_url');
+        expect(read.app_owner?.privateAccess).toMatchObject({
+            hasAccess: false,
+        });
+    });
+
+    it('keeps index_url on a private app embedded for its own owner', async () => {
+        const { actor, userId } = await makeUser();
+        const indexUrl = `https://${uniqueSubdomain('own')}.example.test/`;
+        const app = await createAppWithIndexUrl(userId, indexUrl, {
+            isPrivate: true,
+        });
+        const row = await server.stores.subdomain.create({
+            userId,
+            subdomain: uniqueSubdomain('embed-own'),
+            appOwner: app.id,
+        });
+
+        const read = await readRow(actor, String(row.uuid));
+
+        expect(read.app_owner?.index_url).toBe(indexUrl);
+        expect(read.app_owner?.privateAccess).toMatchObject({
+            hasAccess: true,
+        });
+    });
+
+    it("withholds a hosted app_owner's index_url once its subdomain is gone", async () => {
+        const viewer = await makeUser();
+        const developer = await makeUser();
+        const gone = uniqueSubdomain('gone');
+        const app = await createAppWithIndexUrl(
+            developer.userId,
+            `https://${gone}.site.puter.localhost/`,
+        );
+        const row = await server.stores.subdomain.create({
+            userId: viewer.userId,
+            subdomain: uniqueSubdomain('embed-gone'),
+            appOwner: app.id,
+        });
+
+        const read = await readRow(viewer.actor, String(row.uuid));
+
+        expect(read.app_owner).not.toHaveProperty('index_url');
+        expect(read.app_owner?.privateAccess).toMatchObject({
+            hasAccess: false,
+            reason: 'hosted_backing_unavailable',
+        });
+    });
+});
+
+// -- associated_app derivation at scale --
+//
+// ~24 index_url candidates per subdomain: a page this size must be chunked
+// to stay under SQLite's bound-parameter limit.
+
+describe('SubdomainDriver.select at scale', () => {
+    it('resolves associated_app for 1,400 subdomains without tripping the SQL variable limit', async () => {
+        const { actor, userId } = await makeUser();
+        const prefix = `scale-${Math.random().toString(36).slice(2, 8)}-`;
+        const count = 1400;
+        const names: string[] = [];
+        for (let i = 0; i < count; i++) {
+            names.push(`${prefix}${i}`);
+        }
+
+        // Bulk-insert directly — bypasses the driver's per-user quota, the
+        // same way a bulk-provisioned fleet of sites would exist in prod.
+        const placeholders = names.map(() => '(?, ?, ?)').join(', ');
+        const values: unknown[] = [];
+        for (const name of names) {
+            values.push(uuidv4(), name, userId);
+        }
+        await server.clients.db.write(
+            `INSERT INTO \`subdomains\` (\`uuid\`, \`subdomain\`, \`user_id\`) VALUES ${placeholders}`,
+            values,
+        );
+
+        const lastSub = names[names.length - 1]!;
+        const app = await createAppWithIndexUrl(
+            userId,
+            `http://${lastSub}.site.puter.localhost/`,
+        );
+
+        const result = (await withActor(actor, () =>
+            driver.select({}),
+        )) as Array<Record<string, unknown>>;
+
+        expect(result.length).toBe(count);
+        const lastItem = result.find((r) => r.subdomain === lastSub);
+        expect(
+            (lastItem?.associated_app as { uid: string } | null)?.uid,
+        ).toBe(app.uid);
+    }, 30_000);
+});

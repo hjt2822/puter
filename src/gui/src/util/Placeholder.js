@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2024 Puter Technologies Inc.
+ * Copyright (C) 2024-present Puter Technologies Inc.
  *
  * This file is part of Puter.
  *
@@ -27,13 +27,13 @@
 /**
  * Placeholder creates a simple element with a unique ID
  * as an HTML string.
- * 
+ *
  * This can be useful where string concatenation is used
  * to build element trees.
- * 
+ *
  * The `replaceWith` method can be used to replace the
  * placeholder with a real element.
- * 
+ *
  * @returns {PlaceholderReturn}
  */
 const Placeholder = def(() => {
@@ -45,11 +45,11 @@ const Placeholder = def(() => {
         replaceWith: (el) => {
             const place = document.getElementById(id);
             place.replaceWith(el);
-        }
+        },
     };
 }, 'util.Placeholder');
 
-const anti_collision = `94d2cb6b85a1`; // Arbitrary random string
+const anti_collision = 'a4d2cb6b85a1'; // Arbitrary random string
 Placeholder.next_id_ = 0;
 Placeholder.get_next_id_ = () => `${anti_collision}_${Placeholder.next_id_++}`;
 

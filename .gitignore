@@ -16,13 +16,63 @@ dist/
 .vscode/**/*
 !.vscode/extensions.json
 !.vscode/launch.json
-!.vscode/settings.json
 !.vscode/tasks.json
 
 # Local env files
 .env
 !.env.example
 
+# Per-developer / deployment config override. `config.default.json` ships in
+# the repo and is the authoritative source; `config.json` (if present) wins
+# at runtime for the local machine only.
+config.json
+
 # this is for jetbrain IDEs
 .idea/
 /puter
+
+# Local Netlify folder
+.netlify
+src/emulator/release/
+
+# ======================================================================
+# vscode
+# ======================================================================
+# vscode configuration
+.vscode/
+
+# JS language server, ref: https://code.visualstudio.com/docs/languages/jsconfig
+jsconfig.json
+
+# ======================================================================
+# playwright test (currently only test the file-system)
+# ======================================================================
+tests/client-config.yaml
+
+# ======================================================================
+# python
+# ======================================================================
+__pycache__/
+
+# ======================================================================
+# other
+# ======================================================================
+# AI STUFF
+AGENTS.md
+.roo
+
+# source maps
+*.map
+
+
+coverage/
+.vitest-reports/
+*.log
+undefined
+servers.json
+config.*.json
+
+volatile/
+
+# Local build override
+docker-compose.override.yml

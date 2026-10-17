@@ -1,0 +1,835 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import copy from './copy.js';
+import deleteFSEntry from './deleteFSEntry.js';
+import getReadURL from './getReadUrl.js';
+import getShareLink from './getShareLink.js';
+import mkdir from './mkdir.js';
+import move from './move.js';
+import read from './read.js';
+import readdir from './readdir.js';
+import readdirSubdomains from './readdirSubdomains.js';
+import rename from './rename.js';
+import revokeReadURL from './revokeReadUrl.js';
+import share from './share.js';
+import sign from './sign.js';
+import space from './space.js';
+import stat from './stat.js';
+import unshare from './unshare.js';
+import write from './write.js';
+
+/**
+ * Pins the request every `puter.fs.*` call style produces, by faking the
+ * network boundary (XMLHttpRequest). Every documented and legacy argument
+ * shape is covered so the operations can be restructured without changing
+ * what apps observe on the wire.
+ */
+
+class FakeXHR {
+    // Set per test: (parsedRequestBody, xhr) => response object, or a Blob.
+    static respondWith = null;
+    static status = 200;
+    static requests = [];
+
+    _listeners = {};
+    responseType = '';
+
+    open (method, url) {
+        this.method = method;
+        this.url = url;
+    }
+
+    setRequestHeader (name, value) {
+        (this.requestHeaders ??= {})[name] = value;
+    }
+
+    addEventListener (type, fn) {
+        (this._listeners[type] ??= []).push(fn);
+    }
+
+    getResponseHeader (name) {
+        if ( name === 'content-type' ) {
+            return this.responseType === 'blob' ? 'application/octet-stream' : 'application/json';
+        }
+        return null;
+    }
+
+    send (body) {
+        FakeXHR.requests.push(this);
+        this.requestBody = body ?? null;
+        this.status = FakeXHR.status;
+        const payload = FakeXHR.respondWith
+            ? FakeXHR.respondWith(body ? JSON.parse(body) : null, this)
+            : { success: true };
+        queueMicrotask(() => {
+            if ( this.responseType === 'blob' ) {
+                this.response = payload;
+            } else {
+                this.responseText = JSON.stringify(payload);
+            }
+            for ( const fn of this._listeners.load ?? [] ) {
+                fn.call(this, { target: this });
+            }
+        });
+    }
+}
+
+const lastRequest = () => FakeXHR.requests.at(-1);
+const lastBody = () => JSON.parse(lastRequest().requestBody);
+
+// A stand-in for the FileSystem module: the operations only ever reach for
+// the API origin, the auth token and the socket id.
+const makeFS = () => ({
+    APIOrigin: 'https://api.test',
+    authToken: 'test-token',
+    socket: { id: 'socket-1' },
+    // getShareLink reads the GUI origin and the calling app off the instance.
+    get puter () { return globalThis.puter; },
+    // write delegates to upload, which has its own tests.
+    upload: vi.fn(async () => ({ uid: 'written' })),
+    copy, delete: deleteFSEntry, getReadURL, getShareLink, mkdir, move, read,
+    readdir, readdirSubdomains, rename, revokeReadURL, share, sign, space,
+    stat, unshare, write,
+});
+
+const makeCache = () => {
+    const store = new Map();
+    return {
+        get: vi.fn(async key => store.get(key)),
+        set: vi.fn((key, value) => store.set(key, value)),
+        del: vi.fn(key => store.delete(key)),
+        flushall: vi.fn(() => store.clear()),
+    };
+};
+
+const origXHR = globalThis.XMLHttpRequest;
+const origPuter = globalThis.puter;
+
+let fs;
+
+beforeEach(() => {
+    FakeXHR.requests = [];
+    FakeXHR.respondWith = null;
+    FakeXHR.status = 200;
+    globalThis.XMLHttpRequest = FakeXHR;
+    fs = makeFS();
+    globalThis.puter = {
+        authToken: 'test-token',
+        APIOrigin: 'https://api.test',
+        env: 'nodejs',
+        appID: undefined,
+        _cache: makeCache(),
+        // As the real one: keys carry the identity they were read as.
+        fsCacheKey: (kind, path) =>
+            `${kind}:https://api.test:test-token:${path}`,
+        fs,
+    };
+});
+
+afterEach(() => {
+    globalThis.XMLHttpRequest = origXHR;
+    globalThis.puter = origPuter;
+});
+
+describe('copy', () => {
+    it('copy(source, destination) sends both paths', async () => {
+        await fs.copy('/a/file.txt', '/b');
+        expect(lastRequest().url).toBe('https://api.test/copy');
+        expect(lastBody()).toMatchObject({
+            source: '/a/file.txt',
+            destination: '/b',
+            original_client_socket_id: 'socket-1',
+            socket_id: 'socket-1',
+        });
+    });
+
+    it('copy(source, destination, options) applies the options', async () => {
+        await fs.copy('/a/file.txt', '/b', { overwrite: true, newName: 'other.txt', dedupeName: true });
+        expect(lastBody()).toMatchObject({
+            overwrite: true,
+            new_name: 'other.txt',
+            dedupe_name: true,
+        });
+    });
+
+    it('copy(options) is equivalent to the positional form', async () => {
+        await fs.copy({ source: '/a/file.txt', destination: '/b', newName: 'other.txt' });
+        expect(lastBody()).toMatchObject({
+            source: '/a/file.txt',
+            destination: '/b',
+            new_name: 'other.txt',
+        });
+    });
+
+    it('accepts the legacy snake_case option names', async () => {
+        await fs.copy('/a/file.txt', '/b', { new_name: 'other.txt', dedupe_name: true });
+        expect(lastBody()).toMatchObject({ new_name: 'other.txt', dedupe_name: true });
+    });
+
+    it('does not mutate the caller options object', async () => {
+        const options = { source: 'file.txt', destination: 'dir' };
+        await fs.copy(options);
+        expect(options).toEqual({ source: 'file.txt', destination: 'dir' });
+    });
+
+    it('calls the trailing success callback with the response', async () => {
+        FakeXHR.respondWith = () => ({ uid: 'copied' });
+        const success = vi.fn();
+        await fs.copy('/a/file.txt', '/b', undefined, success);
+        expect(success).toHaveBeenCalledWith({ uid: 'copied' });
+    });
+});
+
+describe('move', () => {
+    it('moves into the destination when it is a directory', async () => {
+        FakeXHR.respondWith = body => (body.path === '/b' ? { is_dir: true } : { success: true });
+        await fs.move('/a/file.txt', '/b');
+        expect(lastBody()).toMatchObject({ source: '/a/file.txt', destination: '/b' });
+        expect(lastBody().new_name).toBeUndefined();
+    });
+
+    it('treats a non-directory destination as the new path', async () => {
+        FakeXHR.respondWith = (body, xhr) => {
+            if ( xhr.url.endsWith('/stat') ) return { is_dir: false };
+            return { success: true };
+        };
+        await fs.move('/a/file.txt', '/b/renamed.txt');
+        expect(lastBody()).toMatchObject({
+            destination: '/b',
+            new_name: 'renamed.txt',
+        });
+    });
+
+    it('skips the destination lookup when newName is given', async () => {
+        await fs.move('/a/file.txt', '/b', { newName: 'other.txt', createMissingParents: true });
+        expect(FakeXHR.requests).toHaveLength(1);
+        expect(lastBody()).toMatchObject({
+            destination: '/b',
+            new_name: 'other.txt',
+            create_missing_parents: true,
+        });
+    });
+
+    it('treats a missing destination as the new path', async () => {
+        FakeXHR.respondWith = (body, xhr) => {
+            if ( ! xhr.url.endsWith('/stat') ) return { success: true };
+            xhr.status = 404;
+            return { message: 'Subject does not exist', code: 'subject_does_not_exist' };
+        };
+        await fs.move('/a/file.txt', '/b/renamed.txt');
+        expect(lastRequest().url).toBe('https://api.test/move');
+        expect(lastBody()).toMatchObject({ destination: '/b', new_name: 'renamed.txt' });
+    });
+
+    it('rejects without moving when the destination lookup is denied', async () => {
+        const denied = { message: 'Access denied', code: 'access_denied' };
+        FakeXHR.respondWith = (body, xhr) => {
+            xhr.status = 403;
+            return denied;
+        };
+        const error = vi.fn();
+        await expect(fs.move('/a/file.txt', '/b/hidden', undefined, undefined, error))
+            .rejects.toEqual(denied);
+        expect(error).toHaveBeenCalledWith(denied);
+        expect(FakeXHR.requests.map(xhr => xhr.url)).toEqual(['https://api.test/stat']);
+    });
+
+    it('moves into a uid destination without a lookup', async () => {
+        const dirUid = '0f8fad5b-d9cb-469f-a165-70867728950e';
+        await fs.move('/a/file.txt', dirUid);
+        expect(FakeXHR.requests).toHaveLength(1);
+        expect(lastBody()).toMatchObject({ source: '/a/file.txt', destination: dirUid });
+        expect(lastBody().new_name).toBeUndefined();
+    });
+
+    it('sends a uid source through unchanged', async () => {
+        const uid = '0f8fad5b-d9cb-469f-a165-70867728950e';
+        await fs.move({ source: uid, destination: '/b', newName: 'x.txt' });
+        expect(lastBody()).toMatchObject({ source: uid, destination: '/b' });
+    });
+});
+
+describe('mkdir', () => {
+    it('splits the path into parent and name', async () => {
+        await fs.mkdir('/a/b/c');
+        expect(lastRequest().url).toBe('https://api.test/mkdir');
+        expect(lastBody()).toMatchObject({
+            parent: '/a/b',
+            path: 'c',
+            overwrite: false,
+            dedupe_name: false,
+            create_missing_parents: false,
+            original_client_socket_id: 'socket-1',
+        });
+    });
+
+    it('resolves a UID-shaped relative name as a path', async () => {
+        const name = '0f8fad5b-d9cb-469f-a165-70867728950e';
+        await fs.mkdir(name);
+        expect(lastBody()).toMatchObject({ parent: '~', path: name });
+    });
+
+    it('mkdir(path, options) applies the options', async () => {
+        await fs.mkdir('/a/b', { dedupeName: true, createMissingParents: true });
+        expect(lastBody()).toMatchObject({ dedupe_name: true, create_missing_parents: true });
+    });
+
+    it('accepts the `rename` and `recursive` aliases', async () => {
+        await fs.mkdir('/a/b', { rename: true, recursive: true });
+        expect(lastBody()).toMatchObject({ dedupe_name: true, create_missing_parents: true });
+    });
+
+    it('mkdir(path, success) still takes a bare callback', async () => {
+        const success = vi.fn();
+        await fs.mkdir('/a/b', success);
+        expect(success).toHaveBeenCalledTimes(1);
+        expect(lastBody()).toMatchObject({ parent: '/a', path: 'b' });
+    });
+});
+
+describe('delete', () => {
+    it('wraps a single path in an array', async () => {
+        await fs.delete('/a/file.txt');
+        expect(lastRequest().url).toBe('https://api.test/delete');
+        expect(lastBody()).toEqual({
+            paths: ['/a/file.txt'],
+            descendants_only: false,
+            recursive: true,
+        });
+    });
+
+    it('accepts an array of paths', async () => {
+        await fs.delete(['/a/one.txt', '/a/two.txt']);
+        expect(lastBody().paths).toEqual(['/a/one.txt', '/a/two.txt']);
+    });
+
+    it('delete(paths, options) applies the options', async () => {
+        await fs.delete('/a/dir', { recursive: false, descendantsOnly: true });
+        expect(lastBody()).toMatchObject({ recursive: false, descendants_only: true });
+    });
+
+    it('delete(options) is equivalent to the positional form', async () => {
+        await fs.delete({ paths: '/a/dir', recursive: false });
+        expect(lastBody()).toMatchObject({ paths: ['/a/dir'], recursive: false });
+    });
+});
+
+describe('read', () => {
+    beforeEach(() => {
+        FakeXHR.respondWith = () => new Blob(['contents']);
+    });
+
+    it('requests the file as a blob and defeats the HTTP cache', async () => {
+        const blob = await fs.read('/a/file.txt');
+        expect(await blob.text()).toBe('contents');
+        expect(lastRequest().url).toBe('https://api.test/read?file=%2Fa%2Ffile.txt');
+        expect(lastRequest().method).toBe('get');
+        expect(lastRequest().requestHeaders['Cache-Control']).toBe('no-cache');
+    });
+
+    it('read(path, options) forwards the byte range', async () => {
+        await fs.read('/a/file.txt', { offset: 4, byte_count: 8 });
+        expect(lastRequest().url).toBe('https://api.test/read?file=%2Fa%2Ffile.txt&offset=4&byte_count=8');
+    });
+
+    it('reads by uid, and by path when a UID-shaped name has a ./ prefix', async () => {
+        const uid = '0f8fad5b-d9cb-469f-a165-70867728950e';
+        await fs.read(uid);
+        expect(lastRequest().url).toBe(`https://api.test/read?file=${uid}`);
+        await fs.read(`./${uid}`);
+        expect(lastRequest().url).toBe(`https://api.test/read?file=%7E%2F${uid}`);
+    });
+
+    it('opts back into HTTP caching with { cache: true }', async () => {
+        await fs.read('/a/file.txt', { cache: true });
+        expect(lastRequest().requestHeaders?.['Cache-Control']).toBeUndefined();
+    });
+
+    it('read(path, success) still takes a bare callback', async () => {
+        const success = vi.fn();
+        await fs.read('/a/file.txt', success);
+        expect(success).toHaveBeenCalledTimes(1);
+    });
+});
+
+describe('rename', () => {
+    it('rename(path, newName) addresses the item by path', async () => {
+        await fs.rename('/a/file.txt', 'renamed.txt');
+        expect(lastRequest().url).toBe('https://api.test/rename');
+        expect(lastBody()).toMatchObject({ path: '/a/file.txt', new_name: 'renamed.txt' });
+    });
+
+    it('rename({ uid, newName }) addresses the item by uid', async () => {
+        await fs.rename({ uid: 'abc', newName: 'renamed.txt' });
+        expect(lastBody()).toMatchObject({ uid: 'abc', new_name: 'renamed.txt' });
+        expect(lastBody().path).toBeUndefined();
+    });
+});
+
+describe('space', () => {
+    it('reads storage usage', async () => {
+        FakeXHR.respondWith = () => ({ capacity: 10, used: 4 });
+        await expect(fs.space()).resolves.toEqual({ capacity: 10, used: 4 });
+        expect(lastRequest().url).toBe('https://api.test/df');
+        expect(lastRequest().requestBody).toBeNull();
+    });
+
+    it('space(success) still takes a bare callback', async () => {
+        const success = vi.fn();
+        await fs.space(success);
+        expect(success).toHaveBeenCalledTimes(1);
+    });
+});
+
+describe('sign', () => {
+    beforeEach(() => {
+        FakeXHR.respondWith = body => ({
+            token: 'tok',
+            signatures: body.items.map((item, index) => ({ uid: item.uid, index })),
+        });
+    });
+
+    it('returns a single object when one item is signed', async () => {
+        const result = await fs.sign('app-1', { uid: 'one' });
+        expect(lastBody()).toEqual({ app_uid: 'app-1', items: [{ uid: 'one' }] });
+        expect(result).toEqual({ token: 'tok', items: { uid: 'one', index: 0 } });
+    });
+
+    it('returns an array when several items are signed', async () => {
+        const result = await fs.sign('app-1', [{ uid: 'one' }, { uid: 'two' }]);
+        expect(result.items).toEqual([
+            { uid: 'one', index: 0 },
+            { uid: 'two', index: 1 },
+        ]);
+    });
+
+    it('passes the signed result to the success callback', async () => {
+        const success = vi.fn();
+        await fs.sign('app-1', { uid: 'one' }, success);
+        expect(success).toHaveBeenCalledWith({ token: 'tok', items: { uid: 'one', index: 0 } });
+    });
+});
+
+describe('stat', () => {
+    it('sends the path and the token in the payload', async () => {
+        FakeXHR.respondWith = () => ({ uid: 'u1', is_dir: false });
+        await fs.stat('/a/file.txt');
+        expect(lastRequest().url).toBe('https://api.test/stat');
+        expect(lastBody()).toMatchObject({ path: '/a/file.txt', auth_token: 'test-token' });
+    });
+
+    it('stat(path, options) forwards the return_* flags', async () => {
+        await fs.stat('/a/file.txt', { returnSize: true, returnPermissions: true });
+        expect(lastBody()).toMatchObject({ return_size: true, return_permissions: true });
+    });
+
+    it('stat(path, options, success) still takes trailing callbacks', async () => {
+        const success = vi.fn();
+        await fs.stat('/a/file.txt', { returnSize: true }, success);
+        expect(success).toHaveBeenCalledTimes(1);
+    });
+
+    it('coalesces concurrent identical requests into one call', async () => {
+        const [ first, second ] = await Promise.all([
+            fs.stat('/a/file.txt'),
+            fs.stat('/a/file.txt'),
+        ]);
+        expect(FakeXHR.requests).toHaveLength(1);
+        expect(first).toEqual(second);
+    });
+
+    it('serves an eventually-consistent read from the cache', async () => {
+        await fs.stat('/a/file.txt');
+        FakeXHR.requests = [];
+        await fs.stat({ path: '/a/file.txt', consistency: 'eventual' });
+        expect(FakeXHR.requests).toHaveLength(0);
+    });
+
+    it('does not serve one identity a result read as another', async () => {
+        await fs.stat('/a/file.txt');
+        FakeXHR.requests = [];
+        // Same path, same realm, different token: a `~`-shaped key would hit.
+        globalThis.puter.fsCacheKey = (kind, path) =>
+            `${kind}:https://api.test:other-token:${path}`;
+        fs.authToken = 'other-token';
+
+        await fs.stat({ path: '/a/file.txt', consistency: 'eventual' });
+        expect(FakeXHR.requests).toHaveLength(1);
+    });
+
+    it('asks for shares and publishes them in the SDK shape', async () => {
+        FakeXHR.respondWith = () => ({
+            uid: 'u1',
+            is_dir: false,
+            is_shared: true,
+            shares: [
+                {
+                    uid: 's1',
+                    mode: 'write',
+                    uid_entry: 'u1',
+                    is_dir: false,
+                    holder: 'someone',
+                    inherited_from: null,
+                },
+            ],
+        });
+        const item = await fs.stat('/a/file.txt', { returnShares: true });
+        expect(lastBody()).toMatchObject({ return_shares: true });
+        expect(item.is_shared).toBe(true);
+        expect(item.shares[0]).toMatchObject({
+            uid: 's1',
+            mode: 'write',
+            entryUid: 'u1',
+            holder: 'someone',
+            inheritedFrom: null,
+        });
+    });
+
+    it('re-reads a cached item after its sharing changes', async () => {
+        FakeXHR.respondWith = () => ({ uid: 'u1', is_dir: false, is_shared: false });
+        await fs.stat('/a/file.txt');
+
+        FakeXHR.respondWith = () => ({ status: 'success', results: [{ status: 'success', uid: 's1', mode: 'read' }] });
+        await fs.share('/a/file.txt', 'friend', 'read');
+
+        // Without invalidation the stale is_shared: false would be served here.
+        FakeXHR.requests = [];
+        FakeXHR.respondWith = () => ({ uid: 'u1', is_dir: false, is_shared: true });
+        const item = await fs.stat({ path: '/a/file.txt', consistency: 'eventual' });
+        expect(FakeXHR.requests).toHaveLength(1);
+        expect(item.is_shared).toBe(true);
+    });
+
+    it('sends a team recipient through instead of dropping it', async () => {
+        FakeXHR.respondWith = () => ({ status: 'success', results: [] });
+        await fs.share({
+            path: '/a/file.txt',
+            recipient: { team: 'ws-uid-1' },
+            mode: 'read',
+        });
+        // Dropped before this mapping existed, so the call shared with nobody
+        // and still reported success.
+        expect(lastBody().recipients).toEqual([{ team: 'ws-uid-1' }]);
+    });
+
+    it('sends a team handle under its own field', async () => {
+        FakeXHR.respondWith = () => ({ status: 'success', results: [] });
+        await fs.share({
+            path: '/a/file.txt',
+            recipient: { teamHandle: 'acme' },
+            mode: 'read',
+        });
+        expect(lastBody().recipients).toEqual([{ teamHandle: 'acme' }]);
+    });
+
+    it('publishes the team a share reached', async () => {
+        FakeXHR.respondWith = () => ({
+            uid: 'u1',
+            is_dir: false,
+            is_shared: true,
+            shares: [
+                {
+                    uid: 's1',
+                    mode: 'read',
+                    uid_entry: 'u1',
+                    is_dir: false,
+                    holder: null,
+                    holder_team: { uid: 'ws-uid-1', name: 'Acme', handle: 'acme' },
+                },
+            ],
+        });
+        const item = await fs.stat('/a/file.txt', { returnShares: true });
+        // `holder` is null for a team share, so without this the client
+        // is told the file is shared with nobody.
+        expect(item.shares[0].holderTeam).toEqual({
+            uid: 'ws-uid-1',
+            name: 'Acme',
+            handle: 'acme',
+        });
+        expect(item.shares[0].holder).toBe(null);
+    });
+
+    it('re-reads a cached item after a share is withdrawn', async () => {
+        FakeXHR.respondWith = () => ({ uid: 'u1', is_dir: false, is_shared: true });
+        await fs.stat('/a/file.txt');
+
+        FakeXHR.respondWith = () => ({ revoked: 1 });
+        await fs.unshare('/a/file.txt', 'friend');
+
+        FakeXHR.requests = [];
+        FakeXHR.respondWith = () => ({ uid: 'u1', is_dir: false, is_shared: false });
+        const item = await fs.stat({ path: '/a/file.txt', consistency: 'eventual' });
+        expect(FakeXHR.requests).toHaveLength(1);
+        expect(item.is_shared).toBe(false);
+    });
+
+    it('does not serve one uid\'s cached entry for another uid', async () => {
+        FakeXHR.respondWith = body => ({ uid: body.uid, name: `${body.uid}.txt`, is_dir: false });
+        await fs.stat({ uid: 'uid-a' });
+        FakeXHR.requests = [];
+        const item = await fs.stat({ uid: 'uid-b', consistency: 'eventual' });
+        expect(FakeXHR.requests).toHaveLength(1);
+        expect(item.uid).toBe('uid-b');
+    });
+
+    it('resolves a UID-shaped relative path as a path', async () => {
+        const name = '0f8fad5b-d9cb-469f-a165-70867728950e';
+        await fs.stat(name);
+        expect(lastBody().path).toBe(`~/${name}`);
+        expect(lastBody().uid).toBeUndefined();
+    });
+
+    it('keeps a share-carrying result out of the cache', async () => {
+        FakeXHR.respondWith = () => ({ uid: 'u1', is_dir: false, shares: [] });
+        await fs.stat('/a/cached.txt', { returnShares: true });
+        FakeXHR.requests = [];
+        // Would be served from the cache had the previous call populated it.
+        await fs.stat({ path: '/a/cached.txt', consistency: 'eventual' });
+        expect(FakeXHR.requests).toHaveLength(1);
+    });
+});
+
+describe('readdir', () => {
+    beforeEach(() => {
+        FakeXHR.respondWith = () => [{ uuid: 'u1', name: 'file.txt', path: '/a/file.txt', isDir: false }];
+    });
+
+    it('lists a directory and normalizes entries to the v1 shape', async () => {
+        const entries = await fs.readdir('/a');
+        expect(lastRequest().url).toBe('https://api.test/fs/readdir');
+        expect(lastBody()).toMatchObject({ path: '/a', auth_token: 'test-token' });
+        expect(entries[0]).toMatchObject({ name: 'file.txt', is_dir: false, uid: 'u1' });
+    });
+
+    it('carries the share flag into the v1 shape', async () => {
+        FakeXHR.respondWith = () => [
+            { uuid: 'u1', name: 'mine.txt', path: '/a/mine.txt', isShared: true },
+            { uuid: 'u2', name: 'theirs.txt', path: '/a/theirs.txt', isShared: null },
+        ];
+        const entries = await fs.readdir('/a');
+        expect(entries.map((e) => e.is_shared)).toEqual([true, null]);
+    });
+
+    it('readdir(path, options) applies the options', async () => {
+        await fs.readdir('/a', { limit: 5, sortBy: 'modified', sortOrder: 'desc' });
+        expect(lastBody()).toMatchObject({ limit: 5, sortBy: 'modified', sortOrder: 'desc' });
+    });
+
+    it('readdir(path, options) honours an eventually-consistent read', async () => {
+        await fs.readdir('/a');
+        FakeXHR.requests = [];
+        await fs.readdir('/a', { consistency: 'eventual' });
+        expect(FakeXHR.requests).toHaveLength(0);
+    });
+
+    it('readdir(path, success) still takes a bare callback', async () => {
+        const success = vi.fn();
+        await fs.readdir('/a', success);
+        expect(success).toHaveBeenCalledTimes(1);
+    });
+
+    it('rejects instead of hanging when neither path nor uid is given', async () => {
+        await expect(fs.readdir({})).rejects.toMatchObject({ code: 'NO_PATH_OR_UID' });
+        expect(FakeXHR.requests).toHaveLength(0);
+    });
+});
+
+describe('getReadURL / revokeReadURL', () => {
+    it('builds a token URL for a file', async () => {
+        FakeXHR.respondWith = (body, xhr) =>
+            (xhr.url.endsWith('/stat') ? { uid: 'u1', is_dir: false } : { token: 'tok' });
+        const url = await fs.getReadURL('/a/file.txt', '1h');
+        expect(lastBody()).toEqual({ expiresIn: '1h', permissions: ['fs:u1:read'] });
+        expect(url).toBe('https://api.test/token-read?uid=u1&token=tok');
+    });
+
+    it('defaults the expiry to 24h', async () => {
+        FakeXHR.respondWith = (body, xhr) =>
+            (xhr.url.endsWith('/stat') ? { uid: 'u1', is_dir: false } : { token: 'tok' });
+        await fs.getReadURL('/a/file.txt');
+        expect(lastBody().expiresIn).toBe('24h');
+    });
+
+    it('refuses to sign a directory', async () => {
+        FakeXHR.respondWith = () => ({ uid: 'u1', is_dir: true });
+        await expect(fs.getReadURL('/a')).rejects.toBe('Cannot create readUrl for directory');
+        expect(FakeXHR.requests).toHaveLength(1);
+    });
+
+    const JWT = 'aaa.bbb.ccc';
+
+    it('revokes by bare JWT', async () => {
+        await expect(fs.revokeReadURL(`  ${JWT}  `)).resolves.toBeUndefined();
+        expect(lastRequest().url).toBe('https://api.test/auth/revoke-own-access-token');
+        expect(lastBody()).toEqual({ token: JWT });
+    });
+
+    it('revokes by the URL getReadURL() returns', async () => {
+        await expect(fs.revokeReadURL(`https://api.test/token-read?uid=u1&token=${JWT}`)).resolves.toBeUndefined();
+        expect(lastBody()).toEqual({ token: JWT });
+    });
+
+    it('rejects a value with no extractable JWT before sending a request', async () => {
+        await expect(fs.revokeReadURL('not-a-token')).rejects.toMatchObject({ code: 'field_invalid' });
+        await expect(fs.revokeReadURL(`https://api.test/token-read/${JWT}`)).rejects.toMatchObject({ code: 'field_invalid' });
+        expect(FakeXHR.requests).toHaveLength(0);
+    });
+
+    it('rejects an empty value before sending a request', async () => {
+        await expect(fs.revokeReadURL('  ')).rejects.toMatchObject({ code: 'field_missing' });
+        expect(FakeXHR.requests).toHaveLength(0);
+    });
+});
+
+describe('write', () => {
+    it('turns a string into a File under the target name', async () => {
+        await fs.write('/a/notes.txt', 'hello');
+        const [ file, parent, options ] = fs.upload.mock.calls[0];
+        expect(file).toBeInstanceOf(File);
+        expect(file.name).toBe('notes.txt');
+        expect(await file.text()).toBe('hello');
+        expect(parent).toBe('/a');
+        expect(options).toMatchObject({ overwrite: true, dedupeName: false, strict: true });
+    });
+
+    it('names the file after itself, in the app root, when only a File is given', async () => {
+        await fs.write(new File(['x'], 'photo.png'));
+        const [ file, parent ] = fs.upload.mock.calls[0];
+        expect(file.name).toBe('photo.png');
+        expect(parent).toBe('~');
+    });
+
+    it('creates an empty file when no data is given', async () => {
+        await fs.write('/a/empty.txt');
+        const [ file ] = fs.upload.mock.calls[0];
+        expect(await file.text()).toBe('');
+    });
+
+    it('leaves dedupeName unset when the caller opts out of overwriting', async () => {
+        await fs.write('/a/notes.txt', 'hello', { overwrite: false });
+        expect(fs.upload.mock.calls[0][2]).toMatchObject({ overwrite: false, dedupeName: undefined });
+    });
+
+    // These used to be built with `new Error(...)` around the object, which
+    // reduced every one of them to the message "[object Object]".
+    it('reports a readable message when no target path is given', async () => {
+        await expect(fs.write()).rejects.toMatchObject({
+            code: 'NO_TARGET_PATH',
+            message: 'No target path provided.',
+        });
+        expect(fs.upload).not.toHaveBeenCalled();
+    });
+
+    it('reports a readable message when the data is an unsupported type', async () => {
+        await expect(fs.write('/a/notes.txt', 42)).rejects.toMatchObject({
+            code: 'field_invalid',
+            message: 'write() data parameter is an invalid type',
+        });
+        expect(fs.upload).not.toHaveBeenCalled();
+    });
+
+    it('reports a readable message when readdir has nothing to address', async () => {
+        await expect(fs.readdir({})).rejects.toMatchObject({
+            code: 'NO_PATH_OR_UID',
+            message: 'Either path or uid must be provided.',
+        });
+    });
+});
+
+describe('authentication gate', () => {
+    beforeEach(() => {
+        globalThis.puter.authToken = undefined;
+        globalThis.puter.env = 'web';
+        globalThis.puter.ui = { authenticateWithPuter: vi.fn(async () => { throw new Error('nope'); }) };
+    });
+
+    // Each operation used to reject and then fire its request anyway.
+    const operations = {
+        copy: () => fs.copy('/a', '/b'),
+        delete: () => fs.delete('/a'),
+        getReadURL: () => fs.getReadURL('/a/file.txt'),
+        mkdir: () => fs.mkdir('/a'),
+        move: () => fs.move('/a', '/b'),
+        read: () => fs.read('/a'),
+        readdir: () => fs.readdir('/a'),
+        readdirSubdomains: () => fs.readdirSubdomains({ directory_ids: [1] }),
+        rename: () => fs.rename('/a', 'b'),
+        sign: () => fs.sign('app-1', { uid: 'one' }),
+        space: () => fs.space(),
+        stat: () => fs.stat('/a'),
+        revokeReadURL: () => fs.revokeReadURL('aaa.bbb.ccc'),
+    };
+
+    for ( const [ name, call ] of Object.entries(operations) ) {
+        it(`${name} rejects without sending a request`, async () => {
+            await expect(call()).rejects.toBe('Authentication failed.');
+            expect(FakeXHR.requests).toHaveLength(0);
+        });
+    }
+
+    it('proceeds once authentication succeeds', async () => {
+        globalThis.puter.ui.authenticateWithPuter = vi.fn(async () => {
+            globalThis.puter.authToken = 'fresh-token';
+        });
+        await fs.space();
+        expect(FakeXHR.requests).toHaveLength(1);
+    });
+});
+
+describe('getShareLink', () => {
+    const FILE_UID = '2b7d8c1e-4f3a-4b6c-9d1e-0a1b2c3d4e5f';
+    const statFile = () => ({ uid: FILE_UID, is_dir: false });
+
+    beforeEach(() => {
+        globalThis.puter.defaultGUIOrigin = 'https://gui.test/';
+        globalThis.puter.appName = undefined;
+    });
+
+    it('stats the path and builds the app link on the file uid', async () => {
+        FakeXHR.respondWith = statFile;
+        const link = await fs.getShareLink('/a/file.txt', 'editor');
+        expect(lastRequest().url).toBe('https://api.test/stat');
+        expect(lastBody()).toMatchObject({ path: '/a/file.txt' });
+        expect(link).toBe(`https://gui.test/app/editor?file=${FILE_UID}`);
+    });
+
+    it('takes a uid in place of a path, and the options form', async () => {
+        FakeXHR.respondWith = statFile;
+        await fs.getShareLink(FILE_UID, 'editor');
+        expect(lastBody()).toMatchObject({ uid: FILE_UID });
+        expect(lastBody().path).toBeUndefined();
+
+        const link = await fs.getShareLink({ uid: FILE_UID, appName: 'my app' });
+        expect(link).toBe(`https://gui.test/app/my%20app?file=${FILE_UID}`);
+    });
+
+    it('defaults the app to the one the SDK runs in', async () => {
+        FakeXHR.respondWith = statFile;
+        globalThis.puter.appName = 'notepad';
+        expect(await fs.getShareLink('/a/file.txt')).toBe(`https://gui.test/app/notepad?file=${FILE_UID}`);
+    });
+
+    it('rejects before the network without a file or an app', async () => {
+        await expect(fs.getShareLink('/a/file.txt')).rejects.toMatchObject({ code: 'app_name_required' });
+        await expect(fs.getShareLink({ appName: 'editor' })).rejects.toMatchObject({ code: 'field_missing' });
+        expect(FakeXHR.requests).toHaveLength(0);
+    });
+
+    it('rejects a directory', async () => {
+        FakeXHR.respondWith = () => ({ uid: 'dir-uid', is_dir: true });
+        await expect(fs.getShareLink('/a/dir', 'editor')).rejects.toMatchObject({ code: 'not_a_file' });
+    });
+
+    it('feeds legacy callbacks the same result', async () => {
+        FakeXHR.respondWith = statFile;
+        const success = vi.fn();
+        const error = vi.fn();
+        const link = await fs.getShareLink('/a/file.txt', 'editor', success, error);
+        expect(success).toHaveBeenCalledWith(link);
+        expect(error).not.toHaveBeenCalled();
+
+        const failed = vi.fn();
+        await expect(fs.getShareLink('/a/file.txt', undefined, vi.fn(), failed))
+            .rejects.toMatchObject({ code: 'app_name_required' });
+        expect(failed).toHaveBeenCalledWith(expect.objectContaining({ code: 'app_name_required' }));
+    });
+});

@@ -1,0 +1,396 @@
+/*
+ * Copyright (C) 2024-present Puter Technologies Inc.
+ *
+ * This file is part of Puter.
+ *
+ * Puter is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published
+ * by the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+import { formatCredits, formatDollarsFromMicrocents, usageIsCredits } from './credits.js';
+import { addonCreditsRemaining, usageBudget } from './usageBudget.js';
+
+// Whether the server reported credits — decides whether the usage surfaces
+// render credits or fall back to dollars.
+let usageShowsCredits = false;
+
+// Sort state for the usage table
+let usageTableSortState = {
+    column: 'cost', // default sort by cost
+    direction: 'desc', // default descending (highest cost first)
+};
+let usageTableData = []; // Store raw data for sorting
+let usageTableRendered = false; // A table (possibly empty) has rendered from a successful load
+let usageTableExpanded = false; // Track if table is showing all rows
+const USAGE_TABLE_INITIAL_ROWS = 10;
+
+const TabUsage = {
+    id: 'usage',
+    label: 'Usage',
+    icon: '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" class="bi bi-speedometer2" viewBox="0 0 16 16"> <path d="M8 4a.5.5 0 0 1 .5.5V6a.5.5 0 0 1-1 0V4.5A.5.5 0 0 1 8 4M3.732 5.732a.5.5 0 0 1 .707 0l.915.914a.5.5 0 1 1-.708.708l-.914-.915a.5.5 0 0 1 0-.707M2 10a.5.5 0 0 1 .5-.5h1.586a.5.5 0 0 1 0 1H2.5A.5.5 0 0 1 2 10m9.5 0a.5.5 0 0 1 .5-.5h1.5a.5.5 0 0 1 0 1H12a.5.5 0 0 1-.5-.5m.754-4.246a.39.39 0 0 0-.527-.02L7.547 9.31a.91.91 0 1 0 1.302 1.258l3.434-4.297a.39.39 0 0 0-.029-.518z"/> <path fill-rule="evenodd" d="M0 10a8 8 0 1 1 15.547 2.661c-.442 1.253-1.845 1.602-2.932 1.25C11.309 13.488 9.475 13 8 13c-1.474 0-3.31.488-4.615.911-1.087.352-2.49.003-2.932-1.25A8 8 0 0 1 0 10m8-7a7 7 0 0 0-6.603 9.329c.203.575.923.876 1.68.63C4.397 12.533 6.358 12 8 12s3.604.532 4.923.96c.757.245 1.477-.056 1.68-.631A7 7 0 0 0 8 3"/> </svg>',
+    html: () => {
+        return `
+            <div class="dashboard-section-header">
+                <div style="display: flex; justify-content: space-between; align-items: center;">
+                    <h2>${i18n('usage')}</h2>
+                    <a href="#" class="billing-plan-btn usage-plan-btn" style="display: none;"></a>
+                </div>
+                <p>Puter resources and AI usage</p>
+            </div>
+            <div class="driver-usage">
+                <div class="driver-usage-header">
+                    <h3 style="margin:0; font-size: 14px; flex-grow: 1; font-weight: 500;">${i18n('Storage')}</h3>
+                    <div style="font-size: 13px; margin-bottom: 3px; opacity:0.85;">
+                        <span id="storage-used-percent"></span>
+                        <span> &middot; </span>
+                        <span id="storage-used"></span>
+                        <span> used of </span>
+                        <span id="storage-capacity"></span>
+                        <span id="storage-puter-used-w" style="display:none;">&nbsp;(<span id="storage-puter-used"></span> ${i18n('storage_puter_used')})</span>
+                    </div>
+                </div>
+                <div id="storage-bar-wrapper">
+                    <div id="storage-bar"></div>
+                    <div id="storage-bar-host"></div>
+                </div>
+                <div class="driver-usage-container" style="margin-top: 30px;">
+                    <div class="driver-usage-header">
+                        <h3 style="margin:0; font-size: 14px; flex-grow: 1; font-weight: 500;">${i18n('Resources')}</h3>
+                        <div style="font-size: 13px; margin-bottom: 3px; opacity:0.85;">
+                            <span class="usage-progbar-percent"></span>
+                            <span> &middot; </span>
+                            <span id="total-usage"></span>
+                            <span> used of </span>
+                            <span id="total-capacity"></span>
+                        </div>
+                    </div>
+                    <div class="usage-progbar-wrapper">
+                        <div class="usage-progbar" style="width: 0;"></div>
+                    </div>
+                    <p class="usage-addon-credits" style="display: none;">
+                        <span class="usage-addon-left"></span>
+                        <span class="usage-addon-note">&middot; ${i18n('addon_credits_note')}</span>
+                    </p>
+                    <h3 style="margin:15px 0 10px 0; font-size: 14px; font-weight: 500;">Usage Details</h3>
+                    <div class="driver-usage-details-content visible">
+                    </div>
+                </div>
+            </div>`;
+    },
+    init: ($el_window) => {
+        setupPlanButton($el_window);
+        // Guard the click: UIUpgradeAccount only exists on hosted puter.com, and
+        // without the guard clicking would throw a TypeError.
+        $($el_window).find('.usage-plan-btn').on('click', (e) => {
+            e.preventDefault();
+            if ( typeof window.UIUpgradeAccount === 'function' ) {
+                (new window.UIUpgradeAccount()).open_as_window();
+            }
+        });
+
+        refreshUsageDetails($el_window);
+
+        // Click handler for sortable table headers
+        $($el_window).on('click', '.driver-usage-details-content-table th[data-sort]', function () {
+            const column = $(this).data('sort');
+
+            // Toggle direction if same column, otherwise default to descending
+            if ( usageTableSortState.column === column ) {
+                usageTableSortState.direction = usageTableSortState.direction === 'asc' ? 'desc' : 'asc';
+            } else {
+                usageTableSortState.column = column;
+                usageTableSortState.direction = 'desc';
+            }
+
+            renderUsageTable();
+        });
+
+        // Click handler for "Show more" to expand the table
+        $($el_window).on('click', '.usage-table-show-more', function () {
+            usageTableExpanded = true;
+            renderUsageTable();
+        });
+
+        // Click handler for "Show less" to collapse the table
+        $($el_window).on('click', '.usage-table-show-less', function () {
+            usageTableExpanded = false;
+            renderUsageTable();
+        });
+    },
+    // Refresh whenever the tab is (re)activated — otherwise the usage numbers
+    // stay frozen at page-load time for the whole session (there is no other
+    // refresh path), diverging from the Home cards which do refresh.
+    onActivate: ($el_window) => {
+        setupPlanButton($el_window);
+        refreshUsageDetails($el_window);
+    },
+};
+
+// init and the initial-route onActivate both fire when the dashboard opens
+// directly on this tab; share the in-flight refresh instead of issuing
+// duplicate request pairs.
+let usageRefreshPromise = null;
+function refreshUsageDetails ($el_window) {
+    if ( ! usageRefreshPromise ) {
+        usageRefreshPromise = update_usage_details($el_window).finally(() => {
+            usageRefreshPromise = null;
+        });
+    }
+    return usageRefreshPromise;
+}
+
+let planBtnRetryTimer = null;
+
+function setupPlanButton ($el_window, retryDelay = 250) {
+    const $planBtn = $($el_window).find('.usage-plan-btn');
+    clearTimeout(planBtnRetryTimer);
+    // UIUpgradeAccount is only present on hosted puter.com; on a self-hosted
+    // install the button has no working target, so hide it entirely rather
+    // than showing a dead control. Hosted deployments can attach it *after*
+    // the dashboard initializes, though — retry with decaying backoff so a
+    // load-order race can't hide the button from a subscriber. Give up after
+    // ~30s: a script that hasn't landed by then never will (self-hosted), and
+    // onActivate re-checks on every return to the tab anyway. The bound also
+    // releases the captured $el_window instead of pinning it forever.
+    if ( typeof window.UIUpgradeAccount !== 'function' ) {
+        $planBtn.hide();
+        if ( retryDelay <= 10000 ) {
+            planBtnRetryTimer = setTimeout(
+                () => setupPlanButton($el_window, retryDelay * 1.5),
+                retryDelay,
+            );
+        }
+        return;
+    }
+    const hasSubscription = window.user?.subscription?.active;
+    $planBtn
+        .text(hasSubscription ? 'Manage Plan' : 'Upgrade')
+        .toggleClass('manage', !!hasSubscription)
+        .toggleClass('upgrade', !hasSubscription)
+        .show();
+}
+
+function getSortIcon (column) {
+    const isActive = usageTableSortState.column === column;
+    const direction = usageTableSortState.direction;
+
+    if ( ! isActive ) {
+        // Neutral sort icon (both arrows, dimmed)
+        return `<span class="sort-icon sort-icon-neutral">
+            <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" fill="currentColor" viewBox="0 0 16 16">
+                <path d="M3.5 3.5a.5.5 0 0 0-1 0v8.793l-1.146-1.147a.5.5 0 0 0-.708.708l2 1.999.007.007a.497.497 0 0 0 .7-.006l2-2a.5.5 0 0 0-.707-.708L3.5 12.293V3.5zm4 .5a.5.5 0 0 1 0-1h1a.5.5 0 0 1 0 1h-1zm0 3a.5.5 0 0 1 0-1h3a.5.5 0 0 1 0 1h-3zm0 3a.5.5 0 0 1 0-1h5a.5.5 0 0 1 0 1h-5zm0 3a.5.5 0 0 1 0-1h7a.5.5 0 0 1 0 1h-7z"/>
+            </svg>
+        </span>`;
+    } else if ( direction === 'asc' ) {
+        // Ascending icon
+        return `<span class="sort-icon sort-icon-asc">
+            <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" fill="currentColor" viewBox="0 0 16 16">
+                <path d="M3.5 12.5a.5.5 0 0 1-1 0V3.707L1.354 4.854a.5.5 0 1 1-.708-.708l2-1.999.007-.007a.498.498 0 0 1 .7.006l2 2a.5.5 0 1 1-.707.708L3.5 3.707V12.5zm3.5-9a.5.5 0 0 1 .5-.5h7a.5.5 0 0 1 0 1h-7a.5.5 0 0 1-.5-.5zM7.5 6a.5.5 0 0 0 0 1h5a.5.5 0 0 0 0-1h-5zm0 3a.5.5 0 0 0 0 1h3a.5.5 0 0 0 0-1h-3zm0 3a.5.5 0 0 0 0 1h1a.5.5 0 0 0 0-1h-1z"/>
+            </svg>
+        </span>`;
+    } else {
+        // Descending icon
+        return `<span class="sort-icon sort-icon-desc">
+            <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" fill="currentColor" viewBox="0 0 16 16">
+                <path d="M3.5 2.5a.5.5 0 0 0-1 0v8.793l-1.146-1.147a.5.5 0 0 0-.708.708l2 1.999.007.007a.497.497 0 0 0 .7-.006l2-2a.5.5 0 0 0-.707-.708L3.5 11.293V2.5zm3.5 1a.5.5 0 0 1 .5-.5h7a.5.5 0 0 1 0 1h-7a.5.5 0 0 1-.5-.5zM7.5 6a.5.5 0 0 0 0 1h5a.5.5 0 0 0 0-1h-5zm0 3a.5.5 0 0 0 0 1h3a.5.5 0 0 0 0-1h-3zm0 3a.5.5 0 0 0 0 1h1a.5.5 0 0 0 0-1h-1z"/>
+            </svg>
+        </span>`;
+    }
+}
+
+function renderUsageTable () {
+    // Sort the data
+    const sortedData = [...usageTableData].sort((a, b) => {
+        let aVal, bVal;
+
+        switch ( usageTableSortState.column ) {
+            case 'resource':
+                aVal = a.resource.toLowerCase();
+                bVal = b.resource.toLowerCase();
+                break;
+            case 'cost':
+            default:
+                aVal = a.rawCost;
+                bVal = b.rawCost;
+                break;
+        }
+
+        if ( aVal < bVal ) return usageTableSortState.direction === 'asc' ? -1 : 1;
+        if ( aVal > bVal ) return usageTableSortState.direction === 'asc' ? 1 : -1;
+        return 0;
+    });
+
+    // Determine how many rows to show
+    const hasMoreRows = sortedData.length > USAGE_TABLE_INITIAL_ROWS;
+    const rowsToShow = usageTableExpanded ? sortedData : sortedData.slice(0, USAGE_TABLE_INITIAL_ROWS);
+    const hiddenRowCount = sortedData.length - USAGE_TABLE_INITIAL_ROWS;
+
+    // Build the wrapper with potential collapsed state
+    const isCollapsed = hasMoreRows && !usageTableExpanded;
+    let h = `<div class="usage-table-wrapper${isCollapsed ? ' collapsed' : ''}">`;
+
+    // Build the table
+    h += '<table class="driver-usage-details-content-table">';
+
+    h += `<thead>
+        <tr>
+            <th data-sort="resource" class="sortable-th">Resource ${getSortIcon('resource')}</th>
+            <th>Units</th>
+            <th data-sort="cost" class="sortable-th">${usageShowsCredits ? i18n('credits') : 'Cost'} ${getSortIcon('cost')}</th>
+        </tr>
+    </thead>`;
+
+    h += '<tbody>';
+    for ( const row of rowsToShow ) {
+        h += `
+        <tr>
+            <td>${window.html_encode(row.resource.replaceAll('_dot_', '.'))}</td>
+            <td>${row.formattedUnits}</td>
+            <td>${row.formattedCost}</td>
+        </tr>`;
+    }
+    h += '</tbody>';
+    h += '</table>';
+
+    // Add "Show more" overlay if there are hidden rows
+    if ( isCollapsed ) {
+        h += `<div class="usage-table-fade-overlay">
+            <button class="usage-table-show-more">Show ${hiddenRowCount} more</button>
+        </div>`;
+    }
+
+    // Add "Show less" button when expanded and there are more rows than the initial limit
+    if ( usageTableExpanded && hasMoreRows ) {
+        h += `<div class="usage-table-show-less-wrapper">
+            <button class="usage-table-show-less">Show less</button>
+        </div>`;
+    }
+
+    h += '</div>';
+
+    $('.driver-usage-details-content').html(h);
+}
+
+async function update_usage_details ($el_window) {
+    const monthlyUsagePromise = puter.auth.getMonthlyUsage().then(res => {
+        const budget = usageBudget(res.usage, res.allowanceInfo);
+        const addonLeft = addonCreditsRemaining(res.allowanceInfo);
+        // The server reports credits (already scaled) or raw amounts (no
+        // multiplier configured), and says which via the unit flag.
+        const inCredits = usageIsCredits(res.allowanceInfo);
+        usageShowsCredits = inCredits;
+        const amount = (v) => inCredits
+            ? formatCredits(v)
+            : formatDollarsFromMicrocents(v);
+
+        $('#total-usage').html(amount(budget.used));
+        $('#total-capacity').html(inCredits
+            ? `${amount(budget.capacity)} ${i18n(addonLeft === null ? 'credits' : 'monthly_credits')}`
+            : amount(budget.capacity));
+        $('.usage-progbar-percent').html(`${budget.percent }%`);
+        $('.usage-progbar').css({
+            width: `${budget.barPercent }%`,
+            'background-color': window.usage_bar_color(budget.barPercent),
+        });
+
+        $('.usage-addon-credits').toggle(addonLeft !== null);
+        if ( addonLeft !== null ) {
+            $('.usage-addon-left').html(i18n('addon_credits_available', { amount: amount(addonLeft) }));
+        }
+
+        // Store raw data for sorting
+        usageTableData = [];
+        for ( let key in res.usage ) {
+            // value must be object
+            if ( typeof res.usage[key] !== 'object' ) {
+                continue;
+            }
+
+            const rawUnits = res.usage[key].units;
+            const rawCost = res.usage[key].cost;
+
+            // Format units for display
+            let formattedUnits;
+            if ( key.endsWith(':bytes') ) {
+                formattedUnits = window.byte_format(rawUnits);
+            } else {
+                formattedUnits = window.number_format(rawUnits, { decimals: 0, thousandSeparator: ',' });
+            }
+
+            usageTableData.push({
+                resource: key,
+                rawUnits: rawUnits,
+                formattedUnits: formattedUnits,
+                rawCost: rawCost,
+                formattedCost: inCredits ? formatCredits(rawCost) : formatDollarsFromMicrocents(rawCost),
+            });
+        }
+
+        renderUsageTable();
+        usageTableRendered = true;
+    }).catch(err => {
+        console.error('Failed to load monthly usage:', err);
+        // Only show the failure note when nothing has rendered yet — a
+        // transient refresh error must not wipe a table the user is already
+        // looking at (mirrors the Apps grid's error handling). Track "has
+        // rendered", not data length: an account with zero usage renders a
+        // legitimately empty table.
+        if ( ! usageTableRendered ) {
+            $('.driver-usage-details-content').html(
+                '<p style="opacity:0.7; font-size:13px;">Usage details are unavailable right now.</p>',
+            );
+        }
+    });
+
+    const spacePromise = puter.fs.space().then(res => {
+        // Guard capacity 0 — otherwise 0/0 renders literally as "NaN%".
+        let usage_percentage = res.capacity ? (res.used / res.capacity * 100).toFixed(0) : '0';
+        usage_percentage = usage_percentage > 100 ? 100 : usage_percentage;
+
+        let general_used = res.used;
+
+        let host_usage_percentage = 0;
+        if ( res.host_used ) {
+            $('#storage-puter-used').html(window.byte_format(res.used));
+            $('#storage-puter-used-w').show();
+
+            general_used = res.host_used;
+            host_usage_percentage = ((res.host_used - res.used) / res.capacity * 100).toFixed(0);
+        }
+
+        $('#storage-used').html(window.byte_format(general_used));
+        $('#storage-capacity').html(window.byte_format(res.capacity));
+        $('#storage-used-percent').html(
+            `${usage_percentage }%${
+                host_usage_percentage > 0
+                    ? ` / ${ host_usage_percentage }%` : ''}`,
+        );
+        const totalStoragePercent = Number(usage_percentage) + Number(host_usage_percentage);
+        const storageColor = window.usage_bar_color(totalStoragePercent);
+        $('#storage-bar').css({
+            width: `${usage_percentage }%`,
+            'background-color': storageColor,
+        });
+        $('#storage-bar-host').css({
+            width: `${host_usage_percentage }%`,
+            'background-color': storageColor,
+        });
+    }).catch(err => {
+        console.error('Failed to load storage usage:', err);
+    });
+
+    // Wait for both promises to complete
+    await Promise.all([monthlyUsagePromise, spacePromise]);
+}
+
+export default TabUsage;

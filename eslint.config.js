@@ -1,139 +1,130 @@
-import js from "@eslint/js";
-import globals from "globals";
+import js from '@eslint/js';
+import tseslintPlugin from '@typescript-eslint/eslint-plugin';
+import tseslintParser from '@typescript-eslint/parser';
+import prettierPlugin from 'eslint-plugin-prettier';
+import prettierConfig from 'eslint-config-prettier';
+import { defineConfig } from 'eslint/config';
+import globals from 'globals';
 
-export default [
-    js.configs.recommended,
+// typescript-eslint's flat/recommended preset is an array of configs (base +
+// eslint-recommended overrides + recommended rules). Flatten its rules so we
+// can apply them via our own `files`-scoped blocks.
+const tsRecommendedRules = tseslintPlugin.configs['flat/recommended'].reduce(
+    (acc, cfg) => ({ ...acc, ...(cfg.rules ?? {}) }),
+    {},
+);
 
-    {
-        // Global ignores
-        ignores: [
-            "**/*.min.js",
-            "**/src/lib/**",
-            "**/dist/",
-            "src/backend/src/public/assets/**",
-            "incubator/**"
-        ],
-    },
-    {
-        // Top-level and tools use Node
-        files: [
-            "tools/**/*.js",
-        ],
-        languageOptions: {
-            globals: {
-                ...globals.node,
-            }
-        }
-    },
-    {
-        // Back end
-        files: [
-            "src/backend/**/*.js",
-            "mods/**/*.js",
-            "dev-server.js",
-            "utils.js",
-        ],
-        languageOptions: {
-            globals: {
-                ...globals.node,
-                "kv": true,
-                "def": true,
-                "use": true,
-                "ll":true,
-            }
-        }
-    },
-    {
-        // Front end
-        files: [
-            "src/**/*.js",
-        ],
-        ignores: [
-            "src/backend/**/*.js",
-        ],
-        languageOptions: {
-            globals: {
-                ...globals.browser,
-                ...globals.commonjs,
-                // Weird false positives
-                "Buffer": true,
-                // Puter Common
-                "puter": true,
-                "i18n": true,
-                "html_encode": true,
-                "html_decode": true,
-                "isMobile": true,
-                // Class Registry
-                "logger": true,
-                "def": true,
-                "use": true,
-                // Libraries
-                "saveAs": true,         // FileSaver
-                "iro": true,            // iro.js color picker
-                "$": true,              // jQuery
-                "jQuery": true,         // jQuery
-                "JSZip": true,          // JSZip
-                "_": true,              // lodash
-                "QRCode": true,         // qrcode
-                "io": true,             // socket.io
-                "timeago": true,        // timeago
-                "SelectionArea": true,  // viselect
-                // Puter GUI Globals
-                "set_menu_item_prop": true,
-                "determine_active_container_parent": true,
-                "privacy_aware_path": true,
-                "api_origin": true,
-                "auth_token": true,
-                "logout": true,
-                "is_email": true,
-                "select_ctxmenu_item": true,
-            }
-        }
-    },
-    {
-        // Mods
-        // NOTE: Mods have backend and frontend parts, so this just includes the globals for both.
-        files: [
-            "mods/**/*.js",
-        ],
-        languageOptions: {
-            globals: {
-                ...globals.node,
-                "use": true,
-                "window": true,
-                "puter": true,
-            }
-        }
-    },
-    {
-        // Tests
-        files: [
-            "**/test/**/*.js",
-        ],
-        languageOptions: {
-            globals: {
-                ...globals.mocha,
-            }
-        }
-    },
-    {
-        // Phoenix
-        files: [
-            "src/phoenix/**/*.js",
-        ],
-        languageOptions: {
-            globals: {
-                ...globals.node,
-            }
-        }
-    },
-    {
-        // Global rule settings
-        rules: {
-            "no-prototype-builtins": "off", // Complains about any use of hasOwnProperty()
-            "no-unused-vars": "off", // Temporary, we just have a lot of these
-            "no-debugger": "warn",
-            "no-async-promise-executor": "off",  // We do this quite often and it's fine
-        }
-    },
+const prettierRules = {
+    ...prettierConfig.rules,
+    'prettier/prettier': 'error',
+};
+
+const unusedVarsOptions = {
+    args: 'after-used',
+    argsIgnorePattern: '^_',
+    varsIgnorePattern: '^_',
+    caughtErrorsIgnorePattern: '^_',
+    destructuredArrayIgnorePattern: '^_',
+    ignoreRestSiblings: true,
+};
+
+const preferConstOptions = {
+    destructuring: 'all',
+    ignoreReadBeforeAssign: false,
+};
+
+const lintedGlobals = {
+    ...globals.node,
+    extension: 'readonly',
+    config: 'readonly',
+    global_config: 'readonly',
+};
+
+const jsFiles = [
+    'src/backend/**/*.{js,mjs,cjs}',
+    'extensions/**/*.{js,mjs,cjs}',
 ];
+
+const tsIgnores = [
+    '**/*.test.ts',
+    '**/*.test.mts',
+    '**/*.spec.ts',
+    '**/*.spec.mts',
+    'src/backend/test/**',
+    'src/backend/tools/**',
+    'src/backend/vitest.config.ts',
+    'src/backend/vitest.bench.config.ts',
+];
+
+const createTsConfig = ({ files, project }) => ({
+    files,
+    ignores: tsIgnores,
+    languageOptions: {
+        parser: tseslintParser,
+        globals: lintedGlobals,
+        parserOptions: {
+            ecmaVersion: 'latest',
+            sourceType: 'module',
+            projectService: { defaultProject: project },
+            tsconfigRootDir: import.meta.dirname,
+        },
+    },
+    plugins: {
+        '@typescript-eslint': tseslintPlugin,
+        prettier: prettierPlugin,
+    },
+    rules: {
+        ...tsRecommendedRules,
+        ...prettierRules,
+        '@typescript-eslint/no-unused-vars': ['error', unusedVarsOptions],
+        '@typescript-eslint/no-explicit-any': 'warn',
+        'prefer-const': ['error', preferConstOptions],
+    },
+});
+
+export default defineConfig([
+    {
+        ignores: [
+            '**/*.dbmig.js',
+            'dist/**',
+            'build/**',
+            'volatile/**',
+            'node_modules/**',
+            'puter.js/**',
+            'apps/**',
+            'experiment/**',
+            'workers/**',
+            'src/public/**',
+            'src/gui/**',
+            'src/docs/**',
+            'src/puter-js/**',
+            'src/worker/**',
+            'submodules/**',
+            'tests/**',
+            'tools/**',
+        ],
+    },
+    {
+        files: jsFiles,
+        ignores: ['**/*.test.js'],
+        plugins: {
+            js,
+            prettier: prettierPlugin,
+        },
+        extends: ['js/recommended'],
+        languageOptions: {
+            ecmaVersion: 'latest',
+            sourceType: 'module',
+            globals: lintedGlobals,
+        },
+        rules: {
+            ...prettierRules,
+            'no-unused-vars': ['error', unusedVarsOptions],
+            'prefer-const': ['error', preferConstOptions],
+        },
+    },
+    createTsConfig({
+        files: ['src/backend/**/*.ts', 'extensions/**/*.ts'],
+        project: './tsconfig.json',
+    }),
+]);

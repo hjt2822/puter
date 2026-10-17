@@ -1,171 +1,116 @@
-class FetchDriverCallBackend {
-    constructor ({ context }) {
-        this.context = context;
-        this.response_handlers = this.constructor.response_handlers;
-    }
-    
-    static response_handlers = {
-        'application/x-ndjson': async resp => {
-            const Stream = async function* Stream (readableStream) {
-                const reader = readableStream.getReader();
-                let value, done;
-                while ( ! done ) {
-                    ({ value, done } = await reader.read());
-                    if ( done ) break;
-                    const parts = (new TextDecoder().decode(value).split('\n'));
-                    for ( const part of parts ) {
-                        if ( part.trim() === '' ) continue;
-                        yield JSON.parse(part);
-                    }
-                }
-            }
-            
-            return Stream(resp.body);
-        },
-        'application/json': async resp => {
-            return await resp.json();
-        },
-        'application/octet-stream': async resp => {
-            return await resp.blob();
-        },
-    }
-    
-    async call ({ driver, method_name, parameters }) {
-        const resp = await fetch(`${this.context.APIOrigin}/drivers/call`, {
-            headers: {
-                Authorization: `Bearer ${this.context.authToken}`,
-                'Content-Type': 'application/json',
-            },
-            method: 'POST',
-            body: JSON.stringify({
-                'interface': driver.iface_name,
-                ...(driver.service_name
-                    ? { service: driver.service_name }
-                    : {}),
-                method: method_name,
-                args: parameters,
-            }),
-        });
-        
-        const content_type = resp.headers.get('content-type')
-            .split(';')[0].trim(); // TODO: parser for Content-Type
-        const handler = this.response_handlers[content_type];
-        if ( ! handler ) {
-            const msg = `unrecognized content type: ${content_type}`;
-            console.error(msg);
-            console.error('creating blob so dev tools shows response...');
-            await resp.blob();
-            throw new Error(msg);
-        }
-        
-        return await handler(resp);
-    }
-}
+import { driverCallEnvelope, fetchUrl } from '../lib/networkUtils.js';
 
-class Driver {
-    constructor ({
-        iface,
-        iface_name,
-        service_name,
-        call_backend,
-    }) {
-        this.iface = iface;
-        this.iface_name = iface_name;
-        this.service_name = service_name;
-        this.call_backend = call_backend;
-    }
-    async call (method_name, parameters) {
-        return await this.call_backend.call({
-            driver: this,
-            method_name,
-            parameters,
-        });
-    }
-}
-
-class Drivers {
+/**
+ * A driver interface bound to an SDK instance, as returned by
+ * `puter.drivers.get()`. Calls resolve the response envelope rather than the
+ * unwrapped result — see `driverCallEnvelope`.
+ */
+export class Driver {
     /**
-     * Creates a new instance with the given authentication token, API origin, and app ID,
-     *
-     * @class
-     * @param {string} authToken - Token used to authenticate the user.
-     * @param {string} APIOrigin - Origin of the API server. Used to build the API endpoint URLs.
-     * @param {string} appID - ID of the app to use.
+     * @param {import('../index.js').Puter} puter
+     * @param {string} ifaceName
      */
-    constructor (authToken, APIOrigin, appID) {
-        this.authToken = authToken;
-        this.APIOrigin = APIOrigin;
-        this.appID = appID;
-        
-        // Driver-specific
+    constructor (puter, ifaceName) {
+        this.puter = puter;
+        this.iface_name = ifaceName;
+    }
+
+    /**
+     * @param {string} methodName
+     * @param {Record<string, unknown>} [parameters]
+     * @returns {Promise<unknown>}
+     */
+    async call (methodName, parameters) {
+        return await driverCallEnvelope({
+            puter: this.puter,
+            iface: this.iface_name,
+            method: methodName,
+            args: parameters,
+        });
+    }
+}
+
+/**
+ * The `puter.drivers` module: call driver interfaces directly.
+ */
+export class DriversModule {
+    /** @param {import('../index.js').Puter} puter */
+    constructor (puter) {
+        this.puter = puter;
         this.drivers_ = {};
-
-        this.context = {};
-        Object.defineProperty(this.context, 'authToken', {
-            get: () => this.authToken,
-        });
-        Object.defineProperty(this.context, 'APIOrigin', {
-            get: () => this.APIOrigin,
-        });
     }
 
-    /**
-     * Sets a new authentication token and resets the socket connection with the updated token, if applicable.
-     *
-     * @param {string} authToken - The new authentication token.
-     * @memberof [AI]
-     * @returns {void}
-     */
-    setAuthToken (authToken) {
-        this.authToken = authToken;
+    _init ({ puter }) {
+        puter.call = this.call.bind(this);
     }
 
-    /**
-     * Sets the API origin.
-     * 
-     * @param {string} APIOrigin - The new API origin.
-     * @memberof [AI]
-     * @returns {void}
-     */
-    setAPIOrigin (APIOrigin) {
-        this.APIOrigin = APIOrigin;
-    }
-    
+    /** @returns {Promise<Record<string, unknown>>} */
     async list () {
-        const resp = await fetch(`${this.APIOrigin}/lsmod`, {
-            headers: {
-                Authorization: 'Bearer ' + this.authToken,
-            },
-            method: 'POST'
+        const resp = await fetchUrl(`${this.puter.APIOrigin}/lsmod`, {
+            method: 'POST',
+            includePuterAuth: true,
+            logContext: { service: 'drivers', operation: 'list', params: {} },
         });
         const list = await resp.json();
         return list.interfaces;
     }
-    
-    async get (iface_name, service_name) {
-        const key = `${iface_name}:${service_name}`;
-        if ( this.drivers_[key] ) return this.drivers_[key];
-        
-        const interfaces = await this.list();
-        if ( ! interfaces[iface_name] ) {
-            throw new Error(`Interface ${iface_name} not found`);
+
+    /**
+     * Returns a handle for an interface. Cached per interface, so repeated
+     * `get()` calls hand back the same object.
+     *
+     * @param {string} ifaceName
+     * @returns {Promise<Driver>}
+     */
+    async get (ifaceName) {
+        return this.drivers_[ifaceName] ??= new Driver(this.puter, ifaceName);
+    }
+
+    /**
+     * Calls a driver method. The interface resolves to its default
+     * implementation on the backend, and a method with the same name as its
+     * interface can be left out:
+     *
+     *   puter.drivers.call('ipgeo', { ip: '1.2.3.4' })
+     *
+     * is the same as:
+     *
+     *   puter.drivers.call('ipgeo', 'ipgeo', { ip: '1.2.3.4' })
+     *
+     * @param {...unknown} args `(iface, method, parameters)`, or `(iface,
+     *   parameters)` for the method named after its interface.
+     * @returns {Promise<unknown>}
+     */
+    async call (...args) {
+        let ifaceName, methodName, parameters;
+
+        if ( args.length >= 4 ) {
+            // (iface, implementation, method, parameters) — the implementation
+            // slot predates interface-level defaults and is resolved by the
+            // backend, so it is accepted and ignored.
+            ([ifaceName, , methodName, parameters] = args);
+        } else if ( args.length === 3 ) {
+            ([ifaceName, methodName, parameters] = args);
+        } else {
+            ([ifaceName, parameters] = args);
+            methodName = ifaceName;
         }
-        
-        return this.drivers_[key] = new Driver ({
-            call_backend: new FetchDriverCallBackend({
-                context: this.context,
-            }),
-            iface: interfaces[iface_name],
-            iface_name,
-            service_name,
-        });
+
+        const driver = await this.get(ifaceName);
+        return await driver.call(methodName, parameters);
     }
-    
-    async call (iface_name, service_name, method_name, parameters) {
-        const driver = await this.get(iface_name, service_name);
-        return await driver.call(method_name, parameters);
-    }
-    
 }
+
+/**
+ * The public face of the module: derived from the class, with the internal
+ * `puter` handle and the driver cache omitted.
+ *
+ * @typedef {import('../lib/types.js').OmitMembers<
+ *     typeof DriversModule,
+ *     'puter' | 'drivers_' | '_init'
+ * >} DriversConstructor
+ */
+
+export const Drivers = /** @type {DriversConstructor} */ (DriversModule);
 
 export default Drivers;

@@ -1,5 +1,5 @@
-/**
- * Copyright (C) 2024 Puter Technologies Inc.
+/*
+ * Copyright (C) 2024-present Puter Technologies Inc.
  *
  * This file is part of Puter.
  *
@@ -7,23 +7,25 @@
  * it under the terms of the GNU Affero General Public License as published
  * by the Free Software Foundation, either version 3 of the License, or
  * (at your option) any later version.
- * 
+ *
  * This program is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
  * GNU Affero General Public License for more details.
- * 
+ *
  * You should have received a copy of the GNU Affero General Public License
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
+import { openRevalidatePopup } from '../../util/openid.js';
+import { fetchWithSessionCookieRetry, isSessionAuthError } from '../../util/sessionAuth.js';
 import Placeholder from '../../util/Placeholder.js';
 import PasswordEntry from '../Components/PasswordEntry.js';
-import UIWindow from '../UIWindow.js'
+import UIWindow from '../UIWindow.js';
 
 // TODO: DRY: We could specify a validator and endpoint instead of writing
 // a DOM tree and event handlers for each of these. (low priority)
-async function UIWindowChangeEmail(options){
+async function UIWindowChangeEmail (options) {
     options = options ?? {};
 
     const password_entry = new PasswordEntry({});
@@ -31,25 +33,32 @@ async function UIWindowChangeEmail(options){
 
     const internal_id = window.uuidv4();
     let h = '';
-    h += `<div class="change-email" style="padding: 20px; border-bottom: 1px solid #ced7e1;">`;
-        // error msg
-        h += `<div class="form-error-msg"></div>`;
-        // success msg
-        h += `<div class="form-success-msg"></div>`;
-        // new email
-        h += `<div style="overflow: hidden; margin-top: 10px; margin-bottom: 30px;">`;
-            h += `<label for="confirm-new-email-${internal_id}">${i18n('new_email')}</label>`;
-            h += `<input id="confirm-new-email-${internal_id}" type="text" name="new-email" class="new-email" autocomplete="off" />`;
-        h += `</div>`;
-        // password confirmation
-        h += `<div style="overflow: hidden; margin-top: 10px; margin-bottom: 30px;">`;
-            h += `<label>${i18n('account_password')}</label>`;
-            h += `${place_password_entry.html}`;
-        h += `</div>`;
+    h += '<div class="change-email" style="padding: 20px; border-bottom: 1px solid #ced7e1;">';
+    // error msg
+    h += '<div class="form-error-msg"></div>';
+    // success msg
+    h += '<div class="form-success-msg"></div>';
+    // new email
+    h += '<div style="overflow: hidden; margin-top: 10px; margin-bottom: 30px;">';
+    h += `<label for="confirm-new-email-${internal_id}">${i18n('new_email')}</label>`;
+    h += `<input id="confirm-new-email-${internal_id}" type="text" name="new-email" class="new-email" autocomplete="off" />`;
+    h += '</div>';
+    // password / OIDC revalidate
+    h += '<div class="change-email-auth-row" style="overflow: hidden; margin-top: 10px; margin-bottom: 30px;">';
+    h += '<div class="change-email-password-wrap">';
+    h += `<label>${i18n('account_password')}</label>`;
+    h += `${place_password_entry.html}`;
+    h += '</div>';
+    h += '<div class="change-email-oidc-wrap" style="display:none;">';
+    h += '<p class="change-email-oidc-flow-notice" style="margin:0;font-size:12px;color:#666;"></p>';
+    h += '<span class="change-email-revalidated-msg" style="display:none;"></span>';
+    h += '</div>';
+    h += '<p class="change-email-oidc-hint" style="margin-top:6px;font-size:12px;color:#666;display:none;"></p>';
+    h += '</div>';
 
-        // Change Email
-        h += `<button class="change-email-btn button button-primary button-block button-normal">${i18n('change_email')}</button>`;
-    h += `</div>`;
+    // Change Email
+    h += `<button class="change-email-btn button button-primary button-block button-normal">${i18n('change_email')}</button>`;
+    h += '</div>';
 
     const el_window = await UIWindow({
         title: i18n('change_email'),
@@ -72,8 +81,16 @@ async function UIWindowChangeEmail(options){
         height: 'auto',
         dominant: true,
         show_in_taskbar: false,
-        onAppend: function(this_window){
-            $(this_window).find(`.new-email`).get(0)?.focus({preventScroll:true});
+        onAppend: function (this_window) {
+            $(this_window).find('.new-email').get(0)?.focus({ preventScroll: true });
+            const oidc_only = !!(window.user && window.user.oidc_only);
+            const authRow = $(this_window).find('.change-email-auth-row');
+            if ( oidc_only ) {
+                authRow.find('.change-email-password-wrap').hide();
+                // OIDC: no notice box; user will see revalidation when they continue
+            } else {
+                authRow.find('.change-email-oidc-wrap').hide();
+            }
         },
         window_class: 'window-publishWebsite',
         body_css: {
@@ -81,65 +98,126 @@ async function UIWindowChangeEmail(options){
             height: '100%',
             'background-color': 'rgb(245 247 249)',
             'backdrop-filter': 'blur(3px)',
-        },    
-        ...options.window_options
-    })
+        },
+        ...options.window_options,
+    });
 
     password_entry.attach(place_password_entry);
 
-    $(el_window).find('.change-email-btn').on('click', function(e){
-        // hide previous error/success msg
-        $(el_window).find('.form-success-msg, .form-success-msg').hide();
+    const origin = window.gui_origin || window.api_origin || '';
+    const apiUrl = `${origin}/user-protected/change-email`;
+    let revalidated = false;
+
+    const hint = $(el_window).find('.change-email-oidc-hint');
+    const REVALIDATE_POPUP_TEXT = i18n('revalidate_sign_in_popup') || 'Sign in with your linked account in the popup.';
+
+    const myOpenRevalidatePopup = async (revalidateUrl) => {
+        revalidateUrl = revalidateUrl || (window.user && window.user.oidc_revalidate_url);
+        $(el_window).find('.change-email-btn').addClass('disabled');
+        hint.text(REVALIDATE_POPUP_TEXT).show();
+        try {
+            await openRevalidatePopup(revalidateUrl);
+        } catch (e) {
+            onError(e.message || 'Authentication failed');
+            return;
+        } finally {
+            hint.hide();
+        }
+    };
+
+    $(el_window).find('.change-email-btn').on('click', async function (e) {
+        $(el_window).find('.form-success-msg, .form-error-msg').hide();
 
         const new_email = $(el_window).find('.new-email').val();
-        const password = $(el_window).find('.password').val();
+        const password = password_entry.get('value');
+        const oidc_only = !!(window.user && window.user.oidc_only);
 
-        if(!new_email){
+        if ( ! new_email ) {
             $(el_window).find('.form-error-msg').html(i18n('all_fields_required'));
             $(el_window).find('.form-error-msg').fadeIn();
             return;
         }
 
-        $(el_window).find('.form-error-msg').hide();
+        if ( oidc_only && !revalidated && !password ) {
+            await myOpenRevalidatePopup();
 
-        // disable button
+            const res = await doSubmit({ new_email });
+            const data = await res.json().catch(() => ({}));
+            if ( res.ok ) onSuccess();
+            else if ( isSessionAuthError(res, data) ) onReauthRequired(data);
+            else onError(data.message || 'Request failed');
+            return;
+        }
+        $(el_window).find('.form-error-msg').hide();
         $(el_window).find('.change-email-btn').addClass('disabled');
-        // disable input
         $(el_window).find('.new-email').attr('disabled', true);
-    
-        $.ajax({
-            url: window.api_origin + "/user-protected/change-email",
-            type: 'POST',
-            async: true,
-            headers: {
-                "Authorization": "Bearer "+window.auth_token
-            },
-            contentType: "application/json",
-            data: JSON.stringify({ 
-                new_email: new_email, 
-                password: password_entry.get('value'),
-            }),				
-            success: function (data){
-                $(el_window).find('.form-success-msg').html(i18n('email_change_confirmation_sent'));
-                $(el_window).find('.form-success-msg').fadeIn();
-                $(el_window).find('input').val('');
-                // update email
-                window.user.email = new_email;
-                // enable button
-                $(el_window).find('.change-email-btn').removeClass('disabled');
-                // enable input
-                $(el_window).find('.new-email').attr('disabled', false);
-            },
-            error: function (err){
-                $(el_window).find('.form-error-msg').html(html_encode(err.responseJSON?.message));
-                $(el_window).find('.form-error-msg').fadeIn();
-                // enable button
-                $(el_window).find('.change-email-btn').removeClass('disabled');
-                // enable input
-                $(el_window).find('.new-email').attr('disabled', false);
+
+        let res = await doSubmit({ new_email, password });
+        const data = await res.json().catch(() => ({}));
+
+        if ( res.ok ) {
+            onSuccess();
+            return;
+        }
+        if ( isSessionAuthError(res, data) ) {
+            onReauthRequired(data);
+            return;
+        }
+        if ( data.code === 'oidc_revalidation_required' && data.revalidate_url ) {
+            await myOpenRevalidatePopup(data.revalidate_url);
+            const r = await doSubmit({ new_email });
+            if ( r.ok ) {
+                onSuccess();
+                return;
             }
-        });	
-    })
+            const d = await r.json().catch(() => ({}));
+            if ( isSessionAuthError(r, d) ) onReauthRequired(d);
+            else onError(d.message || 'Request failed');
+            return;
+        }
+        onError(data.message || 'Request failed');
+    });
+
+    function doSubmit ({ new_email, password } = {}) {
+        // Do not send Authorization: user-protected endpoints use session cookie (hasHttpOnlyCookie).
+        // On a 401 caused by a missing/bad cookie the wrapper mints the cookie
+        // from the GUI bearer token via /session/sync-cookie and retries once.
+        const send = () => fetch(apiUrl, {
+            method: 'POST',
+            credentials: 'include',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                new_email,
+                password: password !== undefined && password !== '' ? password : undefined,
+            }),
+        });
+        return fetchWithSessionCookieRetry(send, { origin, authToken: window.auth_token });
+    }
+
+    function onError (message) {
+        $(el_window).find('.form-error-msg').html(html_encode(message));
+        $(el_window).find('.form-error-msg').fadeIn();
+        $(el_window).find('.change-email-btn').removeClass('disabled');
+        $(el_window).find('.new-email').attr('disabled', false);
+    }
+
+    // Session cookie is absent and couldn't be minted from the bearer
+    // token — force the sign-in flow so it gets set, then the user can
+    // retry the change.
+    function onReauthRequired (data) {
+        onError(i18n('reauth_required_message'));
+        window.handleReauthRequired({ reason: data.reason, auth_id: data.auth_id });
+    }
+
+    function onSuccess () {
+        const new_email = $(el_window).find('.new-email').val();
+        $(el_window).find('.form-success-msg').html(i18n('email_change_confirmation_sent'));
+        $(el_window).find('.form-success-msg').fadeIn();
+        $(el_window).find('input').val('');
+        window.user.email = new_email;
+        $(el_window).find('.change-email-btn').removeClass('disabled');
+        $(el_window).find('.new-email').attr('disabled', false);
+    }
 }
 
-export default UIWindowChangeEmail
+export default UIWindowChangeEmail;

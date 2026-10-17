@@ -1,0 +1,1163 @@
+/**
+ * Copyright (C) 2024-present Puter Technologies Inc.
+ *
+ * This file is part of Puter.
+ *
+ * Puter is free software: you can redistribute it and/or modify it under the
+ * terms of the GNU Affero General Public License as published by the Free
+ * Software Foundation, either version 3 of the License, or (at your option) any
+ * later version.
+ *
+ * This program is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+ * FOR A PARTICULAR PURPOSE. See the GNU Affero General Public License for more
+ * details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program. If not, see
+ * [https://www.gnu.org/licenses/](https://www.gnu.org/licenses/).
+ */
+
+import { createServer, type Server } from 'node:http';
+import type { AddressInfo } from 'node:net';
+import {
+    afterAll,
+    afterEach,
+    beforeAll,
+    beforeEach,
+    describe,
+    expect,
+    it,
+    type MockInstance,
+    vi,
+} from 'vitest';
+import type { IConfig } from '../../types';
+import { DDBClient } from './DDBClient';
+
+const TABLE = 'kv-items';
+const GSI = 'by-kind';
+
+const localConfig = (): IConfig =>
+    ({
+        port: 0,
+        extensions: [],
+        dynamo: { inMemory: true, bootstrapTables: true },
+    }) as unknown as IConfig;
+
+/**
+ * The emulator reports a table as CREATING for a tick after `CreateTable`
+ * returns, so wait until it actually answers a read before using it.
+ */
+const awaitTable = async (
+    client: DDBClient,
+    table: string,
+    key: Record<string, unknown>,
+): Promise<void> => {
+    for (let attempt = 0; attempt < 100; attempt++) {
+        try {
+            await client.get(table, key);
+            return;
+        } catch (error) {
+            if ((error as Error).name !== 'ResourceNotFoundException')
+                throw error;
+            await new Promise((resolve) => setTimeout(resolve, 20));
+        }
+    }
+    throw new Error(`table ${table} never became queryable`);
+};
+
+const tableSchema = {
+    TableName: TABLE,
+    KeySchema: [
+        { AttributeName: 'pk', KeyType: 'HASH' as const },
+        { AttributeName: 'sk', KeyType: 'RANGE' as const },
+    ],
+    AttributeDefinitions: [
+        { AttributeName: 'pk', AttributeType: 'S' as const },
+        { AttributeName: 'sk', AttributeType: 'S' as const },
+        { AttributeName: 'kind', AttributeType: 'S' as const },
+    ],
+    GlobalSecondaryIndexes: [
+        {
+            IndexName: GSI,
+            KeySchema: [{ AttributeName: 'kind', KeyType: 'HASH' as const }],
+            Projection: { ProjectionType: 'ALL' as const },
+            ProvisionedThroughput: {
+                ReadCapacityUnits: 5,
+                WriteCapacityUnits: 5,
+            },
+        },
+    ],
+    ProvisionedThroughput: { ReadCapacityUnits: 5, WriteCapacityUnits: 5 },
+};
+
+describe('DDBClient — item operations', () => {
+    let client: DDBClient;
+
+    beforeAll(async () => {
+        client = new DDBClient(localConfig());
+        await client.createTableIfNotExists(tableSchema);
+        await awaitTable(client, TABLE, { pk: 'ready', sk: 'ready' });
+    });
+
+    it('round-trips an item and reports consumed capacity', async () => {
+        await client.put(TABLE, { pk: 'u1', sk: 'profile', name: 'ada' });
+
+        const result = await client.get(TABLE, { pk: 'u1', sk: 'profile' });
+        expect(result.Item).toEqual({ pk: 'u1', sk: 'profile', name: 'ada' });
+        expect(result.ConsumedCapacity?.TableName).toBe(TABLE);
+    });
+
+    it('returns no Item for a key that does not exist', async () => {
+        const result = await client.get(TABLE, { pk: 'nobody', sk: 'here' });
+        expect(result.Item).toBeUndefined();
+    });
+
+    it('honours a strongly consistent read', async () => {
+        await client.put(TABLE, { pk: 'u2', sk: 'profile', name: 'grace' });
+        const result = await client.get(
+            TABLE,
+            { pk: 'u2', sk: 'profile' },
+            true,
+        );
+        expect(result.Item?.name).toBe('grace');
+    });
+
+    it('applies an update expression and returns the new item', async () => {
+        await client.put(TABLE, { pk: 'u3', sk: 'counter', hits: 1 });
+        const updated = await client.update(
+            TABLE,
+            { pk: 'u3', sk: 'counter' },
+            'SET #h = :next',
+            { ':next': 5 },
+            { '#h': 'hits' },
+        );
+        expect(updated.Attributes).toMatchObject({ hits: 5 });
+    });
+
+    it('supports an update expression with no values or names', async () => {
+        await client.put(TABLE, { pk: 'u4', sk: 'doc', stale: true });
+        const updated = await client.update(
+            TABLE,
+            { pk: 'u4', sk: 'doc' },
+            'REMOVE stale',
+        );
+        expect(updated.Attributes).toEqual({ pk: 'u4', sk: 'doc' });
+    });
+
+    it('deletes an item', async () => {
+        await client.put(TABLE, { pk: 'u5', sk: 'temp' });
+        await client.del(TABLE, { pk: 'u5', sk: 'temp' });
+        const result = await client.get(TABLE, { pk: 'u5', sk: 'temp' });
+        expect(result.Item).toBeUndefined();
+    });
+
+    it('deletes only while its condition holds', async () => {
+        await client.put(TABLE, { pk: 'u6', sk: 'guarded', v: 1 });
+
+        await expect(
+            client.del(
+                TABLE,
+                { pk: 'u6', sk: 'guarded' },
+                {
+                    condition: {
+                        expression: '#v = :wrong',
+                        names: { '#v': 'v' },
+                        values: { ':wrong': 2 },
+                    },
+                },
+            ),
+        ).rejects.toMatchObject({ name: 'ConditionalCheckFailedException' });
+        expect(
+            (await client.get(TABLE, { pk: 'u6', sk: 'guarded' })).Item,
+        ).toBeDefined();
+
+        await client.del(
+            TABLE,
+            { pk: 'u6', sk: 'guarded' },
+            {
+                condition: {
+                    expression: '#v = :right',
+                    names: { '#v': 'v' },
+                    values: { ':right': 1 },
+                },
+            },
+        );
+        expect(
+            (await client.get(TABLE, { pk: 'u6', sk: 'guarded' })).Item,
+        ).toBeUndefined();
+    });
+
+    it('fetches keys from several tables in one batch', async () => {
+        await client.put(TABLE, { pk: 'b1', sk: 'a', v: 1 });
+        await client.put(TABLE, { pk: 'b1', sk: 'b', v: 2 });
+
+        const result = await client.batchGet([
+            { table: TABLE, items: { pk: 'b1', sk: 'a' } },
+            { table: TABLE, items: { pk: 'b1', sk: 'b' } },
+        ]);
+
+        const values = (result.Responses?.[TABLE] ?? [])
+            .map((item) => item.v as number)
+            .sort();
+        expect(values).toEqual([1, 2]);
+    });
+});
+
+describe('DDBClient — queries', () => {
+    let client: DDBClient;
+
+    beforeAll(async () => {
+        client = new DDBClient(localConfig());
+        await client.createTableIfNotExists(tableSchema);
+        await awaitTable(client, TABLE, { pk: 'ready', sk: 'ready' });
+        for (const sk of ['post#1', 'post#2', 'post#3', 'note#1']) {
+            await client.put(TABLE, {
+                pk: 'q1',
+                sk,
+                kind: sk.split('#')[0],
+                size: sk === 'post#2' ? 10 : 1,
+            });
+        }
+    });
+
+    it('queries by partition key', async () => {
+        const result = await client.query(TABLE, { pk: 'q1' });
+        expect(result.Items).toHaveLength(4);
+        expect(result.ConsumedCapacity?.TableName).toBe(TABLE);
+    });
+
+    it('narrows the sort key with begins_with', async () => {
+        const result = await client.query(
+            TABLE,
+            { pk: 'q1' },
+            0,
+            undefined,
+            '',
+            false,
+            { beginsWith: { key: 'sk', value: 'post#' } },
+        );
+        expect(result.Items?.map((item) => item.sk)).toEqual([
+            'post#1',
+            'post#2',
+            'post#3',
+        ]);
+    });
+
+    it('ignores an empty begins_with value', async () => {
+        const result = await client.query(
+            TABLE,
+            { pk: 'q1' },
+            0,
+            undefined,
+            '',
+            false,
+            { beginsWith: { key: 'sk', value: '' } },
+        );
+        expect(result.Items).toHaveLength(4);
+    });
+
+    it('applies a filter expression with its own names and values', async () => {
+        const result = await client.query(
+            TABLE,
+            { pk: 'q1' },
+            0,
+            undefined,
+            '',
+            false,
+            {
+                filter: {
+                    expression: '#s > :min',
+                    names: { '#s': 'size' },
+                    values: { ':min': 5 },
+                },
+            },
+        );
+        expect(result.Items?.map((item) => item.sk)).toEqual(['post#2']);
+    });
+
+    it('counts without returning items', async () => {
+        const result = await client.query(
+            TABLE,
+            { pk: 'q1' },
+            0,
+            undefined,
+            '',
+            false,
+            { select: 'COUNT' },
+        );
+        expect(result.Count).toBe(4);
+        expect(result.Items).toBeUndefined();
+    });
+
+    it('pages through results with the last evaluated key', async () => {
+        const seen: string[] = [];
+        let pageKey: Record<string, unknown> | undefined;
+        let pages = 0;
+
+        do {
+            const page = await client.query(TABLE, { pk: 'q1' }, 2, pageKey);
+            pages += 1;
+            expect(page.Items?.length).toBeLessThanOrEqual(2);
+            for (const item of page.Items ?? []) seen.push(item.sk as string);
+            pageKey = page.LastEvaluatedKey;
+        } while (pageKey && pages < 10);
+
+        expect(pages).toBeGreaterThan(1);
+        expect(new Set(seen).size).toBe(4);
+    });
+
+    it('queries a secondary index', async () => {
+        const result = await client.query(
+            TABLE,
+            { kind: 'note' },
+            0,
+            undefined,
+            GSI,
+        );
+        expect(result.Items?.map((item) => item.sk)).toEqual(['note#1']);
+    });
+});
+
+describe('DDBClient — batch writes', () => {
+    let client: DDBClient;
+
+    beforeAll(async () => {
+        client = new DDBClient(localConfig());
+        await client.createTableIfNotExists(tableSchema);
+        await awaitTable(client, TABLE, { pk: 'ready', sk: 'ready' });
+    });
+
+    it('reports no consumed capacity for an empty batch', async () => {
+        await expect(client.batchPut([])).resolves.toEqual({
+            ConsumedCapacity: [],
+        });
+    });
+
+    it('splits a batch larger than the service limit into chunks', async () => {
+        const params = Array.from({ length: 60 }, (_, index) => ({
+            table: TABLE,
+            item: { pk: 'bulk', sk: `item-${index}`, index },
+        }));
+
+        const result = await client.batchPut(params);
+
+        expect(result.ConsumedCapacity).toHaveLength(1);
+        expect(result.ConsumedCapacity[0].TableName).toBe(TABLE);
+        expect(result.ConsumedCapacity[0].CapacityUnits).toBeGreaterThan(0);
+
+        const stored = await client.query(TABLE, { pk: 'bulk' });
+        expect(stored.Items).toHaveLength(60);
+    });
+
+    it('reports no consumed capacity for an empty delete batch', async () => {
+        await expect(client.batchDel([])).resolves.toEqual({
+            ConsumedCapacity: [],
+        });
+    });
+
+    it('batch-deletes across chunks, leaving unrelated items alone', async () => {
+        const items = Array.from({ length: 30 }, (_, index) => ({
+            table: TABLE,
+            item: { pk: 'bulk-del', sk: `item-${index}`, index },
+        }));
+        await client.batchPut(items);
+
+        // Delete all but the last item — 29 keys still exercises chunking
+        // paths shared with batchPut while proving deletion is targeted.
+        const result = await client.batchDel(
+            items.slice(0, -1).map(({ table, item }) => ({
+                table,
+                key: { pk: item.pk, sk: item.sk },
+            })),
+        );
+
+        expect(result.ConsumedCapacity).toHaveLength(1);
+        expect(result.ConsumedCapacity[0].TableName).toBe(TABLE);
+
+        const stored = await client.query(TABLE, { pk: 'bulk-del' });
+        expect(stored.Items?.map((item) => item.sk)).toEqual(['item-29']);
+    });
+});
+
+describe('DDBClient — expired item sweep', () => {
+    it('deletes only the items past their ttl when the table already existed', async () => {
+        const client = new DDBClient(localConfig());
+        const table = 'ttl-items';
+        const schema = {
+            TableName: table,
+            KeySchema: [{ AttributeName: 'pk', KeyType: 'HASH' as const }],
+            AttributeDefinitions: [
+                { AttributeName: 'pk', AttributeType: 'S' as const },
+            ],
+            ProvisionedThroughput: {
+                ReadCapacityUnits: 5,
+                WriteCapacityUnits: 5,
+            },
+        };
+
+        await client.createTableIfNotExists(schema, 'expireAt');
+        await awaitTable(client, table, { pk: 'ready' });
+        const now = Math.floor(Date.now() / 1000);
+        await client.put(table, { pk: 'stale', expireAt: now - 60 });
+        await client.put(table, { pk: 'fresh', expireAt: now + 3600 });
+        await client.put(table, { pk: 'eternal' });
+
+        // Second call finds the table in use, so the sweep runs.
+        await client.createTableIfNotExists(schema, 'expireAt');
+
+        expect((await client.get(table, { pk: 'stale' })).Item).toBeUndefined();
+        expect((await client.get(table, { pk: 'fresh' })).Item).toBeDefined();
+        expect((await client.get(table, { pk: 'eternal' })).Item).toBeDefined();
+    });
+
+    it('keeps an item whose ttl is 0, which never expires', async () => {
+        const client = new DDBClient(localConfig());
+        const table = 'ttl-zero-items';
+        const schema = {
+            TableName: table,
+            KeySchema: [{ AttributeName: 'pk', KeyType: 'HASH' as const }],
+            AttributeDefinitions: [
+                { AttributeName: 'pk', AttributeType: 'S' as const },
+            ],
+            ProvisionedThroughput: {
+                ReadCapacityUnits: 5,
+                WriteCapacityUnits: 5,
+            },
+        };
+
+        await client.createTableIfNotExists(schema, 'expireAt');
+        await awaitTable(client, table, { pk: 'ready' });
+        await client.put(table, { pk: 'zero', expireAt: 0 });
+
+        // Second call finds the table in use, so the sweep runs.
+        await client.createTableIfNotExists(schema, 'expireAt');
+
+        expect((await client.get(table, { pk: 'zero' })).Item).toBeDefined();
+    });
+
+    it('keeps an item whose ttl is not a number, which the sweep can never purge', async () => {
+        const client = new DDBClient(localConfig());
+        const table = 'ttl-nan-items';
+        const schema = {
+            TableName: table,
+            KeySchema: [{ AttributeName: 'pk', KeyType: 'HASH' as const }],
+            AttributeDefinitions: [
+                { AttributeName: 'pk', AttributeType: 'S' as const },
+            ],
+            ProvisionedThroughput: {
+                ReadCapacityUnits: 5,
+                WriteCapacityUnits: 5,
+            },
+        };
+
+        await client.createTableIfNotExists(schema, 'expireAt');
+        await awaitTable(client, table, { pk: 'ready' });
+        const past = Math.floor(Date.now() / 1000) - 60;
+        await client.put(table, { pk: 'stringTtl', expireAt: String(past) });
+
+        // Second call finds the table in use, so the sweep runs.
+        await client.createTableIfNotExists(schema, 'expireAt');
+
+        expect(
+            (await client.get(table, { pk: 'stringTtl' })).Item,
+        ).toBeDefined();
+    });
+});
+
+describe('DDBClient — expired item sweep on an empty table', () => {
+    it('completes without deleting anything', async () => {
+        const client = new DDBClient(localConfig());
+        const table = 'ttl-empty';
+        const schema = {
+            TableName: table,
+            KeySchema: [{ AttributeName: 'pk', KeyType: 'HASH' as const }],
+            AttributeDefinitions: [
+                { AttributeName: 'pk', AttributeType: 'S' as const },
+            ],
+            ProvisionedThroughput: {
+                ReadCapacityUnits: 5,
+                WriteCapacityUnits: 5,
+            },
+        };
+
+        await client.createTableIfNotExists(schema, 'expireAt');
+        await awaitTable(client, table, { pk: 'ready' });
+        await expect(
+            client.createTableIfNotExists(schema, 'expireAt'),
+        ).resolves.toBeUndefined();
+    });
+});
+
+describe('DDBClient — credentialled configuration', () => {
+    it('refuses an aws config that is missing a key', () => {
+        expect(
+            () =>
+                new DDBClient({
+                    port: 0,
+                    extensions: [],
+                    dynamo: { aws: { access_key: 'only-one' } },
+                } as unknown as IConfig),
+        ).toThrow('requires both `access_key` and `secret_key`');
+    });
+
+    it('skips table creation on a managed deployment', async () => {
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+        const client = new DDBClient({
+            port: 0,
+            extensions: [],
+            dynamo: {
+                aws: { access_key: 'a', secret_key: 'b', region: 'us-west-2' },
+                endpoint: 'http://127.0.0.1:1',
+            },
+        } as unknown as IConfig);
+
+        // Would fail against the unreachable endpoint if it actually tried.
+        await client.createTableIfNotExists(tableSchema);
+        expect(warn).toHaveBeenCalledWith(
+            expect.stringContaining(
+                'Creating DynamoDB tables is disabled by default',
+            ),
+        );
+        warn.mockRestore();
+    });
+
+    it('rebinds an aws-credentialled client on recreate', async () => {
+        const client = new DDBClient({
+            port: 0,
+            extensions: [],
+            dynamo: {
+                aws: { access_key: 'a', secret_key: 'b' },
+                endpoint: 'http://127.0.0.1:1',
+            },
+        } as unknown as IConfig);
+
+        await expect(client.recreateClient()).resolves.toBeUndefined();
+    });
+
+    it('rebinds the underlying client on recreate', async () => {
+        const client = new DDBClient(localConfig());
+        await client.createTableIfNotExists(tableSchema);
+        await awaitTable(client, TABLE, { pk: 'ready', sk: 'ready' });
+        await client.put(TABLE, { pk: 'recreate', sk: 'a', v: 1 });
+
+        await client.recreateClient();
+
+        // Same in-memory store: the recreated client sees earlier writes.
+        const result = await client.get(TABLE, { pk: 'recreate', sk: 'a' });
+        expect(result.Item?.v).toBe(1);
+    });
+});
+
+// Unprocessed items are a throttling signal the emulator never produces, so
+// the retry loop is driven against a stub speaking the DynamoDB wire format.
+describe('DDBClient — unprocessed batch items', () => {
+    let server: Server;
+    let endpoint: string;
+    let responses: unknown[];
+    let requestCount = 0;
+
+    beforeAll(async () => {
+        server = createServer((req, res) => {
+            let body = '';
+            req.on('data', (chunk) => {
+                body += chunk;
+            });
+            req.on('end', () => {
+                const next = responses.shift() ?? {};
+                requestCount += 1;
+                res.writeHead(200, {
+                    'content-type': 'application/x-amz-json-1.0',
+                });
+                res.end(JSON.stringify(next));
+            });
+        });
+        await new Promise<void>((resolve) =>
+            server.listen(0, '127.0.0.1', resolve),
+        );
+        endpoint = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    });
+
+    afterAll(async () => {
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+    });
+
+    const stubClient = () =>
+        new DDBClient({
+            port: 0,
+            extensions: [],
+            dynamo: {
+                aws: { access_key: 'a', secret_key: 'b', region: 'us-west-2' },
+                endpoint,
+            },
+        } as unknown as IConfig);
+
+    const unprocessed = (pk: string) => ({
+        UnprocessedItems: {
+            [TABLE]: [{ PutRequest: { Item: { pk: { S: pk } } } }],
+        },
+        ConsumedCapacity: [{ TableName: TABLE, CapacityUnits: 1 }],
+    });
+
+    it('retries the leftover items and sums capacity across attempts', async () => {
+        requestCount = 0;
+        responses = [
+            unprocessed('retry-me'),
+            {
+                UnprocessedItems: {},
+                ConsumedCapacity: [{ TableName: TABLE, CapacityUnits: 2 }],
+            },
+        ];
+
+        const result = await stubClient().batchPut([
+            { table: TABLE, item: { pk: 'retry-me' } },
+        ]);
+
+        expect(requestCount).toBe(2);
+        expect(result.ConsumedCapacity).toEqual([
+            { TableName: TABLE, CapacityUnits: 3 },
+        ]);
+    });
+
+    it('gives up with a bad-request error when items never drain', async () => {
+        requestCount = 0;
+        responses = Array.from({ length: 12 }, () => unprocessed('stuck'));
+
+        await expect(
+            stubClient().batchPut([{ table: TABLE, item: { pk: 'stuck' } }]),
+        ).rejects.toMatchObject({
+            statusCode: 400,
+            legacyCode: 'bad_request',
+            message: 'Failed to batch write all items to DynamoDB',
+        });
+        // One initial attempt plus the full retry budget.
+        expect(requestCount).toBe(9);
+    }, 30_000);
+
+    it('tolerates a response that reports no capacity at all', async () => {
+        requestCount = 0;
+        responses = [{ UnprocessedItems: {} }];
+
+        await expect(
+            stubClient().batchPut([{ table: TABLE, item: { pk: 'quiet' } }]),
+        ).resolves.toEqual({ ConsumedCapacity: [] });
+        expect(requestCount).toBe(1);
+    });
+
+    it('ignores capacity entries with no table name', async () => {
+        requestCount = 0;
+        responses = [
+            {
+                UnprocessedItems: {},
+                ConsumedCapacity: [{ CapacityUnits: 7 }],
+            },
+        ];
+
+        await expect(
+            stubClient().batchPut([{ table: TABLE, item: { pk: 'anon' } }]),
+        ).resolves.toEqual({ ConsumedCapacity: [] });
+    });
+});
+
+// UnprocessedKeys are batchGet's analogue of UnprocessedItems above, driven
+// against the same kind of wire-format stub.
+describe('DDBClient — unprocessed batch keys', () => {
+    let server: Server;
+    let endpoint: string;
+    let responses: unknown[];
+    let requestCount = 0;
+
+    beforeAll(async () => {
+        server = createServer((req, res) => {
+            let body = '';
+            req.on('data', (chunk) => {
+                body += chunk;
+            });
+            req.on('end', () => {
+                const next = responses.shift() ?? {};
+                requestCount += 1;
+                res.writeHead(200, {
+                    'content-type': 'application/x-amz-json-1.0',
+                });
+                res.end(JSON.stringify(next));
+            });
+        });
+        await new Promise<void>((resolve) =>
+            server.listen(0, '127.0.0.1', resolve),
+        );
+        endpoint = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    });
+
+    afterAll(async () => {
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+    });
+
+    const stubClient = () =>
+        new DDBClient({
+            port: 0,
+            extensions: [],
+            dynamo: {
+                aws: { access_key: 'a', secret_key: 'b', region: 'us-west-2' },
+                endpoint,
+            },
+        } as unknown as IConfig);
+
+    const unprocessed = (pk: string) => ({
+        UnprocessedKeys: {
+            [TABLE]: { Keys: [{ pk: { S: pk } }] },
+        },
+        ConsumedCapacity: [{ TableName: TABLE, CapacityUnits: 1 }],
+    });
+
+    it('retries leftover keys and merges responses and capacity across attempts', async () => {
+        requestCount = 0;
+        responses = [
+            unprocessed('retry-me'),
+            {
+                Responses: {
+                    [TABLE]: [{ pk: { S: 'retry-me' }, v: { N: '1' } }],
+                },
+                UnprocessedKeys: {},
+                ConsumedCapacity: [{ TableName: TABLE, CapacityUnits: 2 }],
+            },
+        ];
+
+        const result = await stubClient().batchGet([
+            { table: TABLE, items: { pk: 'retry-me' } },
+        ]);
+
+        expect(requestCount).toBe(2);
+        expect(result.Responses?.[TABLE]).toEqual([{ pk: 'retry-me', v: 1 }]);
+        expect(result.ConsumedCapacity).toEqual([
+            { TableName: TABLE, CapacityUnits: 3 },
+        ]);
+    });
+
+    it('gives up with a bad-request error when keys never drain', async () => {
+        requestCount = 0;
+        responses = Array.from({ length: 12 }, () => unprocessed('stuck'));
+
+        await expect(
+            stubClient().batchGet([{ table: TABLE, items: { pk: 'stuck' } }]),
+        ).rejects.toMatchObject({
+            statusCode: 400,
+            legacyCode: 'bad_request',
+            message: 'Failed to batch get all items from DynamoDB',
+        });
+        // One initial attempt plus the full retry budget.
+        expect(requestCount).toBe(9);
+    }, 30_000);
+
+    it('tolerates a response that reports no items or capacity at all', async () => {
+        requestCount = 0;
+        responses = [{ Responses: {}, UnprocessedKeys: {} }];
+
+        await expect(
+            stubClient().batchGet([{ table: TABLE, items: { pk: 'quiet' } }]),
+        ).resolves.toEqual({ Responses: {}, ConsumedCapacity: [] });
+        expect(requestCount).toBe(1);
+    });
+
+    it('ignores capacity entries with no table name', async () => {
+        requestCount = 0;
+        responses = [
+            {
+                Responses: {},
+                UnprocessedKeys: {},
+                ConsumedCapacity: [{ CapacityUnits: 7 }],
+            },
+        ];
+
+        await expect(
+            stubClient().batchGet([{ table: TABLE, items: { pk: 'anon' } }]),
+        ).resolves.toEqual({ Responses: {}, ConsumedCapacity: [] });
+    });
+});
+
+// Answers by operation (X-Amz-Target) and records how many requests overlap, so
+// chunk concurrency and the TTL sweep's retries can be asserted.
+describe('DDBClient — batch write chunks and TTL sweep', () => {
+    let server: Server;
+    let endpoint: string;
+    let handlers: Record<string, (body: Record<string, unknown>) => unknown>;
+    let calls: string[];
+    let inFlight = 0;
+    let peakInFlight = 0;
+
+    beforeAll(async () => {
+        server = createServer((req, res) => {
+            let body = '';
+            req.on('data', (chunk) => {
+                body += chunk;
+            });
+            req.on('end', () => {
+                const op = String(req.headers['x-amz-target']).split('.')[1];
+                calls.push(op);
+                inFlight += 1;
+                peakInFlight = Math.max(peakInFlight, inFlight);
+                setTimeout(() => {
+                    inFlight -= 1;
+                    const reply = handlers[op]?.(JSON.parse(body)) ?? {};
+                    const { status = 200, ...payload } = reply as {
+                        status?: number;
+                    };
+                    res.writeHead(status, {
+                        'content-type': 'application/x-amz-json-1.0',
+                    });
+                    res.end(JSON.stringify(payload));
+                }, 20);
+            });
+        });
+        await new Promise<void>((resolve) =>
+            server.listen(0, '127.0.0.1', resolve),
+        );
+        endpoint = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    });
+
+    afterAll(async () => {
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+    });
+
+    beforeEach(() => {
+        calls = [];
+        inFlight = 0;
+        peakInFlight = 0;
+    });
+
+    const stubClient = (extra: Record<string, unknown> = {}) =>
+        new DDBClient({
+            port: 0,
+            extensions: [],
+            dynamo: {
+                aws: { access_key: 'a', secret_key: 'b', region: 'us-west-2' },
+                endpoint,
+                ...extra,
+            },
+        } as unknown as IConfig);
+
+    it('writes chunks concurrently, a bounded number at a time', async () => {
+        handlers = { BatchWriteItem: () => ({ UnprocessedItems: {} }) };
+
+        await stubClient().batchPut(
+            Array.from({ length: 200 }, (_, i) => ({
+                table: TABLE,
+                item: { pk: `item-${i}` },
+            })),
+        );
+
+        expect(calls).toHaveLength(8);
+        expect(peakInFlight).toBeGreaterThan(1);
+        expect(peakInFlight).toBeLessThanOrEqual(4);
+    });
+
+    it('stops starting chunks once one fails', async () => {
+        handlers = {
+            BatchWriteItem: () => ({
+                status: 400,
+                __type: 'com.amazon.coral.validate#ValidationException',
+                message: 'bad item',
+            }),
+        };
+
+        await expect(
+            stubClient().batchPut(
+                Array.from({ length: 250 }, (_, i) => ({
+                    table: TABLE,
+                    item: { pk: `item-${i}` },
+                })),
+            ),
+        ).rejects.toThrow('bad item');
+        // The first wave fails; none of the six chunks queued behind it run.
+        expect(calls.length).toBeLessThanOrEqual(4);
+    });
+
+    it('lets chunks already in flight finish before rejecting', async () => {
+        let replies = 0;
+        handlers = {
+            BatchWriteItem: (body) => {
+                replies += 1;
+                if (replies === 1) {
+                    return {
+                        status: 400,
+                        __type: 'com.amazon.coral.validate#ValidationException',
+                        message: 'bad item',
+                    };
+                }
+                // The rest need one retry, so they are still writing when the
+                // failure comes back.
+                return replies <= 4
+                    ? { UnprocessedItems: body.RequestItems }
+                    : { UnprocessedItems: {} };
+            },
+        };
+
+        await expect(
+            stubClient().batchPut(
+                Array.from({ length: 100 }, (_, i) => ({
+                    table: TABLE,
+                    item: { pk: `item-${i}` },
+                })),
+            ),
+        ).rejects.toThrow('bad item');
+        const sentBeforeReject = calls.length;
+        await new Promise((resolve) => setTimeout(resolve, 200));
+
+        // Nothing is written after the caller has seen the error.
+        expect(calls.length).toBe(sentBeforeReject);
+        expect(inFlight).toBe(0);
+    });
+
+    it('retries the unprocessed deletes of the TTL sweep', async () => {
+        const expired = [{ pk: { S: 'old' } }];
+        let batchWrites = 0;
+        handlers = {
+            CreateTable: () => ({
+                status: 400,
+                __type: 'com.amazonaws.dynamodb.v20120810#ResourceInUseException',
+                message: 'Table already exists',
+            }),
+            Scan: () => ({ Items: expired }),
+            BatchWriteItem: (body) => {
+                batchWrites += 1;
+                return batchWrites === 1
+                    ? { UnprocessedItems: body.RequestItems }
+                    : { UnprocessedItems: {} };
+            },
+        };
+
+        await stubClient({ bootstrapTables: true }).createTableIfNotExists(
+            {
+                TableName: TABLE,
+                KeySchema: [{ AttributeName: 'pk', KeyType: 'HASH' }],
+                AttributeDefinitions: [
+                    { AttributeName: 'pk', AttributeType: 'S' },
+                ],
+                BillingMode: 'PAY_PER_REQUEST',
+            },
+            'ttl',
+        );
+
+        expect(calls).toEqual([
+            'CreateTable',
+            'Scan',
+            'BatchWriteItem',
+            'BatchWriteItem',
+        ]);
+    });
+});
+
+// Throttles are a service-side signal the emulator never produces, so these
+// drive the client against a stub answering in DynamoDB's error shape.
+describe('DDBClient — throttle logging', () => {
+    let server: Server;
+    let endpoint: string;
+    let responses: { status: number; body: unknown }[];
+    let warn: MockInstance<typeof console.warn>;
+
+    beforeAll(async () => {
+        server = createServer((req, res) => {
+            req.resume();
+            req.on('end', () => {
+                const next = responses.shift() ?? { status: 200, body: {} };
+                res.writeHead(next.status, {
+                    'content-type': 'application/x-amz-json-1.0',
+                });
+                res.end(JSON.stringify(next.body));
+            });
+        });
+        await new Promise<void>((resolve) =>
+            server.listen(0, '127.0.0.1', resolve),
+        );
+        endpoint = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    });
+
+    afterAll(async () => {
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+    });
+
+    beforeEach(() => {
+        warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    });
+
+    afterEach(() => {
+        vi.restoreAllMocks();
+    });
+
+    const stubClient = () =>
+        new DDBClient({
+            port: 0,
+            extensions: [],
+            dynamo: {
+                aws: {
+                    access_key: 'a',
+                    secret_key: 'b',
+                    region: 'eu-central-1',
+                },
+                endpoint,
+            },
+        } as unknown as IConfig);
+
+    const throttled = (reason = 'TableWriteKeyRangeThroughputExceeded') => ({
+        status: 400,
+        body: {
+            __type: 'com.amazonaws.dynamodb.v20120810#ProvisionedThroughputExceededException',
+            message:
+                'The level of configured provisioned throughput for the table was exceeded.',
+            ThrottlingReasons: [
+                {
+                    reason,
+                    resource: `arn:aws:dynamodb:eu-central-1:0:table/${TABLE}`,
+                },
+            ],
+        },
+    });
+    const ok = (body: unknown = {}) => ({ status: 200, body });
+
+    const ddbWarnings = () =>
+        warn.mock.calls
+            .map(([line]) => String(line))
+            .filter((line) => line.startsWith('[ddb] '));
+
+    it('logs the key of a throttled update that succeeds on retry', async () => {
+        responses = [
+            throttled(),
+            ok({
+                Attributes: {
+                    pk: { S: 'hot' },
+                    sk: { S: 'counter' },
+                    v: { N: '1' },
+                },
+            }),
+        ];
+
+        const result = await stubClient().update(
+            TABLE,
+            { pk: 'hot', sk: 'counter' },
+            'SET v = :v',
+            { ':v': 1 },
+        );
+
+        expect(result.Attributes?.v).toBe(1);
+        expect(ddbWarnings()).toEqual([
+            '[ddb] throttled UpdateItem kv-items pk=hot sk=counter in eu-central-1: TableWriteKeyRangeThroughputExceeded',
+        ]);
+    }, 15_000);
+
+    it('logs only the key attributes of a throttled put', async () => {
+        const client = stubClient();
+        // On a managed deployment this creates nothing but learns the key schema.
+        await client.createTableIfNotExists(tableSchema);
+        responses = [throttled(), ok()];
+
+        await client.put(TABLE, {
+            pk: 'user-1',
+            sk: 'settings',
+            secret: 'do-not-log',
+        });
+
+        expect(ddbWarnings()).toEqual([
+            '[ddb] throttled PutItem kv-items pk=user-1 sk=settings in eu-central-1: TableWriteKeyRangeThroughputExceeded',
+        ]);
+        expect(warn.mock.calls.flat().join('\n')).not.toContain('do-not-log');
+    }, 15_000);
+
+    it('logs a hot key once a minute and counts the throttles in between', async () => {
+        const now = vi.spyOn(Date, 'now').mockReturnValue(1_000_000);
+        const client = stubClient();
+        const read = 'TableReadKeyRangeThroughputExceeded';
+
+        responses = [throttled(read), ok(), throttled(read), ok()];
+        await client.get(TABLE, { pk: 'burst', sk: 'a' });
+        await client.get(TABLE, { pk: 'burst', sk: 'a' });
+
+        now.mockReturnValue(1_000_000 + 61_000);
+        responses = [throttled(read), ok()];
+        await client.get(TABLE, { pk: 'burst', sk: 'a' });
+
+        expect(ddbWarnings()).toEqual([
+            `[ddb] throttled GetItem kv-items pk=burst sk=a in eu-central-1: ${read}`,
+            `[ddb] throttled GetItem kv-items pk=burst sk=a in eu-central-1: ${read} (+1 since last logged)`,
+        ]);
+    }, 15_000);
+
+    it('names the partition a throttled query read', async () => {
+        responses = [throttled('IndexReadKeyRangeThroughputExceeded'), ok()];
+
+        await stubClient().query(TABLE, { kind: 'note' }, 0, undefined, GSI);
+
+        expect(ddbWarnings()).toEqual([
+            '[ddb] throttled Query kv-items index=by-kind kind=note in eu-central-1: IndexReadKeyRangeThroughputExceeded',
+        ]);
+    }, 15_000);
+
+    it('names up to five keys of a throttled batch', async () => {
+        responses = [
+            throttled('TableReadKeyRangeThroughputExceeded'),
+            ok({ Responses: {}, UnprocessedKeys: {} }),
+        ];
+
+        await stubClient().batchGet(
+            Array.from({ length: 7 }, (_, index) => ({
+                table: TABLE,
+                items: { pk: `batch-${index}`, sk: 's' },
+            })),
+        );
+
+        expect(ddbWarnings()).toEqual([
+            '[ddb] throttled BatchGetItem kv-items pk=batch-0 sk=s, pk=batch-1 sk=s, pk=batch-2 sk=s, pk=batch-3 sk=s, pk=batch-4 sk=s (+2 more) in eu-central-1: TableReadKeyRangeThroughputExceeded',
+        ]);
+    }, 15_000);
+
+    it('logs batch items DynamoDB hands back unprocessed', async () => {
+        const client = stubClient();
+        await client.createTableIfNotExists(tableSchema);
+        responses = [
+            ok({
+                UnprocessedItems: {
+                    [TABLE]: [
+                        {
+                            PutRequest: {
+                                Item: {
+                                    pk: { S: 'left' },
+                                    sk: { S: 'over' },
+                                    v: { N: '1' },
+                                },
+                            },
+                        },
+                    ],
+                },
+            }),
+            ok({ UnprocessedItems: {} }),
+        ];
+
+        await client.batchPut([
+            { table: TABLE, item: { pk: 'left', sk: 'over', v: 1 } },
+            { table: TABLE, item: { pk: 'done', sk: 'fine', v: 2 } },
+        ]);
+
+        expect(ddbWarnings()).toEqual([
+            '[ddb] unprocessed BatchWriteItem kv-items pk=left sk=over in eu-central-1',
+        ]);
+    });
+
+    it('does not log errors that are not throttles', async () => {
+        responses = [
+            {
+                status: 400,
+                body: {
+                    __type: 'com.amazonaws.dynamodb.v20120810#ConditionalCheckFailedException',
+                    message: 'The conditional request failed',
+                },
+            },
+        ];
+
+        await expect(
+            stubClient().del(
+                TABLE,
+                { pk: 'guarded', sk: 'a' },
+                { condition: { expression: 'attribute_exists(pk)' } },
+            ),
+        ).rejects.toMatchObject({ name: 'ConditionalCheckFailedException' });
+        expect(ddbWarnings()).toEqual([]);
+    });
+});

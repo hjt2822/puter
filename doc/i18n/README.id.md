@@ -15,13 +15,9 @@
     ·
     <a href="https://discord.com/invite/PQcx7Teh8u">Discord</a>
     ·
-    <a href="https://www.youtube.com/@EricsPuterVideos">YouTube</a>
-    ·
     <a href="https://reddit.com/r/puter">Reddit</a>
     ·
     <a href="https://twitter.com/HeyPuter">X (Twitter)</a>
-    ·
-    <a href="https://hackerone.com/puter_h1b">Bug Bounty</a>
 </p>
 
 <h3 align="center"><img width="800" style="border-radius:5px;" alt="screenshot" src="https://assets.puter.site/puter.com-screenshot-3.webp"></h3>
@@ -117,7 +113,7 @@ Terhubung dengan maintainer dan komunitas melalui saluran-saluran berikut:
 - Reddit: [reddit.com/r/puter/](https://www.reddit.com/r/puter/)
 - Mastodon: [mastodon.social/@puter](https://mastodon.social/@puter)
 - Isu keamanan? [security@puter.com](mailto:security@puter.com)
-- Email maintainers di [hi@puter.com](mailto:hi@puter.com)
+- Email pengelola di [hi@puter.com](mailto:hi@puter.com)
 
 Kami selalu senang membantu Anda dengan pertanyaan apa pun yang Anda miliki. Jangan ragu untuk bertanya!
 

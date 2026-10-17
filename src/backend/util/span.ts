@@ -1,0 +1,112 @@
+/*
+ * Copyright (C) 2024-present Puter Technologies Inc.
+ *
+ * This file is part of Puter.
+ *
+ * Puter is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published
+ * by the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+import { type Attributes, SpanStatusCode, trace } from '@opentelemetry/api';
+
+const tracer = trace.getTracer('puter-backend');
+
+type AttrsOrFactory = Attributes | (() => Attributes);
+
+/**
+ * Run `fn` inside an active span. Handles sync + async transparently, records
+ * exceptions, and always closes the span.
+ */
+export function withSpan<T>(
+    name: string,
+    attrs: AttrsOrFactory,
+    fn: () => T,
+): T {
+    return tracer.startActiveSpan(name, (span) => {
+        try {
+            // Mirror the name into an attribute: X-Ray can only filter by
+            // annotations, and annotations come from attributes.
+            span.setAttribute('span_name', name);
+            const a = typeof attrs === 'function' ? attrs() : attrs;
+            if (a) span.setAttributes(a);
+            const result = fn();
+            if (result instanceof Promise) {
+                return result
+                    .then(
+                        (v) => {
+                            span.setStatus({ code: SpanStatusCode.OK });
+                            return v;
+                        },
+                        (err: unknown) => {
+                            recordError(span, err);
+                            throw err;
+                        },
+                    )
+                    .finally(() => span.end()) as T;
+            }
+            span.setStatus({ code: SpanStatusCode.OK });
+            span.end();
+            return result;
+        } catch (err) {
+            recordError(span, err);
+            span.end();
+            throw err;
+        }
+    });
+}
+
+function recordError(span: ReturnType<typeof tracer.startSpan>, err: unknown) {
+    const e = err instanceof Error ? err : new Error(String(err));
+    span.recordException(e);
+    span.setStatus({ code: SpanStatusCode.ERROR, message: e.message });
+}
+
+/**
+ * Stage-3 method decorator: wrap the decorated method in a span. Usage: class
+ * Foo {
+ *
+ * @Span() // span name = "Foo.bar"
+ *         async bar() { ... }
+ *
+ * @Span('custom.name') // span name = "custom.name"
+ *         async baz() { ... }
+ *
+ * @Span('db.read', (query: string) => ({ 'db.statement': query }))
+ *         async read(query: string) { ... }  // attrs built from call args
+ *     }
+ */
+export function Span(
+    name?: string,
+    attrs?: Attributes | ((...args: never[]) => Attributes),
+) {
+    return function <This, Args extends unknown[], Return>(
+        target: (this: This, ...args: Args) => Return,
+        ctx: ClassMethodDecoratorContext<
+            This,
+            (this: This, ...args: Args) => Return
+        >,
+    ) {
+        return function (this: This, ...args: Args): Return {
+            const spanName =
+                name ??
+                `${(this as { constructor?: { name?: string } })?.constructor?.name ?? 'fn'}.${String(ctx.name)}`;
+            const spanAttrs: AttrsOrFactory =
+                typeof attrs === 'function'
+                    ? () => attrs(...(args as unknown as never[]))
+                    : (attrs ?? {});
+            return withSpan(spanName, spanAttrs, () =>
+                target.apply(this, args),
+            );
+        };
+    };
+}

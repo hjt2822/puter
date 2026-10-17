@@ -1,0 +1,843 @@
+/* eslint-disable no-invalid-this */
+/* eslint-disable @stylistic/indent */
+/**
+ * Copyright (C) 2024-present Puter Technologies Inc.
+ *
+ * This file is part of Puter.
+ *
+ * Puter is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published
+ * by the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+import UIWindow from '../UIWindow.js';
+import UIContextMenu from '../UIContextMenu.js';
+import UIAlert from '../UIAlert.js';
+import UIWindowSaveAccount from '../UIWindowSaveAccount.js';
+import UIWindowLogin from '../UIWindowLogin.js';
+import UIWindowFeedback from '../UIWindowFeedback.js';
+import apply_item_added_to_containers from '../../helpers/applyItemAddedToContainers.js';
+import { clear_shared_param } from '../../helpers/parseSharedPath.js';
+import UIDashboardNotifications from './UIDashboardNotifications.js';
+/**
+ * Creates and displays the Dashboard window.
+ *
+ * @param {Object} [options] - Configuration options for the dashboard
+ * @returns {Promise<HTMLElement>} The dashboard window element
+ *
+ * @fires dashboard-will-open - Dispatched on window before dashboard renders.
+ *   Extensions can use this to add custom tabs. The event detail contains { tabs: [] }
+ *   where tabs is an array that extensions can push new tab objects to.
+ *   Tab objects should have: id, label, icon (SVG string), html() function,
+ *   and optionally init($el_window) and onActivate($el_window) methods.
+ *
+ * @fires dashboard-ready - Dispatched on window when dashboard is fully initialized and ready.
+ *   The event detail contains { window: $el_window } where $el_window is the jQuery-wrapped
+ *   dashboard window element. Extensions can listen for this event to add custom functionality.
+ */
+
+// Import tab modules
+import TabHome from './TabHome.js';
+import TabFiles from './TabFiles.js';
+import TabApps from './TabApps.js';
+import TabUsage from './TabUsage.js';
+import TabAccount from './TabAccount.js';
+import TabSecurity from './TabSecurity.js';
+import TabTeams from './TabTeams.js';
+import teamBadgeHtml from './teamBadge.js';
+
+// Registry of built-in tabs
+const builtinTabs = [
+    TabHome,
+    TabApps,
+    TabFiles,
+    TabTeams,
+    '-',
+    TabUsage,
+    TabAccount,
+    TabSecurity,
+];
+
+async function UIDashboard (options) {
+    // eslint-disable-next-line no-unused-vars
+    options = options ?? {};
+
+    // Mark dashboard mode on <body> so window chrome can adapt — e.g. app
+    // windows keep their minimize button even though fullpage-mode hides it.
+    $('body').addClass('dashboard-mode');
+
+    // Create mutable tabs array from built-in tabs
+    const tabs = [...builtinTabs];
+
+    // Dispatch 'dashboard-will-open' event to allow extensions to add tabs
+    window.dispatchEvent(new CustomEvent('dashboard-will-open', { detail: { tabs } }));
+
+    // True if the untrusted route tab id (from the URL hash) names a real tab.
+    // The routing paths below ignore unknown ids outright — this also keeps a
+    // crafted hash (e.g. one containing a quote) from being interpolated into
+    // a jQuery selector, which throws and would otherwise leave the
+    // dashboard's event handlers unbound.
+    const isKnownTabId = tab => tabs.some(t => t !== '-' && t.id === tab);
+
+    // A share link names items only a real account can hold, so a temporary
+    // session is never its recipient. It routes as a plain visit and is asked
+    // to sign in below; the link stays in the address bar across the prompt
+    // because login reloads on success, which brings it back for the account
+    // that can actually see what it points at.
+    const sharedLinkPaths = window.dashboard_initial_route?.shared ?? null;
+    const sharedLinkNeedsLogin = Boolean(sharedLinkPaths && window.user?.is_temp);
+    if ( sharedLinkNeedsLogin ) {
+        window.dashboard_initial_route = { tab: 'apps', path: null };
+    }
+
+    // Tab to render active on open. Apps is the default (root URL / no hash);
+    // Home is reached via #home. Fall back to Apps for an unknown/absent route.
+    const routeTab = window.dashboard_initial_route?.tab;
+    const initialTabId = isKnownTabId(routeTab) ? routeTab : 'apps';
+
+    let h = '';
+
+    h += '<div class="dashboard">';
+
+        // Mobile sidebar toggle
+        h += '<button class="dashboard-sidebar-toggle" aria-label="Open menu" aria-expanded="false">';
+            h += '<span></span><span></span><span></span>';
+        h += '</button>';
+
+        // Scrim behind the mobile drawer; tap closes it
+        h += '<div class="dashboard-sidebar-scrim"></div>';
+
+        // Sidebar
+        h += '<div class="dashboard-sidebar hide-scrollbar">';
+            // Sidebar header with logo and collapse toggle
+            h += '<div class="dashboard-sidebar-header">';
+                h += '<div class="dashboard-sidebar-brand">';
+                    h += `<div class="dashboard-sidebar-logo"><img class="dashboard-sidebar-logo-light" src="${window.icons['logo.svg']}" alt="Puter"><img class="dashboard-sidebar-logo-dark" src="${window.icons['logo-white.svg']}" alt="Puter"><span>Puter</span></div>`;
+                    h += teamBadgeHtml(window.user);
+                h += '</div>';
+                h += '<button class="dashboard-sidebar-collapse-toggle">';
+                    h += `<img class="sidebar-toggle-close" src="${window.icons['sidebar-close.svg']}">`;
+                    h += `<img class="sidebar-toggle-open" src="${window.icons['sidebar-open.svg']}">`;
+                h += '</button>';
+                // Mobile-only close button (the collapse toggle is desktop-only)
+                h += '<button class="dashboard-sidebar-close" aria-label="Close menu">';
+                    h += '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6 6 18M6 6l12 12"/></svg>';
+                h += '</button>';
+            h += '</div>';
+            // Navigation items container
+            h += '<div class="dashboard-sidebar-nav">';
+            for ( let i = 0; i < tabs.length; i++ ) {
+                const tab = tabs[i];
+                if ( tab === '-' ) {
+                    h += '<hr class="dashboard-sidebar-separator">';
+                    continue;
+                }
+                const isActive = tab.id === initialTabId ? ' active' : '';
+                const tabHref = `#${tab.id}`;
+                h += `<a class="dashboard-sidebar-item allow-native-ctxmenu${isActive}" href="${tabHref}" data-section="${tab.id}" data-tooltip="${html_encode(tab.label)}">`;
+                    h += tab.icon;
+                    h += tab.label;
+                h += '</a>';
+            }
+            h += '</div>';
+
+            // User options button at bottom
+            h += '<div class="dashboard-user-options">';
+                h += '<div class="dashboard-user-btn">';
+                    h += `<div class="dashboard-user-avatar profile-pic" style="background-image: url(${window.user?.profile?.picture || window.icons['profile.svg']})"></div>`;
+                    h += `<span class="dashboard-user-name">${window.html_encode(window.user?.username || 'User')}</span>`;
+                    h += '<svg class="dashboard-user-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg>';
+                h += '</div>';
+            h += '</div>';
+        h += '</div>';
+
+        // Main content area
+        h += '<div class="dashboard-content">';
+        for ( let i = 0; i < tabs.length; i++ ) {
+            const tab = tabs[i];
+            if ( tab === '-' ) continue;
+            const isActive = tab.id === initialTabId ? ' active' : '';
+            h += `<div class="dashboard-section dashboard-section-${tab.id}${isActive}" data-section="${tab.id}">`;
+            h += tab.html();
+            h += '</div>';
+        }
+        h += '</div>';
+
+    h += '</div>';
+
+    const el_window = await UIWindow({
+        title: 'Dashboard',
+        app: 'dashboard',
+        single_instance: true,
+        is_fullpage: true,
+        is_resizable: false,
+        is_maximized: true,
+        has_head: false,
+        body_content: h,
+        stay_on_top: false,
+        window_class: 'window-dashboard',
+        body_css: {
+            height: '100%',
+            overflow: 'hidden',
+        },
+    });
+
+    const $el_window = $(el_window);
+
+    // Remove `?ref=...` from the URL, keeping the path and tab hash (mirrors UIDesktop)
+    if ( window.url_query_params?.has('ref') ) {
+        window.history.pushState(null, document.title, window.location.pathname + window.location.hash);
+    }
+
+    // Restore sidebar collapsed state
+    if ( localStorage.getItem('dashboard-sidebar-collapsed') === '1' ) {
+        $el_window.find('.dashboard-sidebar').addClass('collapsed');
+    }
+
+    // Set initial file path BEFORE tabs are initialized (so TabFiles.init() can use it)
+    if ( window.dashboard_initial_route?.tab === 'files' && window.dashboard_initial_route?.path ) {
+        window.dashboard_initial_file_path = window.dashboard_initial_route.path;
+    } else if ( window.dashboard_initial_route?.tab === 'files' && window.dashboard_initial_route?.shared ) {
+        // A share link: open Shared, and pick out the items it names once
+        // the listing is up. Consumed here, so a reload shows Files plainly.
+        window.dashboard_initial_file_path = window.shared_path;
+        window.dashboard_initial_shared_paths = window.dashboard_initial_route.shared;
+        clear_shared_param('#files');
+    }
+
+    // Initialize all tabs
+    for ( const tab of tabs ) {
+        if ( tab.init ) {
+            tab.init($el_window);
+        }
+    }
+
+    // Dispatch 'dashboard-ready' event for extensions
+    window.dispatchEvent(new CustomEvent('dashboard-ready', { detail: { window: $el_window } }));
+
+    // =========================================================================
+    // Socket initialization
+    // In dashboard mode, UIDesktop is never loaded, so we create the socket here.
+    // This runs inside the function (not at module level) to ensure window.gui_origin
+    // and window.auth_token are already set.
+    // =========================================================================
+    window.socket = io(`${window.gui_origin}/`, {
+        auth: {
+            auth_token: window.auth_token,
+        },
+        transports: ['websocket', 'polling'],
+        withCredentials: true,
+    });
+
+    window.socket.on('error', (error) => {
+        console.error('Dashboard Socket Error:', error);
+    });
+
+    window.socket.on('connect', function () {
+        window.socket.emit('puter_is_actually_open');
+    });
+
+    window.socket.on('reconnect', function () {
+        console.log('Dashboard Socket: Reconnected', window.socket.id);
+    });
+
+    window.socket.on('disconnect', () => {
+        console.log('Dashboard Socket: Disconnected');
+    });
+
+    window.socket.on('reconnect_attempt', (attempt) => {
+        console.log('Dashboard Socket: Reconnection Attempt', attempt);
+    });
+
+    window.socket.on('reconnect_error', (error) => {
+        console.log('Dashboard Socket: Reconnection Error', error);
+    });
+
+    window.socket.on('reconnect_failed', () => {
+        console.log('Dashboard Socket: Reconnection Failed');
+    });
+
+    // Upload/download progress tracking
+    window.socket.on('upload.progress', (msg) => {
+        if ( window.progress_tracker[msg.operation_id] ) {
+            window.progress_tracker[msg.operation_id].cloud_uploaded += msg.loaded_diff;
+            if ( window.progress_tracker[msg.operation_id][msg.item_upload_id] ) {
+                window.progress_tracker[msg.operation_id][msg.item_upload_id].cloud_uploaded = msg.loaded;
+            }
+        }
+    });
+
+    window.socket.on('download.progress', (msg) => {
+        if ( window.progress_tracker[msg.operation_id] ) {
+            if ( window.progress_tracker[msg.operation_id][msg.item_upload_id] ) {
+                window.progress_tracker[msg.operation_id][msg.item_upload_id].downloaded = msg.loaded;
+                window.progress_tracker[msg.operation_id][msg.item_upload_id].total = msg.total;
+            }
+        }
+    });
+
+    // Notifications: the bell in the sidebar, its panel, and toasts for what
+    // arrives live. Toasts share the desktop's container and styling.
+    if ( $('.notification-container').length === 0 ) {
+        $('body').append(`<div class="notification-container"><div class="notifications-close-all">${i18n('close_all')}</div></div>`);
+    }
+    // The title the unread count is prefixed onto, and what app windows
+    // restore when they close; captured before either can change it.
+    window.dashboard_base_title ??= document.title;
+    const notifications = UIDashboardNotifications({ $el_window, socket: window.socket });
+
+    // Trash status updates
+    window.socket.on('trash.is_empty', async (msg) => {
+        // Update sidebar Trash icon
+        window.update_trash_icons(msg.is_empty);
+
+        // If currently viewing trash and it's empty, clear the file list
+        const dashboard = window.dashboard_object;
+        if ( msg.is_empty && dashboard && dashboard.currentPath === window.trash_path ) {
+            $('.files-tab .files').empty();
+        }
+    });
+
+    // =========================================================================
+    // Item event handlers
+    // Incremental DOM updates using UIDashboardFileItem for item creation and
+    // direct jQuery manipulation for removals/updates. Mirrors UIDesktop's
+    // approach but adapted for Dashboard's list-view structure.
+    // =========================================================================
+
+    window.socket.on('item.moved', async (resp) => {
+        if ( resp.original_client_socket_id === window.socket.id ) return;
+
+        // Fade out the stale row at the item's OLD location only. A moved item
+        // keeps its uid, so removing by uid would also match the row at the new
+        // location — and when the destination is the directory currently in
+        // view (e.g. after spring-loading a folder open mid-drag), that deletes
+        // the freshly-added row instead of the stale one.
+        const old_path = resp.old_path ?? resp.from_path;
+        if ( old_path ) {
+            // Narrow by uid first when the payload carries one (uids are
+            // UUIDs, safe to interpolate into a selector) — a full-DOM scan
+            // per socket event is O(rows) on the hot path. The uid matches
+            // both the old and new rows, so still compare data-path (raw
+            // value, compared rather than interpolated so quotes/special
+            // characters in names can't break it) to pick the stale one.
+            const $candidates = resp.uid ? $(`.item[data-uid='${resp.uid}']`) : $('.item');
+            $candidates.filter(function () {
+                return $(this).attr('data-path') === old_path;
+            }).fadeOut(150, function () {
+                $(this).remove();
+                window.dashboard_object?.updateFooterStats?.();
+            });
+        }
+
+        // Create new item at destination if user is viewing that directory
+        if ( window.UIDashboardFileItem ) {
+            window.UIDashboardFileItem(resp);
+        }
+    });
+
+    window.socket.on('item.removed', async (item) => {
+        if ( item.original_client_socket_id === window.socket.id ) return;
+        if ( item.descendants_only ) return;
+
+        // Match by uid when present (O(1) attribute selector; uids are UUIDs,
+        // safe to interpolate) and fall back to a path scan for minimal
+        // payloads — a removed item has exactly one row either way.
+        const $rows = item.uid
+            ? $(`.item[data-uid='${item.uid}']`)
+            : $('.item').filter(function () {
+                return $(this).attr('data-path') === item.path;
+            });
+        $rows.fadeOut(150, function () {
+            $(this).remove();
+            // Keep the footer item count / total size in sync with the removal.
+            window.dashboard_object?.updateFooterStats?.();
+        });
+    });
+
+    window.socket.on('item.renamed', async (item) => {
+        if ( item.original_client_socket_id === window.socket.id ) return;
+
+        const $el = $(`.item[data-uid='${item.uid}']`);
+        if ( $el.length === 0 ) return;
+
+        // Update data attributes (raw values — .attr() stores literally)
+        $el.attr('data-name', item.name);
+        $el.attr('data-path', item.path);
+
+        // Update displayed name
+        $el.find('.item-name').text(item.name);
+        $el.find('.item-name-editor').val(item.name);
+    });
+
+    window.socket.on('item.updated', async (item) => {
+        if ( item.original_client_socket_id === window.socket.id ) return;
+
+        const $el = $(`.item[data-uid='${item.uid}']`);
+        if ( $el.length === 0 ) return;
+
+        // Delegate to the shared row updater (defined in TabFiles.init) so
+        // this handler can't drift from renderItem's conventions — an inline
+        // copy here once showed trashed items' raw UID instead of their
+        // original name.
+        window.UIDashboardFileItemUpdate?.($el, item);
+    });
+
+    window.socket.on('item.added', async (item) => {
+        if ( !item || Object.keys(item).length === 0 ) return;
+        if ( item.original_client_socket_id === window.socket.id ) return;
+
+        if ( window.UIDashboardFileItem ) {
+            window.UIDashboardFileItem(item);
+        }
+
+        // The Files tab above is the dashboard's own listing; file dialogs and
+        // explorer windows opened over the dashboard are plain UIWindow item
+        // containers and need the same update the desktop gives them.
+        await apply_item_added_to_containers(item);
+    });
+
+    // Apply initial route from URL - activate the correct tab
+    if ( window.dashboard_initial_route ) {
+        const route = window.dashboard_initial_route;
+
+        // Activate the correct tab if not home. An unknown tab id stays on
+        // the Apps default rendered above rather than being redirected.
+        if ( route.tab && route.tab !== 'home' && isKnownTabId(route.tab) ) {
+            const tabId = route.tab;
+            const $targetTab = $el_window.find(`.dashboard-sidebar-item[data-section="${tabId}"]`);
+
+            // Only switch if the tab exists
+            if ( $targetTab.length > 0 ) {
+                $el_window.find('.dashboard-sidebar-item').removeClass('active');
+                $targetTab.addClass('active');
+                $el_window.find('.dashboard-section').removeClass('active');
+                $el_window.find(`.dashboard-section[data-section="${tabId}"]`).addClass('active');
+
+                document.querySelector('.dashboard-content').setAttribute('class', 'dashboard-content');
+                document.querySelector('.dashboard-content').classList.add(tabId);
+
+                // Call onActivate if exists
+                const tab = tabs.find(t => t.id === tabId);
+                if ( tab?.onActivate ) {
+                    tab.onActivate($el_window);
+                }
+            }
+        }
+    }
+
+    if ( sharedLinkNeedsLogin ) {
+        // Not awaited: the dashboard is already up underneath the cover page.
+        UIWindowLogin({
+            reload_on_success: true,
+            window_options: { cover_page: true, has_head: false },
+        }).then(() => {
+            // Dismissed without signing in: drop the link rather than loop.
+            if ( window.user?.is_temp ) clear_shared_param();
+        });
+    }
+
+    // Handle browser back/forward navigation
+    // This handler is called for both hashchange (manual hash changes) and popstate (back/forward)
+    // A single back/forward fires BOTH popstate and hashchange; track the last
+    // handled URL so the second event doesn't run onActivate (and its fetches) again.
+    let lastHandledHref = window.location.href;
+    const handleRouteChange = () => {
+        if ( window.location.href === lastHandledHref ) return;
+        // A traversal INTO an /app/<name> entry belongs to an open app
+        // window (UIWindow's popstate handler restores/minimizes it), not
+        // tab routing. lastHandledHref deliberately keeps the dashboard URL
+        // underneath: traversing back out of the app returns to exactly
+        // that URL and the equality check above skips re-routing (the
+        // dashboard never actually left).
+        if ( window.location.pathname.startsWith('/app/') ) return;
+        lastHandledHref = window.location.href;
+        const route = window.parseDashboardRoute();
+        // Ignore unknown tab ids entirely (a stale bookmark hash, an in-page
+        // anchor): switching the user to another tab out from under them was
+        // never the behavior, and the early return also keeps untrusted
+        // hashes out of the selectors below.
+        if ( ! isKnownTabId(route.tab) ) return;
+        const tab = route.tab;
+        const filePath = route.path;
+        notifications.close({ restoreFocus: false });
+
+        // Switch to correct tab
+        const $targetTab = $el_window.find(`.dashboard-sidebar-item[data-section="${tab}"]`);
+        if ( tab === 'home' ) {
+            // Home tab
+            $el_window.find('.dashboard-sidebar-item').removeClass('active');
+            $el_window.find('.dashboard-sidebar-item').first().addClass('active');
+            $el_window.find('.dashboard-section').removeClass('active');
+            $el_window.find('.dashboard-section').first().addClass('active');
+            document.querySelector('.dashboard-content').setAttribute('class', 'dashboard-content');
+        } else if ( $targetTab.length > 0 ) {
+            $el_window.find('.dashboard-sidebar-item').removeClass('active');
+            $targetTab.addClass('active');
+            $el_window.find('.dashboard-section').removeClass('active');
+            $el_window.find(`.dashboard-section[data-section="${tab}"]`).addClass('active');
+            document.querySelector('.dashboard-content').setAttribute('class', 'dashboard-content');
+            document.querySelector('.dashboard-content').classList.add(tab);
+        }
+
+        // Refresh the tab we just switched to, mirroring the sidebar-click
+        // handler — otherwise reaching a tab via browser back/forward leaves it
+        // showing stale data because its onActivate never runs.
+        const activeTab = tabs.find(t => t !== '-' && t.id === tab);
+        if ( activeTab?.onActivate ) {
+            activeTab.onActivate($el_window);
+        }
+
+        // Scroll content area to top
+        $el_window.find('.dashboard-content').scrollTop(0);
+
+        // If files tab with path, navigate without adding to history
+        if ( tab === 'files' && filePath ) {
+            const filesTab = tabs.find(t => t.id === 'files');
+            if ( filesTab?.renderDirectory ) {
+                filesTab.renderDirectory(filePath, { skipUrlUpdate: true, skipNavHistory: true });
+            }
+        }
+    };
+
+    // Listen for both hashchange and popstate to handle all navigation scenarios
+    window.addEventListener('hashchange', handleRouteChange);
+    window.addEventListener('popstate', handleRouteChange);
+
+    // Sidebar item click handler — only tab items ([data-section]); plain links
+    // like the "Open Desktop" button navigate natively
+    $el_window.on('click', '.dashboard-sidebar-item[data-section]', function (e) {
+        e.preventDefault();
+        const $this = $(this);
+        const section = $this.attr('data-section');
+        notifications.close({ restoreFocus: false });
+
+        // Update active sidebar item
+        $el_window.find('.dashboard-sidebar-item').removeClass('active');
+        $this.addClass('active');
+
+        // Update active content section
+        $el_window.find('.dashboard-section').removeClass('active');
+        $el_window.find(`.dashboard-section[data-section="${section}"]`).addClass('active');
+
+        // Call onActivate for the tab if it exists
+        const tab = tabs.find(t => t.id === section);
+        if ( tab && tab.onActivate ) {
+            tab.onActivate($el_window);
+        }
+
+        document.querySelector('.dashboard-content').setAttribute('class', 'dashboard-content');
+        document.querySelector('.dashboard-content').classList.add(section);
+
+        // Reflect the current tab in the hash. Root (no hash) defaults to Apps,
+        // but selecting any tab — including Apps — shows its #tab. Only push a
+        // new history entry when the hash actually changes, so re-clicking the
+        // current tab doesn't stack duplicate entries that make Back a no-op.
+        if ( window.location.hash !== `#${section}` ) {
+            history.pushState(null, '', `#${section}`);
+            lastHandledHref = window.location.href;
+        }
+
+        // Scroll content area to top
+        $el_window.find('.dashboard-content').scrollTop(0);
+
+        // Close sidebar on mobile after selection
+        setMobileSidebar(false);
+    });
+
+    // =========================================================================
+    // Mobile drawer
+    // The sidebar becomes a modal drawer below 768px: scrim behind it, close
+    // button in its header, Escape and swipe-left dismiss it. One helper keeps
+    // the drawer, scrim, and toggle (incl. aria-expanded) in sync.
+    // =========================================================================
+    const $sidebar = $el_window.find('.dashboard-sidebar');
+    const $scrim = $el_window.find('.dashboard-sidebar-scrim');
+    const $sidebar_toggle = $el_window.find('.dashboard-sidebar-toggle');
+    const setMobileSidebar = (open) => {
+        $sidebar.toggleClass('open', open);
+        $scrim.toggleClass('open', open);
+        $sidebar_toggle.toggleClass('open', open).attr('aria-expanded', open ? 'true' : 'false');
+    };
+
+    $el_window.on('click', '.dashboard-sidebar-toggle', function () {
+        setMobileSidebar(!$sidebar.hasClass('open'));
+    });
+
+    $el_window.on('click', '.dashboard-sidebar-close, .dashboard-sidebar-scrim', function () {
+        setMobileSidebar(false);
+    });
+
+    $(document).on('keydown.dashboard-mobile-sidebar', function (e) {
+        if ( e.key === 'Escape' && $sidebar.hasClass('open') ) {
+            setMobileSidebar(false);
+        }
+    });
+
+    // Swipe-to-close: the drawer tracks a leftward drag 1:1 (scrim fading in
+    // step), then commits past 35% width or a quick flick, else snaps back.
+    // Transitions are suspended during the drag (.dragging) so releasing
+    // animates from the finger's last position, not from fully-open.
+    {
+        const sidebar = $sidebar[0];
+        const scrim = $scrim[0];
+        let startX = 0, startY = 0, dx = 0, lastX = 0, lastT = 0, velocity = 0;
+        let tracking = false, axis = null;
+
+        sidebar.addEventListener('touchstart', (e) => {
+            if ( ! sidebar.classList.contains('open') ) return;
+            const t = e.touches[0];
+            startX = lastX = t.clientX;
+            startY = t.clientY;
+            lastT = e.timeStamp;
+            dx = 0; velocity = 0; axis = null;
+            tracking = true;
+        }, { passive: true });
+
+        sidebar.addEventListener('touchmove', (e) => {
+            if ( ! tracking ) return;
+            const t = e.touches[0];
+            const moveX = t.clientX - startX;
+            const moveY = t.clientY - startY;
+            // Lock to an axis on the first meaningful movement so vertical
+            // scrolling inside the drawer never drags it sideways.
+            if ( axis === null && (Math.abs(moveX) > 8 || Math.abs(moveY) > 8) ) {
+                axis = Math.abs(moveX) > Math.abs(moveY) ? 'x' : 'y';
+                if ( axis === 'x' ) {
+                    sidebar.classList.add('dragging');
+                    scrim.classList.add('dragging');
+                }
+            }
+            if ( axis !== 'x' ) return;
+            dx = Math.min(0, moveX);
+            const dt = e.timeStamp - lastT;
+            if ( dt > 0 ) velocity = (t.clientX - lastX) / dt;
+            lastX = t.clientX;
+            lastT = e.timeStamp;
+            sidebar.style.transform = `translateX(${dx}px)`;
+            scrim.style.opacity = Math.max(0, 1 + dx / sidebar.offsetWidth);
+        }, { passive: true });
+
+        const endDrag = () => {
+            if ( ! tracking ) return;
+            tracking = false;
+            const shouldClose = axis === 'x'
+                && (dx < -sidebar.offsetWidth * 0.35 || velocity < -0.4);
+            // Re-enable transitions and drop inline styles in the same frame
+            // as the class change so the drawer animates from where it is.
+            sidebar.classList.remove('dragging');
+            scrim.classList.remove('dragging');
+            sidebar.style.transform = '';
+            scrim.style.opacity = '';
+            if ( shouldClose ) setMobileSidebar(false);
+            axis = null; dx = 0;
+        };
+        sidebar.addEventListener('touchend', endDrag);
+        sidebar.addEventListener('touchcancel', endDrag);
+    }
+
+    // Desktop sidebar collapse toggle
+    $el_window.on('click', '.dashboard-sidebar-collapse-toggle', function () {
+        const $sidebar = $el_window.find('.dashboard-sidebar');
+        $sidebar.toggleClass('collapsed');
+        localStorage.setItem('dashboard-sidebar-collapsed', $sidebar.hasClass('collapsed') ? '1' : '0');
+    });
+
+    // Sidebar collapsed tooltips
+    const $tooltip = $('<div class="dashboard-sidebar-tooltip"></div>').appendTo('body');
+    $el_window.on('mouseenter', '.dashboard-sidebar-item[data-tooltip]', function () {
+        if ( ! $el_window.find('.dashboard-sidebar').hasClass('collapsed') ) return;
+        const rect = this.getBoundingClientRect();
+        $tooltip.text($(this).attr('data-tooltip'));
+        $tooltip.css({
+            top: rect.top + rect.height / 2 - $tooltip.outerHeight() / 2,
+            left: rect.right + 8,
+        });
+        $tooltip.addClass('visible');
+    });
+    $el_window.on('mouseleave', '.dashboard-sidebar-item[data-tooltip]', function () {
+        $tooltip.removeClass('visible');
+    });
+
+    // Close sidebar when clicking outside
+    $el_window.on('mousedown touchstart', function (e) {
+        if ( !$(e.target).closest('.dashboard-sidebar').length
+            && !$(e.target).closest('.dashboard-sidebar-toggle').length
+            && $sidebar.hasClass('open') ) {
+            setMobileSidebar(false);
+        }
+    });
+
+    // User options button click handler
+    $el_window.on('click', '.dashboard-user-btn', function () {
+        const $btn = $(this);
+        const $chevron = $btn.find('.dashboard-user-chevron');
+        const pos = this.getBoundingClientRect();
+
+        // Don't open if already open
+        if ( $('.context-menu[data-id="dashboard-user-menu"]').length > 0 ) {
+            return;
+        }
+
+        // Rotate chevron to point upwards
+        $chevron.addClass('open');
+
+        let items = [];
+
+        // Save Session (if temp user)
+        if ( window.user.is_temp ) {
+            items.push({
+                html: i18n('save_session'),
+                icon: '<svg style="margin-bottom: -4px; width: 16px; height: 16px;" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48"><path d="M45.521,39.04L27.527,5.134c-1.021-1.948-3.427-2.699-5.375-1.679-.717,.376-1.303,.961-1.679,1.679L2.479,39.04c-.676,1.264-.635,2.791,.108,4.017,.716,1.207,2.017,1.946,3.42,1.943H41.993c1.403,.003,2.704-.736,3.42-1.943,.743-1.226,.784-2.753,.108-4.017ZM23.032,15h1.937c.565,0,1.017,.467,1,1.031l-.438,14c-.017,.54-.459,.969-1,.969h-1.062c-.54,0-.983-.429-1-.969l-.438-14c-.018-.564,.435-1.031,1-1.031Zm.968,25c-1.657,0-3-1.343-3-3s1.343-3,3-3,3,1.343,3,3-1.343,3-3,3Z" fill="var(--dashboard-warning-icon)"/></svg>',
+                onClick: async function () {
+                    UIWindowSaveAccount({
+                        send_confirmation_code: false,
+                        default_username: window.user.username,
+                        window_options: {
+                            backdrop: true,
+                            close_on_backdrop_click: true,
+                            parent_center: true,
+                            stay_on_top: true,
+                            has_head: false,
+                        },
+                    });
+                },
+            });
+            items.push('-');
+        }
+
+        // Logged in users
+        if ( window.logged_in_users.length > 0 ) {
+            let users_arr = window.logged_in_users;
+
+            // bring logged in user's item to top
+            users_arr.sort(function (x, y) {
+                return x.uuid === window.user.uuid ? -1 : y.uuid == window.user.uuid ? 1 : 0;
+            });
+
+            // create menu items for each user
+            users_arr.forEach(l_user => {
+                items.push({
+                    html: l_user.username,
+                    icon: l_user.username === window.user.username ? '✓' : '',
+                    onClick: async function () {
+                        if ( l_user.username === window.user.username ) {
+                            return;
+                        }
+                        await window.update_auth_data(l_user.auth_token, l_user);
+                        location.reload();
+                    },
+                });
+            });
+
+            items.push('-');
+
+            items.push({
+                html: i18n('add_another_account'),
+                onClick: async function () {
+                    await UIWindowLogin({
+                        reload_on_success: true,
+                        send_confirmation_code: false,
+                        window_options: {
+                            has_head: false,
+                            backdrop: true,
+                            close_on_backdrop_click: true,
+                            parent_center: true,
+                            // Phones/tablets pin every .window to one z-index
+                            // (style.css), which puts the fullpage dashboard
+                            // above this dialog's backdrop wrapper; stay_on_top
+                            // lifts the dialog into the 99999999+ band like
+                            // every other backdropped dashboard dialog.
+                            stay_on_top: true,
+                        },
+                    });
+                },
+            });
+
+            items.push('-');
+        }
+
+        // Build final menu items
+        const menuItems = [
+            ...items,
+            // Developer
+            {
+                html: 'Developers<svg style="width: 11px; height: 11px; margin-left:2px; margin-bottom:-1px;" height="32" viewBox="0 0 32 32" width="32" xmlns="http://www.w3.org/2000/svg"><path d="m26 28h-20a2.0027 2.0027 0 0 1 -2-2v-20a2.0027 2.0027 0 0 1 2-2h10v2h-10v20h20v-10h2v10a2.0027 2.0027 0 0 1 -2 2z"/><path d="m20 2v2h6.586l-8.586 8.586 1.414 1.414 8.586-8.586v6.586h2v-10z"/><path d="m0 0h32v32h-32z" fill="none"/></svg>',
+                html_active: 'Developers<svg style="width: 11px; height: 11px; margin-left:2px; margin-bottom:-1px;" height="32" viewBox="0 0 32 32" width="32" xmlns="http://www.w3.org/2000/svg"><path d="m26 28h-20a2.0027 2.0027 0 0 1 -2-2v-20a2.0027 2.0027 0 0 1 2-2h10v2h-10v20h20v-10h2v10a2.0027 2.0027 0 0 1 -2 2z" style="fill: rgb(255, 255, 255);"/><path d="m20 2v2h6.586l-8.586 8.586 1.414 1.414 8.586-8.586v6.586h2v-10z" style="fill: rgb(255, 255, 255);"/><path d="m0 0h32v32h-32z" fill="none"/></svg>',
+                onClick: function () {
+                    window.open('https://developer.puter.com', '_blank');
+                },
+            },
+            // Contact Us
+            {
+                html: i18n('contact_us'),
+                onClick: async function () {
+                    UIWindowFeedback({
+                        window_options: {
+                            backdrop: true,
+                            close_on_backdrop_click: true,
+                            parent_center: true,
+                            stay_on_top: true,
+                            has_head: false,
+                        },
+                    });
+                },
+            },
+            '-',
+            // Log out
+            {
+                html: i18n('log_out'),
+                onClick: async function () {
+                    // Check for open windows
+                    if ( $('.window-app').length > 0 ) {
+                        const alert_resp = await UIAlert({
+                            message: `<p>${i18n('confirm_open_apps_log_out')}</p>`,
+                            buttons: [
+                                {
+                                    label: i18n('close_all_windows_and_log_out'),
+                                    value: 'close_and_log_out',
+                                    type: 'primary',
+                                },
+                                {
+                                    label: i18n('cancel'),
+                                },
+                            ],
+                        });
+                        if ( alert_resp === 'close_and_log_out' ) {
+                            window.logout();
+                        }
+                    } else {
+                        window.logout();
+                    }
+                },
+            },
+        ];
+
+        UIContextMenu({
+            id: 'dashboard-user-menu',
+            parent_element: $btn[0],
+            position: {
+                top: pos.top - 8,
+                left: pos.left,
+            },
+            items: menuItems,
+            onClose: () => {
+                // Rotate chevron back to point downwards
+                $chevron.removeClass('open');
+            },
+        });
+    });
+
+    return el_window;
+}
+
+export default UIDashboard;

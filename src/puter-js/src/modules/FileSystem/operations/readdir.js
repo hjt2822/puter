@@ -1,50 +1,242 @@
-import * as utils from '../../../lib/utils.js';
+import { dedupe } from '../../../lib/networkUtils.js';
+import { fetchAllPages, iteratePages } from '../../../lib/pagination.js';
 import getAbsolutePathForApp from '../utils/getAbsolutePathForApp.js';
+import mapV2EntryToV1 from '../utils/mapV2EntryToV1.js';
+import { fsRequest, parseOperationArgs } from './scaffold.js';
 
-const readdir = async function (...args) {
-    let options;
+/** @typedef {import('../types.js').ReaddirOptions} ReaddirOptions */
+/** @typedef {import('../types.js').ReaddirOptionsOwn} ReaddirOptionsOwn */
+/** @typedef {import('../types.js').FSItemRead} FSItemRead */
+/** @typedef {import('../../../lib/types.js').ListPage<FSItemRead>} FSItemPage */
+/** @typedef {import('../../../lib/types.js').RequestCallbacks<FSItemPage>} FSItemPageCallbacks */
 
-    // If first argument is an object, it's the options
-    if (typeof args[0] === 'object' && args[0] !== null) {
-        options = args[0];
-    } else {
-        // Otherwise, we assume separate arguments are provided
-        options = {
-            path: args[0],
-            success: args[1],
-            error: args[2],
-        };
+// Listings larger than this are served but never cached.
+const MAX_CACHE_SIZE = 100 * 1024 * 1024;
+
+// Normalize each v2 entry to the v1 shape, in place, so the bare array and the
+// `{items, cursor?, total?}` envelope both return the legacy shape and the
+// cache is populated with it.
+const normalizeEntries = (result) => {
+    if ( Array.isArray(result) ) {
+        return result.map(mapV2EntryToV1);
+    }
+    if ( result && Array.isArray(result.items) ) {
+        return { ...result, items: result.items.map(mapV2EntryToV1) };
+    }
+    return result;
+};
+
+// One HTTP /readdir request. `pageParams` holds the pagination params for
+// this page (cursor/includeTotal), if any. Resolves with the raw response:
+// a bare array (legacy) or an `{items, cursor?, total?}` envelope.
+const requestOnce = function (options, pageParams) {
+    // Build request payload - support both path and uid parameters
+    const body = {
+        no_thumbs: options.no_thumbs,
+        no_assocs: options.no_assocs,
+        no_subdomains: options.no_subdomains,
+        auth_token: this.authToken,
+    };
+    if ( options.limit !== undefined ) body.limit = options.limit;
+    if ( options.offset !== undefined ) body.offset = options.offset;
+    if ( options.sortBy !== undefined ) body.sortBy = options.sortBy;
+    if ( options.sortOrder !== undefined ) body.sortOrder = options.sortOrder;
+    if ( options.recursive !== undefined ) body.recursive = options.recursive;
+    if ( options.depth !== undefined ) body.depth = options.depth;
+    if ( pageParams ) {
+        body.cursor = pageParams.cursor ?? null;
+        if ( pageParams.includeTotal !== undefined ) {
+            body.includeTotal = pageParams.includeTotal;
+        }
     }
 
-    return new Promise(async (resolve, reject) => {
-        // path is required
-        if(!options.path){
-            throw new Error({ code: 'NO_PATH', message: 'No path provided.' });
-        }
+    if ( options.uid ) {
+        body.uid = options.uid;
+    } else if ( options.path ) {
+        body.path = getAbsolutePathForApp(options.path);
+    }
 
-        // If auth token is not provided and we are in the web environment, 
-        // try to authenticate with Puter
-        if(!puter.authToken && puter.env === 'web'){
-            try{
-                await puter.ui.authenticateWithPuter();
-            }catch(e){
-                // if authentication fails, throw an error
-                reject('Authentication failed.');
+    return fsRequest.call(this, {
+        // Backend serves readdir on the v2 `/fs/readdir` route, which returns
+        // camelCase entries; we normalize them to the v1 shape so existing
+        // callers see an unchanged response.
+        endpoint: '/fs/readdir',
+        // The token travels in the payload rather than the auth header.
+        authHeader: false,
+        body,
+        transform: (result) => {
+            const normalized = normalizeEntries(result);
+            // set each individual item's cache
+            const entries = Array.isArray(normalized) ? normalized : (normalized?.items ?? []);
+            for ( const item of entries ) {
+                puter._cache.set(puter.fsCacheKey('item', item.path), item);
             }
+            return normalized;
+        },
+    });
+};
+
+// The promise-returning forms of readdir: the legacy full array, a single
+// limit/offset slice, or one page of the `{items, cursor?, total?}` envelope.
+const readdirPaged = async function (options) {
+    // consistency levels
+    if ( ! options.consistency ) {
+        options.consistency = 'strong';
+    }
+
+    // Either path or uid is required
+    if ( !options.path && !options.uid ) {
+        throw { message: 'Either path or uid must be provided.', code: 'NO_PATH_OR_UID' };
+    }
+
+    // Presence of `cursor` (null = first page) or `includeTotal` opts
+    // into the paginated `{items, cursor?, total?}` envelope.
+    const paginated =
+        Object.prototype.hasOwnProperty.call(options, 'cursor') ||
+        options.includeTotal === true;
+
+    // Unbound listings (no pagination params at all) are fetched page by
+    // page under the hood and returned as the legacy full array.
+    const unbound = ! paginated &&
+        options.limit === undefined &&
+        options.offset === undefined;
+
+    // Generate cache key based on path. Only full listings are cached —
+    // pages and limit/offset-truncated results never are. Recursive
+    // listings are never cached (they'd collide with the direct listing).
+    let cacheKey;
+    if ( options.path && unbound && ! options.recursive ) {
+        cacheKey = puter.fsCacheKey('readdir', options.path);
+    }
+
+    if ( options.consistency === 'eventual' && cacheKey ) {
+        const cachedResult = await puter._cache.get(cacheKey);
+        if ( cachedResult ) {
+            return cachedResult;
+        }
+    }
+
+    // Same parameters share one call; origin and token keep identities apart.
+    const deduplicationKey = 'fs:readdir:' + JSON.stringify({
+        apiOrigin: this.APIOrigin,
+        authToken: this.authToken,
+        path: options.path,
+        uid: options.uid,
+        no_thumbs: options.no_thumbs,
+        no_assocs: options.no_assocs,
+        no_subdomains: options.no_subdomains,
+        consistency: options.consistency,
+        limit: options.limit,
+        offset: options.offset,
+        cursor: paginated ? (options.cursor ?? null) : undefined,
+        includeTotal: options.includeTotal,
+        sortBy: options.sortBy,
+        sortOrder: options.sortOrder,
+        recursive: options.recursive,
+        depth: options.depth,
+    });
+
+    const requestPromise = dedupe(deduplicationKey, async () => {
+        if ( ! unbound ) {
+            // Single request: legacy limit/offset form, or one page of the
+            // envelope when the caller passed cursor/includeTotal.
+            const pageParams = paginated
+                ? { cursor: options.cursor, includeTotal: options.includeTotal }
+                : undefined;
+            return await requestOnce.call(this, options, pageParams);
         }
 
-        // create xhr object
-        const xhr = utils.initXhr('/readdir', this.APIOrigin, this.authToken);
+        const fetchPage = pageParams => requestOnce.call(this, options, pageParams);
+        const result = await fetchAllPages(fetchPage);
 
-        // set up event handlers for load and error events
-        utils.setupXhrEventHandlers(xhr, options.success, options.error, resolve, reject);
+        if ( cacheKey && JSON.stringify(result).length <= MAX_CACHE_SIZE ) {
+            puter._cache.set(cacheKey, result);
+        }
 
-        xhr.send(JSON.stringify({
-            path: getAbsolutePathForApp(options.path),
-            no_thumbs: options.no_thumbs,
-            no_assocs: options.no_assocs,
-        }));
-    })
-}
+        return result;
+    });
+
+    // Legacy callbacks fire once, for the caller that initiated the
+    // request (dedup-reused and cache-served calls never fired them).
+    requestPromise.then(
+        result => { if ( typeof options.success === 'function' ) options.success(result); },
+        err => { if ( typeof options.error === 'function' ) options.error(err); },
+    );
+
+    return await requestPromise;
+};
+
+/**
+ * Options that make readdir resolve with one `{items, cursor?, total?}` page:
+ * `cursor` or `includeTotal`, or a `recursive` listing bounded by `limit` or
+ * `offset` (recursive listings are always paged).
+ *
+ * @typedef {ReaddirOptionsOwn & FSItemPageCallbacks & (
+ *   | { cursor: string | null }
+ *   | { includeTotal: true }
+ *   | { recursive: true, limit: number }
+ *   | { recursive: true, offset: number }
+ * )} ReaddirPageOptions
+ */
+
+/**
+ * @typedef {{
+ *   (options: ReaddirOptions & { stream: true }): AsyncIterableIterator<FSItemPage>,
+ *   (options: ReaddirPageOptions): Promise<FSItemPage>,
+ *   (options: ReaddirOptions): Promise<FSItemRead[]>,
+ *   (path: string, options: ReaddirOptions & { stream: true }): AsyncIterableIterator<FSItemPage>,
+ *   (
+ *     path: string,
+ *     options: ReaddirPageOptions,
+ *     success?: (value: FSItemPage) => void,
+ *     error?: (reason: unknown) => void,
+ *   ): Promise<FSItemPage>,
+ *   (
+ *     path: string,
+ *     options?: ReaddirOptions,
+ *     success?: (value: FSItemRead[]) => void,
+ *     error?: (reason: unknown) => void,
+ *   ): Promise<FSItemRead[]>,
+ *   (
+ *     path: string,
+ *     success?: (value: FSItemRead[]) => void,
+ *     error?: (reason: unknown) => void,
+ *   ): Promise<FSItemRead[]>,
+ * }} ReaddirOperation
+ */
+
+/**
+ * Lists the contents of a directory, addressed by `path` (relative paths
+ * resolve against the app's root directory) or by `uid`.
+ *
+ * By default the whole listing is returned as an array. Passing `cursor` or
+ * `includeTotal`, or `limit`/`offset` with `recursive`, returns one
+ * `{items, cursor?, total?}` page instead, and `stream: true` returns an async
+ * iterator over those pages.
+ *
+ * @type {ReaddirOperation}
+ */
+const readdir = /** @type {ReaddirOperation} */ (function (...args) {
+    const options = parseOperationArgs(args, ['path']);
+
+    // Streaming form: an async iterator of `{items, cursor?, total?}` pages.
+    // No listing cache and no dedup — a generator can't be shared between
+    // consumers — and no legacy callbacks.
+    if ( options.stream === true ) {
+        if ( options.offset !== undefined ) {
+            throw { message: '`offset` cannot be combined with `stream`; pass `cursor` to resume from a position.', code: 'invalid_request' };
+        }
+        if ( !options.path && !options.uid ) {
+            throw { message: 'Either path or uid must be provided.', code: 'NO_PATH_OR_UID' };
+        }
+        const fetchPage = pageParams => requestOnce.call(this, options, pageParams);
+        return iteratePages(fetchPage, {
+            cursor: /** @type {string | null | undefined} */ (options.cursor),
+            includeTotal: options.includeTotal === true,
+        });
+    }
+
+    return readdirPaged.call(this, options);
+});
 
 export default readdir;

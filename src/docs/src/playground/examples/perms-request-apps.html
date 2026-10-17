@@ -1,0 +1,18 @@
+<html>
+<body>
+    <script src="https://js.puter.com/v2/"></script>
+    <button id="request-apps">Request Apps Read Access</button>
+    <script>
+        document.getElementById('request-apps').addEventListener('click', async () => {
+            const granted = await puter.perms.request('apps');
+            if (granted) {
+                puter.print('Apps read access granted');
+                const apps = await puter.apps.list();
+                puter.print(`User has ${apps.length} apps`);
+            } else {
+                puter.print('Apps read access denied');
+            }
+        });
+    </script>
+</body>
+</html>

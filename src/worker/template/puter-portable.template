@@ -1,0 +1,6 @@
+// The ordinary worker runtime: puter.js plus the `router` that user code
+// registers routes on. Handled separately from the webpack project.
+
+#include "./puter-portable-core.template"
+
+#include "../dist/webpackPreamplePart.js"

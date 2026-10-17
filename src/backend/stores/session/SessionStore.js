@@ -1,0 +1,1385 @@
+/*
+ * Copyright (C) 2024-present Puter Technologies Inc.
+ *
+ * This file is part of Puter.
+ *
+ * Puter is free software: you can redistribute it and/or modify it under the
+ * terms of the GNU Affero General Public License as published by the Free
+ * Software Foundation, either version 3 of the License, or (at your option) any
+ * later version.
+ *
+ * This program is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+ * FOR A PARTICULAR PURPOSE. See the GNU Affero General Public License for more
+ * details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program. If not, see
+ * [https://www.gnu.org/licenses/](https://www.gnu.org/licenses/).
+ */
+
+import { v4 as uuidv4 } from 'uuid';
+import { HttpError } from '../../core/http/HttpError.js';
+import { awaitLater } from '../../util/concurrency.js';
+import {
+    isMissingParentViolation,
+    isUniqueViolation,
+} from '../../util/dbError.js';
+import { PuterStore } from '../types';
+
+// `updateActivity` / `updateUserActivity` intentionally skip cache
+// invalidation — they're throttled UPDATEs, stale `last_activity` in
+// the cached row doesn't gate anything, and eating a Redis write per
+// request isn't worth it.
+
+// Prefix is versioned so a schema change (new columns added to the
+// row shape) doesn't leak stale cached rows through Redis on a
+// rolling deploy. Bump the suffix on the next schema change.
+const CACHE_KEY_PREFIX = 'sessions:v2';
+const CACHE_TTL_SECONDS = 15 * 60;
+// Min interval between successive activity flushes per session/user.
+// In-memory throttle keeps DB writes bounded; multi-node duplicates
+// are harmless because the SQL guard `last_activity < ?` makes the
+// UPDATE idempotent.
+const TOUCH_THROTTLE_MS = 60 * 1000;
+// Hard cap to keep the throttle map from growing unbounded for
+// long-lived processes. Clearing only loses throttling — at worst a
+// brief burst of redundant UPDATEs.
+const TOUCH_THROTTLE_MAX_ENTRIES = 10000;
+// Roots per batched revoke statement; each is bound twice.
+const REVOKE_CHUNK_SIZE = 500;
+
+// Per-kind sliding-expiry windows. The `touch` path bumps `expires_at`
+// to `now + window` for the session's kind on activity, so an active
+// session never expires. `access_token` rows are *not* slid — their
+// `expires_at` is hard-set at mint to the caller-specified value.
+// Exported so AuthService can use the same values when seeding new rows.
+export const WEB_WINDOW_SECONDS = 365 * 24 * 60 * 60; // 1y
+export const APP_WINDOW_SECONDS = 365 * 24 * 60 * 60; // 1y
+export const WORKER_WINDOW_SECONDS = 99 * 365 * 24 * 60 * 60; // 99y (virtually infinite);
+
+export const ASSET_WINDOW_SECONDS = 7 * 24 * 60 * 60; // 7 days
+// A godmode app's token lapses at most this long after the desktop last asked
+// for it, so a closed desktop's tokens die on their own. A token past the max
+// age is never renewed again; the next ask replaces it and revokes the old one.
+export const GODMODE_TOKEN_WINDOW_SECONDS = 12 * 60 * 60; // 12h
+export const GODMODE_TOKEN_MAX_AGE_SECONDS = 7 * 24 * 60 * 60; // 7d
+// A renewal that would move a godmode token's expiry by less than this is
+// skipped, so repeat launches don't each write the row.
+const GODMODE_TOKEN_RENEW_STEP_SECONDS = 60 * 60; // 1h
+
+const sqlTimestamp = (ms) =>
+    new Date(ms).toISOString().slice(0, 19).replace('T', ' ');
+
+const nowSeconds = () => Math.floor(Date.now() / 1000);
+
+/** True when a row's `expires_at` has passed. NULL == no row-level expiry. */
+const isExpired = (row, now = nowSeconds()) =>
+    row?.expires_at != null && row.expires_at <= now;
+
+/**
+ * True when a row was created before `notBefore` (unix seconds): an app or
+ * worker row minted for an earlier app that held the same uid.
+ */
+const predates = (row, notBefore) =>
+    notBefore != null &&
+    Number(row?.created_at) > 0 &&
+    Number(row.created_at) < notBefore;
+
+export class SessionStore extends PuterStore {
+    #lastSessionTouchMs = new Map();
+    #lastUserTouchMs = new Map();
+
+    /**
+     * Look up an active session by its uuid. Returns `null` if not found,
+     * soft-revoked, or past its `expires_at`. The cached row is gated by both
+     * `revoked_at` and `expires_at` so a stale-but- expired row in cache
+     * doesn't grant access.
+     */
+    async getByUuid(uuid) {
+        const row = await this.getByUuidAny(uuid);
+        if (!row) return null;
+        if (row.revoked_at != null) return null;
+        if (isExpired(row, nowSeconds())) return null;
+        return row;
+    }
+
+    async getByUuidAny(uuid) {
+        if (!uuid) return null;
+
+        const cached = await this.#readCache(uuid);
+        if (cached) return cached;
+
+        // Revoked moments ago: a replica may still show the row live.
+        const key = this.#cacheKey(uuid);
+        const revokedRecently = await this.isCacheKeyTombstoned([key]);
+        const rows = await this.clients.db[revokedRecently ? 'pread' : 'read'](
+            'SELECT * FROM `sessions` WHERE `uuid` = ? LIMIT 1',
+            [uuid],
+        );
+        const normalized = this.#normalizeRow(rows[0]);
+        if (!normalized) return null;
+
+        if (revokedRecently) {
+            void this.#writeCache(normalized);
+        } else {
+            void this.writeCacheUnlessDeleted([key], () =>
+                this.#writeCache(normalized),
+            );
+        }
+        return normalized;
+    }
+
+    /**
+     * Get sessions for a user. By default returns only active rows; pass `{
+     * includeRevoked: true }` to include soft-revoked rows. Revoke paths pass
+     * `{ primary: true }` so a session created moments ago isn't missed.
+     */
+    async getByUserId(
+        userId,
+        { includeRevoked = false, primary = false } = {},
+    ) {
+        const sql = includeRevoked
+            ? 'SELECT * FROM `sessions` WHERE `user_id` = ?'
+            : 'SELECT * FROM `sessions` WHERE `user_id` = ? AND `revoked_at` IS NULL';
+        const rows = await this.clients.db[primary ? 'pread' : 'read'](sql, [
+            userId,
+        ]);
+        return rows.map((r) => this.#normalizeRow(r)).filter(Boolean);
+    }
+
+    /**
+     * @typedef {object} SignInRow
+     * @property {number} id
+     * @property {number} created_at Unix seconds.
+     * @property {string | null} last_ip
+     * @property {string | null} last_user_agent
+     */
+
+    /**
+     * Interactive sign-ins for a user, newest first, for the account's own
+     * activity view. Revoked rows are included -- a session someone opened and
+     * closed is exactly what the reader is looking for. Derived kinds (app,
+     * access token, asset, worker) are not sign-ins and stay out.
+     *
+     * Uncached and keyset-paginated on `id`: the caller merges this with
+     * another stream, so it asks for one page at a time rather than the whole
+     * history.
+     *
+     * @param {number} userId
+     * @param {{ limit: number; beforeId?: number | null }} opts
+     * @returns {Promise<SignInRow[]>}
+     */
+    async listSignIns(userId, { limit, beforeId = null }) {
+        const rows = await this.clients.db.read(
+            'SELECT `id`, `created_at`, `last_ip`, `last_user_agent` FROM `sessions` ' +
+                "WHERE `user_id` = ? AND `kind` = 'web'" +
+                (beforeId === null ? '' : ' AND `id` < ?') +
+                ' ORDER BY `id` DESC LIMIT ?',
+            beforeId === null ? [userId, limit] : [userId, beforeId, limit],
+        );
+        return rows.map((row) => ({
+            id: Number(row.id),
+            created_at: Number(row.created_at ?? 0),
+            last_ip: row.last_ip ?? null,
+            last_user_agent: row.last_user_agent ?? null,
+        }));
+    }
+
+    /**
+     * Create a new session row.
+     *
+     * @param userId - User ID (numeric)
+     * @param opts.meta - Request-context metadata (IP, UA, etc.) stored as
+     *   JSON.
+     * @param opts.kind - 'web' (default), 'app', 'access_token', 'asset'.
+     * @param opts.label - User-editable label for manage-sessions UI.
+     * @param opts.parent_session_id - Uuid of root session, for derived kinds.
+     * @param opts.last_ip - Request IP at creation.
+     * @param opts.last_user_agent - Request User-Agent at creation.
+     * @param opts.expires_at - Row-level expiry (unix seconds). NULL means no
+     *   row-level expiry (used for `access_token` rows whose JWT `exp` is the
+     *   truth). Sliding kinds (web/app/asset) get this populated by the caller
+     *   per the lifetime table; `touch()` then slides it.
+     * @param opts.app_uid - App UID this row authorizes, for `kind='app'`
+     *   (where it participates in the (user_id, app_uid) idempotency index), or
+     *   the godmode app an `access_token` row was minted for.
+     * @param opts.legacy_token_uid - V1 token_uid this row backfills. Only set
+     *   for `created_via='legacy_backfill'`.
+     * @param opts.access_token_uid - For `kind='access_token'` v2 rows: the
+     *   `token_uid` claim that lives in `access_token_permissions`. Lets
+     *   raw-uuid revoke reverse-find the session row when no JWT was
+     *   presented.
+     * @param opts.created_via - Audit sentinel (e.g. 'legacy_backfill').
+     * @param opts.auth_id - Stable per-user identity (survives re-login);
+     *   carried on every v2 JWT so manage-sessions can group by identity.
+     * @returns The created session row.
+     */
+    async create(userId, opts = {}) {
+        const { row } = await this.#insertSession(userId, opts, {
+            ignoreConflict: false,
+        });
+        return row;
+    }
+
+    /**
+     * Shared INSERT implementation for `create()` and the idempotent
+     * `getOrCreate*` paths. With `ignoreConflict: true`, only a duplicate- key
+     * error from the partial unique indexes is swallowed (concurrent caller won
+     * the race); every other failure — CHECK, NOT NULL, FK, type — throws. The
+     * caller then re-SELECTs to find the winning row. `inserted` is false only
+     * for that swallowed duplicate.
+     */
+    async #insertSession(
+        userId,
+        {
+            meta = {},
+            kind = 'web',
+            label = null,
+            parent_session_id = null,
+            last_ip = null,
+            last_user_agent = null,
+            expires_at = null,
+            app_uid = null,
+            legacy_token_uid = null,
+            access_token_uid = null,
+            created_via = null,
+            auth_id = null,
+        } = {},
+        { ignoreConflict = false } = {},
+    ) {
+        const uuid = uuidv4();
+        const now = nowSeconds();
+        let inserted = true;
+
+        meta.created = new Date().toISOString();
+        meta.created_unix = now;
+
+        // Always issue a plain INSERT. The `getOrCreate*` paths set
+        // ignoreConflict=true so the partial-unique-index race against a
+        // concurrent caller can no-op, but only that specific error class
+        // is swallowed — every other failure (CHECK, NOT NULL, FK, type)
+        // bubbles up. Engine-specific INSERT-IGNORE swallowed all
+        // constraint violations, which masked schema bugs as "row didn't
+        // appear in the DB but the caller cached a synthetic row anyway".
+        try {
+            await this.clients.db.write(
+                `INSERT INTO \`sessions\` (\`uuid\`, \`user_id\`, \`meta\`, \`last_activity\`, \`created_at\`, \`kind\`, \`label\`, \`parent_session_id\`, \`last_ip\`, \`last_user_agent\`, \`expires_at\`, \`app_uid\`, \`legacy_token_uid\`, \`access_token_uid\`, \`created_via\`, \`auth_id\`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                [
+                    uuid,
+                    userId,
+                    JSON.stringify(meta),
+                    now,
+                    now,
+                    kind,
+                    label,
+                    parent_session_id,
+                    last_ip,
+                    last_user_agent,
+                    expires_at,
+                    app_uid,
+                    legacy_token_uid,
+                    access_token_uid,
+                    created_via,
+                    auth_id,
+                ],
+            );
+        } catch (err) {
+            if (isMissingParentViolation(err)) {
+                // The account is gone; a cached copy still answered lookups.
+                await this.stores.user.markDeletedById(userId);
+                throw new HttpError(401, 'This account no longer exists.', {
+                    legacyCode: 'unauthorized',
+                });
+            }
+            if (!ignoreConflict || !isUniqueViolation(err)) {
+                throw err;
+            }
+            // Concurrent caller won the partial-unique-index race. The
+            // caller's re-SELECT will return that winning row; the local
+            // `row` object below is a placeholder for the caller's
+            // `winner ?? created` fallback shape and is never cached on
+            // the ignoreConflict path.
+            inserted = false;
+        }
+
+        const row = {
+            uuid,
+            user_id: userId,
+            meta,
+            created_at: now,
+            last_activity: now,
+            kind,
+            label,
+            parent_session_id,
+            last_ip,
+            last_user_agent,
+            revoked_at: null,
+            expires_at,
+            app_uid,
+            legacy_token_uid,
+            access_token_uid,
+            created_via,
+            auth_id,
+        };
+
+        // Warm the uuid cache so the immediately-following verify hits
+        // Redis instead of the DB. Note: in the ignoreConflict path this
+        // may warm a row that wasn't actually inserted (concurrent racer
+        // won). That's harmless — the idempotent caller re-SELECTs and
+        // overwrites the cache with the winning row.
+        if (!ignoreConflict) {
+            this.#writeCache(row).catch(() => {});
+        }
+
+        return { row, inserted };
+    }
+
+    /**
+     * Rename a session's label. Ownership is enforced via the user_id filter —
+     * a label edit by user A can't touch a row owned by user B even if A
+     * guesses B's session uuid.
+     *
+     * Returns `true` when a row was updated, `false` when no row matched the
+     * (uuid, user_id) pair (either the uuid doesn't exist, the row belongs to
+     * another user, or it's already soft-revoked).
+     */
+    async setLabel(uuid, userId, label) {
+        if (!uuid || !userId) return false;
+        const result = await this.clients.db.write(
+            'UPDATE `sessions` SET `label` = ? WHERE `uuid` = ? AND `user_id` = ? AND `revoked_at` IS NULL',
+            [label, uuid, userId],
+        );
+        const affected = result?.affectedRows ?? 0;
+        if (affected > 0) {
+            // Invalidate every cached view onto the row so the next read
+            // (manage-sessions reload, /whoami, etc.) sees the new label.
+            const rows = await this.clients.db.read(
+                'SELECT `uuid`, `user_id`, `kind`, `app_uid`, `parent_session_id`, `legacy_token_uid`, `meta`, `created_via`, `last_ip`, `last_user_agent` FROM `sessions` WHERE `uuid` = ? LIMIT 1',
+                [uuid],
+            );
+            if (rows[0]) {
+                await this.publishCacheKeys({
+                    keys: this.#allCacheKeysForRow(rows[0]),
+                    broadcast: true,
+                });
+            }
+        }
+        return affected > 0;
+    }
+
+    /**
+     * Soft-revoke a session by uuid. The row remains in the table with
+     * `revoked_at` set; subsequent `getByUuid` calls treat it as not found.
+     * Invalidates the uuid cache and every composite cache key that pointed at
+     * this row (app / legacy-token), so a subsequent re-auth doesn't get a
+     * stale "already authorized" mapping.
+     */
+    async removeByUuid(uuid) {
+        if (!uuid) return;
+
+        // SELECT first so we know which composite cache keys point at
+        // this row. A single UPDATE ... RETURNING would be cleaner but
+        // isn't portable between sqlite/mysql.
+        // `meta` included so #allCacheKeysForRow can read
+        // meta.worker_name for the worker cache key; without it the
+        // composite worker cache entry would survive revocation and
+        // getOrCreateWorker would serve the stale (revoked) row for
+        // up to CACHE_TTL_SECONDS. `created_via` + `last_ip` +
+        // `last_user_agent` ride along for the symmetric legacy-web
+        // key derivation.
+        // Primary read: a row minted moments ago (e.g. revoking a token
+        // right after creating it) may not have replicated yet, and a
+        // replica miss here would return early and silently skip the
+        // revoke. Revokes are rare, so the primary read is cheap.
+        const rows = await this.clients.db.pread(
+            'SELECT `uuid`, `user_id`, `kind`, `app_uid`, `parent_session_id`, `legacy_token_uid`, `meta`, `created_via`, `last_ip`, `last_user_agent` FROM `sessions` WHERE `uuid` = ? AND `revoked_at` IS NULL LIMIT 1',
+            [uuid],
+        );
+        if (rows.length === 0) return;
+
+        // Double-delete pattern: invalidate the cache BEFORE the SQL
+        // UPDATE, then again after. The pre-DEL drops any cached
+        // active-row view so a concurrent reader between the DEL and the
+        // UPDATE goes to the DB (seeing the still-active row is fine —
+        // that's the truth at that instant). The post-DEL clears any
+        // entry a racer might have re-cached during the window. Pays
+        // one extra pipelined DEL per revoke; revokes are rare so the
+        // cost is negligible.
+        const keys = this.#allCacheKeysForRow(rows[0]);
+        await this.publishCacheKeys({ keys, broadcast: true });
+
+        const now = nowSeconds();
+        await this.clients.db.write(
+            'UPDATE `sessions` SET `revoked_at` = ? WHERE `uuid` = ? AND `revoked_at` IS NULL',
+            [now, uuid],
+        );
+        await this.#publishRevoked(rows);
+    }
+
+    /**
+     * Drop every cache key of rows that just ended. A plain DEL leaves the next
+     * miss to a replica that may still show a row live, cached for a full TTL,
+     * so the uuid keys are tombstoned here and on peers (misses read the
+     * primary).
+     */
+    async #dropEndedRowKeys(rows) {
+        const uuidKeys = new Set(rows.map((r) => this.#cacheKey(r.uuid)));
+        await this.tombstoneCacheKeys([...uuidKeys]);
+        await this.publishCacheKeys({
+            keys: rows
+                .flatMap((r) => this.#allCacheKeysForRow(r))
+                .filter((key) => !uuidKeys.has(key)),
+            broadcast: true,
+        });
+    }
+
+    /**
+     * Post-UPDATE half of the double-delete: tombstone the keys, then cache the
+     * revoked rows on this node.
+     */
+    async #publishRevoked(rows) {
+        await this.#dropEndedRowKeys(rows);
+
+        try {
+            const placeholders = rows.map(() => '?').join(', ');
+            const revoked = (
+                await this.clients.db.pread(
+                    `SELECT * FROM \`sessions\` WHERE \`uuid\` IN (${placeholders})`,
+                    rows.map((r) => r.uuid),
+                )
+            )
+                .map((r) => this.#normalizeRow(r))
+                .filter((r) => r?.revoked_at != null);
+            if (revoked.length === 0) return;
+            const pipeline = this.clients.redis.pipeline();
+            for (const row of revoked) {
+                pipeline.set(
+                    this.#cacheKey(row.uuid),
+                    JSON.stringify(row),
+                    'EX',
+                    CACHE_TTL_SECONDS,
+                );
+            }
+            await pipeline.exec();
+        } catch {
+            // No entry is the safe miss; the tombstone sends it to the primary.
+        }
+    }
+
+    /**
+     * Soft-revoke a root session and every derived session that points back to
+     * it via `parent_session_id`. Broadcasts cache invalidation for each
+     * affected row's uuid + composite keys.
+     *
+     * Returns which rows were revoked — `{ userId, uuids }`, or null when there
+     * was nothing active to revoke. Callers use it to tear down anything else
+     * holding the session open; the rows are read here anyway, so reporting
+     * them costs no extra query.
+     */
+    async revokeCascade(rootUuid) {
+        if (!rootUuid) return null;
+        return (await this.revokeCascades([rootUuid]))[0] ?? null;
+    }
+
+    /**
+     * `revokeCascade` over many roots, batched so revoking all of a user's
+     * sessions costs a few primary round trips rather than a few per session.
+     * Returns `{ userId, uuids }` for each user that had rows revoked.
+     *
+     * @param {string[]} rootUuids
+     */
+    async revokeCascades(rootUuids) {
+        const roots = [...new Set(rootUuids.filter(Boolean).map(String))];
+        const uuidsByUser = new Map();
+        for (let i = 0; i < roots.length; i += REVOKE_CHUNK_SIZE) {
+            const chunk = roots.slice(i, i + REVOKE_CHUNK_SIZE);
+            const placeholders = chunk.map(() => '?').join(', ');
+            const scope = `(\`uuid\` IN (${placeholders}) OR \`parent_session_id\` IN (${placeholders})) AND \`revoked_at\` IS NULL`;
+            const scopeParams = [...chunk, ...chunk];
+
+            // Read each affected row's identity columns up-front — every
+            // composite cache mapping (app, legacy-token, legacy-web) must
+            // be invalidated alongside the uuid key, otherwise a follow-up
+            // `getOrCreateApp` would short-circuit to the freshly-revoked row.
+            // Primary read: see `removeByUuid`.
+            const rows = await this.clients.db.pread(
+                'SELECT `uuid`, `user_id`, `kind`, `app_uid`, `parent_session_id`, `legacy_token_uid`, `meta`, `created_via`, `last_ip`, `last_user_agent` ' +
+                    `FROM \`sessions\` WHERE ${scope}`,
+                scopeParams,
+            );
+            if (rows.length === 0) continue;
+
+            // Double-delete: see `removeByUuid` for rationale.
+            await this.publishCacheKeys({
+                keys: rows.flatMap((r) => this.#allCacheKeysForRow(r)),
+                broadcast: true,
+            });
+            await this.clients.db.write(
+                `UPDATE \`sessions\` SET \`revoked_at\` = ? WHERE ${scope}`,
+                [nowSeconds(), ...scopeParams],
+            );
+            await this.#publishRevoked(rows);
+
+            for (const r of rows) {
+                const userId = Number(r.user_id);
+                if (!uuidsByUser.has(userId)) uuidsByUser.set(userId, []);
+                uuidsByUser.get(userId).push(String(r.uuid));
+            }
+        }
+        return [...uuidsByUser].map(([userId, uuids]) => ({ userId, uuids }));
+    }
+
+    /**
+     * Hard-delete the worker sessions matching every given filter, plus the
+     * sessions derived from them via `parent_session_id`. A deleted worker
+     * never comes back, so there is no revoked row worth keeping.
+     *
+     * Returns each deleted row as `{ uuid, userId, accessTokenUid }` so the
+     * caller can announce the revocation and drop access-token grants.
+     *
+     * @param {{
+     *     workerName?: string;
+     *     userId?: number;
+     *     appUid?: string;
+     * }} filter
+     */
+    async deleteWorkerSessions({ workerName, userId, appUid } = {}) {
+        const where = ["`kind` = 'worker'"];
+        const params = [];
+        if (workerName) {
+            const workerNameExpr = this.clients.db.jsonTextExtract('`meta`', [
+                'worker_name',
+            ]);
+            where.push(`${workerNameExpr} = ?`);
+            params.push(workerName);
+        }
+        if (userId) {
+            where.push('`user_id` = ?');
+            params.push(userId);
+        }
+        if (appUid) {
+            where.push('`app_uid` = ?');
+            params.push(appUid);
+        }
+        // No filter would mean every worker session on the server.
+        if (params.length === 0) return [];
+
+        // Primary: a session minted moments ago must not survive a replica miss.
+        const roots = await this.clients.db.pread(
+            `SELECT \`uuid\` FROM \`sessions\` WHERE ${where.join(' AND ')}`,
+            params,
+        );
+        if (roots.length === 0) return [];
+        const rootUuids = roots.map((r) => String(r.uuid));
+        const placeholders = rootUuids.map(() => '?').join(', ');
+        const scope = `\`uuid\` IN (${placeholders}) OR \`parent_session_id\` IN (${placeholders})`;
+        const scopeParams = [...rootUuids, ...rootUuids];
+
+        const rows = await this.clients.db.pread(
+            'SELECT `uuid`, `user_id`, `kind`, `app_uid`, `legacy_token_uid`, `meta`, `created_via`, `last_ip`, `last_user_agent`, `access_token_uid` ' +
+                `FROM \`sessions\` WHERE ${scope}`,
+            scopeParams,
+        );
+
+        // Double-delete: see `removeByUuid` for rationale.
+        const keys = [];
+        for (const r of rows) keys.push(...this.#allCacheKeysForRow(r));
+        await this.publishCacheKeys({ keys, broadcast: true });
+        await this.clients.db.write(
+            `DELETE FROM \`sessions\` WHERE ${scope}`,
+            scopeParams,
+        );
+        await this.#dropEndedRowKeys(rows);
+
+        return rows.map((r) => ({
+            uuid: String(r.uuid),
+            userId: Number(r.user_id),
+            accessTokenUid: r.access_token_uid
+                ? String(r.access_token_uid)
+                : null,
+        }));
+    }
+
+    /**
+     * Access-token identities among the rows `revokeCascade(rootUuid)` would
+     * affect — the root itself when it is a token row, plus any token row
+     * parented to it. Callers use these to drop grants that would otherwise
+     * outlive the revoked row. Must be read _before_ the cascade, while the
+     * rows still qualify as active.
+     *
+     * Both identity columns are consulted: v2 rows carry `access_token_uid`
+     * from mint, v1 rows get `legacy_token_uid` backfilled on first verify.
+     */
+    async accessTokenUidsForCascade(rootUuid) {
+        if (!rootUuid) return [];
+        const rows = await this.clients.db.pread(
+            "SELECT `access_token_uid`, `legacy_token_uid` FROM `sessions` WHERE (`uuid` = ? OR `parent_session_id` = ?) AND `kind` = 'access_token' AND `revoked_at` IS NULL",
+            [rootUuid, rootUuid],
+        );
+        const uids = [];
+        for (const row of rows) {
+            const uid = row.access_token_uid ?? row.legacy_token_uid;
+            if (uid) uids.push(uid);
+        }
+        return uids;
+    }
+
+    /**
+     * Active session row whose access-token identity matches `tokenUid`. Covers
+     * both v2 (`access_token_uid` set at mint) and v1 lazy-backfill
+     * (`legacy_token_uid` set on first verify) rows so raw-uuid revoke can find
+     * the row regardless of whether the token was originally v1 or v2. Returns
+     * `null` if no active row matches.
+     */
+    async findActiveByAccessTokenUid(tokenUid) {
+        if (!tokenUid) return null;
+        const now = nowSeconds();
+        const rows = await this.clients.db.read(
+            "SELECT * FROM `sessions` WHERE `kind` = 'access_token' AND (`access_token_uid` = ? OR `legacy_token_uid` = ?) AND `revoked_at` IS NULL AND (`expires_at` IS NULL OR `expires_at` > ?) ORDER BY `id` DESC LIMIT 1",
+            [tokenUid, tokenUid, now],
+        );
+        return this.#normalizeRow(rows[0]);
+    }
+
+    /**
+     * The token row a godmode app runs on under one web session. A live row is
+     * reused and its `expires_at` moved to `expiresAt`, so the token stays the
+     * same across renewals; a move of under an hour is skipped and the row
+     * comes back with the expiry it has. A row that lapsed or is older than
+     * `maxAgeSeconds` is never extended: a fresh row is minted, and the old one
+     * comes back as `replaced` for the caller to revoke. Concurrent first
+     * launches can each insert a row; both stay valid.
+     *
+     * @param userId - User row id (numeric).
+     * @param opts.parentSessionUid - The web session minting it; revoking that
+     *   session cascades here.
+     * @param opts.appUid - The godmode app.
+     * @param opts.expiresAt - Unix seconds the row lives to unless renewed.
+     * @param opts.maxAgeSeconds - Oldest a row may be and still be renewed.
+     * @param opts.label - Shown in the sessions list.
+     * @param opts.auth_id - Stable per-user identity.
+     */
+    async getOrCreateGodmodeToken(
+        userId,
+        {
+            parentSessionUid,
+            appUid,
+            expiresAt,
+            maxAgeSeconds,
+            label = null,
+            auth_id = null,
+        },
+    ) {
+        if (!userId || !parentSessionUid || !appUid) return null;
+
+        const now = nowSeconds();
+        const renewable = (row) =>
+            !!row &&
+            row.revoked_at == null &&
+            !isExpired(row, now) &&
+            Number(row.created_at) > now - maxAgeSeconds;
+
+        const pointerKey = this.#cacheKeyGodmode(
+            userId,
+            parentSessionUid,
+            appUid,
+        );
+        const cached = await this.#cachedGodmodeRow(pointerKey, {
+            userId,
+            parentSessionUid,
+            appUid,
+        });
+        if (renewable(cached)) {
+            const row = await this.#renewGodmodeRow(cached, expiresAt, now);
+            if (row) return { row, replaced: null };
+        }
+
+        const rows = await this.clients.db.pread(
+            "SELECT * FROM `sessions` WHERE `kind` = 'access_token' AND `user_id` = ? AND `parent_session_id` = ? AND `app_uid` = ? AND `revoked_at` IS NULL ORDER BY `id` DESC LIMIT 1",
+            [userId, parentSessionUid, appUid],
+        );
+        const found = this.#normalizeRow(rows[0]);
+        if (renewable(found)) {
+            const row = await this.#renewGodmodeRow(found, expiresAt, now);
+            if (row) {
+                await this.#writeGodmodePointer(pointerKey, row.uuid);
+                return { row, replaced: null };
+            }
+        }
+
+        const { row } = await this.#insertSession(userId, {
+            kind: 'access_token',
+            label,
+            parent_session_id: parentSessionUid,
+            expires_at: expiresAt,
+            app_uid: appUid,
+            access_token_uid: uuidv4(),
+            auth_id,
+        });
+        await this.#writeGodmodePointer(pointerKey, row.uuid);
+        return { row, replaced: found ?? null };
+    }
+
+    /**
+     * Idempotent "give me the app session for this (user, app)" lookup. Returns
+     * the existing active app session if one exists, or creates a new one.
+     * Concurrent callers converge on a single row via the partial unique index
+     * `idx_sessions_user_app_active`.
+     *
+     * Cache flow:
+     *
+     * 1. Try `sessions:v2:app:<userId>:<appUid>` (full row).
+     * 2. If miss, SELECT; on hit, warm both composite + uuid cache.
+     * 3. If still nothing, INSERT (idempotent under concurrency); the losing racer
+     *    falls through to SELECT and finds the winner's row.
+     *
+     * @param userId - User row id (numeric).
+     * @param appUid - App UID (string).
+     * @param opts.last_ip / opts.last_user_agent - Request context for
+     *   first-time creation. Ignored when a row already exists.
+     * @param opts.auth_id - Stable per-user identity (survives re-login);
+     *   carried on every v2 JWT so manage-sessions can group by identity.
+     * @param opts.notBefore - Unix seconds. A live row created earlier belongs
+     *   to a previous app with this uid; it is revoked and replaced.
+     */
+    async getOrCreateApp(userId, appUid, opts = {}) {
+        if (!userId || !appUid) return null;
+
+        const cacheKey = this.#cacheKeyApp(userId, appUid);
+        const now = nowSeconds();
+        const notBefore = opts.notBefore ?? null;
+
+        const cached = await this.#readCacheKey(cacheKey);
+        const cachedLive =
+            cached && cached.revoked_at == null && !isExpired(cached, now);
+        if (cachedLive && !predates(cached, notBefore)) {
+            return cached;
+        }
+
+        const selectRow = (opts) => this.#selectAppRow(userId, appUid, opts);
+        const { row: existing, primary: onlyOnPrimary } =
+            await this.#selectUnlessEnded(selectRow);
+        if (existing && !predates(existing, notBefore)) {
+            // Auth that misses the cache reads the replica, which already has
+            // a row it returned here; a row only the primary had is cached
+            // before the token goes out.
+            const caching = awaitLater(
+                this.#cacheComposite(cacheKey, existing),
+            );
+            if (onlyOnPrimary) await caching;
+            return existing;
+        }
+        const stale = existing ?? (cachedLive ? cached : null);
+        if (stale) await this.revokeCascade(stale.uuid);
+
+        // INSERT-or-IGNORE so concurrent racers don't throw on the
+        // partial unique index; we re-SELECT below to find the row
+        // that actually won.
+        const { row: created, inserted } = await this.#insertSession(
+            userId,
+            {
+                kind: 'app',
+                app_uid: appUid,
+                parent_session_id: null,
+                last_ip: opts.last_ip ?? null,
+                last_user_agent: opts.last_user_agent ?? null,
+                expires_at: now + APP_WINDOW_SECONDS,
+                auth_id: opts.auth_id ?? null,
+                created_via: opts.created_via ?? null,
+                meta: opts.meta ?? {},
+            },
+            { ignoreConflict: true },
+        );
+
+        // Only a lost race needs the winner read back, and from the primary: a
+        // replica that hasn't seen it would leave `created`, which was never
+        // written.
+        const winner = inserted ? null : await selectRow({ primary: true });
+        const row = winner ?? created;
+        await this.#cacheComposite(cacheKey, row);
+        return row;
+    }
+
+    /**
+     * Idempotent "give me the worker session for this (user, app, worker_name)"
+     * lookup. Same shape as `getOrCreateApp` but keyed on a triple so multiple
+     * workers can sit under the same app (each with its own `worker_name`) and
+     * each gets its own session row.
+     *
+     * `appUid` is allowed null for user-scoped workers — the partial unique
+     * index treats those distinctly (SQLite via NULL-distinct semantics,
+     * MySQL/Postgres via COALESCE in the generated key).
+     *
+     * @param userId - User row id (numeric).
+     * @param opts.appUid - App UID or null for user-scoped workers.
+     * @param opts.workerName - Per-worker discriminator. Required.
+     * @param opts.meta - Additional metadata merged into the row's `meta` blob
+     *   alongside the canonical `worker: true` and `worker_name` markers.
+     * @param opts.last_ip / opts.last_user_agent - Request context for
+     *   first-time creation. Ignored when a row already exists.
+     * @param opts.auth_id - Stable per-user identity (survives re-login).
+     * @param opts.notBefore - Unix seconds. A live row created earlier belongs
+     *   to a previous app with this uid; it is revoked and replaced.
+     */
+    async getOrCreateWorker(userId, opts = {}) {
+        if (!userId || !opts.workerName) return null;
+
+        const existing = await this.getWorker(userId, opts);
+        if (existing && !predates(existing, opts.notBefore ?? null)) {
+            return existing;
+        }
+        if (existing) await this.revokeCascade(existing.uuid);
+
+        const appUid = opts.appUid ?? null;
+        const workerName = String(opts.workerName);
+        const cacheKey = this.#cacheKeyWorker(userId, appUid, workerName);
+        const now = nowSeconds();
+
+        const { row: created } = await this.#insertSession(
+            userId,
+            {
+                kind: 'worker',
+                app_uid: appUid,
+                parent_session_id: null,
+                last_ip: opts.last_ip ?? null,
+                last_user_agent: opts.last_user_agent ?? null,
+                expires_at: now + WORKER_WINDOW_SECONDS,
+                auth_id: opts.auth_id ?? null,
+                meta: {
+                    ...(opts.meta ?? {}),
+                    worker: true,
+                    worker_name: workerName,
+                },
+            },
+            { ignoreConflict: true },
+        );
+
+        // INSERT-IGNORE may have lost the race against another caller;
+        // re-SELECT under the partial unique index to find whichever
+        // row actually won.
+        // After a revoke the replica may still show the old row as live.
+        const { row: winner } = await this.#selectUnlessEnded(
+            (o) => this.#selectWorkerRow(userId, appUid, workerName, o),
+            { primary: existing !== null },
+        );
+        const row = winner ?? created;
+        await this.#cacheComposite(cacheKey, row);
+        return row;
+    }
+
+    /**
+     * Read-only counterpart to `getOrCreateWorker` — looks up the (user, app,
+     * worker_name) session row without creating one. `null` when no such
+     * session exists.
+     */
+    async getWorker(userId, opts = {}) {
+        if (!userId || !opts.workerName) return null;
+        const appUid = opts.appUid ?? null;
+        const workerName = String(opts.workerName);
+
+        const cacheKey = this.#cacheKeyWorker(userId, appUid, workerName);
+        const now = nowSeconds();
+
+        const cached = await this.#readCacheKey(cacheKey);
+        if (cached && cached.revoked_at == null && !isExpired(cached, now)) {
+            return cached;
+        }
+
+        const { row: existing } = await this.#selectUnlessEnded((o) =>
+            this.#selectWorkerRow(userId, appUid, workerName, o),
+        );
+        if (existing) await this.#cacheComposite(cacheKey, existing);
+        return existing;
+    }
+
+    /**
+     * A page of live worker sessions for one worker name, oldest id first —
+     * what the stray-session sweep pages through to find rows whose app no
+     * longer exists. `idx_sessions_kind_user` gives `kind = 'worker'` as a
+     * leading equality, so this range-scans worker sessions only, not the whole
+     * table; the `worker_name` predicate is evaluated on that slice. No
+     * migration.
+     *
+     * @param {{
+     *     workerName: string;
+     *     afterId?: number;
+     *     limit?: number;
+     * }} args
+     *   - `workerName` selects the worker; `afterId` is the keyset cursor (0 for
+     *       the first page); `limit` bounds the page size.
+     */
+    async listWorkerSessions({ workerName, afterId = 0, limit = 500 } = {}) {
+        if (!workerName) return [];
+        const workerNameExpr = this.clients.db.jsonTextExtract('`meta`', [
+            'worker_name',
+        ]);
+        const rows = await this.clients.db.read(
+            `SELECT \`id\`, \`uuid\`, \`user_id\`, \`app_uid\` FROM \`sessions\` ` +
+                `WHERE \`kind\` = 'worker' AND \`revoked_at\` IS NULL AND ` +
+                `\`app_uid\` IS NOT NULL AND ${workerNameExpr} = ? AND \`id\` > ? ` +
+                'ORDER BY `id` LIMIT ?',
+            [workerName, afterId, Math.max(1, Math.floor(limit))],
+        );
+        return rows.map((row) => ({
+            id: Number(row.id),
+            uuid: String(row.uuid),
+            userId: Number(row.user_id),
+            appUid: String(row.app_uid),
+        }));
+    }
+
+    /** Highest row id, the bound for a primary-key walk. */
+    async maxId() {
+        const rows = await this.clients.db.read(
+            'SELECT MAX(`id`) AS `max_id` FROM `sessions`',
+        );
+        return Number(rows[0]?.max_id) || 0;
+    }
+
+    /**
+     * Hard-delete rows with ids in `(afterId, afterId + span]` that were
+     * revoked or expired before `webCutoff` (web rows, which `listSignIns`
+     * reads) or `cutoff` (every other kind), both unix seconds. Bounded by
+     * primary key instead of an index on either column, since `touch` rewrites
+     * `expires_at` constantly. Cached copies need no invalidation: they still
+     * read as revoked or expired.
+     */
+    async purgeEndedInRange(afterId, span, { cutoff, webCutoff }) {
+        const result = await this.clients.db.write(
+            'DELETE FROM `sessions` WHERE `id` > ? AND `id` <= ? AND (' +
+                "(`kind` = 'web' AND (`revoked_at` < ? OR `expires_at` < ?)) OR " +
+                "(`kind` <> 'web' AND (`revoked_at` < ? OR `expires_at` < ?)))",
+            [afterId, afterId + span, webCutoff, webCutoff, cutoff, cutoff],
+        );
+        return result?.affectedRows ?? result?.changes ?? 0;
+    }
+
+    /**
+     * Bump `last_activity` and slide `expires_at` per the row's kind in a
+     * single UPDATE. Sliding kinds (web/app/asset) get their `expires_at`
+     * extended to `now + window`; `access_token` (and unknown kinds) keep their
+     * existing `expires_at` (hard expiry). The `last_activity < ?` guard makes
+     * the UPDATE idempotent across nodes so concurrent touches don't fight.
+     *
+     * When `ip` / `userAgent` are provided and differ from the stored values,
+     * they are written into `last_ip` / `last_user_agent` in the same UPDATE —
+     * and the uuid cache is invalidated so the next read doesn't serve the
+     * pre-roam values. Unchanged values are no-ops at the SQL level (the CASE
+     * guards keep the column write conditional) and skip the cache invalidate.
+     */
+    async updateActivity(
+        uuid,
+        lastActivity,
+        { ip = null, userAgent = null } = {},
+    ) {
+        const webExpires = lastActivity + WEB_WINDOW_SECONDS;
+        const appExpires = lastActivity + APP_WINDOW_SECONDS;
+        const assetExpires = lastActivity + ASSET_WINDOW_SECONDS;
+        await this.clients.db.write(
+            'UPDATE `sessions` SET `last_activity` = ?, `expires_at` = CASE `kind` ' +
+                "WHEN 'web' THEN ? " +
+                "WHEN 'app' THEN ? " +
+                "WHEN 'asset' THEN ? " +
+                'ELSE `expires_at` ' +
+                'END, ' +
+                '`last_ip` = CASE WHEN ? IS NOT NULL AND (`last_ip` IS NULL OR `last_ip` <> ?) THEN ? ELSE `last_ip` END, ' +
+                '`last_user_agent` = CASE WHEN ? IS NOT NULL AND (`last_user_agent` IS NULL OR `last_user_agent` <> ?) THEN ? ELSE `last_user_agent` END ' +
+                'WHERE `uuid` = ? AND (`last_activity` IS NULL OR `last_activity` < ?)',
+            [
+                lastActivity,
+                webExpires,
+                appExpires,
+                assetExpires,
+                ip,
+                ip,
+                ip,
+                userAgent,
+                userAgent,
+                userAgent,
+                uuid,
+                lastActivity,
+            ],
+        );
+
+        // When IP or UA actually changed, the cached row at
+        // `sessions:v2:uuid:<uuid>` is now stale (it carries the old
+        // `last_ip` / `last_user_agent`). Manage-sessions reads off the
+        // cached row, so without this invalidate the UI keeps showing the
+        // pre-roam values until the 15-minute TTL expires.
+        if (ip != null || userAgent != null) {
+            const cached = await this.#readCache(uuid);
+            if (cached) {
+                const ipChanged = ip != null && cached.last_ip !== ip;
+                const uaChanged =
+                    userAgent != null && cached.last_user_agent !== userAgent;
+                if (ipChanged || uaChanged) {
+                    await this.publishCacheKeys({
+                        keys: [this.#cacheKey(uuid)],
+                        broadcast: true,
+                    });
+                }
+            }
+        }
+    }
+
+    /** Update user-level last activity timestamp. */
+    async updateUserActivity(userId, lastActivityTs) {
+        await this.clients.db.write(
+            'UPDATE `user` SET `last_activity_ts` = ? WHERE `id` = ? AND (`last_activity_ts` IS NULL OR `last_activity_ts` < ?)',
+            [lastActivityTs, userId, lastActivityTs],
+        );
+    }
+
+    /**
+     * Best-effort throttled activity touch. Updates the session row's
+     * `last_activity` column and the owning user's `user.last_activity_ts` if
+     * either hasn't been touched within `TOUCH_THROTTLE_MS`.
+     *
+     * When `ip` / `userAgent` are passed, they ride along into `updateActivity`
+     * so a roaming session also refreshes its `last_ip` / `last_user_agent`.
+     * Throttle still applies — the IP/UA fields only get a chance to update
+     * once per `TOUCH_THROTTLE_MS`.
+     *
+     * Callers fire-and-forget — failures are swallowed.
+     *
+     * @param {{
+     *     uuid?: string;
+     *     userId?: number;
+     *     ip?: string | null;
+     *     userAgent?: string | null;
+     * }} [args]
+     */
+    async touch({ uuid, userId, ip = null, userAgent = null } = {}) {
+        const nowMs = Date.now();
+
+        const sessionDue =
+            uuid &&
+            nowMs - (this.#lastSessionTouchMs.get(uuid) ?? 0) >=
+                TOUCH_THROTTLE_MS;
+        const userDue =
+            userId &&
+            nowMs - (this.#lastUserTouchMs.get(userId) ?? 0) >=
+                TOUCH_THROTTLE_MS;
+
+        if (!sessionDue && !userDue) return;
+
+        // Reserve the throttle slot before awaiting so concurrent
+        // callers on the same node coalesce.
+        if (sessionDue) {
+            if (this.#lastSessionTouchMs.size >= TOUCH_THROTTLE_MAX_ENTRIES) {
+                this.#lastSessionTouchMs.clear();
+            }
+            this.#lastSessionTouchMs.set(uuid, nowMs);
+        }
+        if (userDue) {
+            if (this.#lastUserTouchMs.size >= TOUCH_THROTTLE_MAX_ENTRIES) {
+                this.#lastUserTouchMs.clear();
+            }
+            this.#lastUserTouchMs.set(userId, nowMs);
+        }
+
+        const tasks = [];
+        if (sessionDue) {
+            tasks.push(
+                this.updateActivity(uuid, Math.floor(nowMs / 1000), {
+                    ip,
+                    userAgent,
+                }).catch(() => {}),
+            );
+        }
+        if (userDue) {
+            tasks.push(
+                this.updateUserActivity(userId, sqlTimestamp(nowMs)).catch(
+                    () => {},
+                ),
+            );
+        }
+        await Promise.all(tasks);
+    }
+
+    // -- Internals ---------------------------------------------------
+
+    #cacheKey(uuid) {
+        return `${CACHE_KEY_PREFIX}:uuid:${uuid}`;
+    }
+
+    #cacheKeyApp(userId, appUid) {
+        return `${CACHE_KEY_PREFIX}:app:${userId}:${appUid}`;
+    }
+
+    /**
+     * Cache key for a row backfilled from a v1 access token. Nothing creates
+     * these any more, but rows and cached entries from before v1 was retired
+     * still have to be invalidated on revoke.
+     */
+    #cacheKeyLegacyAt(tokenUid) {
+        return `${CACHE_KEY_PREFIX}:legacy-at:${tokenUid}`;
+    }
+
+    /**
+     * Cache key for the (user, app, worker_name) worker-session triple.
+     * `app_uid` is encoded as empty-string for user-scoped workers so the
+     * namespace doesn't fracture on NULL.
+     */
+    #cacheKeyWorker(userId, appUid, workerName) {
+        return `${CACHE_KEY_PREFIX}:worker:${userId}:${appUid ?? ''}:${workerName}`;
+    }
+
+    /**
+     * Cache key naming the godmode token row for (user, web session, app). It
+     * holds only the row's uuid; the row is read through the uuid cache and
+     * checked on every use, and revoking the row drops the key.
+     */
+    #cacheKeyGodmode(userId, parentSessionUid, appUid) {
+        return `${CACHE_KEY_PREFIX}:godmode:${userId}:${parentSessionUid}:${appUid}`;
+    }
+
+    /**
+     * Cache key for the (legacy-web) backfill lookup. IP and UA are
+     * percent-encoded into a single key segment so a UA containing `:` doesn't
+     * fracture the namespace. Same as `#cacheKeyLegacyAt`: kept for
+     * invalidating entries that predate the v1 retirement.
+     */
+    #cacheKeyLegacyWeb(userId, ip, ua) {
+        const tag = encodeURIComponent(`${ip ?? ''}|${ua ?? ''}`);
+        return `${CACHE_KEY_PREFIX}:legacy-web:${userId}:${tag}`;
+    }
+
+    /**
+     * Every cache key currently mapped to a given row. Used by revoke paths so
+     * a single revocation invalidates every cached view onto the same row in
+     * lockstep.
+     */
+    #allCacheKeysForRow(row) {
+        if (!row?.uuid) return [];
+        const keys = [this.#cacheKey(row.uuid)];
+        if (row.kind === 'app' && row.user_id && row.app_uid) {
+            keys.push(this.#cacheKeyApp(row.user_id, row.app_uid));
+        }
+        if (row.kind === 'worker' && row.user_id) {
+            const meta =
+                typeof row.meta === 'string'
+                    ? (() => {
+                          try {
+                              return JSON.parse(row.meta);
+                          } catch {
+                              return null;
+                          }
+                      })()
+                    : row.meta;
+            const workerName = meta?.worker_name;
+            if (typeof workerName === 'string' && workerName) {
+                keys.push(
+                    this.#cacheKeyWorker(
+                        row.user_id,
+                        row.app_uid ?? null,
+                        workerName,
+                    ),
+                );
+            }
+        }
+        // Rows backfilled from a pre-v2 web token were cached by (user_id,
+        // last_ip, last_user_agent). Nothing creates them any more, but the
+        // ones that exist still need that composite key invalidated on revoke,
+        // or it would serve the stale row for up to CACHE_TTL_SECONDS and let a
+        // same-IP/UA replay re-authenticate.
+        if (row.kind === 'web' && row.created_via === 'legacy_backfill') {
+            keys.push(
+                this.#cacheKeyLegacyWeb(
+                    row.user_id,
+                    row.last_ip ?? null,
+                    row.last_user_agent ?? null,
+                ),
+            );
+        }
+        if (
+            row.kind === 'access_token' &&
+            row.user_id &&
+            row.parent_session_id &&
+            row.app_uid
+        ) {
+            keys.push(
+                this.#cacheKeyGodmode(
+                    row.user_id,
+                    row.parent_session_id,
+                    row.app_uid,
+                ),
+            );
+        }
+        if (row.legacy_token_uid) {
+            keys.push(this.#cacheKeyLegacyAt(row.legacy_token_uid));
+        }
+        return keys;
+    }
+
+    async #readCache(uuid) {
+        return this.#readCacheKey(this.#cacheKey(uuid));
+    }
+
+    async #readCacheKey(key) {
+        try {
+            const raw = await this.clients.redis.get(key);
+            return raw ? JSON.parse(raw) : null;
+        } catch {
+            return null;
+        }
+    }
+
+    async #writeCache(session) {
+        if (!session?.uuid) return;
+        await this.#writeCacheKey(this.#cacheKey(session.uuid), session);
+    }
+
+    async #writeCacheKey(key, value, ttlSeconds = CACHE_TTL_SECONDS) {
+        try {
+            await this.clients.redis.set(
+                key,
+                JSON.stringify(value),
+                'EX',
+                ttlSeconds,
+            );
+        } catch {
+            // Best-effort local backfill.
+        }
+    }
+
+    /**
+     * Run a row select on the replica, or on the primary when asked or when the
+     * replica's row ended moments ago (its uuid key is tombstoned) and the
+     * replica may not have the revoke or delete yet. `primary` says which
+     * answered.
+     */
+    async #selectUnlessEnded(select, { primary = false } = {}) {
+        if (primary) return { row: await select({ primary: true }), primary };
+        const row = await select({ primary: false });
+        if (
+            !row ||
+            !(await this.isCacheKeyTombstoned([this.#cacheKey(row.uuid)]))
+        ) {
+            return { row, primary: false };
+        }
+        return { row: await select({ primary: true }), primary: true };
+    }
+
+    /** Cache a row under its composite key and its uuid key, unless it ended. */
+    async #cacheComposite(compositeKey, row) {
+        await this.writeCacheUnlessDeleted(
+            [this.#cacheKey(row.uuid), compositeKey],
+            async () => {
+                await this.#writeCacheKey(compositeKey, row);
+                await this.#writeCache(row);
+            },
+        );
+    }
+
+    /**
+     * Active app session for (userId, appUid). Matches the partial unique index
+     * `idx_sessions_user_app_active`. Kept private — public callers should go
+     * through `getOrCreateApp` so cache and idempotency stay in sync.
+     */
+    async #selectAppRow(userId, appUid, { primary = false } = {}) {
+        const now = nowSeconds();
+        const read = primary ? 'pread' : 'read';
+        const rows = await this.clients.db[read](
+            "SELECT * FROM `sessions` WHERE `kind` = 'app' AND `user_id` = ? AND `app_uid` = ? AND `revoked_at` IS NULL AND (`expires_at` IS NULL OR `expires_at` > ?) LIMIT 1",
+            [userId, appUid, now],
+        );
+        return this.#normalizeRow(rows[0]);
+    }
+
+    /**
+     * Active worker session for (userId, appUid, workerName). Matches the
+     * partial unique index `idx_sessions_user_worker_active`. `appUid` is
+     * allowed null for user-scoped workers; COALESCE keeps the comparison
+     * correct since SQL `= NULL` doesn't match.
+     */
+    async #selectWorkerRow(
+        userId,
+        appUid,
+        workerName,
+        { primary = false } = {},
+    ) {
+        const now = nowSeconds();
+        const read = primary ? 'pread' : 'read';
+        const workerNameExpr = this.clients.db.jsonTextExtract('`meta`', [
+            'worker_name',
+        ]);
+        const appUidExpr = this.clients.db.nullCoalesce('`app_uid`', "''");
+        const appUidBound = this.clients.db.nullCoalesce('?', "''");
+        const rows = await this.clients.db[read](
+            `SELECT * FROM \`sessions\` WHERE \`kind\` = 'worker' AND \`user_id\` = ? AND ${appUidExpr} = ${appUidBound} AND ${workerNameExpr} = ? AND \`revoked_at\` IS NULL AND (\`expires_at\` IS NULL OR \`expires_at\` > ?) LIMIT 1`,
+            [userId, appUid ?? null, workerName, now],
+        );
+        return this.#normalizeRow(rows[0]);
+    }
+
+    /**
+     * The row a godmode pointer names, read the way token auth reads it. Null
+     * when there is no pointer or the row it names isn't this triple's.
+     */
+    async #cachedGodmodeRow(key, { userId, parentSessionUid, appUid }) {
+        const pointer = await this.#readCacheKey(key);
+        if (typeof pointer?.uuid !== 'string') return null;
+        const row = await this.getByUuidAny(pointer.uuid);
+        if (
+            row?.kind !== 'access_token' ||
+            Number(row.user_id) !== Number(userId) ||
+            row.parent_session_id !== parentSessionUid ||
+            row.app_uid !== appUid
+        ) {
+            return null;
+        }
+        return row;
+    }
+
+    /**
+     * Move a live godmode row's expiry up to `expiresAt`, or leave it when the
+     * move is under the renew step. Null when the row turned out to be revoked
+     * or lapsed by the time of the write.
+     */
+    async #renewGodmodeRow(row, expiresAt, now) {
+        if (
+            Number(row.expires_at) >=
+            expiresAt - GODMODE_TOKEN_RENEW_STEP_SECONDS
+        ) {
+            return row;
+        }
+        // The pointer stays: it names this same row after the write.
+        const keys = this.#allCacheKeysForRow(row).filter(
+            (key) =>
+                key !==
+                this.#cacheKeyGodmode(
+                    row.user_id,
+                    row.parent_session_id,
+                    row.app_uid,
+                ),
+        );
+        await this.publishCacheKeys({ keys, broadcast: true });
+        const result = await this.clients.db.write(
+            'UPDATE `sessions` SET `expires_at` = ? WHERE `uuid` = ? AND `revoked_at` IS NULL AND (`expires_at` IS NULL OR `expires_at` > ?)',
+            [expiresAt, row.uuid, now],
+        );
+        await this.publishCacheKeys({ keys, broadcast: true });
+        return result?.anyRowsAffected
+            ? { ...row, expires_at: expiresAt }
+            : null;
+    }
+
+    async #writeGodmodePointer(key, uuid) {
+        await this.#writeCacheKey(key, { uuid }, GODMODE_TOKEN_WINDOW_SECONDS);
+    }
+
+    #normalizeRow(row) {
+        if (!row) return null;
+        // Meta may be stored as JSON string (SQLite) or already parsed
+        if (typeof row.meta === 'string') {
+            try {
+                row.meta = JSON.parse(row.meta);
+            } catch {
+                row.meta = {};
+            }
+        }
+        return row;
+    }
+}

@@ -1,5 +1,5 @@
-/**
- * Copyright (C) 2024 Puter Technologies Inc.
+/*
+ * Copyright (C) 2024-present Puter Technologies Inc.
  *
  * This file is part of Puter.
  *
@@ -17,14 +17,27 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-import { concepts, AdvancedBase } from "@heyputer/putility";
-import TeePromise from "./util/TeePromise.js";
+import TeePromise from './util/TeePromise.js';
+import AdvancedBase from './util/AdvancedBase.js';
 
-export class Service extends concepts.Service {
+const NOOP = async () => {
+};
+
+export class Service extends AdvancedBase {
     // TODO: Service todo items
     static TODO = [
-        'consolidate with BaseService from backend'
+        'consolidate with BaseService from backend',
     ];
+    async __on (id, args) {
+        const handler = this.__get_event_handler(id);
+
+        return await handler(id, ...args);
+    }
+    __get_event_handler (id) {
+        return this[`__on_${id}`]?.bind?.(this)
+            || this.constructor[`__on_${id}`]?.bind?.(this.constructor)
+            || NOOP;
+    }
     construct (o) {
         this.$puter = {};
         for ( const k in o ) this.$puter[k] = o[k];
@@ -34,7 +47,7 @@ export class Service extends concepts.Service {
     init (...a) {
         if ( ! this._init ) return;
         this.services = a[0].services;
-        return this._init(...a)
+        return this._init(...a);
     }
     get context () {
         return { services: this.services };
@@ -53,11 +66,11 @@ export const PROCESS_IPC_ATTACHED = { i18n_key: 'attached' };
 export const END_SOFT = { i: 0, end: true, i18n_key: 'end_soft' };
 export const END_HARD = { i: 1, end: true, i18n_key: 'end_hard' };
 
-export class Process extends AdvancedBase{
+export class Process extends AdvancedBase {
     static PROPERTIES = {
         status: () => PROCESS_INITIALIZING,
         ipc_status: () => PROCESS_IPC_PENDING,
-    }
+    };
     constructor ({ uuid, parent, name, meta }) {
         super();
 
@@ -66,24 +79,26 @@ export class Process extends AdvancedBase{
         this.name = name;
         this.meta = meta;
         this.references = {};
-        
+
         Object.defineProperty(this.references, 'iframe', {
             get: () => {
                 // note: Might eventually make sense to make the
                 // fn on window call here instead.
                 return window.iframe_for_app_instance(this.uuid);
-            }
-        })
+            },
+        });
 
         this._construct();
     }
-    _construct () {}
+    _construct () {
+    }
 
     chstatus (status) {
         this.status = status;
     }
 
-    is_init () {}
+    is_init () {
+    }
 
     signal (sig) {
         this._signal(sig);
@@ -98,21 +113,23 @@ export class Process extends AdvancedBase{
             return name.replace(/Process$/, '').toLowerCase();
         };
         return this.type_ || _to_type_name(this.constructor.name) ||
-            'invalid'
+            'invalid';
     }
 };
 
 export class InitProcess extends Process {
     static created_ = false;
 
-    is_init () { return true; }
+    is_init () {
+        return true;
+    }
 
     _construct () {
         this.name = 'Puter';
 
         this.type_ = 'init'; // thanks minify
 
-        if (InitProcess.created_) {
+        if ( InitProcess.created_ ) {
             throw new Error('InitProccess already created');
         }
 
@@ -134,24 +151,27 @@ export class InitProcess extends Process {
 }
 
 export class PortalProcess extends Process {
-    _construct () { this.type_ = 'app' }
+    _construct () {
+        this.type_ = 'app';
+    }
     _signal (sig) {
         if ( sig.end ) {
             $(this.references.el_win).close({
-                bypass_iframe_messaging: sig.i === END_HARD.i
+                bypass_iframe_messaging: sig.i === END_HARD.i,
             });
         }
     }
-    
-    send (channel, data, context) {
+
+    send (channel, data, { transfer = [] } = {}) {
         const target = this.references.iframe.contentWindow;
         target.postMessage({
             msg: 'messageToApp',
             appInstanceID: channel.returnAddress,
             targetAppInstanceID: this.uuid,
             contents: data,
+            transfer,
         // }, new URL(this.references.iframe.src).origin);
-        }, '*');
+        }, '*', transfer);
     }
 
     async handle_connection (connection, args) {
@@ -181,17 +201,19 @@ export class PortalProcess extends Process {
                 setTimeout(() => {
                     reject(new Error('Connection timeout'));
                 }, 5000);
-            })
+            }),
         ]);
         return outcome;
     }
 };
 export class PseudoProcess extends Process {
-    _construct () { this.type_ = 'ui' }
+    _construct () {
+        this.type_ = 'ui';
+    }
     _signal (sig) {
         if ( sig.end ) {
             $(this.references.el_win).close({
-                bypass_iframe_messaging: sig.i === END_HARD.i
+                bypass_iframe_messaging: sig.i === END_HARD.i,
             });
         }
     }

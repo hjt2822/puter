@@ -1,0 +1,3267 @@
+/*
+ * Copyright (C) 2024-present Puter Technologies Inc.
+ *
+ * This file is part of Puter.
+ *
+ * Puter is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published
+ * by the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+import type { Request, Response } from 'express';
+import type { Readable } from 'node:stream';
+import { v4 as uuidv4 } from 'uuid';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
+import { makeActor, type Actor } from '../../core/actor.js';
+import { runWithContext } from '../../core/context.js';
+import { consumeRouteRateLimit } from '../../core/http/middleware/rateLimit.js';
+import { PuterServer } from '../../server.js';
+import { setupTestServer } from '../../testUtil.js';
+import { generateDefaultFsentries } from '../../util/userProvisioning.js';
+import { SHARE_LIST_LIMIT } from '../share/limits.js';
+import type { FSController } from './FSController.js';
+import type { LegacyFSController } from './LegacyFSController.js';
+import type {
+    ClientSignedWriteResponse,
+    CompleteWriteRequest,
+    SignedWriteRequest,
+} from './requestTypes.js';
+
+// ── Test harness ────────────────────────────────────────────────────
+//
+// Boots one real PuterServer (in-memory sqlite + dynamo + s3 + mock redis).
+// Each test creates its own user via `makeUser` and exercises the live
+// FSController against the wired services / stores.
+
+let server: PuterServer;
+let controller: FSController;
+
+beforeAll(async () => {
+    server = await setupTestServer();
+    controller = server.controllers.fs as unknown as FSController;
+});
+
+afterAll(async () => {
+    await server?.shutdown();
+});
+
+const makeUser = async (): Promise<{ actor: Actor; userId: number }> => {
+    const username = `fsc-${Math.random().toString(36).slice(2, 10)}`;
+    const created = await server.stores.user.create({
+        username,
+        uuid: uuidv4(),
+        password: null,
+        email: `${username}@test.local`,
+        free_storage: 100 * 1024 * 1024,
+        requires_email_confirmation: false,
+    });
+    await generateDefaultFsentries(
+        server.clients.db,
+        server.stores.user,
+        created,
+    );
+    const refreshed = (await server.stores.user.getById(created.id))!;
+    return {
+        userId: refreshed.id,
+        actor: makeActor({
+            user: {
+                id: refreshed.id,
+                uuid: refreshed.uuid,
+                username: refreshed.username,
+                email: refreshed.email ?? null,
+                email_confirmed: true,
+            } as Actor['user'],
+        }),
+    };
+};
+
+interface CapturedResponse {
+    statusCode: number;
+    body: unknown;
+}
+const makeReq = <B>(init: {
+    body?: B;
+    query?: Record<string, unknown>;
+    headers?: Record<string, string>;
+    actor: Actor;
+    user?: { id: number; username: string };
+    method?: string;
+}): Request => {
+    return {
+        body: init.body ?? ({} as B),
+        query: init.query ?? {},
+        headers: init.headers ?? {},
+        // Handlers that serve both verbs (readdir) read params from `query` on
+        // GET and `body` otherwise.
+        ...(init.method ? { method: init.method } : {}),
+        actor: init.actor,
+        // Some controller helpers fall back to `req.user` (set by the
+        // session middleware) for id / username before reading `req.actor`.
+        // Provide it so #getActorUserId / #getActorUsername resolve.
+        user: init.user ?? {
+            id: init.actor.user!.id!,
+            username: init.actor.user!.username!,
+        },
+    } as unknown as Request;
+};
+const makeRes = () => {
+    const captured: CapturedResponse = { statusCode: 200, body: undefined };
+    const res = {
+        json: vi.fn((value: unknown) => {
+            captured.body = value;
+            return res;
+        }),
+        status: vi.fn((code: number) => {
+            captured.statusCode = code;
+            return res;
+        }),
+        setHeader: vi.fn(() => res),
+    };
+    return { res: res as unknown as Response, captured };
+};
+
+const withActor = async <T>(actor: Actor, fn: () => Promise<T>): Promise<T> =>
+    runWithContext({ actor }, fn);
+
+const streamToString = async (stream: Readable): Promise<string> => {
+    const chunks: Buffer[] = [];
+    for await (const chunk of stream) {
+        chunks.push(Buffer.from(chunk as Buffer));
+    }
+    return Buffer.concat(chunks).toString('utf8');
+};
+
+// ── /startBatchWrite ────────────────────────────────────────────────
+
+describe('FSController.startBatchWrites', () => {
+    it('returns [] for an empty/undefined body without creating sessions', async () => {
+        const { actor } = await makeUser();
+        const { res, captured } = makeRes();
+        const req = makeReq<SignedWriteRequest[]>({ body: undefined, actor });
+        await withActor(actor, () => controller.startBatchWrites(req, res));
+        expect(captured.body).toEqual([]);
+    });
+
+    it('creates a pending upload session per request and returns signed targets', async () => {
+        const { actor, userId } = await makeUser();
+        const username = actor.user!.username!;
+        const body: SignedWriteRequest[] = [
+            {
+                fileMetadata: {
+                    path: `/${username}/Documents/a.txt`,
+                    size: 5,
+                },
+            },
+            {
+                fileMetadata: {
+                    path: `/${username}/Documents/b.txt`,
+                    size: 10,
+                },
+            },
+        ];
+        const { res, captured } = makeRes();
+        const req = makeReq<SignedWriteRequest[]>({ body, actor });
+        await withActor(actor, () => controller.startBatchWrites(req, res));
+
+        const responses = captured.body as ClientSignedWriteResponse[];
+        expect(responses).toHaveLength(2);
+        for (const r of responses) {
+            expect(r.sessionId).toEqual(expect.any(String));
+            expect(r.uploadMode).toBe('single');
+            // Storage internals stay server-side: the presigned `url` already
+            // encodes bucket and key.
+            for (const field of ['bucket', 'bucketRegion', 'objectKey']) {
+                expect(r).not.toHaveProperty(field);
+            }
+            // In-memory mock S3 still returns a presigned-URL string for
+            // single-mode uploads — verify it's there but don't assert
+            // shape (varies by region/host config).
+            expect(typeof r.url).toBe('string');
+        }
+
+        // Pending sessions actually landed in the DB and point at the
+        // expected paths for the right user.
+        const sessions =
+            await server.stores.fsEntry.getPendingEntriesBySessionIds(
+                responses.map((r) => r.sessionId),
+            );
+        expect(sessions.map((s) => s?.targetPath).sort()).toEqual([
+            `/${username}/Documents/a.txt`,
+            `/${username}/Documents/b.txt`,
+        ]);
+        for (const session of sessions) {
+            expect(session?.userId).toBe(userId);
+            expect(session?.status).toBe('pending');
+        }
+    });
+
+    it('expands `~/...` paths against the actor home before writing', async () => {
+        const { actor } = await makeUser();
+        const username = actor.user!.username!;
+        const body: SignedWriteRequest[] = [
+            { fileMetadata: { path: '~/Documents/tilde.txt', size: 3 } },
+        ];
+        const { res, captured } = makeRes();
+        const req = makeReq<SignedWriteRequest[]>({ body, actor });
+        await withActor(actor, () => controller.startBatchWrites(req, res));
+        const [response] = captured.body as ClientSignedWriteResponse[];
+        const session = await server.stores.fsEntry.getPendingEntryBySessionId(
+            response!.sessionId,
+        );
+        expect(session?.targetPath).toBe(`/${username}/Documents/tilde.txt`);
+    });
+
+    it('materializes a directory entry when `directory: true`', async () => {
+        const { actor } = await makeUser();
+        const username = actor.user!.username!;
+        const target = `/${username}/Documents/new-batch-dir`;
+        const body: SignedWriteRequest[] = [
+            {
+                // `createMissingParents` lets the service materialize the
+                // target dir even though only `/Documents` exists in the
+                // newly-provisioned home tree.
+                fileMetadata: {
+                    path: target,
+                    size: 0,
+                    createMissingParents: true,
+                },
+                directory: true,
+            },
+        ];
+        const { res } = makeRes();
+        const req = makeReq<SignedWriteRequest[]>({ body, actor });
+        await withActor(actor, () => controller.startBatchWrites(req, res));
+
+        // Directory items aren't pending uploads — they're created
+        // immediately by the service. The fsentry should be queryable.
+        const created = await server.stores.fsEntry.getEntryByPath(target);
+        expect(created).not.toBeNull();
+        expect(created?.isDir).toBe(true);
+    });
+
+    it('rejects the batch when ACL denies any item', async () => {
+        const a = await makeUser();
+        const b = await makeUser();
+        // User a tries to drop a file inside user b's home.
+        const body: SignedWriteRequest[] = [
+            {
+                fileMetadata: {
+                    path: `/${b.actor.user!.username}/Documents/intruder.txt`,
+                    size: 1,
+                },
+            },
+        ];
+        const { res } = makeRes();
+        const req = makeReq<SignedWriteRequest[]>({
+            body,
+            actor: a.actor,
+        });
+        const err = await withActor(a.actor, () =>
+            controller.startBatchWrites(req, res).then(
+                () => null,
+                (e: unknown) => e,
+            ),
+        );
+        const status = (err as { statusCode?: number } | null)?.statusCode;
+        // 404 (can't see) or 403 (can see, can't write) are both valid
+        // denials per ACLService.getSafeAclError.
+        expect([403, 404]).toContain(status);
+    });
+});
+
+// ── /completeBatchWrite ────────────────────────────────────────────
+
+describe('FSController.completeBatchWrites', () => {
+    it('returns [] for an empty body', async () => {
+        const { actor } = await makeUser();
+        const { res, captured } = makeRes();
+        const req = makeReq<CompleteWriteRequest[]>({
+            body: undefined,
+            actor,
+        });
+        await withActor(actor, () => controller.completeBatchWrites(req, res));
+        expect(captured.body).toEqual([]);
+    });
+
+    it('rejects an inline `data:` thumbnail with 400', async () => {
+        const { actor } = await makeUser();
+        const { res } = makeRes();
+        const req = makeReq<CompleteWriteRequest[]>({
+            body: [
+                {
+                    uploadId: 'whatever',
+                    thumbnailData: 'data:image/png;base64,AAA',
+                },
+            ],
+            actor,
+        });
+        await expect(
+            withActor(actor, () => controller.completeBatchWrites(req, res)),
+        ).rejects.toMatchObject({ statusCode: 400 });
+    });
+
+    it('finalizes pending sessions into real fsentries', async () => {
+        const { actor, userId } = await makeUser();
+        const username = actor.user!.username!;
+
+        // 1) Start two batched uploads. The signed-write flow inserts
+        //    pending session rows and gives us back the upload IDs we'll
+        //    feed to /completeBatchWrite.
+        const startBody: SignedWriteRequest[] = [
+            {
+                fileMetadata: {
+                    path: `/${username}/Documents/c.txt`,
+                    size: 5,
+                    contentType: 'text/plain',
+                },
+            },
+            {
+                fileMetadata: {
+                    path: `/${username}/Documents/d.txt`,
+                    size: 7,
+                    contentType: 'text/plain',
+                },
+            },
+        ];
+        const startRes = makeRes();
+        await withActor(actor, () =>
+            controller.startBatchWrites(
+                makeReq<SignedWriteRequest[]>({ body: startBody, actor }),
+                startRes.res,
+            ),
+        );
+        const startResponses = startRes.captured
+            .body as ClientSignedWriteResponse[];
+        expect(startResponses).toHaveLength(2);
+
+        // 2) PUT the declared bytes through each presigned URL, then
+        //    complete via the controller.
+        await fetch(startResponses[0]!.url!, {
+            method: 'PUT',
+            body: '12345',
+        });
+        await fetch(startResponses[1]!.url!, {
+            method: 'PUT',
+            body: '1234567',
+        });
+        const { res, captured } = makeRes();
+        const completeBody: CompleteWriteRequest[] = startResponses.map(
+            (r) => ({ uploadId: r.sessionId }),
+        );
+        await withActor(actor, () =>
+            controller.completeBatchWrites(
+                makeReq<CompleteWriteRequest[]>({
+                    body: completeBody,
+                    actor,
+                }),
+                res,
+            ),
+        );
+
+        const responses = captured.body as Array<{
+            sessionId: string;
+            wasOverwrite: boolean;
+            fsEntry: Record<string, unknown>;
+        }>;
+        expect(responses.map((r) => r.fsEntry.path as string).sort()).toEqual([
+            `/${username}/Documents/c.txt`,
+            `/${username}/Documents/d.txt`,
+        ]);
+        for (const response of responses) {
+            expect(response.wasOverwrite).toBe(false);
+            expect(response.fsEntry.isDir).toBe(false);
+            // Ownership is asserted against the store below — the response
+            // itself must not carry the owner, storage columns, or the
+            // capability tokens.
+            for (const field of [
+                'userId',
+                'id',
+                'parentId',
+                'bucket',
+                'bucketRegion',
+                'publicToken',
+                'fileRequestToken',
+            ]) {
+                expect(response.fsEntry).not.toHaveProperty(field);
+            }
+        }
+
+        // The real fsentries were committed and are now resolvable.
+        for (const path of [
+            `/${username}/Documents/c.txt`,
+            `/${username}/Documents/d.txt`,
+        ]) {
+            const entry = await server.stores.fsEntry.getEntryByPath(path);
+            expect(entry).not.toBeNull();
+            expect(entry?.userId).toBe(userId);
+        }
+    });
+
+    it('reports wasOverwrite=true when finalizing onto an existing entry', async () => {
+        const { actor } = await makeUser();
+        const username = actor.user!.username!;
+        const target = `/${username}/Documents/overwrite-me.txt`;
+
+        // First write — establishes an entry to overwrite.
+        const firstStart = makeRes();
+        await withActor(actor, () =>
+            controller.startBatchWrites(
+                makeReq<SignedWriteRequest[]>({
+                    body: [{ fileMetadata: { path: target, size: 1 } }],
+                    actor,
+                }),
+                firstStart.res,
+            ),
+        );
+        const [firstResponse] = firstStart.captured
+            .body as ClientSignedWriteResponse[];
+        await fetch(firstResponse!.url!, { method: 'PUT', body: 'x' });
+        const firstComplete = makeRes();
+        await withActor(actor, () =>
+            controller.completeBatchWrites(
+                makeReq<CompleteWriteRequest[]>({
+                    body: [{ uploadId: firstResponse!.sessionId }],
+                    actor,
+                }),
+                firstComplete.res,
+            ),
+        );
+
+        // Second write with overwrite=true onto the same path.
+        const secondStart = makeRes();
+        await withActor(actor, () =>
+            controller.startBatchWrites(
+                makeReq<SignedWriteRequest[]>({
+                    body: [
+                        {
+                            fileMetadata: {
+                                path: target,
+                                size: 2,
+                                overwrite: true,
+                            },
+                        },
+                    ],
+                    actor,
+                }),
+                secondStart.res,
+            ),
+        );
+        const [secondResponse] = secondStart.captured
+            .body as ClientSignedWriteResponse[];
+        await fetch(secondResponse!.url!, { method: 'PUT', body: 'yy' });
+
+        const secondComplete = makeRes();
+        await withActor(actor, () =>
+            controller.completeBatchWrites(
+                makeReq<CompleteWriteRequest[]>({
+                    body: [{ uploadId: secondResponse!.sessionId }],
+                    actor,
+                }),
+                secondComplete.res,
+            ),
+        );
+
+        const [finalized] = secondComplete.captured.body as Array<{
+            wasOverwrite: boolean;
+        }>;
+        expect(finalized?.wasOverwrite).toBe(true);
+    });
+
+    // Regression: a signed (direct-to-S3) upload could declare a tiny size
+    // and PUT far more — the presigned URL doesn't bound the body. The
+    // completion path must reconcile the recorded size against the object's
+    // true size, or storage accounting is permanently understated and the
+    // quota is bypassable.
+    it('reconciles the recorded size to the real uploaded bytes (ignores under-declared size)', async () => {
+        const { actor, userId } = await makeUser();
+        const username = actor.user!.username!;
+        const target = `/${username}/Documents/under-declared.bin`;
+
+        // Declare 1 byte.
+        const start = makeRes();
+        await withActor(actor, () =>
+            controller.startBatchWrites(
+                makeReq<SignedWriteRequest[]>({
+                    body: [{ fileMetadata: { path: target, size: 1 } }],
+                    actor,
+                }),
+                start.res,
+            ),
+        );
+        const [started] = start.captured.body as ClientSignedWriteResponse[];
+
+        // Actually upload 4096 bytes to the session's object key (simulating
+        // a client that PUTs more than it declared via the signed URL). The
+        // storage location isn't in the response any more, so read it off the
+        // upload session — a real client just PUTs to the presigned URL.
+        const session = await server.stores.fsEntry.getPendingEntryBySessionId(
+            started!.sessionId,
+        );
+        const realBytes = Buffer.alloc(4096, 0x41);
+        await server.stores.s3Object.uploadFromServer(
+            {
+                bucket: session!.bucket!,
+                objectKey: session!.objectKey,
+                contentType: 'application/octet-stream',
+                body: realBytes,
+                contentLength: realBytes.byteLength,
+            },
+            session!.bucketRegion!,
+        );
+
+        const complete = makeRes();
+        await withActor(actor, () =>
+            controller.completeBatchWrites(
+                makeReq<CompleteWriteRequest[]>({
+                    body: [{ uploadId: started!.sessionId }],
+                    actor,
+                }),
+                complete.res,
+            ),
+        );
+
+        const entry = await server.stores.fsEntry.getEntryByPath(target);
+        expect(entry).not.toBeNull();
+        // Recorded size is the true 4096 bytes, not the declared 1.
+        expect(entry?.size).toBe(4096);
+
+        // And the user's accounted usage reflects the real bytes.
+        const allowance =
+            await server.stores.fsEntry.getUserStorageAllowance(userId);
+        expect(allowance.curr).toBeGreaterThanOrEqual(4096);
+    });
+
+    it('emits updated events with GUI metadata when overwriting via batch completion', async () => {
+        const { actor, userId } = await makeUser();
+        const username = actor.user!.username!;
+        const target = `/${username}/Documents/overwrite-event.js`;
+
+        const firstStart = makeRes();
+        await withActor(actor, () =>
+            controller.startBatchWrites(
+                makeReq<SignedWriteRequest[]>({
+                    body: [{ fileMetadata: { path: target, size: 1 } }],
+                    actor,
+                }),
+                firstStart.res,
+            ),
+        );
+        const [firstResponse] = firstStart.captured
+            .body as ClientSignedWriteResponse[];
+        await fetch(firstResponse!.url!, { method: 'PUT', body: 'x' });
+        await withActor(actor, () =>
+            controller.completeBatchWrites(
+                makeReq<CompleteWriteRequest[]>({
+                    body: [{ uploadId: firstResponse!.sessionId }],
+                    actor,
+                }),
+                makeRes().res,
+            ),
+        );
+        const targetEntry = await server.stores.fsEntry.getEntryByPath(target);
+        expect(targetEntry).not.toBeNull();
+        await server.stores.subdomain.create({
+            userId,
+            subdomain: `workers.puter.${username}-worker`,
+            rootDirId: targetEntry!.id,
+        });
+
+        const secondStart = makeRes();
+        await withActor(actor, () =>
+            controller.startBatchWrites(
+                makeReq<SignedWriteRequest[]>({
+                    body: [
+                        {
+                            fileMetadata: {
+                                path: target,
+                                size: 2,
+                                overwrite: true,
+                            },
+                        },
+                    ],
+                    actor,
+                }),
+                secondStart.res,
+            ),
+        );
+        const [secondResponse] = secondStart.captured
+            .body as ClientSignedWriteResponse[];
+        await fetch(secondResponse!.url!, { method: 'PUT', body: 'yy' });
+
+        const emitSpy = vi.spyOn(server.clients.event, 'emit');
+        let updatedCall: (typeof emitSpy.mock.calls)[number] | undefined;
+        try {
+            await withActor(actor, () =>
+                controller.completeBatchWrites(
+                    makeReq<CompleteWriteRequest[]>({
+                        body: [
+                            {
+                                uploadId: secondResponse!.sessionId,
+                                guiMetadata: {
+                                    operationId: 'op-123',
+                                    itemUploadId: 'item-456',
+                                    socketId: 'socket-789',
+                                    originalClientSocketId: 'socket-789',
+                                },
+                            },
+                        ],
+                        actor,
+                    }),
+                    makeRes().res,
+                ),
+            );
+            updatedCall = emitSpy.mock.calls.find(
+                ([eventName]) => eventName === 'outer.gui.item.updated',
+            );
+        } finally {
+            emitSpy.mockRestore();
+        }
+        expect(updatedCall).toBeTruthy();
+        const payload = updatedCall?.[1] as {
+            user_id_list?: number[];
+            response?: Record<string, unknown>;
+        };
+        expect(payload.user_id_list).toEqual([userId]);
+        expect(payload.response).toMatchObject({
+            uid: expect.any(String),
+            uuid: expect.any(String),
+            id: expect.any(String),
+            path: target,
+            name: 'overwrite-event.js',
+            is_dir: false,
+            type: expect.stringMatching(/^application\/javascript/),
+            workers: [
+                expect.objectContaining({
+                    subdomain: `workers.puter.${username}-worker`,
+                    address: expect.stringContaining(`${username}-worker`),
+                }),
+            ],
+            from_new_service: true,
+            operation_id: 'op-123',
+            item_upload_id: 'item-456',
+            socket_id: 'socket-789',
+            original_client_socket_id: 'socket-789',
+        });
+    });
+
+    it("rejects another user's session ids with a 4xx", async () => {
+        const a = await makeUser();
+        const b = await makeUser();
+
+        // a starts a batch; b tries to complete it.
+        const startA = makeRes();
+        await withActor(a.actor, () =>
+            controller.startBatchWrites(
+                makeReq<SignedWriteRequest[]>({
+                    body: [
+                        {
+                            fileMetadata: {
+                                path: `/${a.actor.user!.username}/Documents/x.txt`,
+                                size: 1,
+                            },
+                        },
+                    ],
+                    actor: a.actor,
+                }),
+                startA.res,
+            ),
+        );
+        const [aResponse] = startA.captured.body as ClientSignedWriteResponse[];
+
+        const err = await withActor(b.actor, () =>
+            controller
+                .completeBatchWrites(
+                    makeReq<CompleteWriteRequest[]>({
+                        body: [{ uploadId: aResponse!.sessionId }],
+                        actor: b.actor,
+                    }),
+                    makeRes().res,
+                )
+                .then(
+                    () => null,
+                    (e: unknown) => e,
+                ),
+        );
+        const status = (err as { statusCode?: number } | null)?.statusCode;
+        // FSService.batchCompleteUrlWrite throws 403 on session/user
+        // mismatch (`Upload session access denied`).
+        expect([403, 404]).toContain(status);
+    });
+});
+
+// ── /stat (statEntry) ───────────────────────────────────────────────
+
+describe('FSController.statEntry', () => {
+    it('returns the v2-native entry shape with isDir/path', async () => {
+        const { actor } = await makeUser();
+        const username = actor.user!.username!;
+        // Seed via mkdirEntry so the entry surely exists.
+        const mkdirRes = makeRes();
+        await withActor(actor, () =>
+            controller.mkdirEntry(
+                makeReq({
+                    body: { path: `/${username}/Documents/stat-me` },
+                    actor,
+                }),
+                mkdirRes.res,
+            ),
+        );
+
+        const { res, captured } = makeRes();
+        await withActor(actor, () =>
+            controller.statEntry(
+                makeReq({
+                    body: { path: `/${username}/Documents/stat-me` },
+                    actor,
+                }),
+                res,
+            ),
+        );
+        const body = captured.body as {
+            path: string;
+            isDir: boolean;
+            name: string;
+        };
+        expect(body.path).toBe(`/${username}/Documents/stat-me`);
+        expect(body.isDir).toBe(true);
+        expect(body.name).toBe('stat-me');
+    });
+
+    it('does not leak backend-internal fields to the client', async () => {
+        const { actor } = await makeUser();
+        const username = actor.user!.username!;
+        await withActor(actor, () =>
+            controller.mkdirEntry(
+                makeReq({
+                    body: { path: `/${username}/Documents/no-leak` },
+                    actor,
+                }),
+                makeRes().res,
+            ),
+        );
+
+        const { res, captured } = makeRes();
+        await withActor(actor, () =>
+            controller.statEntry(
+                makeReq({
+                    body: { path: `/${username}/Documents/no-leak` },
+                    actor,
+                }),
+                res,
+            ),
+        );
+        const body = captured.body as Record<string, unknown>;
+        for (const field of [
+            'bucket',
+            'bucketRegion',
+            'userId',
+            'publicToken',
+            'fileRequestToken',
+        ]) {
+            expect(body).not.toHaveProperty(field);
+        }
+    });
+
+    it('includes the subtree size when return_size is set on a directory', async () => {
+        const { actor } = await makeUser();
+        const username = actor.user!.username!;
+        await withActor(actor, () =>
+            controller.mkdirEntry(
+                makeReq({
+                    body: { path: `/${username}/Documents/sized` },
+                    actor,
+                }),
+                makeRes().res,
+            ),
+        );
+
+        const { res, captured } = makeRes();
+        await withActor(actor, () =>
+            controller.statEntry(
+                makeReq({
+                    body: {
+                        path: `/${username}/Documents/sized`,
+                        return_size: true,
+                    },
+                    actor,
+                }),
+                res,
+            ),
+        );
+        const body = captured.body as { size: number };
+        expect(body.size).toBe(0);
+    });
+
+    it('throws 401 when no actor is on the request', async () => {
+        const { actor } = await makeUser();
+        const { res } = makeRes();
+        const req = {
+            ...makeReq({ body: { path: '/x' }, actor }),
+            actor: undefined,
+        } as unknown as Request;
+        await expect(controller.statEntry(req, res)).rejects.toMatchObject({
+            statusCode: 401,
+        });
+    });
+
+    it('draws return_shares from the share-listing budget', async () => {
+        const { actor } = await makeUser();
+        const username = actor.user!.username!;
+        const path = `/${username}/Documents/share-budget`;
+        await withActor(actor, () =>
+            controller.mkdirEntry(
+                makeReq({ body: { path }, actor }),
+                makeRes().res,
+            ),
+        );
+
+        // Spend the whole share:list bucket, as /share/shares' gate would.
+        const chargeReq = makeReq({ body: {}, actor });
+        for (let i = 0; i < SHARE_LIST_LIMIT.limit; i++) {
+            await consumeRouteRateLimit(chargeReq, SHARE_LIST_LIMIT);
+        }
+
+        await expect(
+            withActor(actor, () =>
+                controller.statEntry(
+                    makeReq({ body: { path, return_shares: true }, actor }),
+                    makeRes().res,
+                ),
+            ),
+        ).rejects.toMatchObject({
+            statusCode: 429,
+            legacyCode: 'too_many_requests',
+        });
+
+        // A plain stat spends only its own budget, so it still admits.
+        const { res, captured } = makeRes();
+        await withActor(actor, () =>
+            controller.statEntry(makeReq({ body: { path }, actor }), res),
+        );
+        expect((captured.body as { name: string }).name).toBe('share-budget');
+    });
+
+    describe('parentUid of a home child', () => {
+        const tokenActorFor = async (userId: number, permission: string) => {
+            const user = (await server.stores.user.getById(userId))!;
+            const token = await server.services.auth.createAccessToken(
+                makeActor({ user }),
+                [[permission]],
+            );
+            return (await server.services.auth.authenticateFromToken(token))!;
+        };
+
+        it('nulls it for a token scoped below the home', async () => {
+            const { userId } = await makeUser();
+            const user = (await server.stores.user.getById(userId))!;
+            const username = user.username!;
+            const documents = (await server.stores.fsEntry.getEntryByPath(
+                `/${username}/Documents`,
+            ))!;
+            const scoped = await tokenActorFor(
+                userId,
+                `fs:${documents.uuid}:read`,
+            );
+
+            const { res, captured } = makeRes();
+            await withActor(scoped, () =>
+                controller.statEntry(
+                    makeReq({
+                        body: { path: `/${username}/Documents` },
+                        actor: scoped,
+                    }),
+                    res,
+                ),
+            );
+            expect((captured.body as { parentUid: unknown }).parentUid).toBe(
+                null,
+            );
+        });
+
+        it('keeps it for a token that can list the home', async () => {
+            const { userId } = await makeUser();
+            const user = (await server.stores.user.getById(userId))!;
+            const username = user.username!;
+            const home = (await server.stores.fsEntry.getEntryByPath(
+                `/${username}`,
+            ))!;
+            const scoped = await tokenActorFor(userId, `fs:${home.uuid}:list`);
+
+            const { res, captured } = makeRes();
+            await withActor(scoped, () =>
+                controller.statEntry(
+                    makeReq({
+                        body: { path: `/${username}/Documents` },
+                        actor: scoped,
+                    }),
+                    res,
+                ),
+            );
+            expect((captured.body as { parentUid: unknown }).parentUid).toBe(
+                home.uuid,
+            );
+        });
+
+        it('keeps it for a session actor', async () => {
+            const { actor } = await makeUser();
+            const username = actor.user!.username!;
+            const home = (await server.stores.fsEntry.getEntryByPath(
+                `/${username}`,
+            ))!;
+
+            const { res, captured } = makeRes();
+            await withActor(actor, () =>
+                controller.statEntry(
+                    makeReq({
+                        body: { path: `/${username}/Documents` },
+                        actor,
+                    }),
+                    res,
+                ),
+            );
+            expect((captured.body as { parentUid: unknown }).parentUid).toBe(
+                home.uuid,
+            );
+        });
+    });
+});
+
+// ── /readdir (readdirEntries) ───────────────────────────────────────
+
+describe('FSController.readdirEntries', () => {
+    it('lists children of a directory', async () => {
+        const { actor } = await makeUser();
+        const username = actor.user!.username!;
+        for (const name of ['alpha', 'beta']) {
+            await withActor(actor, () =>
+                controller.mkdirEntry(
+                    makeReq({
+                        body: { path: `/${username}/Documents/${name}` },
+                        actor,
+                    }),
+                    makeRes().res,
+                ),
+            );
+        }
+
+        const { res, captured } = makeRes();
+        await withActor(actor, () =>
+            controller.readdirEntries(
+                makeReq({
+                    body: { path: `/${username}/Documents` },
+                    actor,
+                }),
+                res,
+            ),
+        );
+        const entries = captured.body as Array<{ name: string }>;
+        expect(Array.isArray(entries)).toBe(true);
+        const names = entries.map((e) => e.name);
+        expect(names).toContain('alpha');
+        expect(names).toContain('beta');
+    });
+
+    it('returns root listing when path = "/"', async () => {
+        const { actor } = await makeUser();
+        const { res, captured } = makeRes();
+        await withActor(actor, () =>
+            controller.readdirEntries(
+                makeReq({ body: { path: '/' }, actor }),
+                res,
+            ),
+        );
+        expect(Array.isArray(captured.body)).toBe(true);
+    });
+
+    it('throws 400 when the target is not a directory', async () => {
+        const { actor } = await makeUser();
+        const username = actor.user!.username!;
+        // touch → non-directory entry
+        await withActor(actor, () =>
+            controller.touchEntry(
+                makeReq({
+                    body: {
+                        path: `/${username}/Documents/touched.txt`,
+                        set_modified_to_now: true,
+                    },
+                    actor,
+                }),
+                makeRes().res,
+            ),
+        );
+
+        await expect(
+            withActor(actor, () =>
+                controller.readdirEntries(
+                    makeReq({
+                        body: { path: `/${username}/Documents/touched.txt` },
+                        actor,
+                    }),
+                    makeRes().res,
+                ),
+            ),
+        ).rejects.toMatchObject({
+            statusCode: 400,
+            // Matches the legacy `/readdir` code the SDK moved off of.
+            legacyCode: 'dest_is_not_a_directory',
+        });
+    });
+});
+
+// ── /search (searchEntries) ─────────────────────────────────────────
+
+describe('FSController.searchEntries', () => {
+    it('rejects an empty query with 400', async () => {
+        const { actor } = await makeUser();
+        await expect(
+            withActor(actor, () =>
+                controller.searchEntries(
+                    makeReq({ body: { query: '   ' }, actor }),
+                    makeRes().res,
+                ),
+            ),
+        ).rejects.toMatchObject({ statusCode: 400 });
+    });
+
+    it('finds entries by name', async () => {
+        const { actor } = await makeUser();
+        const username = actor.user!.username!;
+        const needle = `sneedle-${Math.random().toString(36).slice(2, 8)}`;
+        await withActor(actor, () =>
+            controller.mkdirEntry(
+                makeReq({
+                    body: { path: `/${username}/Documents/${needle}` },
+                    actor,
+                }),
+                makeRes().res,
+            ),
+        );
+
+        const { res, captured } = makeRes();
+        await withActor(actor, () =>
+            controller.searchEntries(
+                makeReq({ body: { query: needle }, actor }),
+                res,
+            ),
+        );
+        const results = captured.body as Array<{ name: string }>;
+        expect(Array.isArray(results)).toBe(true);
+        expect(results.some((r) => r.name === needle)).toBe(true);
+    });
+
+    it('scopes app-under-user actors to their AppData root', async () => {
+        const { actor: userActor } = await makeUser();
+        const username = userActor.user!.username!;
+        const appUid = `app-search-${uuidv4()}`;
+        const appActor = makeActor({ ...userActor, app: { uid: appUid } });
+        const needle = `appneedle-${Math.random().toString(36).slice(2, 8)}`;
+
+        // User-owned entry outside AppData — must NOT appear for the app.
+        await withActor(userActor, () =>
+            controller.mkdirEntry(
+                makeReq({
+                    body: { path: `/${username}/Documents/${needle}` },
+                    actor: userActor,
+                }),
+                makeRes().res,
+            ),
+        );
+        // Entry under the app's own AppData — must appear.
+        await withActor(userActor, () =>
+            controller.mkdirEntry(
+                makeReq({
+                    body: {
+                        path: `/${username}/AppData/${appUid}/${needle}`,
+                        create_missing_parents: true,
+                    },
+                    actor: userActor,
+                }),
+                makeRes().res,
+            ),
+        );
+
+        const { res, captured } = makeRes();
+        await withActor(appActor, () =>
+            controller.searchEntries(
+                makeReq({ body: { query: needle }, actor: appActor }),
+                res,
+            ),
+        );
+        const results = captured.body as Array<{ name: string; path: string }>;
+        expect(results.length).toBeGreaterThan(0);
+        for (const r of results) {
+            expect(
+                r.path === `/${username}/AppData/${appUid}` ||
+                    r.path.startsWith(`/${username}/AppData/${appUid}/`),
+            ).toBe(true);
+        }
+        expect(
+            results.some((r) => r.path === `/${username}/Documents/${needle}`),
+        ).toBe(false);
+    });
+
+    it('returns nothing for an app actor when no AppData entries match', async () => {
+        const { actor: userActor } = await makeUser();
+        const username = userActor.user!.username!;
+        const appUid = `app-search-${uuidv4()}`;
+        const appActor = makeActor({ ...userActor, app: { uid: appUid } });
+        const needle = `appneedle-${Math.random().toString(36).slice(2, 8)}`;
+
+        // Only seed outside AppData — the app must not be able to find it.
+        await withActor(userActor, () =>
+            controller.mkdirEntry(
+                makeReq({
+                    body: { path: `/${username}/Documents/${needle}` },
+                    actor: userActor,
+                }),
+                makeRes().res,
+            ),
+        );
+
+        const { res, captured } = makeRes();
+        await withActor(appActor, () =>
+            controller.searchEntries(
+                makeReq({ body: { query: needle }, actor: appActor }),
+                res,
+            ),
+        );
+        expect(captured.body).toEqual([]);
+    });
+});
+
+// ── /read (readEntry, validation paths) ─────────────────────────────
+
+describe('FSController.readEntry', () => {
+    it('throws 400 when reading a directory', async () => {
+        const { actor } = await makeUser();
+        const username = actor.user!.username!;
+        await expect(
+            withActor(actor, () =>
+                controller.readEntry(
+                    makeReq({
+                        query: { path: `/${username}/Documents` },
+                        actor,
+                    }),
+                    makeRes().res,
+                ),
+            ),
+        ).rejects.toMatchObject({ statusCode: 400 });
+    });
+
+    it('throws 401 when no actor', async () => {
+        const { actor } = await makeUser();
+        const req = {
+            ...makeReq({
+                query: { path: `/${actor.user!.username}/Documents` },
+                actor,
+            }),
+            actor: undefined,
+        } as unknown as Request;
+        await expect(
+            controller.readEntry(req, makeRes().res),
+        ).rejects.toMatchObject({ statusCode: 401 });
+    });
+});
+
+// ── /mkdir (mkdirEntry) ─────────────────────────────────────────────
+
+describe('FSController.mkdirEntry', () => {
+    it('throws 400 on missing path', async () => {
+        const { actor } = await makeUser();
+        await expect(
+            withActor(actor, () =>
+                controller.mkdirEntry(
+                    makeReq({ body: {}, actor }),
+                    makeRes().res,
+                ),
+            ),
+        ).rejects.toMatchObject({ statusCode: 400 });
+    });
+
+    it('throws 400 when path normalizes to "/"', async () => {
+        const { actor } = await makeUser();
+        await expect(
+            withActor(actor, () =>
+                controller.mkdirEntry(
+                    makeReq({ body: { path: '/' }, actor }),
+                    makeRes().res,
+                ),
+            ),
+        ).rejects.toMatchObject({ statusCode: 400 });
+    });
+
+    it('creates a directory and emits the GUI added event', async () => {
+        const { actor } = await makeUser();
+        const username = actor.user!.username!;
+        const { res, captured } = makeRes();
+        await withActor(actor, () =>
+            controller.mkdirEntry(
+                makeReq({
+                    body: { path: `/${username}/Documents/created` },
+                    actor,
+                }),
+                res,
+            ),
+        );
+        const body = captured.body as { path: string; isDir: boolean };
+        expect(body.path).toBe(`/${username}/Documents/created`);
+        expect(body.isDir).toBe(true);
+    });
+
+    it('dedupes an existing directory when dedupe_name is true', async () => {
+        const { actor } = await makeUser();
+        const username = actor.user!.username!;
+        const target = `/${username}/Documents/hello`;
+
+        await withActor(actor, () =>
+            controller.mkdirEntry(
+                makeReq({
+                    body: { path: target },
+                    actor,
+                }),
+                makeRes().res,
+            ),
+        );
+
+        const { res, captured } = makeRes();
+        await withActor(actor, () =>
+            controller.mkdirEntry(
+                makeReq({
+                    body: { path: target, dedupe_name: true },
+                    actor,
+                }),
+                res,
+            ),
+        );
+
+        const body = captured.body as {
+            path: string;
+            name: string;
+            isDir: boolean;
+        };
+        expect(body.path).toBe(`/${username}/Documents/hello (1)`);
+        expect(body.name).toBe('hello (1)');
+        expect(body.isDir).toBe(true);
+        expect(
+            await server.stores.fsEntry.getEntryByPath(
+                `/${username}/Documents/hello (1)`,
+            ),
+        ).toMatchObject({ isDir: true });
+    });
+
+    it('requires parent write when deduping an existing directory', async () => {
+        const { actor: userActor } = await makeUser();
+        const username = userActor.user!.username!;
+        const appUid = `app-mkdir-${uuidv4()}`;
+        const appActor = makeActor({ ...userActor, app: { uid: appUid } });
+        const target = `/${username}/AppData/${appUid}`;
+
+        await withActor(userActor, () =>
+            controller.mkdirEntry(
+                makeReq({
+                    body: { path: target },
+                    actor: userActor,
+                }),
+                makeRes().res,
+            ),
+        );
+
+        await expect(
+            withActor(appActor, () =>
+                controller.mkdirEntry(
+                    makeReq({
+                        body: { path: target, dedupe_name: true },
+                        actor: appActor,
+                    }),
+                    makeRes().res,
+                ),
+            ),
+        ).rejects.toMatchObject({ statusCode: 404 });
+        expect(
+            await server.stores.fsEntry.getEntryByPath(
+                `/${username}/AppData/${appUid} (1)`,
+            ),
+        ).toBeNull();
+    });
+
+    it('expands ~/ in the path to the user home', async () => {
+        const { actor } = await makeUser();
+        const username = actor.user!.username!;
+        const { res, captured } = makeRes();
+        await withActor(actor, () =>
+            controller.mkdirEntry(
+                makeReq({
+                    body: { path: '~/Documents/tilde' },
+                    actor,
+                }),
+                res,
+            ),
+        );
+        const body = captured.body as { path: string };
+        expect(body.path).toBe(`/${username}/Documents/tilde`);
+    });
+});
+
+// ── /touch (touchEntry) ─────────────────────────────────────────────
+
+describe('FSController.touchEntry', () => {
+    it('throws 400 on missing path', async () => {
+        const { actor } = await makeUser();
+        await expect(
+            withActor(actor, () =>
+                controller.touchEntry(
+                    makeReq({ body: {}, actor }),
+                    makeRes().res,
+                ),
+            ),
+        ).rejects.toMatchObject({ statusCode: 400 });
+    });
+
+    it('throws 400 when path normalizes to "/"', async () => {
+        const { actor } = await makeUser();
+        await expect(
+            withActor(actor, () =>
+                controller.touchEntry(
+                    makeReq({ body: { path: '/' }, actor }),
+                    makeRes().res,
+                ),
+            ),
+        ).rejects.toMatchObject({ statusCode: 400 });
+    });
+
+    it('creates a non-directory placeholder entry', async () => {
+        const { actor } = await makeUser();
+        const username = actor.user!.username!;
+        const { res, captured } = makeRes();
+        await withActor(actor, () =>
+            controller.touchEntry(
+                makeReq({
+                    body: {
+                        path: `/${username}/Documents/note.txt`,
+                        set_modified_to_now: true,
+                    },
+                    actor,
+                }),
+                res,
+            ),
+        );
+        const body = captured.body as { isDir: boolean; name: string };
+        expect(body.isDir).toBe(false);
+        expect(body.name).toBe('note.txt');
+    });
+});
+
+// ── /rename (renameEntry) ───────────────────────────────────────────
+
+describe('FSController.renameEntry', () => {
+    it('throws 400 on missing new_name', async () => {
+        const { actor } = await makeUser();
+        const username = actor.user!.username!;
+        await expect(
+            withActor(actor, () =>
+                controller.renameEntry(
+                    makeReq({
+                        body: { path: `/${username}/Documents` },
+                        actor,
+                    }),
+                    makeRes().res,
+                ),
+            ),
+        ).rejects.toMatchObject({ statusCode: 400 });
+    });
+
+    it('renames an existing entry', async () => {
+        const { actor } = await makeUser();
+        const username = actor.user!.username!;
+        await withActor(actor, () =>
+            controller.mkdirEntry(
+                makeReq({
+                    body: { path: `/${username}/Documents/before` },
+                    actor,
+                }),
+                makeRes().res,
+            ),
+        );
+        const { res, captured } = makeRes();
+        await withActor(actor, () =>
+            controller.renameEntry(
+                makeReq({
+                    body: {
+                        path: `/${username}/Documents/before`,
+                        new_name: 'after',
+                    },
+                    actor,
+                }),
+                res,
+            ),
+        );
+        const body = captured.body as { path: string; name: string };
+        expect(body.name).toBe('after');
+        expect(body.path).toBe(`/${username}/Documents/after`);
+    });
+});
+
+// ── /delete (deleteEntry) ───────────────────────────────────────────
+
+describe('FSController.deleteEntry', () => {
+    it('removes an entry by path and responds {ok: true}', async () => {
+        const { actor } = await makeUser();
+        const username = actor.user!.username!;
+        const target = `/${username}/Documents/doomed`;
+        await withActor(actor, () =>
+            controller.mkdirEntry(
+                makeReq({ body: { path: target }, actor }),
+                makeRes().res,
+            ),
+        );
+
+        const { res, captured } = makeRes();
+        await withActor(actor, () =>
+            controller.deleteEntry(
+                makeReq({
+                    body: { path: target, recursive: true },
+                    actor,
+                }),
+                res,
+            ),
+        );
+        expect(captured.body).toEqual({ ok: true });
+    });
+
+    it('throws 404 when the entry does not exist', async () => {
+        const { actor } = await makeUser();
+        const username = actor.user!.username!;
+        await expect(
+            withActor(actor, () =>
+                controller.deleteEntry(
+                    makeReq({
+                        body: {
+                            path: `/${username}/Documents/does-not-exist-${uuidv4()}`,
+                        },
+                        actor,
+                    }),
+                    makeRes().res,
+                ),
+            ),
+        ).rejects.toMatchObject({ statusCode: 404 });
+    });
+});
+
+// ── /move (moveEntry) ───────────────────────────────────────────────
+
+describe('FSController.moveEntry', () => {
+    it('moves an entry to a new parent', async () => {
+        const { actor } = await makeUser();
+        const username = actor.user!.username!;
+        const src = `/${username}/Documents/movable`;
+        await withActor(actor, () =>
+            controller.mkdirEntry(
+                makeReq({ body: { path: src }, actor }),
+                makeRes().res,
+            ),
+        );
+
+        const { res, captured } = makeRes();
+        await withActor(actor, () =>
+            controller.moveEntry(
+                makeReq({
+                    body: {
+                        source: { path: src },
+                        destination: { path: `/${username}/Pictures` },
+                    },
+                    actor,
+                }),
+                res,
+            ),
+        );
+        const body = captured.body as { path: string };
+        expect(body.path).toBe(`/${username}/Pictures/movable`);
+    });
+});
+
+// ── /copy (copyEntry) ───────────────────────────────────────────────
+
+describe('FSController.copyEntry', () => {
+    it('copies an entry into another folder', async () => {
+        const { actor } = await makeUser();
+        const username = actor.user!.username!;
+        const src = `/${username}/Documents/c-orig`;
+        await withActor(actor, () =>
+            controller.mkdirEntry(
+                makeReq({ body: { path: src }, actor }),
+                makeRes().res,
+            ),
+        );
+
+        const { res, captured } = makeRes();
+        await withActor(actor, () =>
+            controller.copyEntry(
+                makeReq({
+                    body: {
+                        source: { path: src },
+                        destination: { path: `/${username}/Pictures` },
+                    },
+                    actor,
+                }),
+                res,
+            ),
+        );
+        const body = captured.body as { path: string };
+        expect(body.path).toBe(`/${username}/Pictures/c-orig`);
+    });
+});
+
+// ── outer.gui.item.* events ─────────────────────────────────────────
+//
+// The desktop renders these, so the v2 routes must send what the legacy routes
+// send for the same operation.
+
+describe('FSController GUI item events', () => {
+    type GuiResponse = Record<string, unknown>;
+
+    // The v2 routes don't await their emits, so wait for each expected event
+    // about `uid` to land. They must also land in the order given.
+    const captureGuiEvents = async (
+        expected: Array<[eventName: string, uid: string]>,
+        run: () => Promise<unknown>,
+    ): Promise<GuiResponse[]> => {
+        const emitSpy = vi.spyOn(server.clients.event, 'emit');
+        const indexOf = ([eventName, uid]: [string, string]) =>
+            emitSpy.mock.calls.findIndex(
+                ([name, data]) =>
+                    name === eventName &&
+                    (data as { response: GuiResponse }).response.uuid === uid,
+            );
+        try {
+            await run();
+            await vi.waitFor(() => {
+                for (const event of expected)
+                    expect(indexOf(event)).toBeGreaterThanOrEqual(0);
+            });
+            const order = expected.map(indexOf);
+            expect(order).toEqual([...order].sort((a, b) => a - b));
+            return order.map(
+                (i) =>
+                    (emitSpy.mock.calls[i]![1] as { response: GuiResponse })
+                        .response,
+            );
+        } finally {
+            emitSpy.mockRestore();
+        }
+    };
+
+    const legacyController = () =>
+        server.controllers.legacyFs as unknown as LegacyFSController;
+
+    const mkdir = async (actor: Actor, path: string) => {
+        await withActor(actor, () =>
+            controller.mkdirEntry(
+                makeReq({ body: { path }, actor }),
+                makeRes().res,
+            ),
+        );
+        return (await server.stores.fsEntry.getEntryByPath(path))!;
+    };
+
+    const touch = async (actor: Actor, path: string) => {
+        await withActor(actor, () =>
+            controller.touchEntry(
+                makeReq({ body: { path }, actor }),
+                makeRes().res,
+            ),
+        );
+        return (await server.stores.fsEntry.getEntryByPath(path))!;
+    };
+
+    it('sends item.moved in the same shape as the legacy /move, with old_path', async () => {
+        const { actor } = await makeUser();
+        const username = actor.user!.username!;
+        const viaLegacy = await mkdir(actor, `/${username}/Documents/a`);
+        const viaV2 = await mkdir(actor, `/${username}/Documents/b`);
+
+        const [legacyMoved] = await captureGuiEvents(
+            [['outer.gui.item.moved', viaLegacy.uuid]],
+            () =>
+                withActor(actor, () =>
+                    legacyController().move(
+                        makeReq({
+                            body: {
+                                source: viaLegacy.path,
+                                destination: `/${username}/Pictures`,
+                            },
+                            actor,
+                        }),
+                        makeRes().res,
+                    ),
+                ),
+        );
+        const [v2Moved] = await captureGuiEvents(
+            [['outer.gui.item.moved', viaV2.uuid]],
+            () =>
+                withActor(actor, () =>
+                    controller.moveEntry(
+                        makeReq({
+                            body: {
+                                source: { path: viaV2.path },
+                                destination: { path: `/${username}/Pictures` },
+                            },
+                            actor,
+                        }),
+                        makeRes().res,
+                    ),
+                ),
+        );
+
+        expect(Object.keys(v2Moved!).sort()).toEqual(
+            Object.keys(legacyMoved!).sort(),
+        );
+        expect(v2Moved).toMatchObject({
+            uid: viaV2.uuid,
+            path: `/${username}/Pictures/b`,
+            old_path: `/${username}/Documents/b`,
+            is_dir: true,
+        });
+    });
+
+    it('sends item.removed in the same shape as the legacy /delete', async () => {
+        const { actor } = await makeUser();
+        const username = actor.user!.username!;
+        const viaLegacy = await mkdir(actor, `/${username}/Documents/a`);
+        const viaV2 = await mkdir(actor, `/${username}/Documents/b`);
+
+        const [legacyRemoved] = await captureGuiEvents(
+            [['outer.gui.item.removed', viaLegacy.uuid]],
+            () =>
+                withActor(actor, () =>
+                    legacyController().delete(
+                        makeReq({ body: { path: viaLegacy.path }, actor }),
+                        makeRes().res,
+                    ),
+                ),
+        );
+        const [v2Removed] = await captureGuiEvents(
+            [['outer.gui.item.removed', viaV2.uuid]],
+            () =>
+                withActor(actor, () =>
+                    controller.deleteEntry(
+                        makeReq({
+                            body: { path: viaV2.path, recursive: true },
+                            actor,
+                        }),
+                        makeRes().res,
+                    ),
+                ),
+        );
+
+        expect(Object.keys(v2Removed!).sort()).toEqual(
+            Object.keys(legacyRemoved!).sort(),
+        );
+        expect(v2Removed).toMatchObject({
+            path: viaV2.path,
+            descendants_only: false,
+        });
+    });
+
+    it('sends item.removed for the entry an overwriting move replaces', async () => {
+        const { actor } = await makeUser();
+        const username = actor.user!.username!;
+        const source = await touch(actor, `/${username}/Documents/clash.txt`);
+        const replaced = await touch(actor, `/${username}/Pictures/clash.txt`);
+
+        // Removal first: the desktop hides rows by path.
+        const [removed] = await captureGuiEvents(
+            [
+                ['outer.gui.item.removed', replaced.uuid],
+                ['outer.gui.item.moved', source.uuid],
+            ],
+            () =>
+                withActor(actor, () =>
+                    controller.moveEntry(
+                        makeReq({
+                            body: {
+                                source: { path: source.path },
+                                destination: { path: `/${username}/Pictures` },
+                                overwrite: true,
+                            },
+                            actor,
+                        }),
+                        makeRes().res,
+                    ),
+                ),
+        );
+        expect(removed!.path).toBe(replaced.path);
+    });
+
+    it("sends no item.removed for an owner's Trash entry an overwriting move renamed around", async () => {
+        const owner = await makeUser();
+        const holder = await makeUser();
+        const ownerName = owner.actor.user!.username!;
+        const shared = await mkdir(
+            owner.actor,
+            `/${ownerName}/Documents/shared`,
+        );
+        const source = await touch(owner.actor, `${shared.path}/note.txt`);
+        const occupant = await touch(
+            owner.actor,
+            `/${ownerName}/Trash/note.txt`,
+        );
+        await server.services.acl.setUserUser(
+            owner.actor,
+            holder.actor,
+            {
+                path: shared.path,
+                resolveAncestors: () =>
+                    server.services.fs.getAncestorChain(shared.path),
+            },
+            'write',
+        );
+
+        const emitSpy = vi.spyOn(server.clients.event, 'emit');
+        const announced = (eventName: string, uid: string) =>
+            emitSpy.mock.calls.some(
+                ([name, data]) =>
+                    name === eventName &&
+                    (data as { response: GuiResponse }).response.uuid === uid,
+            );
+        try {
+            await withActor(holder.actor, () =>
+                controller.moveEntry(
+                    makeReq({
+                        body: {
+                            source: { path: source.path },
+                            destination: { path: `/${ownerName}/Trash` },
+                            overwrite: true,
+                        },
+                        actor: holder.actor,
+                    }),
+                    makeRes().res,
+                ),
+            );
+            // A replaced entry's removal goes out before the move's own event.
+            await vi.waitFor(() =>
+                expect(announced('outer.gui.item.moved', source.uuid)).toBe(
+                    true,
+                ),
+            );
+            expect(announced('outer.gui.item.removed', occupant.uuid)).toBe(
+                false,
+            );
+        } finally {
+            emitSpy.mockRestore();
+        }
+        expect(
+            await server.stores.fsEntry.getEntryByUuid(occupant.uuid),
+        ).not.toBeNull();
+    });
+
+    it('sends item.removed for the entry an overwriting copy replaces, first', async () => {
+        const { actor } = await makeUser();
+        const username = actor.user!.username!;
+        const source = await touch(actor, `/${username}/Documents/dup.txt`);
+        const replaced = await touch(actor, `/${username}/Pictures/dup.txt`);
+
+        const emitSpy = vi.spyOn(server.clients.event, 'emit');
+        // GUI item events about the destination path, in emit order.
+        const atPath = () =>
+            emitSpy.mock.calls.flatMap(([name, data]) => {
+                const response = (data as { response?: GuiResponse })?.response;
+                return String(name).startsWith('outer.gui.item.') &&
+                    response?.path === replaced.path
+                    ? [[name, response.uuid]]
+                    : [];
+            });
+        try {
+            await withActor(actor, () =>
+                controller.copyEntry(
+                    makeReq({
+                        body: {
+                            source: { path: source.path },
+                            destination: { path: `/${username}/Pictures` },
+                            overwrite: true,
+                        },
+                        actor,
+                    }),
+                    makeRes().res,
+                ),
+            );
+            await vi.waitFor(() => expect(atPath()).toHaveLength(2));
+            // Removal first: the desktop hides rows by path.
+            expect(atPath()[0]).toEqual([
+                'outer.gui.item.removed',
+                replaced.uuid,
+            ]);
+            expect(atPath()[1]?.[0]).toBe('outer.gui.item.added');
+        } finally {
+            emitSpy.mockRestore();
+        }
+    });
+
+    it('applies new_metadata on move, as trashing does', async () => {
+        const { actor } = await makeUser();
+        const username = actor.user!.username!;
+        const source = await mkdir(actor, `/${username}/Documents/trashed`);
+        const trashMetadata = {
+            original_name: 'trashed',
+            original_path: source.path,
+            trashed_ts: 1700000000,
+        };
+
+        const [moved] = await captureGuiEvents(
+            [['outer.gui.item.moved', source.uuid]],
+            () =>
+                withActor(actor, () =>
+                    controller.moveEntry(
+                        makeReq({
+                            body: {
+                                source: { path: source.path },
+                                destination: { path: `/${username}/Trash` },
+                                new_name: source.uuid,
+                                new_metadata: trashMetadata,
+                            },
+                            actor,
+                        }),
+                        makeRes().res,
+                    ),
+                ),
+        );
+
+        const stored = await server.stores.fsEntry.getEntryByUuidFromPrimary(
+            source.uuid,
+        );
+        expect(JSON.parse(stored!.metadata!)).toMatchObject(trashMetadata);
+        expect(JSON.parse(String(moved!.metadata))).toMatchObject(
+            trashMetadata,
+        );
+    });
+});
+
+// ── /read (readEntry, full read) ────────────────────────────────────
+
+describe('FSController.readEntry (file streaming)', () => {
+    const makeStreamingRes = () => {
+        const captured = {
+            statusCode: 200,
+            headers: {} as Record<string, string>,
+            bodyChunks: [] as Buffer[],
+        };
+        // eslint-disable-next-line @typescript-eslint/no-require-imports
+        const { Writable } =
+            require('node:stream') as typeof import('node:stream');
+        const writable = new Writable({
+            write(chunk: Buffer, _enc, cb) {
+                captured.bodyChunks.push(chunk);
+                cb();
+            },
+        });
+        // Decorate with the Express helpers the controller calls.
+        const res = writable as unknown as Response & {
+            status: (code: number) => unknown;
+            setHeader: (k: string, v: string) => unknown;
+            json: (v: unknown) => unknown;
+            send: (v: unknown) => unknown;
+        };
+        res.status = (code: number) => {
+            captured.statusCode = code;
+            return res;
+        };
+        res.setHeader = (k: string, v: string) => {
+            captured.headers[k] = v;
+            return res;
+        };
+        res.json = vi.fn(() => res);
+        res.send = vi.fn(() => res);
+        return { res, captured };
+    };
+
+    const writeFile = async (
+        userId: number,
+        path: string,
+        body: Buffer,
+        contentType = 'application/octet-stream',
+    ) => {
+        await server.services.fs.write(userId, {
+            fileMetadata: {
+                path,
+                size: body.byteLength,
+                contentType,
+            },
+            fileContent: body,
+        });
+    };
+
+    it('streams the file body with 200 and Content-Type/Length/Disposition headers', async () => {
+        const { actor, userId } = await makeUser();
+        const username = actor.user!.username!;
+        const body = Buffer.from('hello world');
+        const target = `/${username}/Documents/read.txt`;
+        await writeFile(userId, target, body, 'text/plain');
+
+        const { res, captured } = makeStreamingRes();
+        await withActor(actor, () =>
+            controller.readEntry(
+                makeReq({ query: { path: target }, actor }),
+                res,
+            ),
+        );
+        // Pipeline awaits the stream-end on success.
+        expect(captured.statusCode).toBe(200);
+        expect(captured.headers['Content-Type']).toMatch(/text\/plain/);
+        expect(captured.headers['Content-Length']).toBe(
+            String(body.byteLength),
+        );
+        expect(captured.headers['Content-Disposition']).toMatch(
+            /inline; filename=/,
+        );
+        expect(Buffer.concat(captured.bodyChunks).equals(body)).toBe(true);
+    });
+
+    it('returns 206 with Range honored when a Range header is supplied', async () => {
+        const { actor, userId } = await makeUser();
+        const username = actor.user!.username!;
+        const body = Buffer.from('abcdefghij');
+        const target = `/${username}/Documents/ranged.bin`;
+        await writeFile(userId, target, body, 'application/octet-stream');
+
+        const { res, captured } = makeStreamingRes();
+        await withActor(actor, () =>
+            controller.readEntry(
+                makeReq({
+                    query: { path: target },
+                    actor,
+                    headers: { range: 'bytes=0-3' },
+                }),
+                res,
+            ),
+        );
+        // Range presence flips the status to 206 — Content-Range may or
+        // may not be set depending on the underlying S3 mock; the status
+        // transition is the wire-level promise this code holds.
+        expect(captured.statusCode).toBe(206);
+    });
+
+    it('throws 404 when the path does not exist', async () => {
+        const { actor } = await makeUser();
+        const username = actor.user!.username!;
+        await expect(
+            withActor(actor, () =>
+                controller.readEntry(
+                    makeReq({
+                        query: {
+                            path: `/${username}/Documents/missing-${uuidv4()}.txt`,
+                        },
+                        actor,
+                    }),
+                    makeStreamingRes().res,
+                ),
+            ),
+        ).rejects.toMatchObject({ statusCode: 404 });
+    });
+});
+
+// ── /readdir extras: sort + limit/offset ────────────────────────────
+
+describe('FSController.readdirEntries sort + limit', () => {
+    it('accepts sort_by + sort_order and passes them through to listDirectory', async () => {
+        const { actor } = await makeUser();
+        const username = actor.user!.username!;
+        // Spy on the service so we can verify the controller-side
+        // parsing of sort_by/sort_order/limit/offset.
+        const listSpy = vi
+            .spyOn(server.services.fs, 'listDirectory')
+            .mockResolvedValueOnce([] as never);
+        try {
+            await withActor(actor, () =>
+                controller.readdirEntries(
+                    makeReq({
+                        body: {
+                            path: `/${username}/Documents`,
+                            sort_by: 'name',
+                            sort_order: 'desc',
+                            limit: 10,
+                            offset: 5,
+                        },
+                        actor,
+                    }),
+                    makeRes().res,
+                ),
+            );
+            expect(listSpy).toHaveBeenCalledTimes(1);
+            const opts = listSpy.mock.calls[0]![1]!;
+            expect(opts.sortBy).toBe('name');
+            expect(opts.sortOrder).toBe('desc');
+            expect(opts.limit).toBe(10);
+            expect(opts.offset).toBe(5);
+        } finally {
+            listSpy.mockRestore();
+        }
+    });
+
+    it('defaults invalid sort_by/sort_order to null', async () => {
+        const { actor } = await makeUser();
+        const username = actor.user!.username!;
+        const listSpy = vi
+            .spyOn(server.services.fs, 'listDirectory')
+            .mockResolvedValueOnce([] as never);
+        try {
+            await withActor(actor, () =>
+                controller.readdirEntries(
+                    makeReq({
+                        body: {
+                            path: `/${username}/Documents`,
+                            sort_by: 'totally-fake',
+                            sort_order: 'sideways',
+                        },
+                        actor,
+                    }),
+                    makeRes().res,
+                ),
+            );
+            const opts = listSpy.mock.calls[0]![1]!;
+            expect(opts.sortBy).toBeNull();
+            expect(opts.sortOrder).toBeNull();
+        } finally {
+            listSpy.mockRestore();
+        }
+    });
+});
+
+// -- /readdir pagination envelope --
+
+describe('FSController.readdirEntries pagination', () => {
+    const makeDocs = async (names: string[]) => {
+        const { actor } = await makeUser();
+        const username = actor.user!.username!;
+        for (const name of names) {
+            await withActor(actor, () =>
+                controller.mkdirEntry(
+                    makeReq({
+                        body: { path: `/${username}/Documents/${name}` },
+                        actor,
+                    }),
+                    makeRes().res,
+                ),
+            );
+        }
+        return { actor, path: `/${username}/Documents` };
+    };
+
+    const readdir = async (
+        actor: Awaited<ReturnType<typeof makeUser>>['actor'],
+        body: Record<string, unknown>,
+    ) => {
+        const { res, captured } = makeRes();
+        await withActor(actor, () =>
+            controller.readdirEntries(makeReq({ body, actor }), res),
+        );
+        return captured.body;
+    };
+
+    it('keeps the bare array response for limit/offset requests', async () => {
+        const { actor, path } = await makeDocs(['a', 'b', 'c']);
+        const body = await readdir(actor, { path, limit: 2, offset: 1 });
+        expect(Array.isArray(body)).toBe(true);
+        expect((body as unknown[]).length).toBe(2);
+    });
+
+    it('returns the envelope when cursor is present (null = first page)', async () => {
+        const { actor, path } = await makeDocs(['a', 'b', 'c']);
+        const page = (await readdir(actor, { path, cursor: null })) as {
+            items: Array<{ name: string }>;
+            cursor?: string;
+        };
+        expect(page.items.map((e) => e.name)).toEqual(['a', 'b', 'c']);
+        expect(page.cursor).toBeUndefined();
+    });
+
+    it('pages through children with cursors in sort order', async () => {
+        const { actor, path } = await makeDocs(['d1', 'd2', 'd3', 'd4', 'd5']);
+        const names: string[] = [];
+        let cursor: string | null | undefined = null;
+        do {
+            const page = (await readdir(actor, {
+                path,
+                limit: 2,
+                cursor,
+            })) as { items: Array<{ name: string }>; cursor?: string };
+            names.push(...page.items.map((e) => e.name));
+            cursor = page.cursor;
+        } while (cursor);
+        expect(names).toEqual(['d1', 'd2', 'd3', 'd4', 'd5']);
+    });
+
+    it('respects descending sort across pages', async () => {
+        const { actor, path } = await makeDocs(['a', 'b', 'c', 'd']);
+        const first = (await readdir(actor, {
+            path,
+            limit: 2,
+            cursor: null,
+            sortBy: 'name',
+            sortOrder: 'desc',
+        })) as { items: Array<{ name: string }>; cursor?: string };
+        expect(first.items.map((e) => e.name)).toEqual(['d', 'c']);
+        const second = (await readdir(actor, {
+            path,
+            limit: 2,
+            cursor: first.cursor,
+        })) as { items: Array<{ name: string }>; cursor?: string };
+        expect(second.items.map((e) => e.name)).toEqual(['b', 'a']);
+    });
+
+    it('rejects a cursor that conflicts with the requested sort', async () => {
+        const { actor, path } = await makeDocs(['a', 'b', 'c']);
+        const first = (await readdir(actor, {
+            path,
+            limit: 1,
+            cursor: null,
+            sortBy: 'name',
+        })) as { cursor?: string };
+        await expect(
+            withActor(actor, () =>
+                controller.readdirEntries(
+                    makeReq({
+                        body: {
+                            path,
+                            limit: 1,
+                            cursor: first.cursor,
+                            sortBy: 'size',
+                        },
+                        actor,
+                    }),
+                    makeRes().res,
+                ),
+            ),
+        ).rejects.toMatchObject({ statusCode: 400 });
+    });
+
+    it('reports total with includeTotal', async () => {
+        const { actor, path } = await makeDocs(['a', 'b', 'c']);
+        const page = (await readdir(actor, {
+            path,
+            limit: 1,
+            cursor: null,
+            includeTotal: true,
+        })) as { items: unknown[]; total?: number };
+        expect(page.items.length).toBe(1);
+        expect(page.total).toBe(3);
+    });
+
+    it('wraps the root listing in an envelope when asked', async () => {
+        const { actor } = await makeUser();
+        const page = (await readdir(actor, {
+            path: '/',
+            cursor: null,
+            includeTotal: true,
+        })) as { items: unknown[]; total?: number; cursor?: string };
+        expect(Array.isArray(page.items)).toBe(true);
+        expect(page.total).toBe(page.items.length);
+        expect(page.cursor).toBeUndefined();
+    });
+});
+
+// -- /readdir recursive (nested listing) --
+
+describe('FSController.readdirEntries recursive', () => {
+    // Seed a nested tree under Documents/tree and return its base path.
+    // Relative depths: l1a/l1b = 1, l2a = 2, l3a = 3, l4a = 4.
+    const makeTree = async () => {
+        const { actor, userId } = await makeUser();
+        const username = actor.user!.username!;
+        const base = `/${username}/Documents/tree`;
+        const dirs = [
+            base,
+            `${base}/l1a`,
+            `${base}/l1b`,
+            `${base}/l1a/l2a`,
+            `${base}/l1a/l2a/l3a`,
+            `${base}/l1a/l2a/l3a/l4a`,
+        ];
+        for (const path of dirs) {
+            await withActor(actor, () =>
+                controller.mkdirEntry(
+                    makeReq({ body: { path }, actor }),
+                    makeRes().res,
+                ),
+            );
+        }
+        return { actor, userId, base };
+    };
+
+    const readdir = async (
+        actor: Awaited<ReturnType<typeof makeUser>>['actor'],
+        body: Record<string, unknown>,
+    ) => {
+        const { res, captured } = makeRes();
+        await withActor(actor, () =>
+            controller.readdirEntries(makeReq({ body, actor }), res),
+        );
+        return captured.body;
+    };
+
+    const rel = (base: string, items: Array<{ path: string }>) =>
+        items.map((e) => e.path.slice(base.length + 1)).sort();
+
+    it('depth 1 returns only direct children (like a normal readdir)', async () => {
+        const { actor, base } = await makeTree();
+        const page = (await readdir(actor, {
+            path: base,
+            recursive: true,
+            depth: 1,
+        })) as { items: Array<{ path: string }>; cursor?: string };
+        expect(rel(base, page.items)).toEqual(['l1a', 'l1b']);
+    });
+
+    it('deeper levels appear as depth grows', async () => {
+        const { actor, base } = await makeTree();
+        const d2 = (await readdir(actor, {
+            path: base,
+            recursive: true,
+            depth: 2,
+        })) as { items: Array<{ path: string }> };
+        expect(rel(base, d2.items)).toEqual(['l1a', 'l1a/l2a', 'l1b']);
+
+        const d3 = (await readdir(actor, {
+            path: base,
+            recursive: true,
+            depth: 3,
+        })) as { items: Array<{ path: string }> };
+        expect(rel(base, d3.items)).toEqual([
+            'l1a',
+            'l1a/l2a',
+            'l1a/l2a/l3a',
+            'l1b',
+        ]);
+    });
+
+    it('caps depth at 10 so a huge depth returns the whole subtree', async () => {
+        const { actor, base } = await makeTree();
+        const page = (await readdir(actor, {
+            path: base,
+            recursive: true,
+            depth: 9999,
+        })) as { items: Array<{ path: string }> };
+        expect(rel(base, page.items)).toEqual([
+            'l1a',
+            'l1a/l2a',
+            'l1a/l2a/l3a',
+            'l1a/l2a/l3a/l4a',
+            'l1b',
+        ]);
+    });
+
+    it('pages through the whole subtree with cursors, no dupes or gaps', async () => {
+        const { actor, base } = await makeTree();
+        const seen: string[] = [];
+        let cursor: string | null | undefined = null;
+        do {
+            const page = (await readdir(actor, {
+                path: base,
+                recursive: true,
+                depth: 10,
+                limit: 2,
+                cursor,
+            })) as { items: Array<{ path: string }>; cursor?: string };
+            expect(page.items.length).toBeLessThanOrEqual(2);
+            seen.push(...page.items.map((e) => e.path));
+            cursor = page.cursor;
+        } while (cursor);
+        expect(
+            rel(
+                base,
+                seen.map((path) => ({ path })),
+            ),
+        ).toEqual(['l1a', 'l1a/l2a', 'l1a/l2a/l3a', 'l1a/l2a/l3a/l4a', 'l1b']);
+    });
+
+    it('sorts a recursive listing, paging in the same order', async () => {
+        const { actor, base } = await makeTree();
+        // A recursive `name` sort is path order, so descending walks the
+        // subtree backwards.
+        const descending = (await readdir(actor, {
+            path: base,
+            recursive: true,
+            depth: 10,
+            sortBy: 'name',
+            sortOrder: 'desc',
+        })) as { items: Array<{ path: string }> };
+        expect(
+            descending.items.map((e) => e.path.slice(base.length + 1)),
+        ).toEqual(['l1b', 'l1a/l2a/l3a/l4a', 'l1a/l2a/l3a', 'l1a/l2a', 'l1a']);
+
+        const seen: string[] = [];
+        let cursor: string | null | undefined = null;
+        do {
+            const page = (await readdir(actor, {
+                path: base,
+                recursive: true,
+                depth: 10,
+                sortOrder: 'desc',
+                limit: 2,
+                cursor,
+            })) as { items: Array<{ path: string }>; cursor?: string };
+            seen.push(...page.items.map((e) => e.path.slice(base.length + 1)));
+            cursor = page.cursor;
+        } while (cursor);
+        expect(seen).toEqual([
+            'l1b',
+            'l1a/l2a/l3a/l4a',
+            'l1a/l2a/l3a',
+            'l1a/l2a',
+            'l1a',
+        ]);
+    });
+
+    it('counts the subtree with includeTotal', async () => {
+        const { actor, base } = await makeTree();
+        const page = (await readdir(actor, {
+            path: base,
+            recursive: true,
+            depth: 2,
+            cursor: null,
+            includeTotal: true,
+        })) as { items: unknown[]; total?: number };
+        expect(page.total).toBe(3); // l1a, l1b, l2a
+    });
+
+    it('enriches entries with type, thumbnail and associatedApp', async () => {
+        const { actor, base } = await makeTree();
+        const page = (await readdir(actor, {
+            path: base,
+            recursive: true,
+            depth: 1,
+        })) as {
+            items: Array<{
+                type?: unknown;
+                thumbnail?: unknown;
+                associatedApp?: unknown;
+            }>;
+        };
+        for (const item of page.items) {
+            expect(item.type).toBe('folder');
+            expect(item.thumbnail ?? null).toBeNull();
+            expect('associatedApp' in item).toBe(true);
+        }
+    });
+
+    it('gives files a MIME type and an associatedApp field', async () => {
+        const { actor } = await makeUser();
+        const username = actor.user!.username!;
+        const dir = `/${username}/Documents/files`;
+        await withActor(actor, () =>
+            controller.mkdirEntry(
+                makeReq({ body: { path: dir }, actor }),
+                makeRes().res,
+            ),
+        );
+        await withActor(actor, () =>
+            controller.touchEntry(
+                makeReq({ body: { path: `${dir}/pic.png` }, actor }),
+                makeRes().res,
+            ),
+        );
+        const page = (await readdir(actor, {
+            path: dir,
+            recursive: true,
+            depth: 1,
+        })) as {
+            items: Array<{
+                name: string;
+                type?: unknown;
+                associatedApp?: unknown;
+            }>;
+        };
+        const file = page.items.find((e) => e.name === 'pic.png')!;
+        expect(String(file.type)).toContain('image/png');
+        expect('associatedApp' in file).toBe(true);
+    });
+
+    it('masks denials for app-under-user actors as a 404 (legacy parity)', async () => {
+        const { actor: userActor } = await makeUser();
+        const username = userActor.user!.username!;
+        const appActor = makeActor({
+            ...userActor,
+            app: { uid: `app-readdir-${uuidv4()}` },
+        });
+        // The user's Documents is outside the app's AppData subtree, so the
+        // app can't list it. Legacy `/readdir` masks this as a 404
+        // subject_does_not_exist rather than leaking a 403.
+        await expect(
+            withActor(appActor, () =>
+                controller.readdirEntries(
+                    makeReq({
+                        body: { path: `/${username}/Documents` },
+                        actor: appActor,
+                    }),
+                    makeRes().res,
+                ),
+            ),
+        ).rejects.toMatchObject({
+            statusCode: 404,
+            legacyCode: 'subject_does_not_exist',
+        });
+    });
+
+    it('rejects recursive listing at the root', async () => {
+        const { actor } = await makeUser();
+        await expect(
+            withActor(actor, () =>
+                controller.readdirEntries(
+                    makeReq({
+                        body: { path: '/', recursive: true },
+                        actor,
+                    }),
+                    makeRes().res,
+                ),
+            ),
+        ).rejects.toMatchObject({ statusCode: 400 });
+    });
+
+    it('does not leak another users identically-named subtree', async () => {
+        const { actor, base } = await makeTree();
+        // A second user with the same relative tree must not appear.
+        await makeTree();
+        const page = (await readdir(actor, {
+            path: base,
+            recursive: true,
+            depth: 10,
+        })) as { items: Array<{ path: string }> };
+        for (const item of page.items) {
+            expect(item.path.startsWith(`${base}/`)).toBe(true);
+        }
+        expect(page.items).toHaveLength(5);
+    });
+});
+
+// -- /readdir over GET (query params) --
+
+describe('FSController.readdirEntriesViaGet', () => {
+    const seed = async (names: string[]) => {
+        const { actor } = await makeUser();
+        const username = actor.user!.username!;
+        const dir = `/${username}/Documents/get-readdir`;
+        await withActor(actor, () =>
+            controller.mkdirEntry(
+                makeReq({ body: { path: dir }, actor }),
+                makeRes().res,
+            ),
+        );
+        for (const name of names) {
+            await withActor(actor, () =>
+                controller.mkdirEntry(
+                    makeReq({ body: { path: `${dir}/${name}` }, actor }),
+                    makeRes().res,
+                ),
+            );
+        }
+        return { actor, dir };
+    };
+
+    // Query strings carry every value as a string — that is the whole risk
+    // surface of this route, so tests pass strings the way a real URL would.
+    const getReaddir = async (
+        actor: Awaited<ReturnType<typeof makeUser>>['actor'],
+        query: Record<string, unknown>,
+    ) => {
+        const { res, captured } = makeRes();
+        await withActor(actor, () =>
+            controller.readdirEntriesViaGet(
+                makeReq({ query, actor, method: 'GET' }),
+                res,
+            ),
+        );
+        return captured.body;
+    };
+
+    it('lists a directory from query params', async () => {
+        const { actor, dir } = await seed(['a', 'b', 'c']);
+        const body = await getReaddir(actor, { path: dir });
+        expect(Array.isArray(body)).toBe(true);
+        expect((body as Array<{ name: string }>).map((e) => e.name)).toEqual([
+            'a',
+            'b',
+            'c',
+        ]);
+    });
+
+    it('honors string limit/offset like the POST form', async () => {
+        const { actor, dir } = await seed(['a', 'b', 'c']);
+        const body = (await getReaddir(actor, {
+            path: dir,
+            limit: '2',
+            offset: '1',
+        })) as Array<{ name: string }>;
+        expect(body.map((e) => e.name)).toEqual(['b', 'c']);
+    });
+
+    it('treats an empty cursor as the first page and returns the envelope', async () => {
+        const { actor, dir } = await seed(['a', 'b', 'c']);
+        const page = (await getReaddir(actor, { path: dir, cursor: '' })) as {
+            items: Array<{ name: string }>;
+            cursor?: string;
+        };
+        expect(page.items.map((e) => e.name)).toEqual(['a', 'b', 'c']);
+        expect(page.cursor).toBeUndefined();
+    });
+
+    it('pages through with a string cursor', async () => {
+        const { actor, dir } = await seed(['d1', 'd2', 'd3', 'd4', 'd5']);
+        const names: string[] = [];
+        let cursor: string | undefined = '';
+        do {
+            const page = (await getReaddir(actor, {
+                path: dir,
+                limit: '2',
+                cursor,
+            })) as { items: Array<{ name: string }>; cursor?: string };
+            names.push(...page.items.map((e) => e.name));
+            cursor = page.cursor;
+        } while (cursor);
+        expect(names).toEqual(['d1', 'd2', 'd3', 'd4', 'd5']);
+    });
+
+    it('coerces string includeTotal=true', async () => {
+        const { actor, dir } = await seed(['a', 'b', 'c']);
+        const page = (await getReaddir(actor, {
+            path: dir,
+            limit: '1',
+            cursor: '',
+            includeTotal: 'true',
+        })) as { items: unknown[]; total?: number };
+        expect(page.items.length).toBe(1);
+        expect(page.total).toBe(3);
+    });
+
+    it('coerces string recursive/depth and lists nested entries', async () => {
+        const { actor } = await makeUser();
+        const username = actor.user!.username!;
+        const base = `/${username}/Documents/get-tree`;
+        for (const path of [base, `${base}/a`, `${base}/a/b`]) {
+            await withActor(actor, () =>
+                controller.mkdirEntry(
+                    makeReq({ body: { path }, actor }),
+                    makeRes().res,
+                ),
+            );
+        }
+        const page = (await getReaddir(actor, {
+            path: base,
+            recursive: 'true',
+            depth: '2',
+        })) as { items: Array<{ path: string }> };
+        expect(
+            page.items.map((e) => e.path.slice(base.length + 1)).sort(),
+        ).toEqual(['a', 'a/b']);
+    });
+
+    it('rejects a non-directory target with the legacy code', async () => {
+        const { actor } = await makeUser();
+        const username = actor.user!.username!;
+        const file = `/${username}/Documents/get-file.txt`;
+        await withActor(actor, () =>
+            controller.touchEntry(
+                makeReq({ body: { path: file }, actor }),
+                makeRes().res,
+            ),
+        );
+        await expect(
+            withActor(actor, () =>
+                controller.readdirEntriesViaGet(
+                    makeReq({ query: { path: file }, actor, method: 'GET' }),
+                    makeRes().res,
+                ),
+            ),
+        ).rejects.toMatchObject({
+            statusCode: 400,
+            legacyCode: 'dest_is_not_a_directory',
+        });
+    });
+
+    it('does not expose internal ids, storage columns or tokens', async () => {
+        const { actor, dir } = await seed(['a']);
+        const body = (await getReaddir(actor, { path: dir })) as Array<
+            Record<string, unknown>
+        >;
+        const entry = body[0]!;
+        // Numeric primary keys and storage/token columns must never ship in a
+        // listing — entries are addressed by uuid.
+        for (const field of [
+            'id',
+            'parentId',
+            'userId',
+            'associatedAppId',
+            'bucket',
+            'bucketRegion',
+            'publicToken',
+            'fileRequestToken',
+        ]) {
+            expect(entry).not.toHaveProperty(field);
+        }
+        expect(entry.uuid).toEqual(expect.any(String));
+        // No user-identifying data anywhere in the serialized payload.
+        const serialized = JSON.stringify(body);
+        expect(serialized).not.toContain('@');
+        expect(serialized).not.toMatch(/"(email|owner|user_id|userId)"/);
+    });
+});
+
+// ── /touch additional branches ──────────────────────────────────────
+
+describe('FSController.touchEntry additional branches', () => {
+    it('forwards set_accessed_to_now / set_created_to_now / create_missing_parents flags', async () => {
+        const { actor } = await makeUser();
+        const username = actor.user!.username!;
+        const touchSpy = vi
+            .spyOn(server.services.fs, 'touch')
+            .mockResolvedValueOnce({
+                path: `/${username}/Documents/spy.txt`,
+                name: 'spy.txt',
+                isDir: false,
+            } as never);
+        try {
+            await withActor(actor, () =>
+                controller.touchEntry(
+                    makeReq({
+                        body: {
+                            path: `/${username}/Documents/spy.txt`,
+                            set_accessed_to_now: true,
+                            set_modified_to_now: 'yes', // string coercion
+                            set_created_to_now: 1, // numeric coercion
+                            create_missing_parents: 'true',
+                        },
+                        actor,
+                    }),
+                    makeRes().res,
+                ),
+            );
+            const opts = touchSpy.mock.calls[0]![1]!;
+            expect(opts.setAccessed).toBe(true);
+            expect(opts.setModified).toBe(true);
+            expect(opts.setCreated).toBe(true);
+            expect(opts.createMissingParents).toBe(true);
+        } finally {
+            touchSpy.mockRestore();
+        }
+    });
+});
+
+// ── /delete additional branches ─────────────────────────────────────
+
+describe('FSController.deleteEntry additional branches', () => {
+    it('forwards descendants_only + recursive flags', async () => {
+        const { actor } = await makeUser();
+        const username = actor.user!.username!;
+        const target = `/${username}/Documents/dscnd`;
+        await withActor(actor, () =>
+            controller.mkdirEntry(
+                makeReq({ body: { path: target }, actor }),
+                makeRes().res,
+            ),
+        );
+        const removeSpy = vi
+            .spyOn(server.services.fs, 'remove')
+            .mockResolvedValueOnce(undefined as never);
+        try {
+            await withActor(actor, () =>
+                controller.deleteEntry(
+                    makeReq({
+                        body: {
+                            path: target,
+                            recursive: 'yes',
+                            descendants_only: '1',
+                        },
+                        actor,
+                    }),
+                    makeRes().res,
+                ),
+            );
+            const opts = removeSpy.mock.calls[0]![1]!;
+            expect(opts.recursive).toBe(true);
+            expect(opts.descendantsOnly).toBe(true);
+        } finally {
+            removeSpy.mockRestore();
+        }
+    });
+});
+
+// ── /move additional branches ───────────────────────────────────────
+
+describe('FSController.moveEntry additional branches', () => {
+    it('forwards new_name, overwrite, and dedupe_name (via change_name alias)', async () => {
+        const { actor } = await makeUser();
+        const username = actor.user!.username!;
+        const src = `/${username}/Documents/mv-orig`;
+        await withActor(actor, () =>
+            controller.mkdirEntry(
+                makeReq({ body: { path: src }, actor }),
+                makeRes().res,
+            ),
+        );
+        const moveSpy = vi
+            .spyOn(server.services.fs, 'move')
+            .mockResolvedValueOnce({
+                path: `/${username}/Pictures/renamed`,
+            } as never);
+        try {
+            await withActor(actor, () =>
+                controller.moveEntry(
+                    makeReq({
+                        body: {
+                            source: { path: src },
+                            destination: { path: `/${username}/Pictures` },
+                            new_name: 'renamed',
+                            overwrite: 'true',
+                            change_name: 'true', // alias for dedupe_name
+                        },
+                        actor,
+                    }),
+                    makeRes().res,
+                ),
+            );
+            const opts = moveSpy.mock.calls[0]![1]!;
+            expect(opts.newName).toBe('renamed');
+            expect(opts.overwrite).toBe(true);
+            expect(opts.dedupeName).toBe(true);
+        } finally {
+            moveSpy.mockRestore();
+        }
+    });
+});
+
+// ── /copy additional branches ───────────────────────────────────────
+
+describe('FSController.copyEntry additional branches', () => {
+    it('forwards new_name with dedupe_name defaulting to true', async () => {
+        const { actor } = await makeUser();
+        const username = actor.user!.username!;
+        const src = `/${username}/Documents/cp-orig`;
+        await withActor(actor, () =>
+            controller.mkdirEntry(
+                makeReq({ body: { path: src }, actor }),
+                makeRes().res,
+            ),
+        );
+        const copySpy = vi
+            .spyOn(server.services.fs, 'copy')
+            .mockResolvedValueOnce({
+                path: `/${username}/Pictures/cp-orig`,
+            } as never);
+        try {
+            await withActor(actor, () =>
+                controller.copyEntry(
+                    makeReq({
+                        body: {
+                            source: { path: src },
+                            destination: { path: `/${username}/Pictures` },
+                            new_name: 'cp-renamed',
+                        },
+                        actor,
+                    }),
+                    makeRes().res,
+                ),
+            );
+            const opts = copySpy.mock.calls[0]![1]!;
+            expect(opts.newName).toBe('cp-renamed');
+            // Default for copy is dedupeName=true (unlike move which is false).
+            expect(opts.dedupeName).toBe(true);
+        } finally {
+            copySpy.mockRestore();
+        }
+    });
+});
+
+// ── /search additional ──────────────────────────────────────────────
+
+describe('FSController.searchEntries fallback fields', () => {
+    it('falls back to body.text when body.query is missing', async () => {
+        const { actor } = await makeUser();
+        const username = actor.user!.username!;
+        const needle = `txtfb-${Math.random().toString(36).slice(2, 8)}`;
+        await withActor(actor, () =>
+            controller.mkdirEntry(
+                makeReq({
+                    body: { path: `/${username}/Documents/${needle}` },
+                    actor,
+                }),
+                makeRes().res,
+            ),
+        );
+
+        const { res, captured } = makeRes();
+        await withActor(actor, () =>
+            controller.searchEntries(
+                // No `query` key — only `text`.
+                makeReq({ body: { text: needle }, actor }),
+                res,
+            ),
+        );
+        const results = captured.body as Array<{ name: string }>;
+        expect(results.some((r) => r.name === needle)).toBe(true);
+    });
+
+    it('forwards `limit` to searchByName when provided', async () => {
+        const { actor } = await makeUser();
+        const searchSpy = vi
+            .spyOn(server.services.fs, 'searchByName')
+            .mockResolvedValueOnce([] as never);
+        try {
+            await withActor(actor, () =>
+                controller.searchEntries(
+                    makeReq({
+                        body: { query: 'anything', limit: 50 },
+                        actor,
+                    }),
+                    makeRes().res,
+                ),
+            );
+            expect(searchSpy.mock.calls[0]![2]).toBe(50);
+        } finally {
+            searchSpy.mockRestore();
+        }
+    });
+});
+
+// ── /stat additional ────────────────────────────────────────────────
+
+describe('FSController.statEntry additional branches', () => {
+    it('returns return_size for a directory containing files', async () => {
+        const { actor, userId } = await makeUser();
+        const username = actor.user!.username!;
+        const dir = `/${username}/Documents/sized-with-file`;
+        await withActor(actor, () =>
+            controller.mkdirEntry(
+                makeReq({ body: { path: dir }, actor }),
+                makeRes().res,
+            ),
+        );
+        const fileBody = Buffer.from('123');
+        await server.services.fs.write(userId, {
+            fileMetadata: {
+                path: `${dir}/a.txt`,
+                size: fileBody.byteLength,
+                contentType: 'text/plain',
+            },
+            fileContent: fileBody,
+        });
+
+        const { res, captured } = makeRes();
+        await withActor(actor, () =>
+            controller.statEntry(
+                makeReq({
+                    body: { path: dir, return_size: true },
+                    actor,
+                }),
+                res,
+            ),
+        );
+        const body = captured.body as { size: number };
+        expect(body.size).toBeGreaterThanOrEqual(fileBody.byteLength);
+    });
+});
+
+describe('FSController.statEntry return_size disclosure', () => {
+    it('answers the owner-wide size only to a caller who could list it', async () => {
+        const { actor: owner, userId } = await makeUser();
+        const username = owner.user!.username!;
+        const dir = `/${username}/Documents/shared-sized`;
+        await withActor(owner, () =>
+            controller.mkdirEntry(
+                makeReq({ body: { path: dir }, actor: owner }),
+                makeRes().res,
+            ),
+        );
+        const body = Buffer.from('1234567890');
+        await server.services.fs.write(userId, {
+            fileMetadata: {
+                path: `${dir}/secret.txt`,
+                size: body.byteLength,
+                contentType: 'text/plain',
+            },
+            fileContent: body,
+        });
+
+        const { actor: viewer } = await makeUser();
+        const viewerName = viewer.user!.username!;
+        const statAsViewer = async () => {
+            const { res, captured } = makeRes();
+            await withActor(viewer, () =>
+                controller.statEntry(
+                    makeReq({
+                        body: { path: dir, return_size: true },
+                        actor: viewer,
+                    }),
+                    res,
+                ),
+            );
+            return captured.body as { size?: number };
+        };
+
+        // `see` is the weakest level: the folder is visible, its contents are not.
+        await server.services.permission.grantUserUserPermission(
+            owner,
+            viewerName,
+            `fs:${dir}:see`,
+        );
+        // The directory row's own size, never the sum of what is under it.
+        expect((await statAsViewer()).size).toBe(0);
+
+        // `list` is where the contents become enumerable, so the sum may go out.
+        await server.services.permission.grantUserUserPermission(
+            owner,
+            viewerName,
+            `fs:${dir}:list`,
+        );
+        expect((await statAsViewer()).size).toBeGreaterThanOrEqual(
+            body.byteLength,
+        );
+    });
+});
+
+// ── #getReportedCosts ───────────────────────────────────────────────
+
+describe('FSController.getReportedCosts', () => {
+    it('mirrors every storage-operation price as a per-operation line item', async () => {
+        const { STORAGE_OP_COSTS } =
+            await import('../../services/metering/costs.js');
+        const reported = controller.getReportedCosts();
+        expect(reported.length).toBe(Object.keys(STORAGE_OP_COSTS).length);
+        for (const [usageType, ucentsPerUnit] of Object.entries(
+            STORAGE_OP_COSTS,
+        )) {
+            expect(reported).toContainEqual({
+                usageType,
+                ucentsPerUnit,
+                unit: 'operation',
+                source: 'controller:fs',
+            });
+        }
+    });
+});
+
+// ── /mkshortcut (mkshortcutEntry) ───────────────────────────────────
+
+describe('FSController.mkshortcutEntry', () => {
+    it('throws 400 on missing name', async () => {
+        const { actor } = await makeUser();
+        const username = actor.user!.username!;
+        await expect(
+            withActor(actor, () =>
+                controller.mkshortcutEntry(
+                    makeReq({
+                        body: {
+                            parent: { path: `/${username}/Documents` },
+                            target: { path: `/${username}/Pictures` },
+                        },
+                        actor,
+                    }),
+                    makeRes().res,
+                ),
+            ),
+        ).rejects.toMatchObject({ statusCode: 400 });
+    });
+
+    it('creates a shortcut entry pointing at the target', async () => {
+        const { actor } = await makeUser();
+        const username = actor.user!.username!;
+        const target = `/${username}/Documents/shortcut-target`;
+        await withActor(actor, () =>
+            controller.mkdirEntry(
+                makeReq({ body: { path: target }, actor }),
+                makeRes().res,
+            ),
+        );
+
+        const { res, captured } = makeRes();
+        await withActor(actor, () =>
+            controller.mkshortcutEntry(
+                makeReq({
+                    body: {
+                        parent: { path: `/${username}/Pictures` },
+                        target: { path: target },
+                        name: 'my-shortcut',
+                    },
+                    actor,
+                }),
+                res,
+            ),
+        );
+        const body = captured.body as {
+            name: string;
+            isShortcut: boolean;
+        };
+        expect(body.name).toBe('my-shortcut');
+        expect(body.isShortcut).toBe(true);
+    });
+});
+
+describe('FSController metadata.objectKey injection', () => {
+    const writeFile = async (
+        actor: Actor,
+        path: string,
+        content: string,
+        metadata?: Record<string, unknown>,
+    ) => {
+        await withActor(actor, () =>
+            controller.write(
+                makeReq({
+                    body: {
+                        fileMetadata: {
+                            path,
+                            size: Buffer.byteLength(content),
+                            contentType: 'text/plain',
+                            overwrite: true,
+                            ...(metadata ? { metadata } : {}),
+                        },
+                        fileContent: content,
+                        encoding: 'utf8',
+                    },
+                    actor,
+                }) as unknown as Request<
+                    Record<string, never>,
+                    null,
+                    import('./requestTypes.js').WriteRequest
+                >,
+                makeRes().res,
+            ),
+        );
+        const entry = await server.stores.fsEntry.getEntryByPath(path, {
+            skipCache: true,
+        });
+        if (!entry) throw new Error(`entry not found after write: ${path}`);
+        return entry;
+    };
+
+    it("does not stream another user's file when a client injects metadata.objectKey on write", async () => {
+        const victim = await makeUser();
+        const attacker = await makeUser();
+        const victimSecret = 'VICTIM-TOP-SECRET-PAYLOAD';
+        const attackerDecoy = 'attacker-own-decoy-bytes';
+
+        const victimEntry = await writeFile(
+            victim.actor,
+            `/${victim.actor.user!.username}/Documents/secret.txt`,
+            victimSecret,
+        );
+
+        const victimRead = await server.services.fs.readContent(victimEntry);
+        expect(await streamToString(victimRead.body)).toBe(victimSecret);
+
+        const attackerEntry = await writeFile(
+            attacker.actor,
+            `/${attacker.actor.user!.username}/Documents/loot.txt`,
+            attackerDecoy,
+            { objectKey: victimEntry.uuid },
+        );
+
+        const persisted = attackerEntry.metadata
+            ? (JSON.parse(attackerEntry.metadata) as Record<string, unknown>)
+            : {};
+        expect(persisted.objectKey).toBeUndefined();
+
+        const attackerRead =
+            await server.services.fs.readContent(attackerEntry);
+        const got = await streamToString(attackerRead.body);
+        expect(got).toBe(attackerDecoy);
+        expect(got).not.toBe(victimSecret);
+    });
+
+    it('read path ignores a divergent metadata.objectKey on an already-poisoned row', async () => {
+        const victim = await makeUser();
+        const attacker = await makeUser();
+        const victimSecret = 'VICTIM-SECRET-FOR-POISON-TEST';
+        const attackerDecoy = 'attacker-decoy-for-poison-test';
+
+        const victimEntry = await writeFile(
+            victim.actor,
+            `/${victim.actor.user!.username}/Documents/secret2.txt`,
+            victimSecret,
+        );
+        const attackerEntry = await writeFile(
+            attacker.actor,
+            `/${attacker.actor.user!.username}/Documents/loot2.txt`,
+            attackerDecoy,
+        );
+
+        await server.stores.fsEntry.updateEntry(attackerEntry.uuid, {
+            metadata: JSON.stringify({ objectKey: victimEntry.uuid }),
+        });
+        const poisoned = await server.stores.fsEntry.getEntryByPath(
+            attackerEntry.path,
+            { skipCache: true },
+        );
+        if (!poisoned) throw new Error('poisoned entry not found');
+        expect(
+            (JSON.parse(poisoned.metadata!) as { objectKey: string }).objectKey,
+        ).toBe(victimEntry.uuid);
+
+        const read = await server.services.fs.readContent(poisoned);
+        expect(await streamToString(read.body)).toBe(attackerDecoy);
+    });
+
+    it('scrubs objectKey from move newMetadata while preserving legit trash metadata', async () => {
+        const victim = await makeUser();
+        const attacker = await makeUser();
+        const victimSecret = 'VICTIM-SECRET-FOR-MOVE-TEST';
+        const attackerDecoy = 'attacker-decoy-for-move-test';
+        const username = attacker.actor.user!.username!;
+
+        const victimEntry = await writeFile(
+            victim.actor,
+            `/${victim.actor.user!.username}/Documents/secret3.txt`,
+            victimSecret,
+        );
+        const attackerEntry = await writeFile(
+            attacker.actor,
+            `/${username}/Documents/loot3.txt`,
+            attackerDecoy,
+        );
+        const documents = await server.stores.fsEntry.getEntryByPath(
+            `/${username}/Documents`,
+            { skipCache: true },
+        );
+        if (!documents) throw new Error('Documents dir not found');
+
+        const moved = await withActor(attacker.actor, () =>
+            server.services.fs.move(attacker.userId, {
+                source: attackerEntry,
+                destinationParent: documents,
+                newName: 'loot3-moved.txt',
+                newMetadata: {
+                    original_path: `/${username}/Documents/loot3.txt`,
+                    trashed_ts: 1700000000,
+                    objectKey: victimEntry.uuid,
+                },
+            }),
+        );
+
+        const persisted = JSON.parse(moved.metadata!) as Record<
+            string,
+            unknown
+        >;
+        expect(persisted.objectKey).toBeUndefined();
+        expect(persisted.original_path).toBe(
+            `/${username}/Documents/loot3.txt`,
+        );
+        expect(persisted.trashed_ts).toBe(1700000000);
+
+        const read = await server.services.fs.readContent(moved);
+        expect(await streamToString(read.body)).toBe(attackerDecoy);
+    });
+});
+
+// ── associatedAppId entitlement gate ────────────────────────────────
+//
+// `associatedAppId` is client-supplied write metadata that's echoed back in
+// legacy FS responses. Binding a file to another tenant's private app would
+// turn `/stat` into an app-row enumeration oracle, so the write path drops
+// any association the actor isn't entitled to make.
+
+describe('FSController associatedAppId entitlement gate', () => {
+    // Seed an app row with a direct insert. `create` treats is_private as a
+    // read-only column, and going through the store would prime the cache —
+    // a raw insert leaves nothing cached so the gate's getById reads the DB.
+    const makeApp = async (
+        ownerUserId: number,
+        opts: { is_private?: boolean } = {},
+    ): Promise<{ id: number }> => {
+        const uid = `app-${uuidv4()}`;
+        await server.clients.db.write(
+            `INSERT INTO \`apps\` (\`uid\`, \`name\`, \`title\`, \`index_url\`, \`owner_user_id\`, \`is_private\`)
+             VALUES (?, ?, ?, ?, ?, ?)`,
+            [
+                uid,
+                uid,
+                'Gate App',
+                'https://gate-app.puter.site/',
+                ownerUserId,
+                opts.is_private ? 1 : 0,
+            ],
+        );
+        const row = (
+            await server.clients.db.read('SELECT id FROM apps WHERE uid = ?', [
+                uid,
+            ])
+        )[0] as { id: number };
+        return { id: row.id };
+    };
+
+    // Write a file via the signed-write flow with the given associatedAppId
+    // and return the committed entry's stored associatedAppId.
+    const writeWithAssociation = async (
+        actor: Actor,
+        path: string,
+        associatedAppId: number,
+    ): Promise<number | null> => {
+        const startRes = makeRes();
+        await withActor(actor, () =>
+            controller.startBatchWrites(
+                makeReq<SignedWriteRequest[]>({
+                    body: [
+                        { fileMetadata: { path, size: 3, associatedAppId } },
+                    ],
+                    actor,
+                }),
+                startRes.res,
+            ),
+        );
+        const [started] = startRes.captured.body as ClientSignedWriteResponse[];
+        await fetch(started.url!, { method: 'PUT', body: 'abc' });
+        const completeRes = makeRes();
+        await withActor(actor, () =>
+            controller.completeBatchWrites(
+                makeReq<CompleteWriteRequest[]>({
+                    body: [{ uploadId: started.sessionId }],
+                    actor,
+                }),
+                completeRes.res,
+            ),
+        );
+        const entry = await server.stores.fsEntry.getEntryByPath(path);
+        return entry?.associatedAppId ?? null;
+    };
+
+    it("drops an association to another tenant's private app", async () => {
+        const victim = await makeUser();
+        const attacker = await makeUser();
+        const victimApp = await makeApp(victim.userId, { is_private: true });
+
+        const stored = await writeWithAssociation(
+            attacker.actor,
+            `/${attacker.actor.user!.username}/Documents/probe.txt`,
+            victimApp.id,
+        );
+        expect(stored).toBeNull();
+    });
+
+    it('keeps an association to a public app the actor does not own', async () => {
+        const owner = await makeUser();
+        const other = await makeUser();
+        const publicApp = await makeApp(owner.userId, { is_private: false });
+
+        const stored = await writeWithAssociation(
+            other.actor,
+            `/${other.actor.user!.username}/Documents/public-assoc.txt`,
+            publicApp.id,
+        );
+        expect(stored).toBe(publicApp.id);
+    });
+
+    it('keeps an association to the actor’s own private app', async () => {
+        const owner = await makeUser();
+        const ownApp = await makeApp(owner.userId, { is_private: true });
+
+        const stored = await writeWithAssociation(
+            owner.actor,
+            `/${owner.actor.user!.username}/Documents/own-assoc.txt`,
+            ownApp.id,
+        );
+        expect(stored).toBe(ownApp.id);
+    });
+});

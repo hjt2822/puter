@@ -1,0 +1,2812 @@
+// This suite tests basic features of puter webdav. it is not a comprehensive webdav test suite unlike litmus
+// but rather it performs some common sense checks to ensure that WebDAV support isn't irrevocably broken in puter
+import type { Request, RequestHandler, Response } from 'express';
+import { Readable, Writable } from 'node:stream';
+import { GetObjectCommand } from '@aws-sdk/client-s3';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
+import { v4 as uuidv4 } from 'uuid';
+import { hash as bcryptHash } from 'bcrypt';
+import { TOTP } from 'otpauth';
+import { PuterRouter } from '../../core/http/PuterRouter.js';
+import type { RouteDescriptor } from '../../core/http/types.js';
+import { PuterServer } from '../../server.js';
+import { setupTestServer } from '../../testUtil.js';
+import { makeActor } from '../../core/actor.js';
+import { runWithContext } from '../../core/context.js';
+import { FULL_API_ACCESS } from '../../services/permission/consts.js';
+import { generateDefaultFsentries } from '../../util/userProvisioning.js';
+import { createSecret as otpCreateSecret } from '../../services/auth/OTPUtil.js';
+import type { WebDAVController } from './WebDAVController.js';
+
+let server: PuterServer;
+let controller: WebDAVController;
+let routes: RouteDescriptor[];
+
+beforeAll(async () => {
+    server = await setupTestServer();
+    controller = server.controllers.webdav as unknown as WebDAVController;
+
+    const router = new PuterRouter();
+    controller.registerRoutes(router);
+    routes = router.routes;
+});
+
+/** Run one handler; true when it called `next` instead of answering. */
+const runHandler = async (
+    handler: RequestHandler,
+    req: Request,
+    res: Response,
+): Promise<boolean> => {
+    let advanced = false;
+    await handler(req, res, (() => {
+        advanced = true;
+    }) as never);
+    return advanced;
+};
+
+/**
+ * Stand in for express's router: walk the controller's collected routes in
+ * order and run the first one that matches the request's method, plus any
+ * `middleware` it declares.
+ *
+ * The options the real server materializes into gates — subdomain, rate limit,
+ * concurrency — are deliberately not applied here; those belong to the
+ * materializer's own tests, and reproducing them would make every case below
+ * share one DAV budget. `server.test.ts` covers the wiring on a real port.
+ */
+const dispatchMiddleware = async (
+    req: Request,
+    res: Response,
+    next: () => void,
+): Promise<void> => {
+    const method = req.method.toLowerCase();
+    for (const route of routes) {
+        if (
+            route.method !== 'use' &&
+            route.method !== 'all' &&
+            route.method !== method
+        ) {
+            continue;
+        }
+        let advanced = true;
+        for (const handler of [
+            ...(route.options.middleware ?? []),
+            route.handler,
+        ]) {
+            advanced = await runHandler(handler, req, res);
+            if (!advanced) break;
+        }
+        // A chain that stopped short of `next` answered the request.
+        if (!advanced) return;
+    }
+    next();
+};
+
+afterAll(async () => {
+    await server?.shutdown();
+});
+
+interface CapturedResponse {
+    statusCode: number;
+    body: unknown;
+    headers: Record<string, string>;
+    ended: boolean;
+}
+
+const makeReq = (init: {
+    method: string;
+    path?: string;
+    body?: unknown;
+    headers?: Record<string, string>;
+    actor?: unknown;
+    socket?: unknown;
+    ip?: string;
+}): Request => {
+    return {
+        method: init.method,
+        path: init.path ?? '/',
+        body: init.body ?? {},
+        query: {},
+        headers: init.headers ?? {},
+        actor: init.actor,
+        socket: init.socket ?? {},
+        ip: init.ip,
+    } as unknown as Request;
+};
+
+const makeRes = () => {
+    const captured: CapturedResponse = {
+        statusCode: 200,
+        body: undefined,
+        headers: {},
+        ended: false,
+    };
+    const listeners: Record<string, Array<() => void>> = {};
+    const res = {
+        // The DAV mount holds a concurrency slot for the life of the request
+        // and releases it on `finish` / `close`, so the stub has to behave
+        // like an emitter or every dispatch throws.
+        once: vi.fn((event: string, fn: () => void) => {
+            (listeners[event] ??= []).push(fn);
+            return res;
+        }),
+        emit: vi.fn((event: string) => {
+            const fns = listeners[event] ?? [];
+            listeners[event] = [];
+            for (const fn of fns) fn();
+        }),
+        json: vi.fn((value: unknown) => {
+            captured.body = value;
+            return res;
+        }),
+        status: vi.fn((code: number) => {
+            captured.statusCode = code;
+            return res;
+        }),
+        set: vi.fn((obj: Record<string, string> | string, val?: string) => {
+            if (typeof obj === 'string') {
+                captured.headers[obj.toLowerCase()] = val!;
+            } else {
+                for (const [k, v] of Object.entries(obj)) {
+                    captured.headers[k.toLowerCase()] = v;
+                }
+            }
+            return res;
+        }),
+        setHeader: vi.fn((key: string, val: string) => {
+            captured.headers[key.toLowerCase()] = val;
+            return res;
+        }),
+        send: vi.fn((value: unknown) => {
+            captured.body = value;
+            res.emit('finish');
+            return res;
+        }),
+        end: vi.fn(() => {
+            captured.ended = true;
+            res.emit('finish');
+            return res;
+        }),
+        headersSent: false,
+    };
+    return { res: res as unknown as Response, captured };
+};
+
+const basicAuth = (user: string, pass: string) =>
+    `Basic ${Buffer.from(`${user}:${pass}`).toString('base64')}`;
+
+const noop = vi.fn();
+
+const makeUser = async () => {
+    const username = `webdav-${Math.random().toString(36).slice(2, 10)}`;
+    const created = await server.stores.user.create({
+        username,
+        uuid: uuidv4(),
+        password: null,
+        email: `${username}@test.local`,
+        free_storage: 100 * 1024 * 1024,
+        requires_email_confirmation: false,
+    });
+    await generateDefaultFsentries(
+        server.clients.db,
+        server.stores.user,
+        created,
+    );
+    const refreshed = (await server.stores.user.getById(created.id))!;
+    return {
+        userId: refreshed.id,
+        username: refreshed.username,
+        actor: {
+            user: {
+                id: refreshed.id,
+                uuid: refreshed.uuid,
+                username: refreshed.username,
+            },
+        },
+    };
+};
+
+describe('WebDAVController', () => {
+    describe('route registration', () => {
+        it('registers one catch-all per DAV verb, all on the dav subdomain', () => {
+            const router = new PuterRouter();
+            controller.registerRoutes(router);
+
+            for (const verb of [
+                'options',
+                'head',
+                'get',
+                'propfind',
+                'proppatch',
+                'mkcol',
+                'put',
+                'delete',
+                'copy',
+                'move',
+                'lock',
+                'unlock',
+            ]) {
+                const route = router.routes.find((r) => r.method === verb);
+                expect(route, verb).toBeDefined();
+                expect(route!.path).toBe('/{*splat}');
+                expect(route!.options.subdomain).toBe('dav');
+                // The gates the materializer installs ahead of the handler.
+                expect(route!.options.rateLimit).toBeDefined();
+                expect(route!.options.concurrent).toBeDefined();
+            }
+
+            // `all` catches the verbs we don't implement, so it has to come
+            // after every route that does.
+            const allIndex = router.routes.findIndex((r) => r.method === 'all');
+            expect(allIndex).toBe(router.routes.length - 1);
+        });
+
+        it('registers HEAD ahead of GET so express does not fold the two', () => {
+            const router = new PuterRouter();
+            controller.registerRoutes(router);
+            const head = router.routes.findIndex((r) => r.method === 'head');
+            const get = router.routes.findIndex((r) => r.method === 'get');
+            expect(head).toBeLessThan(get);
+        });
+    });
+
+    describe('authentication', () => {
+        it('returns 401 when no auth is provided and no session actor', async () => {
+            const { res, captured } = makeRes();
+            await dispatchMiddleware(makeReq({ method: 'OPTIONS' }), res, noop);
+            expect(captured.statusCode).toBe(401);
+            expect(captured.headers['www-authenticate']).toContain('Basic');
+        });
+
+        it('returns 401 for malformed Basic auth (no colon)', async () => {
+            const { res, captured } = makeRes();
+            const encoded = Buffer.from('no-colon-here').toString('base64');
+            await dispatchMiddleware(
+                makeReq({
+                    method: 'OPTIONS',
+                    headers: { authorization: `Basic ${encoded}` },
+                }),
+                res,
+                noop,
+            );
+            expect(captured.statusCode).toBe(401);
+        });
+
+        it('returns 401 for invalid -token auth', async () => {
+            const { res, captured } = makeRes();
+            await dispatchMiddleware(
+                makeReq({
+                    method: 'OPTIONS',
+                    headers: {
+                        authorization: basicAuth('-token', 'bad-token-value'),
+                    },
+                }),
+                res,
+                noop,
+            );
+            expect(captured.statusCode).toBe(401);
+        });
+
+        it('returns 401 for non-existent username', async () => {
+            const { res, captured } = makeRes();
+            await dispatchMiddleware(
+                makeReq({
+                    method: 'OPTIONS',
+                    headers: {
+                        authorization: basicAuth(
+                            'nonexistent-user-xyz',
+                            'password',
+                        ),
+                    },
+                }),
+                res,
+                noop,
+            );
+            expect(captured.statusCode).toBe(401);
+        });
+    });
+
+    describe('Basic-auth brute-force gate', () => {
+        // Every case pins its own `ip` so the per-IP backstop is not shared
+        // with the rest of the file — the memory bucket store is module-wide.
+        const makePasswordUser = async () => {
+            const username = `webdav-pw-${Math.random()
+                .toString(36)
+                .slice(2, 10)}`;
+            const created = await server.stores.user.create({
+                username,
+                uuid: uuidv4(),
+                password: await bcryptHash('correct-horse', 4),
+                email: `${username}@test.local`,
+                free_storage: 100 * 1024 * 1024,
+                requires_email_confirmation: false,
+            });
+            await generateDefaultFsentries(
+                server.clients.db,
+                server.stores.user,
+                created,
+            );
+            return username;
+        };
+
+        const attempt = async (headers: Record<string, string>, ip: string) => {
+            const { res, captured } = makeRes();
+            await dispatchMiddleware(
+                makeReq({ method: 'OPTIONS', headers, ip }),
+                res,
+                noop,
+            );
+            return captured;
+        };
+
+        it('stops guessing one account after ten failures, before the compare', async () => {
+            const username = await makePasswordUser();
+            const ip = '203.0.113.10';
+
+            for (let i = 0; i < 10; i++) {
+                const captured = await attempt(
+                    { authorization: basicAuth(username, `guess-${i}`) },
+                    ip,
+                );
+                expect(captured.statusCode).toBe(401);
+            }
+
+            const lookup = vi.spyOn(server.stores.user, 'getByUsername');
+            const blocked = await attempt(
+                { authorization: basicAuth(username, 'guess-11') },
+                ip,
+            );
+            expect(blocked.statusCode).toBe(429);
+            // Refused ahead of the credential work, so the attempt costs
+            // neither a user lookup nor a bcrypt round.
+            expect(lookup).not.toHaveBeenCalled();
+            lookup.mockRestore();
+
+            // Bucketed per account, not globally: another account from the
+            // same IP still gets its attempt.
+            const otherUsername = await makePasswordUser();
+            expect(
+                (
+                    await attempt(
+                        { authorization: basicAuth(otherUsername, 'nope') },
+                        ip,
+                    )
+                ).statusCode,
+            ).toBe(401);
+        });
+
+        it('does not spend the budget on successful requests', async () => {
+            const username = await makePasswordUser();
+            const ip = '203.0.113.11';
+            const good = {
+                authorization: basicAuth(username, 'correct-horse'),
+            };
+
+            // A working DAV client resends credentials on every request; well
+            // past the failure ceiling, none of them may count against it.
+            for (let i = 0; i < 20; i++) {
+                expect((await attempt(good, ip)).statusCode).toBe(200);
+            }
+            expect(
+                (
+                    await attempt(
+                        { authorization: basicAuth(username, 'wrong') },
+                        ip,
+                    )
+                ).statusCode,
+            ).toBe(401);
+        });
+
+        it('backstops spraying many accounts from one address', async () => {
+            const ip = '203.0.113.12';
+            // Unknown usernames never reach bcrypt, so this is the shape an
+            // attacker uses to mint a fresh per-account bucket every attempt.
+            for (let i = 0; i < 50; i++) {
+                const captured = await attempt(
+                    { authorization: basicAuth(`sprayed-${i}`, 'password') },
+                    ip,
+                );
+                expect(captured.statusCode).toBe(401);
+            }
+            expect(
+                (
+                    await attempt(
+                        { authorization: basicAuth('sprayed-50', 'password') },
+                        ip,
+                    )
+                ).statusCode,
+            ).toBe(429);
+        });
+
+        it('holds token guessing on the per-IP backstop', async () => {
+            const ip = '203.0.113.13';
+            for (let i = 0; i < 50; i++) {
+                expect(
+                    (
+                        await attempt(
+                            { authorization: basicAuth('-token', `bad-${i}`) },
+                            ip,
+                        )
+                    ).statusCode,
+                ).toBe(401);
+            }
+            expect(
+                (
+                    await attempt(
+                        { authorization: basicAuth('-token', 'bad-50') },
+                        ip,
+                    )
+                ).statusCode,
+            ).toBe(429);
+        });
+    });
+
+    describe('OPTIONS (with session actor)', () => {
+        it('returns 200 with DAV headers when actor is present', async () => {
+            const { res, captured } = makeRes();
+            await dispatchMiddleware(
+                makeReq({
+                    method: 'OPTIONS',
+                    actor: {
+                        user: {
+                            id: 1,
+                            uuid: 'test-uuid',
+                            username: 'test',
+                        },
+                    },
+                }),
+                res,
+                noop,
+            );
+            expect(captured.statusCode).toBe(200);
+            expect(captured.headers['dav']).toContain('1');
+            expect(captured.headers['allow']).toContain('PROPFIND');
+            expect(captured.headers['allow']).toContain('GET');
+            expect(captured.headers['allow']).toContain('PUT');
+            expect(captured.headers['allow']).toContain('DELETE');
+        });
+    });
+
+    describe('CORS preflight', () => {
+        it('answers a browser preflight before the auth gate', async () => {
+            const { res, captured } = makeRes();
+            await dispatchMiddleware(
+                makeReq({
+                    method: 'OPTIONS',
+                    path: '/someone/.vscode/settings.json',
+                    headers: {
+                        origin: 'https://code.puter.com',
+                        'access-control-request-method': 'PROPFIND',
+                    },
+                }),
+                res,
+                noop,
+            );
+            // A non-2xx here is what made every browser DAV client give up
+            // before it could send a token.
+            expect(captured.statusCode).toBe(200);
+            expect(captured.headers['dav']).toContain('1');
+            expect(captured.headers['allow']).toContain('PROPFIND');
+            expect(captured.headers['access-control-max-age']).toBe('86400');
+            expect(captured.headers['www-authenticate']).toBeUndefined();
+        });
+
+        it('still authenticates an OPTIONS that is not a preflight', async () => {
+            const { res, captured } = makeRes();
+            await dispatchMiddleware(
+                makeReq({
+                    method: 'OPTIONS',
+                    // An Origin alone isn't a preflight — only the
+                    // `Access-Control-Request-Method` probe is.
+                    headers: { origin: 'https://code.puter.com' },
+                }),
+                res,
+                noop,
+            );
+            expect(captured.statusCode).toBe(401);
+            // macOS opens a mount on this reply, so it keeps the DAV header.
+            expect(captured.headers['dav']).toContain('1');
+        });
+    });
+
+    describe('pending-verification gate', () => {
+        // WebDAV must enforce the same gate every other authenticated route
+        // gets from requireVerifiedAccount — it dispatches off a single use()
+        // with no route options, so the middleware is never wired in and it
+        // has to call assertVerifiedAccount itself. Without it, an account
+        // still pending email/phone/card verification could read/write its
+        // whole filesystem over the `dav` subdomain.
+        const gatedActor = (flags: Record<string, unknown>) => ({
+            user: {
+                id: 1,
+                uuid: 'gated-uuid',
+                username: 'gated',
+                ...flags,
+            },
+        });
+
+        it('rejects a session actor pending phone verification with 403', async () => {
+            const { res, captured } = makeRes();
+            await dispatchMiddleware(
+                makeReq({
+                    method: 'PROPFIND',
+                    actor: gatedActor({ requires_phone_verification: true }),
+                }),
+                res,
+                noop,
+            );
+            expect(captured.statusCode).toBe(403);
+        });
+
+        it('rejects a session actor pending card verification with 403', async () => {
+            const { res, captured } = makeRes();
+            await dispatchMiddleware(
+                makeReq({
+                    method: 'GET',
+                    actor: gatedActor({ requires_card_verification: true }),
+                }),
+                res,
+                noop,
+            );
+            expect(captured.statusCode).toBe(403);
+        });
+
+        it('rejects a session actor with an unconfirmed email with 403', async () => {
+            const { res, captured } = makeRes();
+            await dispatchMiddleware(
+                makeReq({
+                    method: 'PROPFIND',
+                    actor: gatedActor({
+                        requires_email_confirmation: true,
+                        email_confirmed: false,
+                    }),
+                }),
+                res,
+                noop,
+            );
+            expect(captured.statusCode).toBe(403);
+        });
+
+        it('enforces the gate on the Basic-auth path (flags carried onto the built actor)', async () => {
+            const username = `webdav-gated-${Math.random()
+                .toString(36)
+                .slice(2, 10)}`;
+            const created = await server.stores.user.create({
+                username,
+                uuid: uuidv4(),
+                password: await bcryptHash('correct-horse', 4),
+                email: `${username}@test.local`,
+                free_storage: 100 * 1024 * 1024,
+                requires_email_confirmation: false,
+            });
+            await server.stores.user.update(created.id, {
+                requires_phone_verification: 1,
+            });
+
+            const { res, captured } = makeRes();
+            await dispatchMiddleware(
+                makeReq({
+                    method: 'PROPFIND',
+                    headers: {
+                        authorization: basicAuth(username, 'correct-horse'),
+                    },
+                }),
+                res,
+                noop,
+            );
+            expect(captured.statusCode).toBe(403);
+        });
+
+        it('lets a fully-verified session actor through the gate', async () => {
+            const { res, captured } = makeRes();
+            await dispatchMiddleware(
+                makeReq({
+                    method: 'OPTIONS',
+                    actor: gatedActor({
+                        requires_phone_verification: false,
+                        requires_card_verification: false,
+                        requires_email_confirmation: false,
+                    }),
+                }),
+                res,
+                noop,
+            );
+            expect(captured.statusCode).toBe(200);
+        });
+    });
+
+    describe('suspension gate', () => {
+        // WebDAV must also enforce the suspension gate every other authenticated
+        // route gets from requireAuthGate. Same single-use() dispatch means that
+        // middleware is never wired in, so #dispatch calls assertNotSuspended
+        // itself. Without it, a suspended account could read/write/delete its
+        // whole filesystem over the `dav` subdomain.
+        it('rejects a suspended session actor with 403', async () => {
+            const { res, captured } = makeRes();
+            await dispatchMiddleware(
+                makeReq({
+                    method: 'PROPFIND',
+                    actor: {
+                        user: {
+                            id: 1,
+                            uuid: 'suspended-uuid',
+                            username: 'suspended',
+                            suspended: true,
+                        },
+                    },
+                }),
+                res,
+                noop,
+            );
+            expect(captured.statusCode).toBe(403);
+        });
+
+        it('rejects a suspended user on the Basic-auth path with 403', async () => {
+            const username = `webdav-suspended-${Math.random()
+                .toString(36)
+                .slice(2, 10)}`;
+            const created = await server.stores.user.create({
+                username,
+                uuid: uuidv4(),
+                password: await bcryptHash('correct-horse', 4),
+                email: `${username}@test.local`,
+                free_storage: 100 * 1024 * 1024,
+                requires_email_confirmation: false,
+            });
+            await server.stores.user.update(created.id, {
+                suspended: 1,
+            });
+
+            const { res, captured } = makeRes();
+            await dispatchMiddleware(
+                makeReq({
+                    method: 'PROPFIND',
+                    headers: {
+                        authorization: basicAuth(username, 'correct-horse'),
+                    },
+                }),
+                res,
+                noop,
+            );
+            expect(captured.statusCode).toBe(403);
+        });
+    });
+
+    describe('Basic-auth account parity with /login', () => {
+        const makeBasicUser = async (
+            prefix: string,
+            fields: Record<string, unknown>,
+        ) => {
+            const username = `${prefix}-${Math.random().toString(36).slice(2, 10)}`;
+            const created = await server.stores.user.create({
+                username,
+                uuid: uuidv4(),
+                password: await bcryptHash('correct-horse', 4),
+                email: `${username}@test.local`,
+                free_storage: 100 * 1024 * 1024,
+                requires_email_confirmation: false,
+            });
+            await server.stores.user.update(created.id, fields);
+            return { id: created.id, username };
+        };
+
+        const propfindAs = async (username: string, password: string) => {
+            const { res, captured } = makeRes();
+            await dispatchMiddleware(
+                makeReq({
+                    method: 'PROPFIND',
+                    headers: { authorization: basicAuth(username, password) },
+                }),
+                res,
+                noop,
+            );
+            return captured.statusCode;
+        };
+
+        const nowSeconds = () => Math.floor(Date.now() / 1000);
+
+        it('rejects an expired temporary password with 401', async () => {
+            const { username } = await makeBasicUser('webdav-temp-expired', {
+                temp_password_expires_at: nowSeconds() - 60,
+            });
+            expect(await propfindAs(username, 'correct-horse')).toBe(401);
+        });
+
+        it('rejects a seat that has not replaced its temporary password with 403', async () => {
+            const { username } = await makeBasicUser('webdav-temp-live', {
+                temp_password_expires_at: nowSeconds() + 3600,
+                requires_password_change: 1,
+            });
+            expect(await propfindAs(username, 'correct-horse')).toBe(403);
+        });
+
+        it('lets a live temporary password through once the change flag is clear', async () => {
+            const { username } = await makeBasicUser('webdav-temp-ok', {
+                temp_password_expires_at: nowSeconds() + 3600,
+                requires_password_change: 0,
+            });
+            const status = await propfindAs(username, 'correct-horse');
+            expect([401, 403]).not.toContain(status);
+        });
+
+        it('lets a 2FA member of a team that requires 2FA through', async () => {
+            const { id, username } = await makeBasicUser('webdav-2fa', {});
+            const secret = otpCreateSecret(username).secret;
+            await server.stores.user.update(id, {
+                otp_enabled: 1,
+                otp_secret: secret,
+            });
+            const seat = vi
+                .spyOn(server.stores.team, 'getOrgSeat')
+                .mockResolvedValue({ require_2fa: 1 } as never);
+            try {
+                const code = new TOTP({
+                    issuer: 'puter.com',
+                    label: username,
+                    algorithm: 'SHA1',
+                    digits: 6,
+                    secret,
+                }).generate();
+                const status = await propfindAs(
+                    username,
+                    `correct-horse${code}`,
+                );
+                expect([401, 403]).not.toContain(status);
+            } finally {
+                seat.mockRestore();
+            }
+        });
+    });
+
+    describe('unsupported methods', () => {
+        it('returns 405 for unknown HTTP methods', async () => {
+            const { res, captured } = makeRes();
+            await dispatchMiddleware(
+                makeReq({
+                    method: 'PATCH',
+                    actor: {
+                        user: {
+                            id: 1,
+                            uuid: 'test-uuid',
+                            username: 'test',
+                        },
+                    },
+                }),
+                res,
+                noop,
+            );
+            expect(captured.statusCode).toBe(405);
+            expect(captured.headers['allow']).toContain('PROPFIND');
+        });
+    });
+
+    describe('GET', () => {
+        it('returns 404 for a non-existent path', async () => {
+            const { res, captured } = makeRes();
+            await dispatchMiddleware(
+                makeReq({
+                    method: 'GET',
+                    path: '/nonexistent-file-that-does-not-exist.txt',
+                    actor: {
+                        user: {
+                            id: 1,
+                            uuid: 'test-uuid',
+                            username: 'test',
+                        },
+                    },
+                }),
+                res,
+                noop,
+            );
+            expect(captured.statusCode).toBe(404);
+        });
+    });
+
+    describe('PROPFIND', () => {
+        it('returns 207 multistatus for root path', async () => {
+            const { res, captured } = makeRes();
+            await dispatchMiddleware(
+                makeReq({
+                    method: 'PROPFIND',
+                    path: '/',
+                    headers: { depth: '0' },
+                    actor: {
+                        user: {
+                            id: 1,
+                            uuid: 'test-uuid',
+                            username: 'test',
+                        },
+                    },
+                }),
+                res,
+                noop,
+            );
+            expect(captured.statusCode).toBe(207);
+            expect(captured.headers['content-type']).toContain(
+                'application/xml',
+            );
+            expect(captured.body).toContain('multistatus');
+        });
+
+        it('returns 404 for a non-existent path', async () => {
+            const { res, captured } = makeRes();
+            await dispatchMiddleware(
+                makeReq({
+                    method: 'PROPFIND',
+                    path: '/does-not-exist',
+                    headers: { depth: '0' },
+                    actor: {
+                        user: {
+                            id: 1,
+                            uuid: 'test-uuid',
+                            username: 'test',
+                        },
+                    },
+                }),
+                res,
+                noop,
+            );
+            expect(captured.statusCode).toBe(404);
+        });
+
+        it('includes DAV XML properties in the root PROPFIND response', async () => {
+            const { res, captured } = makeRes();
+            await dispatchMiddleware(
+                makeReq({
+                    method: 'PROPFIND',
+                    path: '/',
+                    headers: { depth: '0' },
+                    actor: {
+                        user: {
+                            id: 1,
+                            uuid: 'test-uuid',
+                            username: 'test',
+                        },
+                    },
+                }),
+                res,
+                noop,
+            );
+            const xml = captured.body as string;
+            expect(xml).toContain('<D:response>');
+            expect(xml).toContain('<D:href>');
+            expect(xml).toContain('<D:resourcetype>');
+            expect(xml).toContain('<D:collection/>');
+        });
+    });
+
+    describe('MKCOL', () => {
+        it('rejects creating a collection at root', async () => {
+            const { res, captured } = makeRes();
+            await dispatchMiddleware(
+                makeReq({
+                    method: 'MKCOL',
+                    path: '/',
+                    actor: {
+                        user: {
+                            id: 1,
+                            uuid: 'test-uuid',
+                            username: 'test',
+                        },
+                    },
+                }),
+                res,
+                noop,
+            );
+            expect(captured.statusCode).toBe(403);
+        });
+
+        it('rejects MKCOL with a body', async () => {
+            const { res, captured } = makeRes();
+            await dispatchMiddleware(
+                makeReq({
+                    method: 'MKCOL',
+                    path: '/new-collection',
+                    headers: { 'content-length': '10' },
+                    actor: {
+                        user: {
+                            id: 1,
+                            uuid: 'test-uuid',
+                            username: 'test',
+                        },
+                    },
+                }),
+                res,
+                noop,
+            );
+            expect(captured.statusCode).toBe(415);
+        });
+    });
+
+    describe('PUT', () => {
+        it('rejects macOS junk files (.DS_Store)', async () => {
+            const { res, captured } = makeRes();
+            await dispatchMiddleware(
+                makeReq({
+                    method: 'PUT',
+                    path: '/some/dir/.DS_Store',
+                    actor: {
+                        user: {
+                            id: 1,
+                            uuid: 'test-uuid',
+                            username: 'test',
+                        },
+                    },
+                }),
+                res,
+                noop,
+            );
+            expect(captured.statusCode).toBe(422);
+        });
+
+        it('rejects macOS resource fork files (._prefix)', async () => {
+            const { res, captured } = makeRes();
+            await dispatchMiddleware(
+                makeReq({
+                    method: 'PUT',
+                    path: '/some/dir/._myfile.txt',
+                    actor: {
+                        user: {
+                            id: 1,
+                            uuid: 'test-uuid',
+                            username: 'test',
+                        },
+                    },
+                }),
+                res,
+                noop,
+            );
+            expect(captured.statusCode).toBe(422);
+        });
+
+        it('emits GUI-safe item events without leaking numeric fsentry ids', async () => {
+            const { actor, userId, username } = await makeUser();
+            const target = `/${username}/Documents/webdav-event.txt`;
+            const { res, captured } = makeRes();
+            const req = Object.assign(
+                Readable.from(['hello']),
+                makeReq({
+                    method: 'PUT',
+                    path: target,
+                    headers: { 'content-length': '5' },
+                    actor,
+                }),
+            ) as Request;
+
+            const emitSpy = vi.spyOn(server.clients.event, 'emit');
+            let addedCall: (typeof emitSpy.mock.calls)[number] | undefined;
+            try {
+                await dispatchMiddleware(req, res, noop);
+                await new Promise((resolve) => setTimeout(resolve, 0));
+                addedCall = emitSpy.mock.calls.find(
+                    ([eventName]) => eventName === 'outer.gui.item.added',
+                );
+            } finally {
+                emitSpy.mockRestore();
+            }
+
+            expect(captured.statusCode).toBe(201);
+            expect(addedCall).toBeTruthy();
+            const payload = addedCall?.[1] as {
+                user_id_list?: number[];
+                response?: Record<string, unknown>;
+            };
+            expect(payload.user_id_list).toEqual([userId]);
+            expect(payload.response).toMatchObject({
+                id: expect.any(String),
+                uid: expect.any(String),
+                uuid: expect.any(String),
+                path: target,
+                from_new_service: true,
+            });
+            expect(typeof payload.response?.id).toBe('string');
+            expect(payload.response?.id).toBe(payload.response?.uuid);
+            expect(payload.response).not.toHaveProperty('userId');
+        });
+    });
+
+    describe('DELETE', () => {
+        it('rejects delete when ACL denies write access', async () => {
+            const { res, captured } = makeRes();
+            await dispatchMiddleware(
+                makeReq({
+                    method: 'DELETE',
+                    path: '/nonexistent-file-to-delete.txt',
+                    actor: {
+                        user: {
+                            id: 1,
+                            uuid: 'test-uuid',
+                            username: 'test',
+                        },
+                    },
+                }),
+                res,
+                noop,
+            );
+            expect(captured.statusCode).toBe(403);
+        });
+    });
+
+    describe('COPY', () => {
+        it('returns 400 when Destination header is missing', async () => {
+            const { res, captured } = makeRes();
+            await dispatchMiddleware(
+                makeReq({
+                    method: 'COPY',
+                    path: '/some/file.txt',
+                    actor: {
+                        user: {
+                            id: 1,
+                            uuid: 'test-uuid',
+                            username: 'test',
+                        },
+                    },
+                }),
+                res,
+                noop,
+            );
+            expect(captured.statusCode).toBe(400);
+        });
+    });
+
+    describe('MOVE', () => {
+        it('returns 400 when Destination header is missing', async () => {
+            const { res, captured } = makeRes();
+            await dispatchMiddleware(
+                makeReq({
+                    method: 'MOVE',
+                    path: '/some/file.txt',
+                    actor: {
+                        user: {
+                            id: 1,
+                            uuid: 'test-uuid',
+                            username: 'test',
+                        },
+                    },
+                }),
+                res,
+                noop,
+            );
+            expect(captured.statusCode).toBe(400);
+        });
+    });
+
+    describe('UNLOCK', () => {
+        it('returns 400 when Lock-Token header is missing', async () => {
+            const { res, captured } = makeRes();
+            await dispatchMiddleware(
+                makeReq({
+                    method: 'UNLOCK',
+                    path: '/some/file.txt',
+                    actor: {
+                        user: {
+                            id: 1,
+                            uuid: 'test-uuid',
+                            username: 'test',
+                        },
+                    },
+                }),
+                res,
+                noop,
+            );
+            expect(captured.statusCode).toBe(400);
+        });
+
+        it('returns 204 for an expired/unknown lock token (idempotent)', async () => {
+            const { res, captured } = makeRes();
+            await dispatchMiddleware(
+                makeReq({
+                    method: 'UNLOCK',
+                    path: '/some/file.txt',
+                    headers: {
+                        'lock-token':
+                            '<urn:uuid:00000000-0000-0000-0000-000000000099>',
+                    },
+                    actor: {
+                        user: {
+                            id: 1,
+                            uuid: 'test-uuid',
+                            username: 'test',
+                        },
+                    },
+                }),
+                res,
+                noop,
+            );
+            expect(captured.statusCode).toBe(204);
+        });
+    });
+
+    describe('LOCK', () => {
+        it('creates a new exclusive lock and returns XML with lock token', async () => {
+            const { res, captured } = makeRes();
+            await dispatchMiddleware(
+                makeReq({
+                    method: 'LOCK',
+                    path: '/test/lockable-file.txt',
+                    actor: {
+                        user: {
+                            id: 1,
+                            uuid: 'test-uuid',
+                            username: 'test',
+                        },
+                    },
+                }),
+                res,
+                noop,
+            );
+            expect(captured.statusCode).toBe(200);
+            expect(captured.headers['content-type']).toContain(
+                'application/xml',
+            );
+            const xml = captured.body as string;
+            expect(xml).toContain('lockdiscovery');
+            expect(xml).toContain('urn:uuid:');
+            expect(xml).toContain('<D:exclusive/>');
+            expect(captured.headers['lock-token']).toContain('urn:uuid:');
+        });
+
+        it('rejects locking a path the user has no write access to (e.g. root)', async () => {
+            const { res, captured } = makeRes();
+            await dispatchMiddleware(
+                makeReq({
+                    method: 'LOCK',
+                    path: '/',
+                    actor: {
+                        user: {
+                            id: 1,
+                            uuid: 'test-uuid',
+                            username: 'test',
+                        },
+                    },
+                }),
+                res,
+                noop,
+            );
+            expect(captured.statusCode).toBe(403);
+        });
+
+        it('rejects a second exclusive lock on the same path', async () => {
+            const uniquePath = `/test/double-lock-${Date.now()}.txt`;
+
+            // First lock
+            const { res: res1, captured: cap1 } = makeRes();
+            await dispatchMiddleware(
+                makeReq({
+                    method: 'LOCK',
+                    path: uniquePath,
+                    actor: {
+                        user: {
+                            id: 1,
+                            uuid: 'test-uuid',
+                            username: 'test',
+                        },
+                    },
+                }),
+                res1,
+                noop,
+            );
+            expect(cap1.statusCode).toBe(200);
+
+            // Second lock — should be 423 Locked
+            const { res: res2, captured: cap2 } = makeRes();
+            await dispatchMiddleware(
+                makeReq({
+                    method: 'LOCK',
+                    path: uniquePath,
+                    actor: {
+                        user: {
+                            id: 1,
+                            uuid: 'test-uuid',
+                            username: 'test',
+                        },
+                    },
+                }),
+                res2,
+                noop,
+            );
+            expect(cap2.statusCode).toBe(423);
+        });
+
+        it('refreshes an existing lock when If header provides the token', async () => {
+            const uniquePath = `/test/refresh-lock-${Date.now()}.txt`;
+            const { res: res1, captured: cap1 } = makeRes();
+            await dispatchMiddleware(
+                makeReq({
+                    method: 'LOCK',
+                    path: uniquePath,
+                    actor: {
+                        user: {
+                            id: 1,
+                            uuid: 'test-uuid',
+                            username: 'test',
+                        },
+                    },
+                }),
+                res1,
+                noop,
+            );
+            expect(cap1.statusCode).toBe(200);
+            const lockToken = cap1.headers['lock-token']!.replace(/[<>]/g, '');
+
+            // Refresh
+            const { res: res2, captured: cap2 } = makeRes();
+            await dispatchMiddleware(
+                makeReq({
+                    method: 'LOCK',
+                    path: uniquePath,
+                    headers: { if: `(<${lockToken}>)` },
+                    actor: {
+                        user: {
+                            id: 1,
+                            uuid: 'test-uuid',
+                            username: 'test',
+                        },
+                    },
+                }),
+                res2,
+                noop,
+            );
+            expect(cap2.statusCode).toBe(200);
+            const xml = cap2.body as string;
+            expect(xml).toContain(lockToken);
+        });
+
+        it('grants and reports the requested Timeout, on create and refresh', async () => {
+            const uniquePath = `/test/timeout-lock-${Date.now()}.txt`;
+            const actor = {
+                user: { id: 1, uuid: 'test-uuid', username: 'test' },
+            };
+            const { res: res1, captured: cap1 } = makeRes();
+            await dispatchMiddleware(
+                makeReq({
+                    method: 'LOCK',
+                    path: uniquePath,
+                    headers: { timeout: 'Second-120' },
+                    actor,
+                }),
+                res1,
+                noop,
+            );
+            expect(cap1.statusCode).toBe(200);
+            expect(cap1.body as string).toContain(
+                '<D:timeout>Second-120</D:timeout>',
+            );
+            const lockToken = cap1.headers['lock-token']!.replace(/[<>]/g, '');
+
+            const { res: res2, captured: cap2 } = makeRes();
+            await dispatchMiddleware(
+                makeReq({
+                    method: 'LOCK',
+                    path: uniquePath,
+                    headers: { if: `(<${lockToken}>)`, timeout: 'Second-300' },
+                    actor,
+                }),
+                res2,
+                noop,
+            );
+            expect(cap2.statusCode).toBe(200);
+            expect(cap2.body as string).toContain(
+                '<D:timeout>Second-300</D:timeout>',
+            );
+        });
+
+        it('reports the server max when no Timeout is requested', async () => {
+            const { res, captured } = makeRes();
+            await dispatchMiddleware(
+                makeReq({
+                    method: 'LOCK',
+                    path: `/test/default-timeout-${Date.now()}.txt`,
+                    actor: {
+                        user: { id: 1, uuid: 'test-uuid', username: 'test' },
+                    },
+                }),
+                res,
+                noop,
+            );
+            expect(captured.statusCode).toBe(200);
+            expect(captured.body as string).toContain(
+                '<D:timeout>Second-3600</D:timeout>',
+            );
+        });
+    });
+
+    describe('error handling', () => {
+        it('catches HttpError and returns its status code', async () => {
+            // GET on a non-existent file → HttpError(404) → 404 response
+            const { res, captured } = makeRes();
+            await dispatchMiddleware(
+                makeReq({
+                    method: 'GET',
+                    path: '/no-such-file',
+                    actor: {
+                        user: {
+                            id: 1,
+                            uuid: 'test-uuid',
+                            username: 'test',
+                        },
+                    },
+                }),
+                res,
+                noop,
+            );
+            expect(captured.statusCode).toBe(404);
+        });
+    });
+});
+
+// -- Full-verb coverage -----------------------------------------------
+//
+// The suite above pins auth, gates and the cheap rejections. This one drives
+// each verb against a real provisioned home directory so the success paths
+// (and the 4xx selections between them) are exercised end to end.
+
+describe('WebDAVController verbs', () => {
+    /**
+     * A response double that is also a Writable, so handlers that end with
+     * `body.pipe(res)` (GET) work without a socket.
+     */
+    const makeStreamRes = ({ abortOnFirstChunk = false } = {}) => {
+        const chunks: Buffer[] = [];
+        const captured = {
+            statusCode: 200,
+            headers: {} as Record<string, string>,
+            body: undefined as unknown,
+            ended: false,
+            text: () => Buffer.concat(chunks).toString('utf8'),
+        };
+        const sink = new Writable({
+            write(chunk, _encoding, callback) {
+                chunks.push(Buffer.from(chunk as Buffer));
+                // A client that hangs up mid-download surfaces as the
+                // response being destroyed, not as a write error.
+                if (abortOnFirstChunk) sink.destroy();
+                callback();
+            },
+        });
+        sink.on('finish', () => {
+            captured.ended = true;
+        });
+        const res = Object.assign(sink, {
+            status: (code: number) => {
+                captured.statusCode = code;
+                return res;
+            },
+            set: (key: Record<string, string> | string, value?: string) => {
+                if (typeof key === 'string') {
+                    captured.headers[key.toLowerCase()] = value!;
+                } else {
+                    for (const [k, v] of Object.entries(key)) {
+                        captured.headers[k.toLowerCase()] = v;
+                    }
+                }
+                return res;
+            },
+            setHeader: (key: string, value: string) => {
+                captured.headers[key.toLowerCase()] = value;
+                return res;
+            },
+            json: (value: unknown) => {
+                captured.body = value;
+                return res;
+            },
+            send: (value: unknown) => {
+                captured.body = value;
+                captured.ended = true;
+                // End the underlying Writable so `finish` fires, as it does
+                // on a real response. The DAV mount releases its concurrency
+                // slot on that event — without it every `send()` path would
+                // leak a slot and later requests would 429.
+                if (!sink.writableEnded) sink.end();
+                return res;
+            },
+            headersSent: false,
+        });
+        return { res: res as unknown as Response, captured };
+    };
+
+    const dispatch = async (
+        init: Parameters<typeof makeReq>[0] & { content?: string },
+    ) => {
+        const { res, captured } = makeStreamRes();
+        const base = makeReq(init);
+        const req =
+            init.content === undefined
+                ? base
+                : (Object.assign(
+                      Readable.from([init.content]),
+                      base,
+                  ) as Request);
+        await dispatchMiddleware(req, res, noop);
+        // GUI events and stream pipes settle on the next tick.
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        return captured;
+    };
+
+    const putFile = async (
+        actor: unknown,
+        path: string,
+        content: string,
+    ): Promise<void> => {
+        const captured = await dispatch({
+            method: 'PUT',
+            path,
+            headers: { 'content-length': String(content.length) },
+            actor,
+            content,
+        });
+        if (captured.statusCode !== 201 && captured.statusCode !== 204) {
+            throw new Error(
+                `PUT ${path} failed with ${captured.statusCode}: ${String(captured.body)}`,
+            );
+        }
+    };
+
+    /** Index of the `eventName` GUI emit about `uid` among recorded calls. */
+    const guiEventIndex = (
+        calls: unknown[][],
+        eventName: string,
+        uid: string,
+    ): number =>
+        calls.findIndex(
+            ([name, data]) =>
+                name === eventName &&
+                (data as { response: Record<string, unknown> }).response.uid ===
+                    uid,
+        );
+    const guiResponse = (calls: unknown[][], index: number) =>
+        (calls[index]?.[1] as { response: Record<string, unknown> }).response;
+
+    describe('GET / HEAD', () => {
+        it('streams file bytes with a strong ETag and Last-Modified', async () => {
+            const { actor, username } = await makeUser();
+            const path = `/${username}/Documents/get-me.txt`;
+            await putFile(actor, path, 'webdav-body');
+
+            const captured = await dispatch({ method: 'GET', path, actor });
+            expect(captured.statusCode).toBe(200);
+            expect(captured.text()).toBe('webdav-body');
+            expect(captured.headers['accept-ranges']).toBe('bytes');
+            expect(captured.headers['content-length']).toBe('11');
+            expect(captured.headers.etag).toMatch(/^"[0-9a-f-]+-\d+"$/);
+            expect(captured.headers['last-modified']).toEqual(
+                expect.any(String),
+            );
+        });
+
+        it('answers HEAD with the headers and no body', async () => {
+            const { actor, username } = await makeUser();
+            const path = `/${username}/Documents/head-me.txt`;
+            await putFile(actor, path, 'abcd');
+
+            const captured = await dispatch({ method: 'HEAD', path, actor });
+            expect(captured.statusCode).toBe(200);
+            expect(captured.text()).toBe('');
+            expect(captured.headers['content-length']).toBe('4');
+        });
+
+        it('serves a byte range as 206 with Content-Range', async () => {
+            const { actor, username } = await makeUser();
+            const path = `/${username}/Documents/ranged.txt`;
+            await putFile(actor, path, '0123456789');
+
+            const captured = await dispatch({
+                method: 'GET',
+                path,
+                actor,
+                headers: { range: 'bytes=2-5' },
+            });
+            expect(captured.statusCode).toBe(206);
+            expect(captured.headers['content-range']).toBe('bytes 2-5/10');
+            expect(captured.text()).toBe('2345');
+        });
+
+        /**
+         * Swap the object store's answer for one GET so the body stream is
+         * under the test's control. Intercepts at the S3 SDK client, the real
+         * boundary; every other command still hits the in-memory S3.
+         */
+        const serveBody = (body: Readable) => {
+            const client = server.clients.s3.get(
+                server.stores.s3Object.resolveRegion(null),
+            );
+            const original = client.send.bind(client);
+            return vi.spyOn(client, 'send').mockImplementation(((
+                command: unknown,
+            ) =>
+                command instanceof GetObjectCommand
+                    ? Promise.resolve({
+                          Body: body,
+                          ContentLength: 7,
+                          ContentType: 'text/plain',
+                      })
+                    : original(command as never)) as never);
+        };
+
+        it('tears down the upstream stream when the client disconnects mid-download', async () => {
+            const { actor, username } = await makeUser();
+            const path = `/${username}/Documents/abort-me.txt`;
+            await putFile(actor, path, 'streamed');
+
+            // Never ends on its own: only a teardown can finish it.
+            const body = new Readable({ read() {} });
+            body.push('partial');
+            const send = serveBody(body);
+            const { res } = makeStreamRes({ abortOnFirstChunk: true });
+            try {
+                await dispatchMiddleware(
+                    makeReq({ method: 'GET', path, actor }),
+                    res,
+                    noop,
+                );
+            } finally {
+                send.mockRestore();
+            }
+
+            expect((res as unknown as Writable).destroyed).toBe(true);
+            expect(body.destroyed).toBe(true);
+        });
+
+        it('survives the upstream stream failing mid-download', async () => {
+            const { actor, username } = await makeUser();
+            const path = `/${username}/Documents/reset-me.txt`;
+            await putFile(actor, path, 'streamed');
+
+            // First read hands over a chunk, the next one fails the way a
+            // dropped storage connection does. Without an error listener on
+            // the body that event would take the process down.
+            let reads = 0;
+            const body = new Readable({
+                read() {
+                    reads += 1;
+                    if (reads === 1) this.push('partial');
+                    else this.destroy(new Error('upstream reset'));
+                },
+            });
+            const send = serveBody(body);
+            const { res, captured } = makeStreamRes();
+            try {
+                await expect(
+                    dispatchMiddleware(
+                        makeReq({ method: 'GET', path, actor }),
+                        res,
+                        noop,
+                    ),
+                ).resolves.toBeUndefined();
+            } finally {
+                send.mockRestore();
+            }
+
+            expect(captured.statusCode).toBe(200);
+            expect((res as unknown as Writable).destroyed).toBe(true);
+            expect(body.destroyed).toBe(true);
+        });
+
+        it('refuses to GET a directory', async () => {
+            const { actor, username } = await makeUser();
+            const captured = await dispatch({
+                method: 'GET',
+                path: `/${username}/Documents`,
+                actor,
+            });
+            expect(captured.statusCode).toBe(400);
+            expect(captured.body).toBe('Cannot GET a directory');
+        });
+
+        it("denies reading another user's file with 403", async () => {
+            const owner = await makeUser();
+            const stranger = await makeUser();
+            const path = `/${owner.username}/Documents/private.txt`;
+            await putFile(owner.actor, path, 'secret');
+
+            const captured = await dispatch({
+                method: 'GET',
+                path,
+                actor: stranger.actor,
+            });
+            expect(captured.statusCode).toBe(403);
+            expect(captured.body).toBe('Permission denied');
+        });
+    });
+
+    describe('PROPFIND', () => {
+        it('lists direct children at the default depth', async () => {
+            const { actor, username } = await makeUser();
+            await putFile(
+                actor,
+                `/${username}/Documents/propfind-child.txt`,
+                'x',
+            );
+
+            const captured = await dispatch({
+                method: 'PROPFIND',
+                path: `/${username}/Documents`,
+                actor,
+            });
+            expect(captured.statusCode).toBe(207);
+            const xml = captured.body as string;
+            expect(xml).toContain(`<D:href>/${username}/Documents/</D:href>`);
+            expect(xml).toContain('propfind-child.txt');
+            // A file child carries the two file-only properties.
+            expect(xml).toContain('<D:getcontentlength>1</D:getcontentlength>');
+            expect(xml).toContain(
+                '<D:getcontenttype>text/plain</D:getcontenttype>',
+            );
+        });
+
+        it('reports timestamps in the present, not the epoch', async () => {
+            // Entry timestamps are stored as Unix seconds. Handing those to
+            // `Date` unscaled reads them as milliseconds and dates every file
+            // to January 1970, which clients sort and sync against.
+            const { actor, username } = await makeUser();
+            const path = `/${username}/Documents/dated.txt`;
+            await putFile(actor, path, 'x');
+
+            const captured = await dispatch({
+                method: 'PROPFIND',
+                path,
+                actor,
+                headers: { depth: '0' },
+            });
+            const xml = captured.body as string;
+            const modified = xml.match(
+                /<D:getlastmodified>(.*?)<\/D:getlastmodified>/,
+            )?.[1];
+            expect(modified).toBeDefined();
+            const skew = Math.abs(
+                new Date(modified as string).getTime() - Date.now(),
+            );
+            expect(skew).toBeLessThan(5 * 60 * 1000);
+        });
+
+        it('emits the same ETag for an entry over PROPFIND and GET', async () => {
+            // A client that sees the validator change between the two treats
+            // the file as modified and re-downloads it on every pass.
+            const { actor, username } = await makeUser();
+            const path = `/${username}/Documents/etag-match.txt`;
+            await putFile(actor, path, 'x');
+
+            const propfind = await dispatch({
+                method: 'PROPFIND',
+                path,
+                actor,
+                headers: { depth: '0' },
+            });
+            const propfindEtag = (propfind.body as string).match(
+                /<D:getetag>(.*?)<\/D:getetag>/,
+            )?.[1];
+
+            const get = await dispatch({ method: 'GET', path, actor });
+
+            expect(propfindEtag).toBeDefined();
+            expect(get.headers['etag']).toBe(propfindEtag);
+        });
+
+        it('omits children at depth 0', async () => {
+            const { actor, username } = await makeUser();
+            await putFile(actor, `/${username}/Documents/hidden.txt`, 'x');
+
+            const captured = await dispatch({
+                method: 'PROPFIND',
+                path: `/${username}/Documents`,
+                actor,
+                headers: { depth: '0' },
+            });
+            expect(captured.statusCode).toBe(207);
+            expect(captured.body as string).not.toContain('hidden.txt');
+        });
+
+        it("lists the caller's home directory under the root collection", async () => {
+            const { actor, username } = await makeUser();
+            const captured = await dispatch({
+                method: 'PROPFIND',
+                path: '/',
+                actor,
+            });
+            expect(captured.statusCode).toBe(207);
+            expect(captured.body as string).toContain(
+                `<D:href>/${username}/</D:href>`,
+            );
+        });
+
+        describe('root collection per credential', () => {
+            // Own address, so the per-IP auth failure bucket the rest of the
+            // file draws on can't refuse these.
+            const propfindRoot = (authorization: string) =>
+                dispatch({
+                    method: 'PROPFIND',
+                    path: '/',
+                    headers: { authorization },
+                    ip: '203.0.113.53',
+                });
+
+            const mintToken = async (userId: number, permission: string) => {
+                const user = (await server.stores.user.getById(userId))!;
+                return server.services.auth.createAccessToken(
+                    makeActor({ user }),
+                    [[permission]],
+                );
+            };
+
+            it('lists the home for a password login and a full-access token', async () => {
+                const username = `webdav-root-${Math.random()
+                    .toString(36)
+                    .slice(2, 10)}`;
+                const created = await server.stores.user.create({
+                    username,
+                    uuid: uuidv4(),
+                    password: await bcryptHash('correct-horse', 4),
+                    email: `${username}@test.local`,
+                    free_storage: 100 * 1024 * 1024,
+                    requires_email_confirmation: false,
+                });
+                await generateDefaultFsentries(
+                    server.clients.db,
+                    server.stores.user,
+                    created,
+                );
+                const fullAccess = await mintToken(created.id, FULL_API_ACCESS);
+
+                for (const authorization of [
+                    basicAuth(username, 'correct-horse'),
+                    basicAuth('-token', fullAccess),
+                ]) {
+                    const captured = await propfindRoot(authorization);
+                    expect(captured.statusCode).toBe(207);
+                    expect(captured.body as string).toContain(
+                        `<D:href>/${username}/</D:href>`,
+                    );
+                }
+            });
+
+            it('leaves the home out for a token scoped below it', async () => {
+                const { userId, username } = await makeUser();
+                const home = (await server.stores.fsEntry.getEntryByPath(
+                    `/${username}`,
+                ))!;
+                const documents = (await server.stores.fsEntry.getEntryByPath(
+                    `/${username}/Documents`,
+                ))!;
+                const scoped = await mintToken(
+                    userId,
+                    `fs:${documents.uuid}:read`,
+                );
+
+                const captured = await propfindRoot(
+                    basicAuth('-token', scoped),
+                );
+
+                expect(captured.statusCode).toBe(207);
+                const xml = captured.body as string;
+                expect(xml).toContain('<D:href>/</D:href>');
+                expect(xml).not.toContain(`/${username}/`);
+                expect(xml).not.toContain(home.uuid);
+            });
+
+            it('lists the home for a token that can read it', async () => {
+                const { userId, username } = await makeUser();
+                const home = (await server.stores.fsEntry.getEntryByPath(
+                    `/${username}`,
+                ))!;
+                const scoped = await mintToken(userId, `fs:${home.uuid}:read`);
+
+                const captured = await propfindRoot(
+                    basicAuth('-token', scoped),
+                );
+
+                expect(captured.statusCode).toBe(207);
+                expect(captured.body as string).toContain(
+                    `<D:href>/${username}/</D:href>`,
+                );
+            });
+        });
+
+        it('describes a single file when asked for one', async () => {
+            const { actor, username } = await makeUser();
+            const path = `/${username}/Documents/single.md`;
+            await putFile(actor, path, 'hello');
+
+            const captured = await dispatch({
+                method: 'PROPFIND',
+                path,
+                actor,
+            });
+            expect(captured.statusCode).toBe(207);
+            const xml = captured.body as string;
+            expect(xml).toContain('<D:resourcetype></D:resourcetype>');
+            expect(xml).toContain(
+                '<D:getcontenttype>text/markdown</D:getcontenttype>',
+            );
+        });
+
+        it("answers a share root's parent with a virtual collection", async () => {
+            const owner = await makeUser();
+            const holder = await makeUser();
+            await dispatch({
+                method: 'MKCOL',
+                path: `/${owner.username}/Documents/Album`,
+                actor: owner.actor,
+            });
+            const root = (await server.stores.fsEntry.getEntryByPath(
+                `/${owner.username}/Documents/Album`,
+            ))!;
+            await server.services.acl.setUserUser(
+                owner.actor as never,
+                holder.actor as never,
+                {
+                    path: root.path,
+                    resolveAncestors: () =>
+                        server.services.fs.getAncestorChain(root.path),
+                },
+                'read',
+            );
+
+            // `/<owner>/<uuid>` is where Up from a share root lands; it is not
+            // a real path, so it answers as a virtual collection whose only
+            // member is the share root at its masked path.
+            const captured = await dispatch({
+                method: 'PROPFIND',
+                path: `/${owner.username}/${root.uuid}`,
+                actor: holder.actor,
+            });
+            expect(captured.statusCode).toBe(207);
+            const xml = captured.body as string;
+            expect(xml).toContain(
+                `<D:href>/${owner.username}/${root.uuid}/</D:href>`,
+            );
+            expect(xml).toContain(
+                `<D:href>/${owner.username}/${root.uuid}/Album/</D:href>`,
+            );
+            // The owner's real tree never shows through.
+            expect(xml).not.toContain('/Documents/');
+        });
+
+        it("keeps a share root's parent a 404 for a caller with no share", async () => {
+            const owner = await makeUser();
+            const stranger = await makeUser();
+            await dispatch({
+                method: 'MKCOL',
+                path: `/${owner.username}/Documents/Private`,
+                actor: owner.actor,
+            });
+            const root = (await server.stores.fsEntry.getEntryByPath(
+                `/${owner.username}/Documents/Private`,
+            ))!;
+
+            const captured = await dispatch({
+                method: 'PROPFIND',
+                path: `/${owner.username}/${root.uuid}`,
+                actor: stranger.actor,
+            });
+            expect(captured.statusCode).toBe(404);
+        });
+    });
+
+    describe('PROPPATCH', () => {
+        it('acknowledges a property update with 207', async () => {
+            const { actor, username } = await makeUser();
+            const captured = await dispatch({
+                method: 'PROPPATCH',
+                path: `/${username}/Documents`,
+                actor,
+            });
+            expect(captured.statusCode).toBe(207);
+            expect(captured.body as string).toContain('HTTP/1.1 200 OK');
+        });
+    });
+
+    describe('MKCOL', () => {
+        it('creates a collection and reports its Location', async () => {
+            const { actor, username } = await makeUser();
+            const path = `/${username}/Documents/new-collection`;
+            const captured = await dispatch({ method: 'MKCOL', path, actor });
+            expect(captured.statusCode).toBe(201);
+            expect(captured.headers.location).toBe(`${path}/`);
+            const entry = await server.stores.fsEntry.getEntryByPath(path);
+            expect(entry?.isDir).toBe(true);
+        });
+
+        it('returns 405 when the collection already exists', async () => {
+            const { actor, username } = await makeUser();
+            const path = `/${username}/Documents/twice`;
+            expect(
+                (await dispatch({ method: 'MKCOL', path, actor })).statusCode,
+            ).toBe(201);
+            const second = await dispatch({ method: 'MKCOL', path, actor });
+            expect(second.statusCode).toBe(405);
+            expect(second.body).toBe('Already exists');
+        });
+
+        it("denies creating a collection in another user's home", async () => {
+            const owner = await makeUser();
+            const stranger = await makeUser();
+            const captured = await dispatch({
+                method: 'MKCOL',
+                path: `/${owner.username}/Documents/intruder`,
+                actor: stranger.actor,
+            });
+            expect(captured.statusCode).toBe(403);
+        });
+    });
+
+    describe('PUT', () => {
+        it('creates with 201 and overwrites with 204', async () => {
+            const { actor, username } = await makeUser();
+            const path = `/${username}/Documents/put-twice.txt`;
+
+            const created = await dispatch({
+                method: 'PUT',
+                path,
+                headers: { 'content-length': '3' },
+                actor,
+                content: 'one',
+            });
+            expect(created.statusCode).toBe(201);
+            expect(created.headers.etag).toEqual(expect.any(String));
+
+            const replaced = await dispatch({
+                method: 'PUT',
+                path,
+                headers: { 'content-length': '5' },
+                actor,
+                content: 'three',
+            });
+            expect(replaced.statusCode).toBe(204);
+            expect(
+                (await server.stores.fsEntry.getEntryByPath(path))?.size,
+            ).toBe(5);
+        });
+
+        it('answers an Expect: 100-continue handshake on the socket', async () => {
+            const { actor, username } = await makeUser();
+            const written: string[] = [];
+            const captured = await dispatch({
+                method: 'PUT',
+                path: `/${username}/Documents/expect.txt`,
+                headers: {
+                    'content-length': '2',
+                    expect: '100-continue',
+                },
+                actor,
+                content: 'hi',
+                socket: { write: (chunk: string) => written.push(chunk) },
+            });
+            expect(captured.statusCode).toBe(201);
+            expect(written).toEqual(['HTTP/1.1 100 Continue\r\n\r\n']);
+        });
+
+        it('falls back to X-Expected-Entity-Length when Content-Length is absent', async () => {
+            const { actor, username } = await makeUser();
+            const path = `/${username}/Documents/finder-style.txt`;
+            const captured = await dispatch({
+                method: 'PUT',
+                path,
+                headers: { 'x-expected-entity-length': '4' },
+                actor,
+                content: 'macs',
+            });
+            expect(captured.statusCode).toBe(201);
+            expect(
+                (await server.stores.fsEntry.getEntryByPath(path))?.size,
+            ).toBe(4);
+        });
+    });
+
+    describe('DELETE', () => {
+        it('removes an existing entry with 204', async () => {
+            const { actor, username } = await makeUser();
+            const path = `/${username}/Documents/delete-me.txt`;
+            await putFile(actor, path, 'bye');
+
+            const captured = await dispatch({ method: 'DELETE', path, actor });
+            expect(captured.statusCode).toBe(204);
+            expect(await server.stores.fsEntry.getEntryByPath(path)).toBeNull();
+        });
+
+        it('returns 404 for a path the caller may write but that does not exist', async () => {
+            const { actor, username } = await makeUser();
+            const captured = await dispatch({
+                method: 'DELETE',
+                path: `/${username}/Documents/never-existed.txt`,
+                actor,
+            });
+            expect(captured.statusCode).toBe(404);
+            expect(captured.body).toBe('Not Found');
+        });
+    });
+
+    describe('COPY', () => {
+        it('copies a file to a new destination with 201', async () => {
+            const { actor, username } = await makeUser();
+            const source = `/${username}/Documents/copy-src.txt`;
+            const destination = `/${username}/Documents/copy-dst.txt`;
+            await putFile(actor, source, 'copied');
+
+            const captured = await dispatch({
+                method: 'COPY',
+                path: source,
+                actor,
+                headers: { destination, host: 'dav.puter.localhost' },
+            });
+            expect(captured.statusCode).toBe(201);
+            expect(
+                await server.stores.fsEntry.getEntryByPath(destination),
+            ).not.toBeNull();
+            expect(
+                await server.stores.fsEntry.getEntryByPath(source),
+            ).not.toBeNull();
+        });
+
+        it('accepts an absolute-URL Destination header', async () => {
+            const { actor, username } = await makeUser();
+            const source = `/${username}/Documents/copy-abs-src.txt`;
+            const destination = `/${username}/Documents/copy-abs-dst.txt`;
+            await putFile(actor, source, 'abs');
+
+            const captured = await dispatch({
+                method: 'COPY',
+                path: source,
+                actor,
+                headers: {
+                    destination: `http://dav.puter.localhost${destination}`,
+                    host: 'dav.puter.localhost',
+                },
+            });
+            expect(captured.statusCode).toBe(201);
+            expect(
+                await server.stores.fsEntry.getEntryByPath(destination),
+            ).not.toBeNull();
+        });
+
+        it('overwrites an existing destination with 204 and announces the replaced entry', async () => {
+            const { actor, username } = await makeUser();
+            const source = `/${username}/Documents/copy-over-src.txt`;
+            const destination = `/${username}/Documents/copy-over-dst.txt`;
+            await putFile(actor, source, 'fresh');
+            await putFile(actor, destination, 'stale');
+
+            const replaced =
+                (await server.stores.fsEntry.getEntryByPath(destination))!;
+
+            const emitSpy = vi.spyOn(server.clients.event, 'emit');
+            let captured: Awaited<ReturnType<typeof dispatch>>;
+            let removed: Record<string, unknown> | undefined;
+            try {
+                captured = await dispatch({
+                    method: 'COPY',
+                    path: source,
+                    actor,
+                    headers: { destination, host: 'dav.puter.localhost' },
+                });
+                const calls = emitSpy.mock.calls;
+                const added = () =>
+                    calls.findIndex(
+                        ([name]) => name === 'outer.gui.item.added',
+                    );
+                await vi.waitFor(() =>
+                    expect(added()).toBeGreaterThanOrEqual(0),
+                );
+                const removedAt = guiEventIndex(
+                    calls,
+                    'outer.gui.item.removed',
+                    replaced.uuid,
+                );
+                // Removal first: the desktop hides rows by path.
+                expect(removedAt).toBeGreaterThanOrEqual(0);
+                expect(removedAt).toBeLessThan(added());
+                removed = guiResponse(calls, removedAt);
+            } finally {
+                emitSpy.mockRestore();
+            }
+            expect(captured.statusCode).toBe(204);
+            // Other clients drop the replaced entry's row by this.
+            expect(removed?.path).toBe(destination);
+        });
+
+        it('returns 412 when the destination exists and Overwrite is F', async () => {
+            const { actor, username } = await makeUser();
+            const source = `/${username}/Documents/copy-nf-src.txt`;
+            const destination = `/${username}/Documents/copy-nf-dst.txt`;
+            await putFile(actor, source, 'a');
+            await putFile(actor, destination, 'b');
+
+            const captured = await dispatch({
+                method: 'COPY',
+                path: source,
+                actor,
+                headers: {
+                    destination,
+                    overwrite: 'F',
+                    host: 'dav.puter.localhost',
+                },
+            });
+            expect(captured.statusCode).toBe(412);
+            expect(captured.body).toBe('Destination exists and Overwrite=F');
+        });
+
+        it('returns 404 when the source is missing', async () => {
+            const { actor, username } = await makeUser();
+            const captured = await dispatch({
+                method: 'COPY',
+                path: `/${username}/Documents/no-source.txt`,
+                actor,
+                headers: {
+                    destination: `/${username}/Documents/anywhere.txt`,
+                    host: 'dav.puter.localhost',
+                },
+            });
+            expect(captured.statusCode).toBe(404);
+            expect(captured.body).toBe('Source not found');
+        });
+
+        it('returns 409 when the destination parent is not a directory', async () => {
+            const { actor, username } = await makeUser();
+            const source = `/${username}/Documents/copy-409-src.txt`;
+            const blocker = `/${username}/Documents/not-a-dir.txt`;
+            await putFile(actor, source, 'a');
+            await putFile(actor, blocker, 'b');
+
+            const captured = await dispatch({
+                method: 'COPY',
+                path: source,
+                actor,
+                headers: {
+                    destination: `${blocker}/child.txt`,
+                    host: 'dav.puter.localhost',
+                },
+            });
+            expect(captured.statusCode).toBe(409);
+        });
+    });
+
+    describe('MOVE', () => {
+        it('relocates the entry and leaves nothing behind', async () => {
+            const { actor, username } = await makeUser();
+            const source = `/${username}/Documents/move-src.txt`;
+            const destination = `/${username}/Documents/move-dst.txt`;
+            await putFile(actor, source, 'moving');
+
+            const captured = await dispatch({
+                method: 'MOVE',
+                path: source,
+                actor,
+                headers: { destination, host: 'dav.puter.localhost' },
+            });
+            expect(captured.statusCode).toBe(201);
+            expect(
+                await server.stores.fsEntry.getEntryByPath(source),
+            ).toBeNull();
+            expect(
+                await server.stores.fsEntry.getEntryByPath(destination),
+            ).not.toBeNull();
+        });
+
+        it('overwrites an existing destination and announces both changes', async () => {
+            const { actor, username } = await makeUser();
+            const source = `/${username}/Documents/move-over-src.txt`;
+            const destination = `/${username}/Documents/move-over-dst.txt`;
+            await putFile(actor, source, 'fresh');
+            await putFile(actor, destination, 'stale');
+            const moving =
+                (await server.stores.fsEntry.getEntryByPath(source))!;
+            const replaced =
+                (await server.stores.fsEntry.getEntryByPath(destination))!;
+
+            const emitSpy = vi.spyOn(server.clients.event, 'emit');
+            let captured: Awaited<ReturnType<typeof dispatch>>;
+            let moved: Record<string, unknown> | undefined;
+            let removed: Record<string, unknown> | undefined;
+            try {
+                captured = await dispatch({
+                    method: 'MOVE',
+                    path: source,
+                    actor,
+                    headers: { destination, host: 'dav.puter.localhost' },
+                });
+                const calls = emitSpy.mock.calls;
+                const movedAt = () =>
+                    guiEventIndex(calls, 'outer.gui.item.moved', moving.uuid);
+                await vi.waitFor(() =>
+                    expect(movedAt()).toBeGreaterThanOrEqual(0),
+                );
+                const removedAt = guiEventIndex(
+                    calls,
+                    'outer.gui.item.removed',
+                    replaced.uuid,
+                );
+                // Removal first: the desktop hides rows by path.
+                expect(removedAt).toBeGreaterThanOrEqual(0);
+                expect(removedAt).toBeLessThan(movedAt());
+                moved = guiResponse(calls, movedAt());
+                removed = guiResponse(calls, removedAt);
+            } finally {
+                emitSpy.mockRestore();
+            }
+            expect(captured.statusCode).toBe(204);
+            expect(moved).toMatchObject({
+                path: destination,
+                old_path: source,
+            });
+            expect(removed?.path).toBe(destination);
+        });
+
+        it('returns 412 when the destination exists and Overwrite is F', async () => {
+            const { actor, username } = await makeUser();
+            const source = `/${username}/Documents/move-nf-src.txt`;
+            const destination = `/${username}/Documents/move-nf-dst.txt`;
+            await putFile(actor, source, 'a');
+            await putFile(actor, destination, 'b');
+
+            const captured = await dispatch({
+                method: 'MOVE',
+                path: source,
+                actor,
+                headers: {
+                    destination,
+                    overwrite: 'F',
+                    host: 'dav.puter.localhost',
+                },
+            });
+            expect(captured.statusCode).toBe(412);
+        });
+
+        it('returns 404 when the source is missing', async () => {
+            const { actor, username } = await makeUser();
+            const captured = await dispatch({
+                method: 'MOVE',
+                path: `/${username}/Documents/gone.txt`,
+                actor,
+                headers: {
+                    destination: `/${username}/Documents/elsewhere.txt`,
+                    host: 'dav.puter.localhost',
+                },
+            });
+            expect(captured.statusCode).toBe(404);
+            expect(captured.body).toBe('Source not found');
+        });
+
+        it("denies moving into another user's home", async () => {
+            const owner = await makeUser();
+            const stranger = await makeUser();
+            const source = `/${stranger.username}/Documents/mine.txt`;
+            await putFile(stranger.actor, source, 'x');
+
+            const captured = await dispatch({
+                method: 'MOVE',
+                path: source,
+                actor: stranger.actor,
+                headers: {
+                    destination: `/${owner.username}/Documents/yours.txt`,
+                    host: 'dav.puter.localhost',
+                },
+            });
+            expect(captured.statusCode).toBe(403);
+        });
+    });
+
+    describe('locking interaction', () => {
+        const lockPath = async (actor: unknown, path: string) => {
+            const captured = await dispatch({ method: 'LOCK', path, actor });
+            expect(captured.statusCode).toBe(200);
+            const token = /<D:href>(urn:uuid:[0-9a-f-]+)<\/D:href>/.exec(
+                captured.body as string,
+            )?.[1];
+            expect(token).toBeTruthy();
+            return { token: token!, headers: captured.headers };
+        };
+
+        it('advertises the lock token in the Lock-Token header', async () => {
+            const { actor, username } = await makeUser();
+            const path = `/${username}/Documents/lock-header.txt`;
+            const { token, headers } = await lockPath(actor, path);
+            expect(headers['lock-token']).toBe(`<${token}>`);
+        });
+
+        it('grants a shared lock when the body asks for one', async () => {
+            const { actor, username } = await makeUser();
+            const path = `/${username}/Documents/shared-lock.txt`;
+            const captured = await dispatch({
+                method: 'LOCK',
+                path,
+                actor,
+                body: { lockinfo: { lockscope: { shared: {} } } },
+            });
+            expect(captured.statusCode).toBe(200);
+            expect(captured.body as string).toContain('<D:shared/>');
+        });
+
+        it('allows a second shared lock on the same path', async () => {
+            const { actor, username } = await makeUser();
+            const path = `/${username}/Documents/shared-twice.txt`;
+            const body = { lockinfo: { lockscope: { shared: {} } } };
+            expect(
+                (await dispatch({ method: 'LOCK', path, actor, body }))
+                    .statusCode,
+            ).toBe(200);
+            expect(
+                (await dispatch({ method: 'LOCK', path, actor, body }))
+                    .statusCode,
+            ).toBe(200);
+        });
+
+        it('returns 412 when refreshing an unknown lock token', async () => {
+            const { actor, username } = await makeUser();
+            const captured = await dispatch({
+                method: 'LOCK',
+                path: `/${username}/Documents/refresh-unknown.txt`,
+                actor,
+                headers: {
+                    if: '(<urn:uuid:22222222-2222-2222-2222-222222222222>)',
+                },
+            });
+            expect(captured.statusCode).toBe(412);
+            expect(captured.body).toBe('Lock token not found');
+        });
+
+        it('blocks PUT, DELETE, MKCOL and PROPPATCH on a locked path with 423', async () => {
+            const { actor, username } = await makeUser();
+            const path = `/${username}/Documents/locked-target.txt`;
+            await putFile(actor, path, 'v1');
+            await lockPath(actor, path);
+
+            for (const method of ['PUT', 'DELETE', 'PROPPATCH']) {
+                const captured = await dispatch({
+                    method,
+                    path,
+                    actor,
+                    headers: { 'content-length': '2' },
+                    ...(method === 'PUT' ? { content: 'v2' } : {}),
+                });
+                expect(captured.statusCode).toBe(423);
+                expect(captured.body).toBe('Locked');
+            }
+
+            const collection = `/${username}/Documents/locked-collection`;
+            await lockPath(actor, collection);
+            const mkcol = await dispatch({
+                method: 'MKCOL',
+                path: collection,
+                actor,
+            });
+            expect(mkcol.statusCode).toBe(423);
+        });
+
+        it('lets the lock holder write through with its If token', async () => {
+            const { actor, username } = await makeUser();
+            const path = `/${username}/Documents/lock-and-write.txt`;
+            await putFile(actor, path, 'v1');
+            const { token } = await lockPath(actor, path);
+
+            const captured = await dispatch({
+                method: 'PUT',
+                path,
+                actor,
+                headers: {
+                    'content-length': '2',
+                    if: `(<${token}>)`,
+                },
+                content: 'v2',
+            });
+            expect(captured.statusCode).toBe(204);
+        });
+
+        it('blocks COPY onto a locked destination with 423', async () => {
+            const { actor, username } = await makeUser();
+            const source = `/${username}/Documents/copy-locked-src.txt`;
+            const destination = `/${username}/Documents/copy-locked-dst.txt`;
+            await putFile(actor, source, 'a');
+            await lockPath(actor, destination);
+
+            const captured = await dispatch({
+                method: 'COPY',
+                path: source,
+                actor,
+                headers: { destination, host: 'dav.puter.localhost' },
+            });
+            expect(captured.statusCode).toBe(423);
+        });
+
+        it('releases the lock on UNLOCK and lets writes through again', async () => {
+            const { actor, username } = await makeUser();
+            const path = `/${username}/Documents/unlock-me.txt`;
+            await putFile(actor, path, 'v1');
+            const { token } = await lockPath(actor, path);
+
+            const unlocked = await dispatch({
+                method: 'UNLOCK',
+                path,
+                actor,
+                headers: { 'lock-token': `<${token}>` },
+            });
+            expect(unlocked.statusCode).toBe(204);
+
+            const written = await dispatch({
+                method: 'PUT',
+                path,
+                actor,
+                headers: { 'content-length': '2' },
+                content: 'v2',
+            });
+            expect(written.statusCode).toBe(204);
+        });
+
+        it('refuses to UNLOCK a token minted for a different path', async () => {
+            const { actor, username } = await makeUser();
+            const locked = `/${username}/Documents/other-lock.txt`;
+            const { token } = await lockPath(actor, locked);
+
+            const captured = await dispatch({
+                method: 'UNLOCK',
+                path: `/${username}/Documents/somewhere-else.txt`,
+                actor,
+                headers: { 'lock-token': `<${token}>` },
+            });
+            expect(captured.statusCode).toBe(403);
+            expect(captured.body).toBe('Lock token does not match this path');
+        });
+    });
+
+    describe('shared-path masking', () => {
+        /** A `Secrets/plan.txt` folder in `owner`'s Documents, shared with `to`. */
+        const shareFolder = async (
+            owner: Awaited<ReturnType<typeof makeUser>>,
+            to: Awaited<ReturnType<typeof makeUser>>,
+        ) => {
+            const dirUuid = uuidv4();
+            const dirPath = `/${owner.username}/Documents/Secrets`;
+            const now = Math.floor(Date.now() / 1000);
+            const parent = (await server.stores.fsEntry.getEntryByPath(
+                `/${owner.username}/Documents`,
+            ))!;
+            await server.clients.db.write(
+                'INSERT INTO `fsentries` (`uuid`, `name`, `path`, `user_id`, `is_dir`, `modified`, `parent_id`, `parent_uid`) VALUES (?, ?, ?, ?, 1, ?, ?, ?)',
+                [
+                    dirUuid,
+                    'Secrets',
+                    dirPath,
+                    owner.userId,
+                    now,
+                    parent.id,
+                    parent.uuid,
+                ],
+            );
+            const dir = (await server.stores.fsEntry.getEntryByPath(dirPath))!;
+            await server.clients.db.write(
+                'INSERT INTO `fsentries` (`uuid`, `name`, `path`, `user_id`, `is_dir`, `modified`, `parent_id`, `parent_uid`) VALUES (?, ?, ?, ?, 0, ?, ?, ?)',
+                [
+                    uuidv4(),
+                    'plan.txt',
+                    `${dirPath}/plan.txt`,
+                    owner.userId,
+                    now,
+                    dir.id,
+                    dir.uuid,
+                ],
+            );
+
+            await runWithContext({ actor: owner.actor as never }, () =>
+                server.services.share.share(owner.actor as never, {
+                    uid: dirUuid,
+                    recipient: { username: to.username! },
+                    mode: 'read',
+                }),
+            );
+            return { dirUuid, dirPath };
+        };
+
+        /**
+         * PROPFIND under the ALS wrap a real request gets, pre-auth actor
+         * empty.
+         */
+        const propfind = async (path: string, actor: unknown, depth = '1') => {
+            const { res, captured } = makeRes();
+            await runWithContext({ actor: undefined }, () =>
+                dispatchMiddleware(
+                    makeReq({
+                        method: 'PROPFIND',
+                        path,
+                        headers: { depth },
+                        actor,
+                    }),
+                    res,
+                    noop,
+                ),
+            );
+            return captured;
+        };
+
+        // The DAV controller authenticates in-controller, after the request
+        // context snapshotted an empty `req.actor` — so it has to place the
+        // actor into the context itself or outbound masking silently turns
+        // off and PROPFIND lists the owner's real paths.
+        it('lists a shared folder under its masked path, not the owner’s real one', async () => {
+            const owner = await makeUser();
+            const recipient = await makeUser();
+            const { dirUuid } = await shareFolder(owner, recipient);
+
+            const masked = `/${owner.username}/${dirUuid}/Secrets`;
+            const captured = await propfind(masked, recipient.actor);
+
+            expect(captured.statusCode).toBe(207);
+            const xml = String(captured.body);
+            expect(xml).toContain(`${masked}/plan.txt`);
+            expect(xml).not.toContain('/Documents/Secrets');
+        });
+
+        it('lists each sharer as a collection under the root', async () => {
+            const owner = await makeUser();
+            const recipient = await makeUser();
+            await shareFolder(owner, recipient);
+
+            const captured = await propfind('/', recipient.actor);
+            expect(captured.statusCode).toBe(207);
+            const xml = String(captured.body);
+            // The recipient's own home, plus the owner who shared with them.
+            expect(xml).toContain(`<D:href>/${recipient.username}/</D:href>`);
+            expect(xml).toContain(`<D:href>/${owner.username}/</D:href>`);
+        });
+
+        it('omits the sharers at depth 0', async () => {
+            const owner = await makeUser();
+            const recipient = await makeUser();
+            await shareFolder(owner, recipient);
+
+            const captured = await propfind('/', recipient.actor, '0');
+            expect(captured.statusCode).toBe(207);
+            expect(String(captured.body)).not.toContain(`/${owner.username}/`);
+        });
+
+        it('answers a sharer’s collection with the shares they issued', async () => {
+            const owner = await makeUser();
+            const recipient = await makeUser();
+            const { dirUuid } = await shareFolder(owner, recipient);
+
+            const captured = await propfind(
+                `/${owner.username}`,
+                recipient.actor,
+            );
+            expect(captured.statusCode).toBe(207);
+            const xml = String(captured.body);
+            expect(xml).toContain(`<D:href>/${owner.username}/</D:href>`);
+            // The `<uuid>` level, which the share root hangs off. It borrows
+            // the shared item's name so a client has something to show.
+            expect(xml).toContain(
+                `<D:href>/${owner.username}/${dirUuid}/</D:href>`,
+            );
+            expect(xml).toContain('<D:displayname>Secrets</D:displayname>');
+            // Nothing else of the owner's shows through — not their home
+            // directory's other children, not the folder the share sits in.
+            expect(xml).not.toContain('Documents');
+        });
+
+        it('keeps a sharer’s collection a 403 for a caller with no share', async () => {
+            const owner = await makeUser();
+            const stranger = await makeUser();
+            await shareFolder(owner, await makeUser());
+
+            const captured = await propfind(
+                `/${owner.username}`,
+                stranger.actor,
+            );
+            expect(captured.statusCode).toBe(403);
+        });
+    });
+
+    // The virtual collections invent two levels of path that no fsentry backs.
+    // Everything here checks that they only ever widen to what was actually
+    // shared — the rest of the owner's tree has to stay unreachable and
+    // unnamed.
+    describe('shared-space containment', () => {
+        /**
+         * `owner` shares `Shared/` (holding `in.txt`) with `to`, and keeps
+         * `Private/` (holding `out.txt`) to themselves.
+         */
+        const shareOneOfTwo = async (
+            owner: Awaited<ReturnType<typeof makeUser>>,
+            to: Awaited<ReturnType<typeof makeUser>>,
+        ) => {
+            const mk = async (
+                method: string,
+                path: string,
+                extra: Record<string, string> = {},
+            ) => {
+                const { res, captured } = makeRes();
+                await runWithContext({ actor: undefined }, () =>
+                    dispatchMiddleware(
+                        makeReq({
+                            method,
+                            path,
+                            actor: owner.actor,
+                            headers: extra,
+                        }),
+                        res,
+                        noop,
+                    ),
+                );
+                return captured;
+            };
+            await mk('MKCOL', `/${owner.username}/Documents/Shared`);
+            await mk('MKCOL', `/${owner.username}/Documents/Private`);
+
+            const shared = (await server.stores.fsEntry.getEntryByPath(
+                `/${owner.username}/Documents/Shared`,
+            ))!;
+            const private_ = (await server.stores.fsEntry.getEntryByPath(
+                `/${owner.username}/Documents/Private`,
+            ))!;
+
+            await runWithContext({ actor: owner.actor as never }, () =>
+                server.services.share.share(owner.actor as never, {
+                    uid: shared.uuid,
+                    recipient: { username: to.username! },
+                    mode: 'read',
+                }),
+            );
+            return { shared, private: private_ };
+        };
+
+        const propfind = async (path: string, actor: unknown, depth = '1') => {
+            const { res, captured } = makeRes();
+            await runWithContext({ actor: undefined }, () =>
+                dispatchMiddleware(
+                    makeReq({
+                        method: 'PROPFIND',
+                        path,
+                        headers: { depth },
+                        actor,
+                    }),
+                    res,
+                    noop,
+                ),
+            );
+            return captured;
+        };
+
+        it('lists only the items that were shared, not the owner’s siblings', async () => {
+            const owner = await makeUser();
+            const holder = await makeUser();
+            const { shared, private: hidden } = await shareOneOfTwo(
+                owner,
+                holder,
+            );
+
+            const captured = await propfind(`/${owner.username}`, holder.actor);
+            expect(captured.statusCode).toBe(207);
+            const xml = String(captured.body);
+            expect(xml).toContain(shared.uuid);
+            expect(xml).not.toContain(hidden.uuid);
+            expect(xml).not.toContain('Private');
+        });
+
+        it('does not recurse past the uuid level at Depth: infinity', async () => {
+            const owner = await makeUser();
+            const holder = await makeUser();
+            const { shared } = await shareOneOfTwo(owner, holder);
+
+            const captured = await propfind(
+                `/${owner.username}`,
+                holder.actor,
+                'infinity',
+            );
+            expect(captured.statusCode).toBe(207);
+            const xml = String(captured.body);
+            // The share's own href lives one segment deeper; asking for the
+            // world must not walk into it.
+            expect(xml).toContain(`/${shared.uuid}/`);
+            expect(xml).not.toContain(`/${shared.uuid}/Shared`);
+        });
+
+        it('refuses every way out of a share', async () => {
+            const owner = await makeUser();
+            const holder = await makeUser();
+            const { shared, private: hidden } = await shareOneOfTwo(
+                owner,
+                holder,
+            );
+            const root = `/${owner.username}/${shared.uuid}/Shared`;
+
+            for (const escape of [
+                // Up and sideways out of the shared subtree.
+                `${root}/../Private`,
+                `${root}/../../Documents`,
+                // Percent-encoded, because the path is decoded before it is
+                // resolved — the guard has to sit after that, not before.
+                `${root}/%2e%2e/Private`,
+                // The owner's real path, named directly rather than walked to.
+                `/${owner.username}/Documents/Private`,
+                `/${owner.username}/Documents`,
+                // A mask pointing at an entry the holder was never given —
+                // both a bad tail under a uuid they do hold, and the uuid of
+                // one they don't.
+                `/${owner.username}/${shared.uuid}/Private`,
+                `/${owner.username}/${hidden.uuid}`,
+                `/${owner.username}/${hidden.uuid}/Private`,
+            ]) {
+                const captured = await propfind(escape, holder.actor);
+                expect(captured.statusCode, escape).toBeGreaterThanOrEqual(400);
+                expect(captured.statusCode, escape).toBeLessThan(500);
+                expect(String(captured.body), escape).not.toContain('Private');
+            }
+        });
+
+        it('does not leak one holder’s shares to another', async () => {
+            const owner = await makeUser();
+            const holder = await makeUser();
+            const outsider = await makeUser();
+            await shareOneOfTwo(owner, holder);
+
+            const captured = await propfind('/', outsider.actor);
+            expect(captured.statusCode).toBe(207);
+            expect(String(captured.body)).not.toContain(owner.username);
+        });
+
+        it('drops the sharer once the share is revoked', async () => {
+            const owner = await makeUser();
+            const holder = await makeUser();
+            const { shared } = await shareOneOfTwo(owner, holder);
+
+            expect(String((await propfind('/', holder.actor)).body)).toContain(
+                `/${owner.username}/`,
+            );
+
+            await runWithContext({ actor: owner.actor as never }, () =>
+                server.services.share.unshare(owner.actor as never, {
+                    uid: shared.uuid,
+                    recipient: { username: holder.username! },
+                }),
+            );
+
+            const root = await propfind('/', holder.actor);
+            expect(String(root.body)).not.toContain(`/${owner.username}/`);
+            // And the level it used to stand in for is a plain 403 again.
+            const owned = await propfind(`/${owner.username}`, holder.actor);
+            expect(owned.statusCode).toBe(403);
+        });
+
+        it('refuses writes and reads aimed at the invented levels', async () => {
+            const owner = await makeUser();
+            const holder = await makeUser();
+            const { shared } = await shareOneOfTwo(owner, holder);
+
+            const attempt = async (method: string, path: string) => {
+                const { res, captured } = makeRes();
+                await runWithContext({ actor: undefined }, () =>
+                    dispatchMiddleware(
+                        makeReq({
+                            method,
+                            path,
+                            actor: holder.actor,
+                            headers: { 'content-length': '3' },
+                        }),
+                        res,
+                        noop,
+                    ),
+                );
+                return captured.statusCode;
+            };
+
+            // A collection, so GET is a 400 either way — what matters is that
+            // neither the owner level nor the uuid level accepts a write.
+            expect(await attempt('GET', `/${owner.username}`)).not.toBe(200);
+            expect(
+                await attempt('MKCOL', `/${owner.username}/intruder`),
+            ).toBeGreaterThanOrEqual(400);
+            expect(
+                await attempt(
+                    'MKCOL',
+                    `/${owner.username}/${shared.uuid}/intruder`,
+                ),
+            ).toBeGreaterThanOrEqual(400);
+            expect(
+                await attempt('DELETE', `/${owner.username}/${shared.uuid}`),
+            ).toBeGreaterThanOrEqual(400);
+
+            // Nothing landed in the owner's tree.
+            expect(
+                await server.stores.fsEntry.getEntryByPath(
+                    `/${owner.username}/intruder`,
+                ),
+            ).toBeFalsy();
+        });
+    });
+});
